@@ -1146,6 +1146,10 @@ void describe("fastForwardReviewWithAI — Publish Checks gate (RC3 item 6 / Ste
       createdAt: "2026-01-01T00:00:00.000Z",
       updatedAt: "2026-01-01T00:00:00.000Z",
       implReviewFiles: undefined,
+      // The Fast Forward Publish branch stops on the saved checks verdict
+      // before Step 6, so this fixture's checks must have passed for the run
+      // to reach Step 6's own changed-file-record refusal.
+      lintPayload: { runAt: "2026-01-01T00:00:00.000Z", passed: true, source: "publish" },
       ownership: {
         metaRoot: path.dirname(folderPath),
         projectRoot: path.dirname(folderPath),

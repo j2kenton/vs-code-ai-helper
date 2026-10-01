@@ -163,8 +163,8 @@
     },
     {
       "file": "src/commands/runLintingFixes.ts",
-      "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when no usable Publish check result is recorded — points to Run Publish Checks, the action the message names. Not a review/round outcome.",
-      "snippet": "NotificationRouter.showWarning( reportFilename ? `${taskLabel}: a ${reportFilename} report exists on disk, but no usable Publish check result is"
+      "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when Publish Checks have not run (no recorded result) — points to Run Publish Checks, the action the message names. Not a review/round outcome.",
+      "snippet": "NotificationRouter.showWarning( `${taskLabel}: Publish Checks have not run yet. Run them first.`, undefined, undefined, undefined,"
     },
     {
       "file": "src/commands/runLintingFixes.ts",

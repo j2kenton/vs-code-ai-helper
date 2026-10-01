@@ -1274,7 +1274,10 @@ export async function resumeAndApplyCurrentStageActionV1(
  * Forward was genuinely mid-run for this task when the card was posted — see
  * `activeFastForwardRunsV1.ts`'s doc comment for why that has to be captured
  * then, not re-derived now. When it was, this dispatches
- * `fastForwardReviewWithAI` at the new stage; otherwise it dispatches the
+ * `fastForwardReviewWithAI` at the new stage (a review stage) — or, when the
+ * move lands on Implementation, which Fast Forward Review refuses, starts the
+ * Implementation round itself and returns its outcome, leaving
+ * `autoReviewAfterImplementation` to carry the run on; otherwise it dispatches the
  * new stage's own default action, resolved by `loadResumeActionPlanV1` —
  * the same resolution `resumeAndApplyCurrentStageActionV1` above uses.
  */
@@ -1462,6 +1465,19 @@ export async function resumeAndSetTaskStageV1(
             `operation from its Notifications row (or wait for it to actually finish), then use the stage's own ` +
             `action to continue.`
         );
+        return true;
+      }
+      if (resumeFastForward && stage === "impl") {
+        // Fast Forward Review works only at a review stage and refuses at
+        // Implementation, so "Build the open plan items" starts the round
+        // itself; autoReviewAfterImplementation carries the run on.
+        // `runImplementationWithAI` resolves `void` (no refusal signal), so
+        // the result is not read: only a literal `false` counts as a refusal
+        // to resumeThenDispatchV1, and `undefined` must not be turned into one.
+        await vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", {
+          taskFolderPath: target.taskFolderPath,
+          admissionHandoffTokenV1: admissionHandoffToken,
+        });
         return true;
       }
       if (resumeFastForward) {

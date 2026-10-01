@@ -860,7 +860,7 @@
         },
         {
           "command": "vs-code-ai-helper.runLintingFixes",
-          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && viewItem =~ /-lint-failed/ && !(viewItem =~ /-paused/)",
+          "when": "view == vs-code-ai-helper.tasksView && viewItem =~ /^stage-publish-current/ && !(viewItem =~ /-paused/)",
           "group": "inline@20"
         },
         {

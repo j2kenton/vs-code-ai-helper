@@ -977,6 +977,61 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     }
   });
 
+  // RC5 item 1: during a Fast Forward run the build-remaining option's
+  // consequence must say what really happens — an Implementation round starts
+  // (it no longer dispatches Fast Forward Review, which refuses at Implementation).
+  void it("during a Fast Forward run, the build-remaining option says it starts an Implementation round", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-open-items-ff-active");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-1" }));
+
+    const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    store.set(
+      planFinalUri.toString(),
+      ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [ ] item 2", "- [ ] item 3"].join("\n")
+    );
+    const blockers: ReviewBlocker[] = [
+      { category: "review-confidence", resolver: "unverifiable", description: "Evidence for the retry path could not be confirmed" },
+    ];
+
+    markFastForwardRunActiveV1(folderUri.fsPath);
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-1",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 8/10\n", blockers, taskFixableCount: 0 }
+      );
+      assert.strictEqual(escalated, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      const buildRemaining = decision.options.find((o) => o.optionId === "buildRemaining");
+      assert.ok(buildRemaining, "must offer a 'build the open items' option");
+      assert.match(
+        buildRemaining.consequence,
+        /starts an Implementation round there; the review follows per your auto-review setting/
+      );
+      assert.doesNotMatch(buildRemaining.consequence, /continues fast-forwarding/);
+    } finally {
+      clearFastForwardRunActiveV1(folderUri.fsPath);
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   // RC2 item 3: with every plan item settled, the plateau card must still
   // recommend Advance exactly as before — this rule only changes behavior
   // while genuine work remains open.

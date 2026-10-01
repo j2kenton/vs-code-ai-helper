@@ -55,20 +55,15 @@ void describe("Publish row title and tooltip (RC3 item 7)", () => {
     assert.match(tooltip, /right-click menu/);
   });
 
-  void it("says checks have not run yet when the wand is hidden because no checks exist", () => {
-    const task = makeTask(undefined);
-    const node = new StageNode(task as never, "publish", "current", undefined);
-    const tooltip = (node.tooltip as vscode.MarkdownString).value;
-    assert.match(tooltip, /Run Publish Checks first\./);
-    assert.doesNotMatch(tooltip, /No fixes needed/);
-  });
-
-  void it("says no fixes are needed when the wand is hidden because checks passed", () => {
-    const task = makeTask({ passed: true });
-    const node = new StageNode(task as never, "publish", "current", undefined);
-    const tooltip = (node.tooltip as vscode.MarkdownString).value;
-    assert.match(tooltip, /No fixes needed: Publish Checks passed\./);
-    assert.doesNotMatch(tooltip, /Run Publish Checks first\./);
+  void it("describes the always-shown wand and no longer carries hidden-wand reasons", () => {
+    for (const lint of [undefined, { passed: true }, { passed: false }]) {
+      const node = new StageNode(makeTask(lint) as never, "publish", "current", undefined);
+      const tooltip = (node.tooltip as vscode.MarkdownString).value;
+      assert.match(tooltip, /does nothing if they passed or have not run/);
+      assert.doesNotMatch(tooltip, /No fixes needed/);
+      assert.doesNotMatch(tooltip, /Run Publish Checks first\./);
+      assert.doesNotMatch(tooltip, /appears here if the checks fail/);
+    }
   });
 
   void it("adds no Publish-only tooltip text for a non-publish stage", () => {

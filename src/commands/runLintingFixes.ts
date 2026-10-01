@@ -6,12 +6,9 @@ import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "../utils/taskProgressTransforms";
 import { IncompleteTask } from "../types/incompleteTask";
-import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
-import { readNonEmptyText } from "../utils/fileUtils";
 import {
-  extractCompletionChecksSectionV1,
   runCompletionLint,
   resolvePublishScopeFolder,
 } from "../utils/completionLint";
@@ -294,36 +291,10 @@ export async function runLintingFixes(
   // ever having run for this task.
   const lastReport = resolvedTask.progress.lintPayload;
   if (!lastReport) {
-    // A Completion Checks section on disk — in publish-review.md (the
-    // unified Publish artifact, plan item 17 step 20) or, for a task that
-    // predates that unification, the legacy publish-checks.md — is only
-    // ever written by an actual Publish checks run, never by this
-    // preview/review path. Its presence means checks ran and were reported
-    // at some point, but no lintPayload survived to this task's current
-    // progress (an old task from before lintPayload persistence existed, or
-    // a state file that was reset/edited by hand). Word this so it doesn't
-    // flatly claim "no report found" when there is visibly a Publish report
-    // on disk.
-    const publishReviewUri = vscode.Uri.file(
-      path.join(resolvedTask.taskFolderPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME)
-    );
-    const publishReviewContent = await readNonEmptyText(publishReviewUri);
-    const legacyChecksUri = vscode.Uri.file(
-      path.join(resolvedTask.taskFolderPath, PUBLISH_CHECKS_FILENAME)
-    );
-    const legacyChecksContent = await readNonEmptyText(legacyChecksUri);
-    const reportFilename =
-      publishReviewContent && extractCompletionChecksSectionV1(publishReviewContent) !== undefined
-        ? (STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME)
-        : legacyChecksContent
-          ? PUBLISH_CHECKS_FILENAME
-          : undefined;
+    // No usable lintPayload: checks never ran, or the recorded result did not
+    // survive. One line either way, no AI work.
     NotificationRouter.showWarning(
-      reportFilename
-        ? `${taskLabel}: a ${reportFilename} report exists on disk, but no usable Publish check result is ` +
-          "currently recorded for this task. Run the Publish checks again to refresh the report this action fixes."
-        : `${taskLabel}: the Publish checks have not been run for this task yet. Run the Publish checks first to generate ` +
-          "the report this action fixes.",
+      `${taskLabel}: Publish Checks have not run yet. Run them first.`,
       undefined,
       undefined,
       undefined,
@@ -335,10 +306,12 @@ export async function runLintingFixes(
     );
     return;
   }
-  if (lastReport.passed) {
+  // The effective verdict, as Publish Checks announced it: a run whose only
+  // failures are quarantined known flakes reports `passed: false` but
+  // `passedModuloKnownFlakes: true`, and has nothing to fix.
+  if (lastReport.passedModuloKnownFlakes ?? lastReport.passed) {
     NotificationRouter.showInformation(
-      `${taskLabel}: the latest Publish checks passed — there is nothing to fix. ` +
-        "Re-run the Publish checks if files changed since the last report."
+      `${taskLabel}: Publish Checks passed, so there is nothing to fix.`
     );
     return;
   }

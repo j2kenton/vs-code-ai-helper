@@ -351,9 +351,11 @@ function buildAdvanceOptionV1(
  * Forward)". Always moves to Implementation (`impl`), regardless of the
  * stage the card was raised from: an impl-review plateau with open items
  * means the checklist still needs building, and Implementation is where
- * that happens. Reuses `resumeAndSetTaskStageV1`'s existing
- * `resumeFastForward` handling exactly like {@link buildAdvanceOptionV1} —
- * captured now, at card-build time, for the same reason.
+ * that happens. `resumeFastForward` is captured now, at card-build time,
+ * like {@link buildAdvanceOptionV1}; at `impl` it makes
+ * `resumeAndSetTaskStageV1` start the Implementation round itself (Fast
+ * Forward Review refuses at Implementation), and the owner's
+ * `autoReviewAfterImplementation` setting carries the run on.
  */
 function buildBuildRemainingOptionV1(
   taskFolderPath: string,
@@ -368,7 +370,8 @@ function buildBuildRemainingOptionV1(
     label: `Build the ${planItemsOpen} open plan ${plural}`,
     resumeKind: "continue",
     consequence: resumeFastForward
-      ? `Resumes the task, moves it to Implementation, and continues fast-forwarding there — ${planItemsOpen} ` +
+      ? `Resumes the task, moves it to Implementation, and starts an Implementation round there; the review ` +
+        `follows per your auto-review setting — ${planItemsOpen} ` +
         `plan ${plural} ${verb} still open.`
       : `Resumes the task, moves it to Implementation, and dispatches its next action there — ${planItemsOpen} ` +
         `plan ${plural} ${verb} still open.`,

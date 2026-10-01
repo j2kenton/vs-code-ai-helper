@@ -577,7 +577,7 @@ function validateLintPayload(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "lintPayload must be an object";
   }
-  const allowed = new Set(["runAt", "passed", "summary", "issueCount", "failedChecks", "source"]);
+  const allowed = new Set(["runAt", "passed", "summary", "issueCount", "failedChecks", "source", "passedModuloKnownFlakes"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
       return `lintPayload has an unknown property ${JSON.stringify(key)}`;
@@ -595,6 +595,12 @@ function validateLintPayload(value: unknown): string | undefined {
   }
   if (typeof value["passed"] !== "boolean") {
     return "lintPayload.passed must be a boolean";
+  }
+  if (
+    value["passedModuloKnownFlakes"] !== undefined &&
+    typeof value["passedModuloKnownFlakes"] !== "boolean"
+  ) {
+    return "lintPayload.passedModuloKnownFlakes must be a boolean when present";
   }
   if (value["summary"] !== undefined && !boundedString(value["summary"], MAX_SUMMARY_LENGTH)) {
     return "lintPayload.summary must be a bounded string when present";

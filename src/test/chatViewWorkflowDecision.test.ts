@@ -2694,7 +2694,15 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       const postedBefore = fake.posted.filter((m) => m.type === "state").length;
       op = taskOperations.begin(folder, { label: "Doing work", stage: "impl" });
       assert.ok(op, "expected the exclusive operation lock to be acquired");
-      await waitForState(fake, () => fake.posted.filter((m) => m.type === "state").length > postedBefore);
+      // Wait for the badge itself to clear, not merely for any new state post:
+      // a render that began before `begin` may still post stale state (empty
+      // `targetOps`, badge lit) and would satisfy a bare post-count wait.
+      await waitForState(
+        fake,
+        () =>
+          fake.posted.filter((m) => m.type === "state").length > postedBefore &&
+          (fake.view as unknown as { badge?: unknown }).badge === undefined
+      );
       assert.equal(
         (fake.view as unknown as { badge?: unknown }).badge,
         undefined,

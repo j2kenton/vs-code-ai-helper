@@ -89,7 +89,13 @@ export function queuePublishChecksRunV1<T>(
  */
 type RunPublishChecksArg =
   | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string; admissionHandoffTokenV1?: string };
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      admissionHandoffTokenV1?: string;
+      /** In-process only: the live Fast Forward root this run's checks nest under. */
+      parentOperation?: TaskOperationHandle;
+    };
 
 /**
  * Normalize a command argument into the shape resolveTaskContext expects.
@@ -172,6 +178,18 @@ function extractAdmissionHandoffTokenV1(node: RunPublishChecksArg | undefined): 
     return undefined;
   }
   return typeof node.admissionHandoffTokenV1 === "string" ? node.admissionHandoffTokenV1 : undefined;
+}
+
+/**
+ * Extract the in-process `parentOperation` from `explicitArg`, when present
+ * (RC5 item 2). Like the handoff token, only the explicit-fields shape carries
+ * it; the tree-row `{ task }` shape never does.
+ */
+export function extractParentOperationV1(node: RunPublishChecksArg | undefined): TaskOperationHandle | undefined {
+  if (!node || !("parentOperation" in node)) {
+    return undefined;
+  }
+  return node.parentOperation;
 }
 
 /**
@@ -625,7 +643,7 @@ export function registerRunPublishChecksCommand(
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.runPublishChecks",
     forwardInViewerV1("vs-code-ai-helper.runPublishChecks", (arg?: RunPublishChecksArg) =>
-      runPublishChecks(inventory, arg, undefined, currentTaskStore)
+      runPublishChecks(inventory, arg, extractParentOperationV1(arg), currentTaskStore)
     )
   );
   context.subscriptions.push(disposable);

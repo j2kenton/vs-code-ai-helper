@@ -151,4 +151,36 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
       "the runner-failure wording must be gated on ffRunnerFailureV1 being set"
     );
   });
+
+  // RC5: a task that left the Fast Forward target stage must be handed over,
+  // never reported as a stalled review.
+  void it("returns the stage-left hand-over before the stalled branch can say no comparable result", () => {
+    const stageLeft = source.indexOf("if (ffStageLeftForV1) {");
+    const stalledBranch = source.indexOf("outcome.stalled &&");
+    const generic = source.indexOf('"the review did not produce a new, comparable result"');
+    assert.ok(stageLeft >= 0, "the post-loop stage-left exit must exist");
+    assert.ok(stageLeft < stalledBranch, "the stage-left return must precede the stalled branch");
+    assert.ok(stageLeft < generic, "the stage-left return must precede the generic stall wording");
+  });
+
+  void it("does not dispatch Fast Forward Review when resuming into Implementation", () => {
+    const resumeSource = fs.readFileSync(path.join(process.cwd(), "src", "commands", "resumeTask.ts"), "utf8");
+    const impl = resumeSource.indexOf('if (resumeFastForward && stage === "impl")');
+    const ff = resumeSource.indexOf("vs-code-ai-helper.fastForwardReviewWithAI", impl);
+    assert.ok(impl >= 0, "the impl branch must exist");
+    assert.ok(ff > impl, "the Fast Forward Review dispatch must come after the impl branch");
+    assert.match(resumeSource.slice(impl, ff), /runImplementationWithAI[\s\S]*return true;/);
+  });
+
+  // RC5 review: valid freshness is not a pass, on every entry path.
+  void it("requires a passing saved result for Publish whether or not the checks were run here", () => {
+    const fn = source.slice(source.indexOf("export async function fastForwardReviewWithAI"));
+    const gate = fn.indexOf('if (targetStage === "publish") {\n    const publishScopeFolder');
+    const noReview = fn.indexOf("  if (!initialContent) {\n    // No review has been run yet at this stage");
+    const slice = fn.slice(gate, noReview);
+    const savedRead = slice.indexOf("const savedChecksPayload");
+    const passCheck = slice.indexOf("if (!savedChecksPassed)");
+    assert.ok(savedRead > 0 && passCheck > savedRead, "the pass check must follow the saved-result read");
+    assert.match(slice, /Publish Checks have not passed/);
+  });
 });

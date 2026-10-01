@@ -391,6 +391,7 @@ import {
   ensurePublishReviewLegacySectionsImportedV1,
 } from "../utils/publishChecksFreshness";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
+import { classifyFastForwardStageV1 } from "../utils/fastForwardStageDriftV1";
 import {
   computeWorkingTreeFingerprintV1,
   countCommitsSinceSha,
@@ -2729,6 +2730,7 @@ export async function persistPublishReviewLintPayload(
       updateLintPayload(current, {
         runAt: result.runAt,
         passed: result.passed,
+        passedModuloKnownFlakes: result.passedModuloKnownFlakes,
         summary: result.summary,
         issueCount: result.issueCount,
         failedChecks: result.failedChecks,
@@ -4777,7 +4779,28 @@ async function routeReviewOutcomeV1(
               // review+fix loop (fastForwardReviewWithAI), same as every other
               // landed-on review stage gets via this same block.
               const publishFollowUpReview = next === "publish";
-              if (transition.shouldAutoReview || publishFollowUpReview) {
+              // RC5 item 2: auto-advancing into Publish only chains a review
+              // when Fast Forward may continue (it runs Publish Checks first);
+              // otherwise a single review would be refused for stale checks,
+              // so stop with the one next-step line instead.
+              let publishChecksFirst = false;
+              if (publishFollowUpReview && getAutoAdvanceMode() !== "auto-fast-forward") {
+                const publishProgress = await readTaskProgressAdvisoryV1(folderUri);
+                if (publishProgress) {
+                  const publishScopeFolder = resolvePublishScopeFolder(folderUri, publishProgress).folder;
+                  const publishFreshness = await checkPublishChecksFreshnessV1(
+                    folderUri,
+                    publishScopeFolder,
+                    await resolveHeadCommitSha(publishScopeFolder)
+                  );
+                  publishChecksFirst = publishFreshness.status !== "valid";
+                }
+              }
+              if (publishChecksFirst) {
+                NotificationRouter.showInformation(
+                  `${formatNotificationTaskLabelV1(undefined, folderUri.fsPath)}: Run Publish Checks, then Review.`
+                );
+              } else if (transition.shouldAutoReview || publishFollowUpReview) {
                 // Deferred, never inline: the caller's tracked operation still
                 // holds this task's exclusive lock, so the follow-up review is
                 // scheduled through the single automation dispatcher and only
@@ -8532,6 +8555,78 @@ export async function fastForwardReviewWithAI(
   ) {
     initialContent = undefined;
   }
+  // RC3 item 6 (Step 8): a Publish review can never be dispatched while
+  // Publish Checks are stale or missing — `requirePublishChecksFreshnessOrWarnV1`
+  // inside `runReviewForFolder` refuses it outright, leaving `reviewUri`
+  // untouched. Fast Forward is already running (this closure's own admission
+  // is what got us here), so it runs Publish Checks itself first, through the
+  // same command the Publish row's own button uses, rather than attempting a
+  // review it already knows will be refused.
+  //
+  // RC5 review: this sits BEFORE the existing-review check, not inside it. A
+  // current publish-review.md with stale or missing checks would otherwise
+  // enter the apply loop without the checks ever running; and the review
+  // follows only checks that PASSED (a failed run still writes a freshness
+  // stamp, so the stamp alone cannot say so).
+  if (targetStage === "publish") {
+    const publishScopeFolder = resolvePublishScopeFolder(resolved.folderUri, resolved.progress).folder;
+    const freshnessBeforeChecks = await checkPublishChecksFreshnessV1(
+      resolved.folderUri,
+      publishScopeFolder,
+      await resolveHeadCommitSha(publishScopeFolder)
+    );
+    if (freshnessBeforeChecks.status !== "valid") {
+      // Mint-before/revoke-after, mirroring this file's own redirect call
+      // above: `runPublishChecks` is itself admission-wired and would
+      // otherwise race this function's already-live marker and be refused
+      // `busy` rather than adopt it.
+      const publishChecksHandoffToken = authorizeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
+      try {
+        await vscode.commands.executeCommand("vs-code-ai-helper.runPublishChecks", {
+          taskFolderPath: resolved.folderUri.fsPath,
+          admissionHandoffTokenV1: publishChecksHandoffToken,
+          // Without the parent, the checks ask for a second root and this
+          // run's own lock refuses them.
+          parentOperation: op,
+        });
+      } finally {
+        revokeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
+      }
+      const freshnessAfterChecks = await checkPublishChecksFreshnessV1(
+        resolved.folderUri,
+        publishScopeFolder,
+        await resolveHeadCommitSha(publishScopeFolder)
+      );
+      if (freshnessAfterChecks.status !== "valid") {
+        // `runPublishChecks` already reported why (checks failed, was
+        // cancelled, no model configured, ...) with its own specific
+        // notification — this is a genuine refusal, never "did not
+        // produce usable output", and no review round was ever claimed,
+        // so there is nothing here to terminalize as completed.
+        return false;
+      }
+    }
+    // Valid freshness is not a pass: a failed run still writes the stamp, so
+    // the saved result is checked on every path, including re-entry with
+    // checks that were run (and failed) earlier.
+    const savedChecksPayload = (await readTaskProgressAdvisoryV1(resolved.folderUri))?.lintPayload;
+    // The run's own persisted verdict: it counts known flakes as non-blocking
+    // and a missing script as inconclusive, which cannot be rebuilt from
+    // `failedChecks` alone.
+    const savedChecksPassed =
+      savedChecksPayload !== undefined &&
+      (savedChecksPayload.passedModuloKnownFlakes ?? savedChecksPayload.passed);
+    if (!savedChecksPassed) {
+      if (freshnessBeforeChecks.status === "valid") {
+        // The checks were not run here, so nothing has said why yet.
+        NotificationRouter.showWarning(
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: Publish Checks have not passed. Use Fix Linting & Code Errors, then Review.`
+        );
+      }
+      return false;
+    }
+  }
+
   if (!initialContent) {
     // No review has been run yet at this stage — run the initial review
     // first, then continue straight into the normal fast-forward loop
@@ -8542,54 +8637,6 @@ export async function fastForwardReviewWithAI(
         `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: could not determine the owning workspace for this task. Please open the workspace that created it.`
       );
       return;
-    }
-
-    // RC3 item 6 (Step 8): a Publish review can never be dispatched while
-    // Publish Checks are stale or missing — `requirePublishChecksFreshnessOrWarnV1`
-    // inside `runReviewForFolder` below refuses it outright, leaving
-    // `reviewUri` untouched. Left unhandled, `initialContent` then stays
-    // empty and this function fell into the generic "did not produce usable
-    // output" branch further down — a false description of a review that was
-    // never attempted, on top of the freshness gate's own, more specific
-    // warning. Fast Forward is already running (this closure's own admission
-    // is what got us here), so it runs Publish Checks itself first, through
-    // the same command the Publish row's own button uses, rather than
-    // attempting a review it already knows will be refused.
-    if (targetStage === "publish") {
-      const publishScopeFolder = resolvePublishScopeFolder(resolved.folderUri, resolved.progress).folder;
-      const freshnessBeforeChecks = await checkPublishChecksFreshnessV1(
-        resolved.folderUri,
-        publishScopeFolder,
-        await resolveHeadCommitSha(publishScopeFolder)
-      );
-      if (freshnessBeforeChecks.status !== "valid") {
-        // Mint-before/revoke-after, mirroring this file's own redirect call
-        // above: `runPublishChecks` is itself admission-wired and would
-        // otherwise race this function's already-live marker and be refused
-        // `busy` rather than adopt it.
-        const publishChecksHandoffToken = authorizeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
-        try {
-          await vscode.commands.executeCommand("vs-code-ai-helper.runPublishChecks", {
-            taskFolderPath: resolved.folderUri.fsPath,
-            admissionHandoffTokenV1: publishChecksHandoffToken,
-          });
-        } finally {
-          revokeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
-        }
-        const freshnessAfterChecks = await checkPublishChecksFreshnessV1(
-          resolved.folderUri,
-          publishScopeFolder,
-          await resolveHeadCommitSha(publishScopeFolder)
-        );
-        if (freshnessAfterChecks.status !== "valid") {
-          // `runPublishChecks` already reported why (checks failed, was
-          // cancelled, no model configured, ...) with its own specific
-          // notification — this is a genuine refusal, never "did not
-          // produce usable output", and no review round was ever claimed,
-          // so there is nothing here to terminalize as completed.
-          return false;
-        }
-      }
     }
 
     const ffInitialReviewProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
@@ -8680,6 +8727,30 @@ export async function fastForwardReviewWithAI(
       );
       // The review this run exists to build on never ran: "refused", not "completed".
       return false;
+    }
+  }
+
+  // RC5 items 1 and 2: the initial review above can move the task (a review
+  // that reaches the auto-advance threshold advances it) or never apply at all
+  // (the task sits at Implementation, which is not a review stage). Name the
+  // stage instead of looping on a review that cannot run, and never describe
+  // either case as a stall or a "did not produce a new, comparable result".
+  {
+    const ffStageNow = (await readTaskProgressAdvisoryV1(resolved.folderUri))?.currentStage;
+    const ffStageDrift = ffStageNow ? classifyFastForwardStageV1(stage, targetStage, ffStageNow) : "atTarget";
+    if (ffStageNow && ffStageDrift === "notEntered") {
+      NotificationRouter.showWarning(
+        `Fast Forward Review did not start: ${formatNotificationTaskLabelV1(
+          resolved.progress.displayName,
+          resolved.folderUri.fsPath
+        )} is at ${STAGE_DISPLAY_NAMES[ffStageNow]}, which is not a review stage. Run Implementation, or move ` +
+          "the task to High-Level Code Review first."
+      );
+      return false;
+    }
+    if (ffStageNow && ffStageDrift === "movedOn") {
+      op.report(`advanced to ${STAGE_DISPLAY_NAMES[ffStageNow]} — continuing there`);
+      return;
     }
   }
 
@@ -8816,6 +8887,18 @@ export async function fastForwardReviewWithAI(
   // `updateFastForwardRunStateV1` below) continues the interrupted run's own
   // numbering rather than restarting at 1.
   let attemptNumber = resumeFromAttempt?.attemptNumber ?? 0;
+  // RC5 items 1 and 2: set when the task has left the review's stage mid-run
+  // (an auto-advance into Publish); the run then hands over instead of
+  // dispatching at a stage its apply command refuses, or reporting a stall.
+  let ffStageLeftForV1: TaskStage | undefined;
+  const ffStageHasLeftV1 = async (): Promise<boolean> => {
+    const now = (await readTaskProgressAdvisoryV1(resolved.folderUri))?.currentStage;
+    if (now && classifyFastForwardStageV1(stage, targetStage, now) !== "atTarget") {
+      ffStageLeftForV1 = now;
+      return true;
+    }
+    return false;
+  };
   const resilience = getResilienceSettings();
 
   // Set once isPaused has ridden through this run's own escalation (2a):
@@ -8887,6 +8970,9 @@ export async function fastForwardReviewWithAI(
           stopAtScore: configuredStopLevel,
           token: linked.token,
           apply: async () => {
+            if (await ffStageHasLeftV1()) {
+              return;
+            }
             attemptNumber += 1;
             // RC2 item 12: keeps the map's live counters current so a
             // plateau raised on THIS attempt (which may pause the task deep
@@ -9057,6 +9143,9 @@ export async function fastForwardReviewWithAI(
           baselineReviewer: baselineHistoryEntry?.reviewer,
           baselineTaskFixableCount: baselineHistoryEntry?.taskFixableCount,
           review: async () => {
+            if (await ffStageHasLeftV1()) {
+              return null;
+            }
             const newContent = await readNonEmptyText(reviewUri);
             if (!newContent || newContent === previousContent) {
               return null;
@@ -9171,6 +9260,12 @@ export async function fastForwardReviewWithAI(
   // The run finished — if it rode through its own escalation, re-assert the
   // pause that escalation originally asserted before reporting the outcome.
   await reassertDeferredEscalationPause();
+  if (ffStageLeftForV1) {
+    // The task left the review's stage during the run — hand over to the
+    // follow-up run for the new stage rather than reporting a stall.
+    op.report(`advanced to ${STAGE_DISPLAY_NAMES[ffStageLeftForV1]} — continuing there`);
+    return;
+  }
   if (outcome.escalationDeferred) {
     // 2a: an escalation fired during the run but (per
     // ensemble.resilience.fastForwardSurvivesEscalation) did not abort it.

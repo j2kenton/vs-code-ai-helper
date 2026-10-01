@@ -48,11 +48,13 @@ void describe("Publish row inline buttons", () => {
     }
   });
 
-  void it("shows Fix Linting only when the checks failed", () => {
+  void it("shows Fix Linting on the unpaused current Publish row regardless of check results", () => {
     const fix = publishInline.filter((entry) => entry.command === "vs-code-ai-helper.runLintingFixes");
     assert.ok(fix.length > 0);
     for (const entry of fix) {
-      assert.ok(entry.when?.includes("-lint-failed"), `Fix Linting is shown without a failed-checks condition: ${entry.when}`);
+      assert.ok(!entry.when?.includes("-lint-failed"), `Fix Linting is still gated on failed checks: ${entry.when}`);
+      assert.ok(entry.when?.includes("stage-publish-current"));
+      assert.ok(entry.when?.includes("!(viewItem =~ /-paused/)"));
     }
   });
 

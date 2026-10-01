@@ -2397,6 +2397,7 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   const persisted = await patchTaskProgressStrictV1(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,
+    passedModuloKnownFlakes: result.passedModuloKnownFlakes,
     summary: result.summary,
     issueCount: result.issueCount,
     failedChecks: result.failedChecks,

@@ -151,7 +151,7 @@ void describe("runLintingFixes gate and fallback messages", () => {
 
       assert.equal(surface.entries.length, 1);
       assert.equal(surface.entries[0]?.level, "warning");
-      assert.match(surface.entries[0]?.message ?? "", /have not been run/i);
+      assert.match(surface.entries[0]?.message ?? "", /Publish Checks have not run yet\. Run them first\./);
     } finally {
       rf.restore();
       ws.restore();
@@ -183,12 +183,8 @@ void describe("runLintingFixes gate and fallback messages", () => {
       assert.equal(surface.entries.length, 1);
       assert.equal(surface.entries[0]?.level, "warning");
       const message = surface.entries[0]?.message ?? "";
-      assert.match(message, /publish-checks\.md/i);
-      assert.doesNotMatch(
-        message,
-        /^No Publish report found/i,
-        "must not flatly assert no report exists when a Publish report is visibly present on disk"
-      );
+      // RC5 item 3: one line either way, no report-on-disk variant.
+      assert.match(message, /Publish Checks have not run yet\. Run them first\./);
     } finally {
       rf.restore();
       ws.restore();
@@ -219,12 +215,43 @@ void describe("runLintingFixes gate and fallback messages", () => {
       assert.equal(surface.entries.length, 1);
       assert.equal(surface.entries[0]?.level, "warning");
       const message = surface.entries[0]?.message ?? "";
-      assert.match(message, /publish-review\.md/i);
-      assert.doesNotMatch(
-        message,
-        /^No Publish report found/i,
-        "must not flatly assert no report exists when a Publish report is visibly present on disk"
-      );
+      assert.match(message, /Publish Checks have not run yet\. Run them first\./);
+    } finally {
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("says there is nothing to fix, and starts no round, when the checks passed modulo quarantined known flakes", async () => {
+    // `passed` is false but the effective verdict (what Publish Checks
+    // announced as a pass) is true: the wand must follow the effective one.
+    const taskFolderPath = makeTaskFolder("passed-modulo-known-flakes");
+    const progress: TaskProgress = {
+      ...fixtureProgress(taskFolderPath, "publish"),
+      lintPayload: {
+        runAt: "2026-01-01T00:00:00.000Z",
+        passed: false,
+        passedModuloKnownFlakes: true,
+        summary: "All failures quarantined",
+        issueCount: 1,
+        failedChecks: [],
+      },
+    };
+    writeProgress(taskFolderPath, progress);
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+
+    try {
+      const inventory = makeInventory(taskFolderPath, progress);
+      await runLintingFixes(inventory, vscode.Uri.file(REAL_ROOT), { taskFolderPath });
+
+      assert.equal(surface.entries.length, 1, "no progress summary: no tracked operation may start");
+      assert.equal(surface.entries[0]?.level, "info");
+      assert.match(surface.entries[0]?.message ?? "", /Publish Checks passed, so there is nothing to fix\./);
     } finally {
       rf.restore();
       ws.restore();

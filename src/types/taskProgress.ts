@@ -120,6 +120,11 @@ export interface LintPayload {
   runAt: string;
   /** true = all lint checks passed, false = failures recorded */
   passed: boolean;
+  /** The run's effective verdict (`CompletionLintResult.passedModuloKnownFlakes`):
+   * `passed`, with quarantined known-flake failures non-blocking and a missing
+   * script still inconclusive. Absent on fix-round payloads; treat absent as
+   * equal to `passed`. */
+  passedModuloKnownFlakes?: boolean;
   /** Optional human-readable summary (e.g. "3 errors, 2 warnings") */
   summary?: string;
   /** Number of editor diagnostics plus failed checks. */

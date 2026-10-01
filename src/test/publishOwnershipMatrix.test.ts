@@ -76,6 +76,7 @@ import { safeRemoveDir } from "./testFsUtils";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
+const publishChecksFreshnessModule = require("../utils/publishChecksFreshness") as Record<string, unknown>;
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const runnerRegistryModule = require("../runners/runnerRegistry") as Record<string, unknown>;
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
@@ -653,6 +654,8 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      // Plain "auto" only chains a Publish review when the checks are fresh (RC5 item 2).
+      patch(publishChecksFreshnessModule, "checkPublishChecksFreshnessV1", () => Promise.resolve({ status: "valid" })),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
     ];
     try {
@@ -718,6 +721,8 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => autoAdvanceEnabled),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      // Plain "auto" only chains a Publish review when the checks are fresh (RC5 item 2).
+      patch(publishChecksFreshnessModule, "checkPublishChecksFreshnessV1", () => Promise.resolve({ status: "valid" })),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
     ];
     try {
@@ -757,6 +762,8 @@ void describe("Publish auto-run ownership matrix — auto-advance landing on Pub
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      // Plain "auto" only chains a Publish review when the checks are fresh (RC5 item 2).
+      patch(publishChecksFreshnessModule, "checkPublishChecksFreshnessV1", () => Promise.resolve({ status: "valid" })),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
       patch(modelSelectionModule, "resolveModelForStage", () =>
         Promise.resolve({ source: "settings", modelId: "stub:model" })),
@@ -2526,6 +2533,8 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceMode", () => "auto"),
+      // Plain "auto" only chains a Publish review when the checks are fresh (RC5 item 2).
+      patch(publishChecksFreshnessModule, "checkPublishChecksFreshnessV1", () => Promise.resolve({ status: "valid" })),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
     ];
     try {
