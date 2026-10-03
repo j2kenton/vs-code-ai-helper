@@ -35,18 +35,20 @@ function folderPathOfArgV1(arg: CheckAndReviewPublishArgV1): string | undefined 
  * and no new lock state exists. A run that leaves the checks still not fresh
  * (refused, cancelled, unreadable HEAD) stops here without a second warning;
  * the checks command has already said why, and the review command is still
- * available from the palette to retry on its own.
+ * available from the palette to retry on its own. `"review-dispatched"` means
+ * the review command was started, not that a review was saved: the review
+ * command reports its own outcome (refused, failed or completed).
  */
 export async function checkAndReviewPublishV1(
   arg: CheckAndReviewPublishArgV1,
   deps: CheckAndReviewPublishDepsV1
-): Promise<"reviewed" | "checks-not-fresh"> {
+): Promise<"review-dispatched" | "checks-not-fresh"> {
   const taskFolderPath = folderPathOfArgV1(arg);
   // No resolvable folder (command palette without a row): the review command
   // owns the task picker and its own freshness refusal, so hand straight to it.
   if (!taskFolderPath) {
     await deps.executeCommand("vs-code-ai-helper.runReviewWithAI", arg);
-    return "reviewed";
+    return "review-dispatched";
   }
   const target = { taskFolderPath };
   if (!(await deps.isPublishChecksFresh(taskFolderPath))) {
@@ -56,7 +58,7 @@ export async function checkAndReviewPublishV1(
     }
   }
   await deps.executeCommand("vs-code-ai-helper.runReviewWithAI", target);
-  return "reviewed";
+  return "review-dispatched";
 }
 
 async function isPublishChecksFreshOnDiskV1(taskFolderPath: string): Promise<boolean> {

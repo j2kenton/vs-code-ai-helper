@@ -712,6 +712,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
     for (const keyMap of this.operations.values()) {
       let op = keyMap.get(id);
       if (!op) {continue;}
+      const targetOp = op;
       while (op.parentId !== undefined) {
         const parent = keyMap.get(op.parentId);
         if (!parent) {break;}
@@ -724,10 +725,13 @@ export class TaskOperationRegistry implements vscode.Disposable {
         op.stageGeneration += 1;
       }
       op.activity = activity;
+      targetOp.activity = activity;
       if (options?.elapsedOrigin !== undefined) {
         op.activityStartedAt = options.elapsedOrigin;
+        targetOp.activityStartedAt = options.elapsedOrigin;
       } else if (options?.resetElapsedOrigin || op.activityStartedAt === undefined) {
         op.activityStartedAt = Date.now();
+        targetOp.activityStartedAt = op.activityStartedAt;
       }
       this.triggerChange(false);
       return op.stageGeneration;

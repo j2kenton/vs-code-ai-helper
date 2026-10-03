@@ -58,6 +58,7 @@ import {
 import {
   claimReviewAttempt,
   claimReviewAttemptWithLiveLeaseV1,
+  handleReviewOutcomeV1,
   handleReviewRoutingOutcome,
   ReviewOutcomeContextV1,
   terminalizeUnclosedReviewRoundV1,
@@ -2641,6 +2642,117 @@ void describe("terminalizeUnclosedReviewRoundV1 rejectionReason (item 2 / Step 5
       const ledgerRow = raw.roundLedger?.find((r) => r.roundId === "attempt-review-completed-safetynet");
       assert.equal(ledgerRow?.state, "completed");
       assert.equal(ledgerRow?.outcome?.rejectionReason, undefined);
+    } finally {
+      deactivateNotificationRouter();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+// RC6 item 2: one all-candidate failure must reach the round ledger's
+// rejectionReason, the saved runs/ log and the failure notification, each
+// naming every model tried and why it failed.
+void describe("handleReviewOutcomeV1 all-candidate failure (RC6 item 2)", () => {
+  void it("names every model tried in the ledger reason, the run log and the notification", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const notices: string[] = [];
+    initNotificationRouter({
+      addEntry: (...args: unknown[]): void => {
+        notices.push(String(args[0]));
+      },
+    });
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "review_all_candidates_failed");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "review_all_candidates_failed",
+        currentStage: "impl-high-review",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+        roundLedger: [
+          {
+            roundId: "attempt-all-failed",
+            attemptIds: ["attempt-all-failed"],
+            stage: "impl-high-review",
+            mode: "review",
+            startedAt: "2026-01-01T00:05:00.000Z",
+            state: "open",
+          },
+        ],
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+      const outcome = {
+        kind: "failed",
+        code: "cliExit.1",
+        detail: "Claude CLI: sign-in required",
+        retryable: true,
+        provider: {
+          providerLabel: "Claude Opus (claude-opus-5-5@high)",
+          storedModelId: "claude-cli:claude-opus-5-5@high",
+        },
+        priorRejectedAttemptsV1: [
+          {
+            attemptId: "a1",
+            code: "cliExit.1",
+            detail: "You've hit your usage limit",
+            providerLabel: "OpenAI Codex (gpt-5.6-sol@high)",
+          },
+          {
+            attemptId: "a2",
+            code: "copilotEmptyResponse",
+            detail: "empty response",
+            providerLabel: "GitHub Copilot (gpt-6-sol)",
+          },
+        ],
+      } as unknown as TaskActionOutcomeV1;
+      await handleReviewOutcomeV1(outcome, {
+        extensionUri: folderUri,
+        folderUri,
+        workspaceUri: folderUri,
+        currentStage: "impl-high-review",
+        targetStage: "impl-high-review",
+        reviewUri: folderUri,
+        variables: {},
+        reviewAttemptId: "attempt-all-failed",
+      });
+
+      const expectAll = (label: string, text: string): void => {
+        for (const re of [
+          /OpenAI Codex \(gpt-5\.6-sol@high\)/,
+          /usage limit/,
+          /GitHub Copilot \(gpt-6-sol\)/,
+          /copilotEmptyResponse|empty response/,
+          /Claude Opus \(claude-opus-5-5@high\)/,
+          /sign-in required/,
+        ]) {
+          assert.match(text, re, `${label} must match ${String(re)}`);
+        }
+      };
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = raw.roundLedger?.find((r) => r.roundId === "attempt-all-failed");
+      assert.equal(row?.state, "failed");
+      expectAll("ledger rejectionReason", row?.outcome?.rejectionReason ?? "");
+
+      const runsDir = path.join(folderPath, "runs");
+      const logs = fs.readdirSync(runsDir).map((n) => fs.readFileSync(path.join(runsDir, n), "utf8"));
+      assert.equal(logs.length, 1);
+      expectAll("run log", logs[0]!);
+
+      const failureNotices = notices.filter((n) => /failed:/.test(n));
+      assert.ok(failureNotices.length > 0, "a failure notification must be raised");
+      expectAll("notification", failureNotices.join("\n"));
     } finally {
       deactivateNotificationRouter();
       wsStub.restore();

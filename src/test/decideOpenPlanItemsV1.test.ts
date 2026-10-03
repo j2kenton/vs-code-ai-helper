@@ -384,6 +384,13 @@ void describe("buildOpenPlanItemsNeedDecisionCardInputV1", () => {
     );
   });
 
+  void it("the decide-item-by-item consequence says leaving every item open runs nothing and the task waits", () => {
+    const input = buildOpenPlanItemsNeedDecisionCardInputV1(base);
+    const decide = input.options.find((o) => o.optionId === "decideItemByItem");
+    assert.match(decide?.consequence ?? "", /If you leave every item open, nothing runs and the task waits/);
+    assert.doesNotMatch(decide?.consequence ?? "", /Then builds whatever is still open/);
+  });
+
   void it("does not pause the task", () => {
     const input = buildOpenPlanItemsNeedDecisionCardInputV1(base);
     assert.equal(input.gating?.holdsTaskPaused, false);
@@ -544,6 +551,29 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
     assert.equal([...content.matchAll(/### Open items settled by the owner/g)].length, 1);
     const stored = (await readOpenPlanItemsFormsV1(folder, folder)).find((f) => f.formId === form.formId);
     assert.equal(stored?.state, "applied");
+  });
+
+  void it("leaving every item open reports that nothing will run and leaves the plan untouched", async () => {
+    const folder = makeTaskFolder("flow-none", FOUR_PLAN);
+    const form = await postForm(folder, FOUR_ITEMS);
+    const exec = installExecuteCommandCapture();
+    let result: Awaited<ReturnType<typeof submit>>;
+    try {
+      result = await submit(
+        folder,
+        form,
+        FOUR_ITEMS.map((i) => ({ itemId: idOf(form, i.itemText), choice: "leave", note: "" }))
+      );
+    } finally {
+      exec.restore();
+    }
+    assert.equal(result.kind, "applied");
+    assert.equal(
+      (result as { message: string }).message,
+      "No items were changed. Nothing will run; the items stay open. Fix what blocks them, then use Fast Forward or Apply Review."
+    );
+    assert.equal(readPlan(folder), FOUR_PLAN);
+    assert.deepEqual(exec.calls, [], "a no-change Apply must dispatch nothing");
   });
 
   void it("answering only two applies those two and leaves the others open", async () => {

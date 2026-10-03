@@ -356,7 +356,8 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       // real code path, not merely that the source contains the calls.
       await controllable.invoked;
 
-      const liveRow = taskOperations.getTaskOperations(folderPath)[0];
+      const liveRows = taskOperations.getTaskOperations(folderPath);
+      const liveRow = liveRows[0];
       assert.ok(liveRow, "the root operation must still be live while the apply dispatch is in flight");
       liveRowActivity = liveRow?.activity;
       liveRowModelId = liveRow?.modelId;
@@ -367,7 +368,11 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       controllable.resolveWith("# Plan\n\n1. Do the thing (revised).\n");
       await dispatchPromise;
 
-      assert.equal(liveRowActivity, "running", "the real apply dispatch must have reported 'running' before the provider call");
+      assert.equal(
+        liveRowActivity,
+        "Applying review fixes…",
+        "the leaf (plan-fix) operation must report what it is doing before the provider call"
+      );
       assert.equal(
         liveRowModelId,
         "claude-cli:sonnet@high",
@@ -468,7 +473,11 @@ void describe("applyReviewWithAI — real in-flight activity through the product
         }
       );
 
-      assert.equal(liveRowActivitySeen, "running", "must be observably running before the transport failure");
+      assert.equal(
+        liveRowActivitySeen,
+        "Applying review fixes…",
+        "must be observably applying the review fixes before the transport failure"
+      );
       assert.deepEqual(
         taskOperations.getTaskOperations(folderPath),
         [],
@@ -476,8 +485,8 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       );
       assert.deepEqual(
         ended.map((e) => e.state),
-        ["succeeded"],
-        "the coordinator classifies the transport failure into a normal, non-completed outcome that applyReviewWithAI's runApply handles internally and returns from — the wrapping operation therefore still ends through the ordinary success path, never leaving a stale live row"
+        ["succeeded", "succeeded"],
+        "(plan-fix child + wrapping operation) the coordinator classifies the transport failure into a normal, non-completed outcome that applyReviewWithAI's runApply handles internally and returns from — the wrapping operation therefore still ends through the ordinary success path, never leaving a stale live row"
       );
 
       assert.ok(capturedOp);
@@ -835,6 +844,137 @@ void describe("applyReviewWithAI — real in-flight activity through the product
         (dispatchProbe.coordinatorOutcome as { code?: string } | undefined)?.code,
         "candidatesExhausted"
       );
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("RC6 Part F: plan-fix child operation has stage: 'plan' and activity both standalone and under Fast Forward, and re-review has stage: reviewStage", async () => {
+    const { folderPath } = makeTaskFolder(`applyreview-part-f-${Math.floor(Math.random() * 1e9)}`);
+    const contextPack = path.join(folderPath, "context-pack.md");
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+
+    const controllableApply = controllableTransport();
+    const controllableReReview = controllableTransport();
+    const standaloneApply = controllableTransport();
+    const standaloneReReview = controllableTransport();
+    const patches = [
+      ...installApplyReviewPatches(contextPack),
+      stubV1RunnerSelection([
+        controllableApply.transport,
+        controllableReReview.transport,
+        standaloneApply.transport,
+        standaloneReReview.transport,
+      ]),
+    ];
+
+    try {
+      const context = makeExtensionContext();
+      let parentOpId: string | undefined;
+
+      // 1. Under Fast Forward mode: an explicit parentOperation is passed
+      await runTrackedOperation(
+        folderPath,
+        {
+          label: "Fast Forward",
+          stage: "plan-high-review",
+          taskName: "Apply Review Activity FF Mode",
+          kind: "review",
+          cancellable: true,
+        },
+        async (parentOp) => {
+          parentOpId = parentOp.id;
+          const dispatchPromise = applyReviewWithAI(
+            vscode.Uri.file(REAL_ROOT),
+            context,
+            { taskFolderPath: folderPath },
+            { parentOperation: parentOp }
+          );
+
+          // In-flight apply-review fix child
+          await controllableApply.invoked;
+          const liveOpsDuringApply = taskOperations.getTaskOperations(folderPath);
+          const rootOpDuringApply = liveOpsDuringApply.find((op) => op.id === parentOpId);
+          const planFixOp = liveOpsDuringApply.find((op) => op.kind === "apply-review");
+          assert.ok(planFixOp, "a child operation with kind 'apply-review' must exist during plan fix");
+          assert.equal(planFixOp?.stage, "plan", "the plan-fix operation must have stage: 'plan'");
+          assert.equal(planFixOp?.parentId, parentOpId, "the plan-fix operation must be parented to Fast Forward");
+          assert.equal(planFixOp?.activity, "Applying review fixes…", "the plan-fix child operation must report plan fix activity");
+          assert.equal(rootOpDuringApply?.activity, "Applying review fixes…", "the root operation must report plan fix activity");
+
+          controllableApply.resolveWith("# Plan\n\n1. Do the thing (revised).\n");
+
+          // In-flight re-review child
+          await controllableReReview.invoked;
+          const liveOpsDuringReReview = taskOperations.getTaskOperations(folderPath);
+          const rootOpDuringReReview = liveOpsDuringReReview.find((op) => op.id === parentOpId);
+          const reReviewOp = liveOpsDuringReReview.find((op) => op.kind === "review" && op.id !== parentOpId);
+          assert.ok(reReviewOp, "a child operation for re-review must exist during re-review");
+          assert.equal(reReviewOp?.stage, "plan-high-review", "the re-review child must be registered against the review stage");
+          assert.ok(
+            reReviewOp?.activity === "running" || reReviewOp?.activity === "Re-running review…",
+            "the re-review child operation must report re-review activity"
+          );
+          assert.ok(
+            rootOpDuringReReview?.activity === "running" || rootOpDuringReReview?.activity === "Re-running review…",
+            "the root operation must report re-review activity"
+          );
+
+          controllableReReview.resolveWith("Readiness: 9/10\n\n- Ready.\n");
+          await dispatchPromise;
+        }
+      );
+
+      // 2. Standalone mode: applyReviewWithAI with no parentOperation
+      fs.writeFileSync(path.join(folderPath, "plan.md"), "# Plan\n\n1. Do the thing.\n", "utf8");
+      fs.writeFileSync(path.join(folderPath, "plan-high-review.md"), "Readiness: 6/10\n\n- Needs work.\n", "utf8");
+
+      const standaloneDispatchPromise = applyReviewWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath }
+      );
+
+      // In-flight standalone apply-review fix child
+      await standaloneApply.invoked;
+      const liveOpsDuringStandaloneApply = taskOperations.getTaskOperations(folderPath);
+      const rootOpDuringStandaloneApply = liveOpsDuringStandaloneApply.find((op) => !op.parentId);
+      const planFixOpStandalone = liveOpsDuringStandaloneApply.find(
+        (op) => op.kind === "apply-review" && op.parentId === rootOpDuringStandaloneApply?.id
+      );
+      assert.ok(rootOpDuringStandaloneApply, "the root operation must exist during standalone plan fix");
+      assert.ok(planFixOpStandalone, "a child operation with kind 'apply-review' must exist during standalone plan fix");
+      assert.equal(planFixOpStandalone?.stage, "plan", "the plan-fix operation must have stage: 'plan' in standalone mode");
+      assert.equal(planFixOpStandalone?.parentId, rootOpDuringStandaloneApply?.id, "the plan-fix child operation must be parented to the root operation");
+      assert.equal(planFixOpStandalone?.activity, "Applying review fixes…", "the plan-fix child operation must report plan fix activity in standalone mode");
+      assert.equal(rootOpDuringStandaloneApply?.activity, "Applying review fixes…", "the root operation must report plan fix activity in standalone mode");
+
+      standaloneApply.resolveWith("# Plan\n\n1. Do the thing (revised).\n");
+
+      // In-flight standalone re-review child
+      await standaloneReReview.invoked;
+      const liveOpsDuringStandaloneReReview = taskOperations.getTaskOperations(folderPath);
+      const rootOpDuringStandaloneReReview = liveOpsDuringStandaloneReReview.find((op) => !op.parentId);
+      const reReviewOpStandalone = liveOpsDuringStandaloneReReview.find(
+        (op) => op.kind === "review" && op.parentId === rootOpDuringStandaloneReReview?.id
+      );
+      assert.ok(reReviewOpStandalone, "a child operation for re-review must exist during re-review in standalone mode");
+      assert.equal(reReviewOpStandalone?.stage, "plan-high-review", "the re-review child must be registered against the review stage in standalone mode");
+      assert.ok(
+        reReviewOpStandalone?.activity === "running" || reReviewOpStandalone?.activity === "Re-running review…",
+        "the re-review child operation must report re-review activity in standalone mode"
+      );
+
+      standaloneReReview.resolveWith("Readiness: 9/10\n\n- Ready.\n");
+      await standaloneDispatchPromise;
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();

@@ -1915,6 +1915,12 @@ export interface V1RunnerSelectionV1 {
    * (AC-RUNNER-04).
    */
   reserveNext(attemptId: AttemptIdV1): V1ReserveNextResultV1;
+  /**
+   * How many ranked candidates (primary plus enabled backups) can serve this
+   * mode. The coordinator sizes its per-round invocation budget from it so
+   * every enabled candidate gets one try (RC6 item 2).
+   */
+  readonly candidateCount?: number;
 }
 
 interface V1CandidateV1 {
@@ -2165,6 +2171,7 @@ export function openV1RunnerSelection(options: {
   });
 
   return {
+    candidateCount: ranked.filter((entry) => entry.supported).length,
     reserveNext(attemptId: AttemptIdV1): V1ReserveNextResultV1 {
       if (!anySupported) {
         // No ranked candidate can satisfy this mode at all — the whole

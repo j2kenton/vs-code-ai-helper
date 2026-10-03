@@ -163,7 +163,7 @@ import {
 import { IncompleteTask } from "../types/incompleteTask";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { loadRetryFailedReviewOptionFieldsV1 } from "../utils/resumeActionPlanV1";
-import { stepNameV1 } from "../utils/stepLabelsV1";
+import { stepNameV1, stepProgressLabelV1 } from "../utils/stepLabelsV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   AUTO_REVIEW_TRANSITIONS,
@@ -1011,7 +1011,14 @@ interface ApplyReviewOptions {
    * preflight/edit-execution `coordinator.executeAction` calls. Still unset
    * after a CLI-resolved dispatch, which never reaches the coordinator.
    */
-  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 };
+  // `failedStepV1` (RC6 item 2): "Review" when the probed outcome is the
+  // chained re-review's, so a failure reads "Review failed", not "Apply Review
+  // failed". Unset means the apply step itself.
+  dispatchProbe?: {
+    coordinatorOutcome?: TaskActionOutcomeV1;
+    runnerFailure?: RunnerFailureProbeV1;
+    failedStepV1?: "Review" | "Apply Review";
+  };
 }
 
 interface ExecuteImplementationRunOptions {
@@ -1108,7 +1115,14 @@ interface ExecuteImplementationRunOptions {
    * `dispatchProbe`. Forwarded into `runImplementationOrSealedV1`; left unset
    * after a CLI-resolved dispatch, which never reaches the coordinator.
    */
-  dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 };
+  // `failedStepV1` (RC6 item 2): "Review" when the probed outcome is the
+  // chained re-review's, so a failure reads "Review failed", not "Apply Review
+  // failed". Unset means the apply step itself.
+  dispatchProbe?: {
+    coordinatorOutcome?: TaskActionOutcomeV1;
+    runnerFailure?: RunnerFailureProbeV1;
+    failedStepV1?: "Review" | "Apply Review";
+  };
 }
 
 /**
@@ -2409,6 +2423,29 @@ async function requirePublishChecksFreshnessOrWarnV1(
     }
   );
   return { ok: false };
+}
+
+const FAILED_ROUND_OUTCOME_KINDS_V1: ReadonlySet<TaskActionOutcomeV1["kind"]> = new Set([
+  "failed",
+  "malformedResult",
+  "unavailable",
+  "recoveryRequired",
+  "stalePreflight",
+  "partialEditBlocked",
+]);
+
+/**
+ * RC6 item 6: a review whose round failed (a promotion-guard refusal, every
+ * candidate failing, ...) settles its Notifications row as failed with the
+ * reason, never "completed". Reads the round's own coordinator outcome.
+ */
+export function settleOperationFailedForRoundOutcomeV1(
+  op: TaskOperationHandle | undefined,
+  outcome: TaskActionOutcomeV1 | undefined
+): void {
+  if (op && outcome && FAILED_ROUND_OUTCOME_KINDS_V1.has(outcome.kind)) {
+    op.settleAs("failed", describeTaskActionFailureV1(outcome));
+  }
 }
 
 /**
@@ -5977,6 +6014,16 @@ export async function runReviewForFolder(
     }
     setMechanicalBlockersForStage(folderUri, targetStage, checks.mechanicalBlockers);
     if (targetStage === "publish") {
+      // RC6 item 6: the same entry gate, re-run immediately before the
+      // provider dispatch. The first call above sits ahead of minutes of
+      // checks; a commit made since must refuse here, with the staleCommit
+      // message naming both commits and no model call spent, instead of
+      // surfacing only at the promotion guard after the model has run.
+      const freshnessGateBeforeDispatch = await requirePublishChecksFreshnessOrWarnV1(folderUri, targetStage);
+      if (!freshnessGateBeforeDispatch.ok) {
+        return;
+      }
+      publishFreshnessGuard = freshnessGateBeforeDispatch.guard;
       variables.siblingReviewDisagreement = await buildSiblingReviewDisagreementVariable(
         folderUri,
         variables.reviewedCommitSha
@@ -6700,6 +6747,12 @@ export async function runReviewForFolder(
       },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
+      },
+      // RC6 item 4: the Notifications row names the candidate actually
+      // running (a backup after the primary failed), not the configured
+      // primary set once at dispatch.
+      onCandidateInvokedV1: (info) => {
+        options.operation?.setModel?.(info.storedModelId);
       },
     });
     if (options.dispatchProbe) {
@@ -7551,6 +7604,7 @@ export async function runReviewWithAI(
               : {}),
           }
         );
+        settleOperationFailedForRoundOutcomeV1(op, dispatchProbe.coordinatorOutcome);
         return dispatchProbe.dispatched;
       }
     );
@@ -7881,14 +7935,34 @@ export async function applyReviewWithAI(
     };
 
     reportStageRunningV1(op, stageToken);
-    const outcome = await coordinator.executeAction({
-      actionKey: APPLY_REVIEW_ACTION_KEY_V1,
-      taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
-      taskStatus: "active",
-      taskStage: stage,
-      rawInput: validatedInput,
-      cancellationToken: op.token!,
-    });
+    // RC6 item 1: the plan fix runs as its own child operation registered
+    // against the Plan row (`stage: "plan"`), standalone and under Fast
+    // Forward alike, mirroring the code loop's `stage: "impl"` child — the
+    // tree follows the step that is actually running, and the row's activity
+    // matches the "Applying review fixes…" notification.
+    const planFixOutcome = await runTrackedOperation(
+      lockKey,
+      { parent: op, label: stepNameV1("apply-review"), stage: "plan", kind: "apply-review", cancellable: true, refusedWhenFalse: true },
+      async (fixOp) => {
+        fixOp.reportActivity(stepProgressLabelV1("apply-review"));
+        return coordinator.executeAction({
+          actionKey: APPLY_REVIEW_ACTION_KEY_V1,
+          taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
+          taskStatus: "active",
+          taskStage: stage,
+          rawInput: validatedInput,
+          cancellationToken: fixOp.token ?? op.token!,
+          onCandidateInvokedV1: (info) => {
+            fixOp.setModel?.(info.storedModelId);
+          },
+        });
+      }
+    );
+    if (planFixOutcome === undefined) {
+      // The child could not register (another operation holds this task).
+      return false;
+    }
+    const outcome = planFixOutcome;
     coordinatorOutcomeForAdmissionV1 = outcome;
     if (options.dispatchProbe) {
       options.dispatchProbe.coordinatorOutcome = outcome;
@@ -7920,8 +7994,10 @@ export async function applyReviewWithAI(
         // child handle, or the follow-up command fires while the root
         // (e.g. Fast Forward's loop) is still holding the lock and is
         // silently refused as busy.
-        (reReviewOp) =>
-          runReviewForFolder(
+        async (reReviewOp) => {
+          // RC6 item 1: the re-review row reports what it is doing too.
+          reReviewOp.reportActivity(stepProgressLabelV1("re-review"));
+          await runReviewForFolder(
             extensionUri,
             resolved.folderUri,
             workspaceRoot,
@@ -7929,7 +8005,7 @@ export async function applyReviewWithAI(
             true,
             {
               preserveActiveFallback: options.preserveActiveFallback,
-              operation: op,
+              operation: reReviewOp,
               operationCancellationToken: reReviewOp.token,
               chatViewProvider: options.chatViewProvider,
               dispatchProbe: reReviewDispatchProbe,
@@ -7938,7 +8014,9 @@ export async function applyReviewWithAI(
               // on `automationDispatch`.
               automationDispatch: true,
             }
-          )
+          );
+          settleOperationFailedForRoundOutcomeV1(reReviewOp, reReviewDispatchProbe.coordinatorOutcome);
+        }
       );
       // The re-review's own coordinator.executeAction call is strictly the
       // later of this function's two invocations; when it dispatched, its
@@ -7949,6 +8027,7 @@ export async function applyReviewWithAI(
         coordinatorOutcomeForAdmissionV1 = reReviewDispatchProbe.coordinatorOutcome;
         if (options.dispatchProbe) {
           options.dispatchProbe.coordinatorOutcome = reReviewDispatchProbe.coordinatorOutcome;
+          options.dispatchProbe.failedStepV1 = "Review";
         }
       }
     } else if (outcome.kind === "questions") {
@@ -8286,6 +8365,9 @@ export async function fastForwardReviewWithAI(
   // RC4 item 1: the last Apply Review attempt's runner-level failure, which a
   // CLI dispatch reports instead of a coordinator outcome.
   let ffRunnerFailureV1: RunnerFailureProbeV1 | undefined;
+  // RC6 item 2: which step the last failed outcome belongs to ("Review" for
+  // the initial review or a chained re-review, else "Apply Review").
+  let ffFailedStepV1: "Review" | "Apply Review" = "Apply Review";
 
   try {
   // §7.5 provider-path gate (AC-HOST-03): task/model-INDEPENDENT — it never
@@ -8663,6 +8745,9 @@ export async function fastForwardReviewWithAI(
           dispatchProbe: ffInitialReviewProbe,
         })
     );
+    if (ffInitialReviewProbe.coordinatorOutcome !== undefined) {
+      ffFailedStepV1 = "Review";
+    }
     ffCoordinatorOutcomeForAdmissionV1 = ffInitialReviewProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
     initialContent = await readNonEmptyText(reviewUri);
     // Same unusable check as the pre-dispatch read above (line ~3209) — the
@@ -9007,7 +9092,11 @@ export async function fastForwardReviewWithAI(
             // own probe back in its `finally`, and a CLI-resolved failure
             // (which never reaches the coordinator) arrives as
             // `.runnerFailure` (RC4 item 1).
-            const ffAttemptProbe: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 } = {};
+            const ffAttemptProbe: {
+              coordinatorOutcome?: TaskActionOutcomeV1;
+              runnerFailure?: RunnerFailureProbeV1;
+              failedStepV1?: "Review" | "Apply Review";
+            } = {};
             await applyForTarget(extensionUri, context, concreteArg, {
               ...buildFastForwardApplyReviewOptions(attemptNumber, op, chatViewProvider),
               dispatchProbe: ffAttemptProbe,
@@ -9016,6 +9105,9 @@ export async function fastForwardReviewWithAI(
             // RC4 item 1: a CLI-resolved failure never reaches the coordinator;
             // keep this attempt's runner failure (cleared when it succeeded).
             ffRunnerFailureV1 = ffAttemptProbe.runnerFailure;
+            if (ffAttemptProbe.coordinatorOutcome !== undefined || ffAttemptProbe.runnerFailure !== undefined) {
+              ffFailedStepV1 = ffAttemptProbe.failedStepV1 ?? "Apply Review";
+            }
           },
           // Escalation (see handleReviewRoutingOutcome) can now fire inside
           // Fast Forward and pause the task mid-loop. Without this check,
@@ -9477,9 +9569,9 @@ export async function fastForwardReviewWithAI(
       buildRoundsStalled > 0
         ? `${buildRoundsStalled} consecutive build round(s) ran without landing a new plan-checklist tick`
         : ffRunnerFailureV1
-          ? `Apply Review failed: ${ffRunnerFailureV1.providerLabel}: ${ffRunnerFailureV1.message}`
+          ? `${ffFailedStepV1} failed: ${ffRunnerFailureV1.providerLabel}: ${ffRunnerFailureV1.message}`
           : ffCoordinatorOutcomeForAdmissionV1 && ffDispatchFailureKindsV1.has(ffCoordinatorOutcomeForAdmissionV1.kind)
-          ? `Apply Review failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`
+          ? `${ffFailedStepV1} failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`
           : "the review did not produce a new, comparable result";
     NotificationRouter.showWarning(
       `Fast Forward Review stopped after ${outcome.attempts} attempt(s): ${stalledDetail}. ` +
@@ -15294,7 +15386,11 @@ export async function applyReviewEditWithAI(
   // .dispatchProbe's doc comment. Declared here, OUTSIDE the try block below
   // (not beside `runApply`'s definition inside it), so it is still visible
   // from the try's own `finally`.
-  const applyReviewEditDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1; runnerFailure?: RunnerFailureProbeV1 } = {};
+  const applyReviewEditDispatchProbeV1: {
+    coordinatorOutcome?: TaskActionOutcomeV1;
+    runnerFailure?: RunnerFailureProbeV1;
+    failedStepV1?: "Review" | "Apply Review";
+  } = {};
 
   try {
   // §7.5's task/model-INDEPENDENT provider-path check (AC-HOST-03): before
@@ -15563,8 +15659,10 @@ export async function applyReviewEditWithAI(
       await runTrackedOperation(
         lockKey,
         { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
-        (reReviewOp) =>
-          runReviewForFolder(
+        async (reReviewOp) => {
+          // RC6 item 1: the re-review row reports what it is doing too.
+          reReviewOp.reportActivity(stepProgressLabelV1("re-review"));
+          await runReviewForFolder(
             extensionUri,
             resolved.folderUri,
             workspaceRoot,
@@ -15572,7 +15670,7 @@ export async function applyReviewEditWithAI(
             true,
             {
               preserveActiveFallback: options.preserveActiveFallback,
-              operation: op,
+              operation: reReviewOp,
               operationCancellationToken: reReviewOp.token,
               chatViewProvider: options.chatViewProvider,
               dispatchProbe: reReviewDispatchProbe,
@@ -15583,7 +15681,9 @@ export async function applyReviewEditWithAI(
               // comment on `automationDispatch` for the full rationale.
               automationDispatch: true,
             }
-          )
+          );
+          settleOperationFailedForRoundOutcomeV1(reReviewOp, reReviewDispatchProbe.coordinatorOutcome);
+        }
       );
       // The re-review's own coordinator.executeAction call is strictly the
       // later of this function's two invocations; when it dispatched, its
@@ -15592,6 +15692,7 @@ export async function applyReviewEditWithAI(
       // here is not masked by the edit step's already-settled outcome.
       if (reReviewDispatchProbe.dispatched) {
         applyReviewEditDispatchProbeV1.coordinatorOutcome = reReviewDispatchProbe.coordinatorOutcome;
+        applyReviewEditDispatchProbeV1.failedStepV1 = "Review";
       }
     } else if (!options.parentOperation) {
       // Part 4 (item 8) review fix, 2026-09-24: the implementation-round
@@ -15658,6 +15759,7 @@ export async function applyReviewEditWithAI(
       options.dispatchProbe.coordinatorOutcome =
         applyReviewEditDispatchProbeV1.coordinatorOutcome ?? options.dispatchProbe.coordinatorOutcome;
       options.dispatchProbe.runnerFailure = applyReviewEditDispatchProbeV1.runnerFailure;
+      options.dispatchProbe.failedStepV1 = applyReviewEditDispatchProbeV1.failedStepV1;
     }
     recordAdmissionReleaseTriggerV1(safeReleaseStateV1, applyReviewEditDispatchProbeV1.coordinatorOutcome);
     await releaseAdmissionV1();
@@ -16569,6 +16671,14 @@ export async function resumeReviewInteractionV1(
       },
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
+      },
+      // RC6 item 4 (resume path): the resume has no operation handle of its
+      // own, so the running candidate is reported to the task's root one.
+      onCandidateInvokedV1: (info) => {
+        const rootId = taskOperations.rootOperationIdFor(ownedTask.taskFolderPath);
+        if (rootId) {
+          taskOperations.setModel(rootId, info.storedModelId);
+        }
       },
     });
 

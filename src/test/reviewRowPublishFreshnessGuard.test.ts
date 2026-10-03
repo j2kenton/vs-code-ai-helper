@@ -176,7 +176,7 @@ void describe("review.v1 promotion-time Publish Checks freshness guard (plan PAR
     writeStamp(folder, scopeFolder, "00000000-0000-4000-8000-000000000002", HEAD_SHA);
     await assert.rejects(
       () => promote(folder, guard, "publish-review.md"),
-      /Publish Checks changed/
+      /A new Publish Checks run finished/
     );
     // The stamp itself (written by the test's own setup, simulating a
     // Publish Checks run that already completed) legitimately lives in this
@@ -200,7 +200,7 @@ void describe("review.v1 promotion-time Publish Checks freshness guard (plan PAR
     writeStamp(folder, scopeFolder, RUN_ID, HEAD_SHA);
     await assert.rejects(
       () => promote(folder, guard, "publish-review.md"),
-      /Publish Checks changed/
+      /The commit changed from/
     );
   });
 
@@ -216,7 +216,7 @@ void describe("review.v1 promotion-time Publish Checks freshness guard (plan PAR
     // No writeStamp call: publish-review.md is absent entirely.
     await assert.rejects(
       () => promote(folder, guard, "publish-review.md"),
-      /Publish Checks changed/
+      /Publish Checks have not been run yet/
     );
   });
 

@@ -40,24 +40,30 @@ import {
   acquireWorkAdmissionV1,
   createSafeAdmissionReleaseStateV1,
   describeWorkAdmissionRefusalV1,
+  heldAdmissionClaimIdForTaskV1,
   recordAdmissionReleaseTriggerV1,
   requestSafeAdmissionReleaseV1,
+  SafeAdmissionReleaseStateV1,
   trySafeAdmissionReleaseV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
+import { scheduleAutomationChain } from "../utils/automationChain";
+import { CHECK_AND_REVIEW_PUBLISH_COMMAND_ID_V1 } from "./checkAndReviewPublish";
+import { markPublishReviewStaleV1, writePublishFixNoteV1 } from "../utils/publishChecksFreshness";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import type { decideAdmissionReleaseSafetyV1 } from "../state/recordedCliStopV1";
 
 /**
  * Accepted argument shapes for runLintingFixes.
  * - Tree-view task node passes { task: IncompleteTask }
  * - Resolver-aware callers pass { canonicalId?, taskFolderPath? }
  */
-type RunLintingFixesArg =
+export type RunLintingFixesArg =
   | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string };
+  | { canonicalId?: string; taskFolderPath?: string; testDeps?: Partial<PublishFixReleaseCoordinatorDepsV1> };
 
 /**
  * Normalize a command argument into the shape resolveTaskContext expects.
@@ -134,6 +140,308 @@ function isFileInFolder(fileUri: vscode.Uri, folderPath: string): boolean {
 }
 
 /**
+ * Factory for the delegating WorkAdmissionHandleV1 used by runLintingFixes (RC6 item 5).
+ * Delegates every method to the underlying handle at call time, and records marker removal
+ * when release() completes.
+ */
+export function createReleaseTrackedHandleV1(
+  getHandle: () => WorkAdmissionHandleV1 | undefined,
+  onMarkerRemoved: () => void
+): WorkAdmissionHandleV1 | undefined {
+  const current = getHandle();
+  if (!current) {
+    return undefined;
+  }
+  const tracked: WorkAdmissionHandleV1 = {
+    ownerToken: current.ownerToken,
+    claimId: current.claimId,
+    taskFolderPath: current.taskFolderPath,
+    commandId: current.commandId,
+    purpose: current.purpose,
+    heartbeat: () => current.heartbeat(),
+    handover: () => current.handover(),
+    release: async () => {
+      await current.release();
+      onMarkerRemoved();
+    },
+  };
+  return tracked;
+}
+
+export interface PublishFixReleaseCoordinatorDepsV1 {
+  readonly getTaskFolderUri: () => vscode.Uri | undefined;
+  readonly getLockKey: () => string | undefined;
+  readonly getHandle: () => WorkAdmissionHandleV1 | undefined;
+  readonly onAdmissionHeld: (taskFolderPath: string, reason: string) => void;
+  readonly onAdmissionReleased: () => void;
+  readonly safeReleaseState: SafeAdmissionReleaseStateV1;
+  readonly getFinalChecks: () => { passed: boolean; failedChecks: readonly { command: string }[] } | undefined;
+  readonly getFixSucceeded: () => boolean;
+  readonly lintDispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
+  readonly writeNote?: (taskFolderUri: vscode.Uri, note: string, stillWanted?: () => boolean) => Promise<boolean>;
+  readonly scheduleChain?: typeof scheduleAutomationChain;
+  readonly rootOperationIdFor?: (lockKey: string) => string | undefined;
+  readonly showInformation?: (message: string) => void;
+  readonly showWarning?: (message: string) => void;
+  readonly trySafeRelease?: typeof trySafeAdmissionReleaseV1;
+  readonly requestSafeRelease?: typeof requestSafeAdmissionReleaseV1;
+  readonly classifyDeps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2];
+}
+
+export interface PublishFixReleaseCoordinatorV1 {
+  isPublishReviewOwed(): boolean;
+  isPublishReviewScheduled(): boolean;
+  isMarkerRemoved(): boolean;
+  isReleaseFailed(): boolean;
+  getReleaseFailureText(): string;
+  getReleaseAttemptsInFlight(): number;
+  setPublishReviewOwed(owed: boolean): void;
+  releaseTrackedHandle(): WorkAdmissionHandleV1 | undefined;
+  schedulePublishReviewAfterFixOnce(): void;
+  writePublishFixNoteSafely(note: string, stillWanted?: () => boolean): Promise<boolean>;
+  concludeOwedPublishReview(): Promise<void>;
+  trackReleaseAttempt<T>(attempt: () => Promise<T>): Promise<T>;
+  heartbeatTick(classifyDeps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]): Promise<void>;
+  releaseAdmission(classifyDeps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]): Promise<void>;
+  finishPublishFix(classifyDeps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]): Promise<void>;
+}
+
+export function createPublishFixReleaseCoordinatorV1(
+  deps: PublishFixReleaseCoordinatorDepsV1
+): PublishFixReleaseCoordinatorV1 {
+  let publishReviewOwed = false;
+  let publishReviewScheduled = false;
+  let markerRemoved = false;
+  let releaseFailed = false;
+  let releaseFailureText = "";
+  let releaseAttemptsInFlight = 0;
+
+  const releaseTrackedHandle = (): WorkAdmissionHandleV1 | undefined =>
+    createReleaseTrackedHandleV1(
+      () => deps.getHandle(),
+      () => {
+        markerRemoved = true;
+      }
+    );
+
+  const showInformationSafely = (message: string): void => {
+    try {
+      (deps.showInformation ?? NotificationRouter.showInformation)(message);
+    } catch (error) {
+      console.warn("[runLintingFixes] showInformation failed", error);
+    }
+  };
+
+  const showWarningSafely = (message: string): void => {
+    try {
+      (deps.showWarning ?? NotificationRouter.showWarning)(message);
+    } catch (error) {
+      console.warn("[runLintingFixes] showWarning failed", error);
+    }
+  };
+
+  const schedulePublishReviewAfterFixOnce = (): void => {
+    const lockKey = deps.getLockKey();
+    if (publishReviewScheduled || lockKey === undefined) {
+      return;
+    }
+    publishReviewScheduled = true;
+    const rootId = deps.rootOperationIdFor
+      ? deps.rootOperationIdFor(lockKey)
+      : taskOperations.rootOperationIdFor(lockKey);
+    let droppedSynchronously = false;
+    const scheduleFn = deps.scheduleChain ?? scheduleAutomationChain;
+    void scheduleFn(
+      {
+        command: CHECK_AND_REVIEW_PUBLISH_COMMAND_ID_V1,
+        arg: { taskFolderPath: lockKey },
+        taskKey: lockKey,
+        chainId: "publish-review-after-fix",
+        dispatchEvenIfRootFails: true,
+        onDropped: (reason) => {
+          droppedSynchronously = true;
+          if (reason === "duplicate-chain") {
+            showInformationSafely(
+              "A Publish review is already scheduled for this task."
+            );
+          } else if (reason === "automation-disabled") {
+            showInformationSafely(
+              "Automatic follow-ups are off, so the Publish review was not started. Run “Run Publish Checks, Then Review”."
+            );
+          }
+        },
+        intent: {
+          trigger: "Fix Linting & Code Errors ended with Publish Checks passing: review the fixed code",
+          settingKey: undefined,
+          expectedTiming: "right after the fix, once its admission marker is released",
+          willRetry: false,
+          retryNote: "Not retried automatically if dropped — run “Run Publish Checks, Then Review”.",
+        },
+      },
+      rootId ? { id: rootId } : undefined
+    ).catch((error) => {
+      console.warn("[runLintingFixes] scheduling the Publish review failed", error);
+    });
+    if (rootId && !droppedSynchronously) {
+      showInformationSafely(
+        "The Publish review will run once the commit-and-push flow finishes."
+      );
+    }
+  };
+
+  const writePublishFixNoteSafely = async (
+    note: string,
+    stillWanted?: () => boolean
+  ): Promise<boolean> => {
+    const taskFolderUri = deps.getTaskFolderUri();
+    if (!taskFolderUri) {
+      return false;
+    }
+    try {
+      if (deps.writeNote) {
+        return await deps.writeNote(taskFolderUri, note, stillWanted);
+      }
+      return await writePublishFixNoteV1(taskFolderUri, note, stillWanted);
+    } catch (error) {
+      console.warn("[runLintingFixes] could not write the Publish fix note", error);
+      return false;
+    }
+  };
+
+  const concludeOwedPublishReview = async (): Promise<void> => {
+    try {
+      if (!publishReviewOwed || releaseAttemptsInFlight > 0) {
+        return;
+      }
+      if (markerRemoved) {
+        publishReviewOwed = false;
+        schedulePublishReviewAfterFixOnce();
+      } else if (releaseFailed) {
+        publishReviewOwed = false;
+        const note =
+          "> Publish Checks pass after the fix, but the Publish review was not started: the task's admission " +
+          `marker could not be released (${releaseFailureText}). Use Release Stuck Admission Markers, then ` +
+          "Run Publish Checks, Then Review.";
+        await writePublishFixNoteSafely(note);
+        showWarningSafely(note.replace(/^> /, ""));
+      }
+    } catch (error) {
+      console.warn("[runLintingFixes] concluding the owed Publish review failed", error);
+    }
+  };
+
+  const trackReleaseAttempt = async <T>(attempt: () => Promise<T>): Promise<T> => {
+    releaseAttemptsInFlight++;
+    try {
+      return await attempt();
+    } catch (error) {
+      if (deps.safeReleaseState.released) {
+        releaseFailed = true;
+        releaseFailureText = (error instanceof Error ? error.message : String(error)).slice(0, 120);
+      }
+      throw error;
+    } finally {
+      releaseAttemptsInFlight--;
+      await concludeOwedPublishReview();
+    }
+  };
+
+  const heartbeatTick = async (
+    classifyDeps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]
+  ): Promise<void> => {
+    const currentHandle = deps.getHandle();
+    if (!currentHandle) {
+      return;
+    }
+    await currentHandle.heartbeat();
+    if (deps.safeReleaseState.releaseRequested && !deps.safeReleaseState.released) {
+      await trackReleaseAttempt(() =>
+        (deps.trySafeRelease ?? trySafeAdmissionReleaseV1)(
+          deps.safeReleaseState,
+          releaseTrackedHandle(),
+          deps.onAdmissionHeld,
+          deps.onAdmissionReleased,
+          classifyDeps ?? deps.classifyDeps
+        )
+      );
+    }
+  };
+
+  const releaseAdmission = async (
+    classifyDeps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]
+  ): Promise<void> => {
+    await trackReleaseAttempt(() =>
+      (deps.requestSafeRelease ?? requestSafeAdmissionReleaseV1)(
+        deps.safeReleaseState,
+        releaseTrackedHandle(),
+        deps.onAdmissionHeld,
+        deps.onAdmissionReleased,
+        classifyDeps ?? deps.classifyDeps
+      )
+    );
+  };
+
+  const finishPublishFix = async (
+    classifyDeps?: Parameters<typeof decideAdmissionReleaseSafetyV1>[2]
+  ): Promise<void> => {
+    recordAdmissionReleaseTriggerV1(deps.safeReleaseState, deps.lintDispatchProbe?.coordinatorOutcome);
+    if (deps.getTaskFolderUri() !== undefined) {
+      const fixSucceeded = deps.getFixSucceeded();
+      const finalChecks = deps.getFinalChecks();
+      if (fixSucceeded && finalChecks?.passed === true) {
+        publishReviewOwed = true;
+      } else if (!fixSucceeded && finalChecks?.passed === false) {
+        const failing =
+          finalChecks.failedChecks.map((check) => check.command).join(", ") || "see Completion Checks";
+        await writePublishFixNoteSafely(`> Publish Checks still fail after the fix: ${failing}.`);
+      }
+    }
+    let releaseErrorV1: unknown;
+    let releaseFailedWithErrorV1 = false;
+    try {
+      await releaseAdmission(classifyDeps);
+    } catch (error) {
+      releaseErrorV1 = error;
+      releaseFailedWithErrorV1 = true;
+    }
+    if (!deps.getHandle()) {
+      markerRemoved = true;
+    }
+    await concludeOwedPublishReview();
+    if (publishReviewOwed) {
+      const heldText =
+        "Publish Checks pass after the fix. The Publish review will start once the previous provider process is confirmed stopped.";
+      if (await writePublishFixNoteSafely(`> ${heldText}`, () => publishReviewOwed)) {
+        showInformationSafely(heldText);
+      }
+    }
+    if (releaseFailedWithErrorV1) {
+      throw releaseErrorV1;
+    }
+  };
+
+  return {
+    isPublishReviewOwed: () => publishReviewOwed,
+    isPublishReviewScheduled: () => publishReviewScheduled,
+    isMarkerRemoved: () => markerRemoved,
+    isReleaseFailed: () => releaseFailed,
+    getReleaseFailureText: () => releaseFailureText,
+    getReleaseAttemptsInFlight: () => releaseAttemptsInFlight,
+    setPublishReviewOwed: (owed: boolean): void => {
+      publishReviewOwed = owed;
+    },
+    releaseTrackedHandle,
+    schedulePublishReviewAfterFixOnce,
+    writePublishFixNoteSafely,
+    concludeOwedPublishReview,
+    trackReleaseAttempt,
+    heartbeatTick,
+    releaseAdmission,
+    finishPublishFix,
+  };
+}
+
+/**
  * Second Publish action: fix the issues the latest Publish-checks report
  * (persisted lint payload + publish-review.md, produced by runPublishChecks)
  * identified. Applies editor autofixes first, then hands remaining failures
@@ -168,7 +476,12 @@ export async function runLintingFixes(
   // `acquireWorkAdmissionV1` genesis is always correct — there is no
   // same-process marker to adopt.
   const earlyFolderPath = extractSynchronousLintingFolderPathV1(explicitArg);
-  const early = earlyFolderPath
+  // A nested fix (`parentOperation`, the commit-and-push flow's "Fix with AI")
+  // runs under the parent's already-held admission marker for this task;
+  // acquiring a second one would be refused as busy and the fix would never
+  // start. The parent owns the marker, so the nested fix holds none.
+  const parentHoldsAdmissionV1 = parentOperation !== undefined;
+  const early = earlyFolderPath && !parentHoldsAdmissionV1
     ? await acquireWorkAdmissionV1({
         taskFolderPath: earlyFolderPath,
         purpose: "admission",
@@ -187,7 +500,6 @@ export async function runLintingFixes(
   // returns, so a resolution failure, an unsupported stage, an already-passed
   // report, or a completed run all release admission exactly once.
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
-  let heartbeat = handle ? setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
   // Item 2 / Step 57: shared safe-release gate (`workAdmissionV1.ts`) — a
   // release is requested at most once, but only actually unlinks the marker
   // once the round's recorded processes are all confirmed gone; until then
@@ -203,18 +515,15 @@ export async function runLintingFixes(
       heartbeat = undefined;
     }
   };
-  async function heartbeatTickV1(): Promise<void> {
-    if (!handle) {
-      return;
-    }
-    await handle.heartbeat();
-    if (safeReleaseStateV1.releaseRequested && !safeReleaseStateV1.released) {
-      await trySafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
-    }
-  }
-  const releaseAdmissionV1 = async (): Promise<void> => {
-    await requestSafeAdmissionReleaseV1(safeReleaseStateV1, handle, onAdmissionHeldV1, onAdmissionReleasedV1);
-  };
+  // ── RC6 item 5: Publish review after a successful fix ─────────────────────
+  // The follow-up review needs its own admission, so it may only be started
+  // once THIS command's marker is actually removed. `safeReleaseStateV1.released`
+  // is set before `handle.release()` resolves (and a heartbeat tick and the
+  // finalizer can both be mid-release), so the marker's removal is observed
+  // through the handle's own `release()` completing instead.
+  const publishFixV1: { taskFolderUri?: vscode.Uri; lockKey?: string } = {};
+  let finalChecksV1: { passed: boolean; failedChecks: readonly { command: string }[] } | undefined;
+  let fixSucceededV1 = false;
   // Item 2 / Step 57a completion fix (2026-09-29 review): out-param the AI
   // final-fixes dispatch below fills from its own runImplementationOrSealedV1
   // call, read back here so the terminal recordAdmissionReleaseTriggerV1 call
@@ -223,6 +532,22 @@ export async function runLintingFixes(
   // instead of leaving them unset — mirrors runImplementationWithAI's own
   // dispatchProbe wiring.
   const lintDispatchProbeV1: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
+
+  const coordinator = createPublishFixReleaseCoordinatorV1({
+    getTaskFolderUri: () => publishFixV1.taskFolderUri,
+    getLockKey: () => publishFixV1.lockKey,
+    getHandle: () => handle,
+    onAdmissionHeld: onAdmissionHeldV1,
+    onAdmissionReleased: onAdmissionReleasedV1,
+    safeReleaseState: safeReleaseStateV1,
+    getFinalChecks: () => finalChecksV1,
+    getFixSucceeded: () => fixSucceededV1,
+    lintDispatchProbe: lintDispatchProbeV1,
+    ...(explicitArg && "testDeps" in explicitArg ? explicitArg.testDeps : {}),
+  });
+
+  let heartbeat = handle ? setInterval(() => void coordinator.heartbeatTick(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) : undefined;
+
 
   try {
   const resolvedTask = await resolveTaskContext(inventory, resolverArg, {
@@ -236,7 +561,7 @@ export async function runLintingFixes(
     return;
   }
 
-  if (!handle) {
+  if (!handle && !parentHoldsAdmissionV1) {
     const late = await acquireWorkAdmissionV1({
       taskFolderPath: resolvedTask.taskFolderPath,
       purpose: "admission",
@@ -252,7 +577,7 @@ export async function runLintingFixes(
       return;
     }
     handle = late.handle;
-    heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+    heartbeat = setInterval(() => void coordinator.heartbeatTick(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
   const taskLabel = notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
@@ -392,6 +717,18 @@ export async function runLintingFixes(
             taskOperations.rootOperationIdFor(lockKey)
           );
           try {
+            // RC6 item 5: the fix is about to change the code the Publish
+            // review describes, so mark that document stale at once — it is
+            // never shown as current after its code changed.
+            publishFixV1.taskFolderUri = taskFolderUri;
+            publishFixV1.lockKey = lockKey;
+            // A write failure aborts the fix (handled by the catch below)
+            // rather than letting code change under a review shown as current.
+            await markPublishReviewStaleV1(
+              taskFolderUri,
+              "workspace files (Fix Linting & Code Errors)",
+              new Date().toISOString()
+            );
             progress.report({ message: "Checking for linting errors..." });
 
             // Check for TypeScript/JavaScript files with problems inside the
@@ -512,6 +849,7 @@ export async function runLintingFixes(
 
             const postFixLint = await runCompletionLint(taskFolderUri, relevantFiles);
             await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+            finalChecksV1 = { passed: postFixLint.passed, failedChecks: postFixLint.failedChecks };
 
             if (!postFixLint.passed) {
 
@@ -651,7 +989,11 @@ export async function runLintingFixes(
                       taskStage: "publish",
                       taskFolderUri: taskFolderUri,
                       taskDisplayName: resolvedTask.progress.displayName,
-                      roundProcessClaimId: handle?.claimId,
+                      // A nested fix holds no marker of its own; record its
+                      // provider process against the parent's held claim.
+                      roundProcessClaimId:
+                        handle?.claimId ??
+                        (parentHoldsAdmissionV1 ? heldAdmissionClaimIdForTaskV1(lockKey) : undefined),
                       dispatchProbe: lintDispatchProbeV1,
                       onProgress: (message) => aiProgress.report({ message }),
                       // Mirror structured preflight questions into task-local
@@ -692,6 +1034,7 @@ export async function runLintingFixes(
                   if (result?.status === "completed") {
                     const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles);
                     await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    finalChecksV1 = { passed: rerunLint.passed, failedChecks: rerunLint.failedChecks };
                     await inventory.refresh();
                     if (!rerunLint.passed) {
                       // RC3 item 11 (Step 9): fixes were applied, but the
@@ -707,6 +1050,8 @@ export async function runLintingFixes(
                         `AI final fixes were applied, but checks still fail.${stillFailingNote}`
                       );
                     } else {
+                      // Every awaited step on this path has returned.
+                      fixSucceededV1 = true;
                       NotificationRouter.showInformation("AI final fixes applied; completion lint was rerun.");
                     }
                   } else {
@@ -719,6 +1064,7 @@ export async function runLintingFixes(
                     // below (see the `return` after this block).
                     const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles);
                     await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    finalChecksV1 = { passed: rerunLint.passed, failedChecks: rerunLint.failedChecks };
                     await inventory.refresh();
                     const stillFailingNote =
                       rerunLint.failedChecks.length > 0
@@ -751,6 +1097,12 @@ export async function runLintingFixes(
             // refreshed persisted lint payload.
             await inventory.refresh();
 
+            // Deterministic path: every awaited step has returned. A fix
+            // "succeeded" only when the checks it was meant to satisfy pass.
+            if (postFixLint.passed && fixedCount > 0) {
+              fixSucceededV1 = true;
+            }
+
             if (fixedCount > 0) {
               NotificationRouter.showInformation(
                 `Linting fixes applied to ${fixedCount} file(s) in the Publish scope!` +
@@ -778,6 +1130,10 @@ export async function runLintingFixes(
               );
             }
           } catch (error) {
+            // An error ends the fix without a verdict: nothing is owed and no
+            // note is written; the stale banner stays.
+            fixSucceededV1 = false;
+            finalChecksV1 = undefined;
             try {
               await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
               await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
@@ -796,8 +1152,7 @@ export async function runLintingFixes(
     }
   );
   } finally {
-    recordAdmissionReleaseTriggerV1(safeReleaseStateV1, lintDispatchProbeV1.coordinatorOutcome);
-    await releaseAdmissionV1();
+    await coordinator.finishPublishFix();
   }
 }
 

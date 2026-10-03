@@ -52,6 +52,7 @@
  */
 import * as assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -101,7 +102,8 @@ import {
   createWorkflowLeaseStoreV1,
   WorkflowLeaseStoreV1,
 } from "../services/workflowLeaseStoreV1";
-import { describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
+import { describeTaskActionFailureV1, describeTaskActionOutcomeForLogV1 } from "../utils/taskActionOutcomeTextV1";
+import { withMalformedResultRetryV1 } from "../actions/productionTaskActionRuntimeV1";
 import { writeRunLog } from "../utils/runLog";
 import { safeRemoveDir } from "./testFsUtils";
 import { runWithRoundProcessTaskFolderV1 } from "../state/roundProcessContextV1";
@@ -113,6 +115,9 @@ import {
 } from "../state/workAdmissionV1";
 import { beginProcessSpawnAttemptV1, beginRoundProcessRecordingV1 } from "../state/roundProcessRecordV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { handleReviewOutcomeV1 } from "../commands/reviewActions";
+import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
+import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { writeOwnershipBackedTaskProgress } from "./taskFolderFixture";
 
 const TEST_ACTION_KEY = "coordinatorTestAction.v1";
@@ -211,7 +216,8 @@ function stubSelectionOpener(
   transports: readonly AgentTransportV1[],
   exhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1,
   /** false models a Copilot-shaped provider with no file access of its own. */
-  providerReadsWorkspaceNatively = true
+  providerReadsWorkspaceNatively = true,
+  candidateCountOverride?: number
 ): StubSelectionSource {
   let opened = 0;
   let reservedCount = 0;
@@ -219,6 +225,7 @@ function stubSelectionOpener(
   const opener: RunnerSelectionOpenerV1 = ({ session, mode }) => {
     opened += 1;
     return {
+      candidateCount: candidateCountOverride ?? transports.length,
       reserveNext(attemptId): V1ReserveNextResultV1 {
         const transport = transports[cursor];
         if (!transport) {
@@ -236,19 +243,22 @@ function stubSelectionOpener(
         }
         cursor += 1;
         reservedCount += 1;
+        const candidateModelId = (transport as { storedModelId?: string }).storedModelId ?? "copilot:test";
+        const candidateLabel = (transport as { providerLabel?: string }).providerLabel ?? "Test Provider";
+        const candidateProviderId = (transport as { providerId?: string }).providerId ?? "copilot";
         const handle = session.reserve({
           attemptId,
           mode,
           runnerId: transport.runnerId,
-          providerId: "copilot",
-          modelId: "copilot:test",
+          providerId: candidateProviderId,
+          modelId: candidateModelId,
         });
         return {
           kind: "reserved",
           reserved: {
             handle,
-            providerLabel: "Test Provider",
-            storedModelId: "copilot:test",
+            providerLabel: candidateLabel,
+            storedModelId: candidateModelId,
             providerReadsWorkspaceNatively,
             createTransport: () => transport,
           },
@@ -298,7 +308,8 @@ function makeHarness(
     readonly providerReadsWorkspaceNatively: boolean;
   },
   /** Item 2 / Step 55: lets a test wrap the durable orchestrator (e.g. to force a `settleInvocation` failure) instead of the plain file-backed one. */
-  orchestratorOverride?: ActionConversationOrchestratorV1
+  orchestratorOverride?: ActionConversationOrchestratorV1,
+  candidateCountOverride?: number
 ): Harness {
   const promoted: CompletedContentV1[] = [];
   const row: ProviderTaskActionRowV1 = {
@@ -328,7 +339,8 @@ function makeHarness(
   const selection = stubSelectionOpener(
     transports,
     selectionExhaustion,
-    readTools?.providerReadsWorkspaceNatively ?? true
+    readTools?.providerReadsWorkspaceNatively ?? true,
+    candidateCountOverride
   );
   const followUps: TaskActionFollowUpRequestV1[] = [];
   const leaseHeldAtFollowUp: (string | undefined)[] = [];
@@ -1332,17 +1344,14 @@ void describe("taskActionCoordinatorV1", () => {
   });
 
   /**
-   * Item 2 / Step 55: before this branch existed, a bounded invocation
-   * deadline (Step 54's broker outcome, `transportFailure` with code
-   * `invocationDeadlineExceeded` and no response started) fell into the same
-   * pre-response fallback path as an ordinary transport failure and could
-   * silently start a second, fully unrelated provider — exactly the
-   * candidate-fallback-after-timeout the plan requires never happens. This
-   * proves the terminal branch: only the first candidate is ever reserved or
-   * invoked, and the operation settles `failed`/`retryable: true` naming the
-   * deadline code.
+   * RC6 item 2: a bounded invocation deadline (`transportFailure` with code
+   * `invocationDeadlineExceeded`) on one candidate no longer ends the round
+   * while an enabled candidate is still untried. This proves the round
+   * advances to the second candidate and completes there, with two
+   * invocations and two reservations. A deadline on the last (or only)
+   * candidate is still terminal.
    */
-  void it("settles a bounded invocation deadline as a terminal failure and never starts a fallback candidate", async () => {
+  void it("advances past a bounded invocation deadline to the next untried enabled candidate", async () => {
     const seen: ActionCorrelationV1[] = [];
     const timedOut: AgentTransportV1 = {
       runnerId: "scripted-transport",
@@ -1367,16 +1376,11 @@ void describe("taskActionCoordinatorV1", () => {
     );
     const harness = makeHarness([timedOut, wouldSucceed]);
     const outcome = await harness.coordinator.executeAction(baseRequest());
-    assert.equal(outcome.kind, "failed");
-    if (outcome.kind !== "failed") {
-      assert.fail("expected failed");
-    }
-    assert.equal(outcome.code, "invocationDeadlineExceeded");
-    assert.equal(outcome.retryable, true);
-    // Exactly one candidate was ever reserved or invoked — the second
-    // (would-succeed) transport is never reached.
-    assert.equal(seen.length, 1);
-    assert.equal(harness.selection.reserved, 1);
+    // RC6 item 2: every enabled candidate is tried before the round fails,
+    // so the deadline on the first candidate advances to the second.
+    assert.equal(outcome.kind, "completed");
+    assert.equal(seen.length, 2);
+    assert.equal(harness.selection.reserved, 2);
   });
 
   /**
@@ -1578,11 +1582,10 @@ void describe("taskActionCoordinatorV1", () => {
     });
 
     /**
-     * The budget is pinned at MAX_MALFORMED_RESULT_INVOCATIONS_V1 = 3 (the
-     * initial attempt plus at most two advances) so a five-candidate stage
-     * cannot burn five CLI invocations on one press.
+     * RC6 item 2: the budget is max(3, enabled candidate count), so a
+     * five-candidate stage tries every enabled candidate once before failing.
      */
-    void it("stops advancing after 3 total invocations, even with more candidates configured", async () => {
+    void it("tries every enabled candidate once when more than three are configured", async () => {
       const harness = makeHarness([
         malformedTransport(),
         malformedTransport(),
@@ -1594,8 +1597,8 @@ void describe("taskActionCoordinatorV1", () => {
       assert.equal(outcome.kind, "malformedResult");
       assert.equal(
         harness.selection.reserved,
-        3,
-        "only the initial attempt plus two advances may be reserved"
+        5,
+        "every enabled candidate must be tried once"
       );
     });
 
@@ -1805,38 +1808,64 @@ void describe("taskActionCoordinatorV1", () => {
      * than reserving a 4th candidate.
      */
     void it("caps total invocations at 3 when a malformed result is followed by transport failures", async () => {
-      const harness = makeHarness([
-        malformedTransport(),
-        preResponseFailingTransport(),
-        preResponseFailingTransport(),
-        envelopeTransport(() => {
-          throw new Error("must not reserve a 4th candidate once the shared budget is exhausted");
-        }),
-      ]);
+      const harness = makeHarness(
+        [
+          malformedTransport(),
+          preResponseFailingTransport(),
+          preResponseFailingTransport(),
+          envelopeTransport(() => {
+            throw new Error("must not reserve a 4th candidate once the shared budget is exhausted");
+          }),
+        ],
+        {},
+        [],
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        3
+      );
       const outcome = await harness.coordinator.executeAction(baseRequest());
-      assert.equal(outcome.kind, "malformedResult");
-      if (outcome.kind === "malformedResult") {
-        assert.equal(
-          outcome.code,
-          "invalidJson",
-          "the honest diagnosis (the malformed result from attempt 1) must be reported, not masked by the later transport failures"
-        );
-        assert.equal(
-          outcome.malformedInvocationsUsedV1,
-          3,
-          // 2026-08-13 review fix: the stamped count must track the
-          // operation's TOTAL invocations (1 malformed + 2 transport
-          // failures = 3), not the count at the moment the malformed result
-          // occurred (1). A stale count here would let the outer wrapper in
-          // productionTaskActionRuntimeV1.ts believe only 1 of 3 invocations
-          // had been spent and open further operations past the shared cap.
-        );
+      // RC6 item 2: the current (last) failure is the outcome, and the history
+      // carries the earlier malformed attempt and the first transport failure.
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "connectFailed");
+        assert.equal(outcome.priorRejectedAttemptsV1?.length, 2);
+        assert.equal(outcome.priorRejectedAttemptsV1?.[0]?.code, "invalidJson");
       }
       assert.equal(
         harness.selection.reserved,
         3,
         "only 3 total invocations may be reserved once the malformed budget is armed"
       );
+    });
+
+    void it("names the last candidate when it fails setup after an earlier malformed result", async () => {
+      // The first read (at reservation) matches; the broker's later check
+      // sees a different runner id, so preparing the invocation throws.
+      let runnerIdReads = 0;
+      const badLast = {
+        get runnerId(): string {
+          runnerIdReads += 1;
+          return runnerIdReads === 1 ? "scripted-transport" : "mismatched-runner";
+        },
+        providerLabel: "Last Model",
+        storedModelId: "copilot:last",
+        invoke: () => Promise.resolve({ kind: "completed" as const }),
+      } as unknown as AgentTransportV1;
+      const first = Object.assign(malformedTransport(), {
+        providerLabel: "First Model",
+        storedModelId: "copilot:first",
+      });
+      const harness = makeHarness([first, badLast]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "providerUnavailablePreInvocation");
+        assert.equal(outcome.provider?.providerLabel, "Last Model");
+        assert.equal(outcome.priorRejectedAttemptsV1?.[0]?.providerLabel, "First Model");
+      }
     });
 
     /**
@@ -1967,20 +1996,22 @@ void describe("taskActionCoordinatorV1", () => {
       const harness = makeHarness([
         malformedTransport(),
         networkFaultAlways(),
-        envelopeTransport(() => {
-          throw new Error("must not reserve a 3rd candidate once the shared budget is exhausted");
-        }),
+        networkFaultAlways(),
       ]);
       const outcome = await harness.coordinator.executeAction(baseRequest());
-      // 1 (malformed) + 1 (network-fault fallback, budget already armed at
-      // that point) = 2 total invocations; the retry that would make a 3rd
-      // must be refused by the same shared-cap check the ordinary fallback
-      // uses, leaving the malformed result as the honest diagnosis.
-      assert.equal(outcome.kind, "malformedResult");
+      // RC6 item 2 / Step 2c: candidate-first. Instead of burning the 3rd
+      // invocation on retrying candidate 2's network fault while candidate 3
+      // is still untried, the loop advances to candidate 3. Candidate 3 is
+      // invoked (count=3), exhausting the budget; its failure is the outcome
+      // and the earlier malformed attempt rides in the history.
+      assert.equal(outcome.kind, "failed");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.priorRejectedAttemptsV1?.[0]?.code, "invalidJson");
+      }
       assert.equal(
         harness.selection.reserved,
-        2,
-        "the network-fault retry must not push total invocations past the shared 3-budget once armed"
+        3,
+        "advances to the untried candidate instead of retrying candidate 2 on network fault"
       );
     });
   });
@@ -4838,4 +4869,513 @@ void describe("taskActionCoordinatorV1 — item 2 / Step 55: cancellation termin
       }
     }
   );
+
+  function preResponseFailingTransport(code = "connectFailed", detail?: string): AgentTransportV1 {
+    return {
+      runnerId: "scripted-transport",
+      invoke: () => Promise.resolve({ kind: "transportFailure" as const, code, detail }),
+    };
+  }
+
+  function malformedTransport(text = "not valid json"): AgentTransportV1 {
+    return {
+      runnerId: "scripted-transport",
+      invoke: (_request, output): Promise<{ kind: "completed" }> => {
+        output.write(`<<<ENSEMBLE_AI_RESULT_V1>>>\n${text}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`);
+        return Promise.resolve({ kind: "completed" as const });
+      },
+    };
+  }
+
+  function networkFaultAlways(): AgentTransportV1 {
+    return {
+      runnerId: "scripted-transport",
+      invoke: () =>
+        Promise.resolve({
+          kind: "transportFailure" as const,
+          code: "copilotRequestFailed",
+          networkFault: true,
+        }),
+    };
+  }
+
+  void describe("RC6 Part A: provider selection & failure reporting (item 2)", () => {
+    void it("tries all enabled candidates and names all three with reasons on end-to-end failure", async () => {
+      const codexTransport = Object.assign(
+        preResponseFailingTransport("cliExit.1", "OpenAI Codex CLI failed: You've hit your usage limit"),
+        { storedModelId: "codex-cli:gpt-5.6-sol@high", providerLabel: "OpenAI Codex (gpt-5.6-sol@high)" }
+      );
+      const copilotTransport = Object.assign(
+        {
+          runnerId: "copilot-lm",
+          invoke: () =>
+            Promise.resolve({
+              kind: "transportFailure" as const,
+              code: "copilotEmptyResponse",
+              detail: "Copilot returned an empty response",
+              networkFault: true,
+            }),
+        },
+        { storedModelId: "copilot:gpt-6-sol", providerLabel: "GitHub Copilot (gpt-6-sol)" }
+      );
+      const claudeTransport = Object.assign(
+        preResponseFailingTransport("cliExit.1", "Claude CLI failed: sign-in required"),
+        { storedModelId: "claude-cli:claude-opus-5-5@high", providerLabel: "Claude Opus (claude-opus-5-5@high)" }
+      );
+
+      const harness = makeHarness([codexTransport, copilotTransport, claudeTransport]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+
+      assert.equal(outcome.kind, "failed");
+      assert.equal(harness.selection.reserved, 3, "every enabled candidate must be tried");
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "cliExit.1");
+        assert.equal(outcome.priorRejectedAttemptsV1?.length, 2);
+        assert.equal(outcome.priorRejectedAttemptsV1[0]?.providerLabel, "OpenAI Codex (gpt-5.6-sol@high)");
+        assert.match(outcome.priorRejectedAttemptsV1[0]?.detail ?? "", /usage limit/);
+        assert.equal(outcome.priorRejectedAttemptsV1[1]?.providerLabel, "GitHub Copilot (gpt-6-sol)");
+        assert.match(outcome.priorRejectedAttemptsV1[1]?.code ?? "", /copilotEmptyResponse/);
+        assert.equal(outcome.provider?.providerLabel, "Claude Opus (claude-opus-5-5@high)");
+
+        const formatted = describeTaskActionFailureV1(outcome);
+        assert.match(formatted, /OpenAI Codex \(gpt-5\.6-sol@high\)/);
+        assert.match(formatted, /usage limit/);
+        assert.match(formatted, /GitHub Copilot \(gpt-6-sol\)/);
+        assert.match(formatted, /copilotEmptyResponse/);
+        assert.match(formatted, /Claude Opus \(claude-opus-5-5@high\)/);
+        assert.match(formatted, /sign-in required/);
+      }
+    });
+
+    void it("a real all-candidate failure reaches the ledger reason, the run log and the notification, each naming every model", async () => {
+      const codexTransport = Object.assign(
+        preResponseFailingTransport("cliExit.1", "OpenAI Codex CLI failed: You've hit your usage limit"),
+        { storedModelId: "codex-cli:gpt-5.6-sol@high", providerLabel: "OpenAI Codex (gpt-5.6-sol@high)" }
+      );
+      const copilotTransport = Object.assign(
+        {
+          runnerId: "copilot-lm",
+          invoke: () =>
+            Promise.resolve({
+              kind: "transportFailure" as const,
+              code: "copilotEmptyResponse",
+              detail: "Copilot returned an empty response",
+              networkFault: true,
+            }),
+        },
+        { storedModelId: "copilot:gpt-6-sol", providerLabel: "GitHub Copilot (gpt-6-sol)" }
+      );
+      const claudeTransport = Object.assign(
+        preResponseFailingTransport("cliExit.1", "Claude CLI failed: sign-in required"),
+        { storedModelId: "claude-cli:claude-opus-5-5@high", providerLabel: "Claude Opus (claude-opus-5-5@high)" }
+      );
+      const harness = makeHarness([codexTransport, copilotTransport, claudeTransport]);
+      // The outcome below is produced by the real candidate loop, not constructed.
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "failed");
+
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-sinks-"));
+      cp.execFileSync("git", ["init", "-q"], { cwd: root, windowsHide: true });
+      configureWorkflowPrivateStorageRootV1(fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-coordinator-sinks-private-")));
+      const fsTarget = vscode.workspace.fs as unknown as Record<string, unknown>;
+      const fsOrig = { ...fsTarget };
+      const fsKeys = ["readFile", "writeFile", "rename", "delete", "createDirectory", "readDirectory", "stat"];
+      fsTarget.readFile = (u: vscode.Uri): Promise<Uint8Array> =>
+        fs.promises.readFile(u.fsPath).then((b) => new Uint8Array(b));
+      fsTarget.writeFile = async (u: vscode.Uri, c: Uint8Array): Promise<void> => {
+        await fs.promises.mkdir(path.dirname(u.fsPath), { recursive: true });
+        await fs.promises.writeFile(u.fsPath, c);
+      };
+      fsTarget.rename = async (a: vscode.Uri, b: vscode.Uri): Promise<void> => {
+        await fs.promises.rm(b.fsPath, { force: true });
+        await fs.promises.rename(a.fsPath, b.fsPath);
+      };
+      fsTarget.delete = (u: vscode.Uri): Promise<void> => fs.promises.rm(u.fsPath, { force: true, recursive: true });
+      fsTarget.createDirectory = (u: vscode.Uri): Promise<void> =>
+        fs.promises.mkdir(u.fsPath, { recursive: true }).then(() => undefined);
+      fsTarget.readDirectory = async (u: vscode.Uri): Promise<[string, number][]> =>
+        (await fs.promises.readdir(u.fsPath, { withFileTypes: true })).map((e) => [e.name, e.isDirectory() ? 2 : 1]);
+      fsTarget.stat = async (u: vscode.Uri): Promise<unknown> => {
+        const st = await fs.promises.stat(u.fsPath);
+        return { type: st.isDirectory() ? 2 : 1, size: st.size, ctime: st.ctimeMs, mtime: st.mtimeMs };
+      };
+      const ws = vscode.workspace as unknown as Record<string, unknown>;
+      const wsOrig = ws.workspaceFolders;
+      ws.workspaceFolders = [{ uri: vscode.Uri.file(root), name: "root", index: 0 }];
+      const notices: string[] = [];
+      initNotificationRouter({
+        addEntry: (...args: unknown[]): void => {
+          notices.push(String(args[0]));
+        },
+      });
+      try {
+        const folderPath = path.join(root, "plans", "real_all_failed");
+        fs.mkdirSync(folderPath, { recursive: true });
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify({
+            ensembleProgressVersion: 1,
+            taskFolder: "real_all_failed",
+            currentStage: "impl-high-review",
+            status: "active",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            updatedAt: "2026-01-01T00:00:00.000Z",
+            ownership: {
+              metaRoot: path.join(root, "plans"),
+              projectRoot: root,
+              workspaceRoot: root,
+              boundAt: "2026-01-01T00:00:00.000Z",
+            },
+            roundLedger: [
+              {
+                roundId: "attempt-real",
+                attemptIds: ["attempt-real"],
+                stage: "impl-high-review",
+                mode: "review",
+                startedAt: "2026-01-01T00:05:00.000Z",
+                state: "open",
+              },
+            ],
+          }),
+          "utf8"
+        );
+        const folderUri = vscode.Uri.file(folderPath);
+        await handleReviewOutcomeV1(outcome, {
+          extensionUri: folderUri,
+          folderUri,
+          workspaceUri: folderUri,
+          currentStage: "impl-high-review",
+          targetStage: "impl-high-review",
+          reviewUri: folderUri,
+          variables: {},
+          reviewAttemptId: "attempt-real",
+        });
+        const expectAll = (label: string, text: string): void => {
+          for (const re of [
+            /OpenAI Codex \(gpt-5\.6-sol@high\)/,
+            /usage limit/,
+            /GitHub Copilot \(gpt-6-sol\)/,
+            /copilotEmptyResponse|empty response/,
+            /Claude Opus \(claude-opus-5-5@high\)/,
+            /sign-in required/,
+          ]) {
+            assert.match(text, re, `${label} must match ${String(re)}`);
+          }
+        };
+        const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as {
+          roundLedger?: { roundId: string; state: string; outcome?: { rejectionReason?: string } }[];
+        };
+        const row = raw.roundLedger?.find((r) => r.roundId === "attempt-real");
+        assert.equal(row?.state, "failed");
+        expectAll("ledger rejectionReason", row?.outcome?.rejectionReason ?? "");
+        const runsDir = path.join(folderPath, "runs");
+        const logs = fs.readdirSync(runsDir).map((n) => fs.readFileSync(path.join(runsDir, n), "utf8"));
+        assert.equal(logs.length, 1);
+        expectAll("run log", logs[0]!);
+        const failureNotices = notices.filter((n) => /failed:/.test(n));
+        assert.ok(failureNotices.length > 0, "a failure notification must be raised");
+        expectAll("notification", failureNotices.join("\n"));
+      } finally {
+        deactivateNotificationRouter();
+        ws.workspaceFolders = wsOrig;
+        for (const k of fsKeys) fsTarget[k] = fsOrig[k];
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    void it("a response-started transport failure and a deadline on earlier candidates still let every enabled candidate be tried", async () => {
+      const startedTransport = Object.assign(
+        {
+          runnerId: "copilot-lm",
+          invoke: () =>
+            Promise.resolve({
+              kind: "transportFailure" as const,
+              code: "cliExit.2",
+              detail: "stream broke mid-response",
+              responseStarted: true,
+            }),
+        },
+        { storedModelId: "model-a", providerLabel: "Provider A" }
+      );
+      const deadlineTransport = Object.assign(
+        preResponseFailingTransport("invocationDeadlineExceeded", "deadline"),
+        { storedModelId: "model-b", providerLabel: "Provider B" }
+      );
+      const lastTransport = Object.assign(
+        preResponseFailingTransport("cliExit.1", "fatal"),
+        { storedModelId: "model-c", providerLabel: "Provider C" }
+      );
+      const harness = makeHarness([startedTransport, deadlineTransport, lastTransport]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "failed");
+      assert.equal(harness.selection.reserved, 3, "every enabled candidate must be tried");
+      if (outcome.kind === "failed") {
+        // The shared formatter feeds the ledger rejectionReason, the run log
+        // (describeTaskActionOutcomeForLogV1) and the failure notification.
+        for (const text of [
+          describeTaskActionFailureV1(outcome),
+          describeTaskActionOutcomeForLogV1(outcome, "review.md"),
+        ]) {
+          assert.match(text, /Provider A/);
+          assert.match(text, /Provider B/);
+          assert.match(text, /Provider C/);
+        }
+      }
+    });
+
+    void it("the review ledger reason, run log and notification all render the combined failure from the same outcome", () => {
+      const src = fs.readFileSync(
+        path.join(__dirname, "..", "..", "src", "commands", "reviewActions.ts"),
+        "utf8"
+      );
+      assert.match(src, /rejectionReason: describeTaskActionFailureV1\(outcome\)/);
+      assert.match(src, /describeTaskActionOutcomeForLogV1\(\s*outcome,\s*STAGE_ARTIFACT_FILENAMES/);
+      assert.match(src, /failed: \$\{describeTaskActionFailureV1\(outcome\)\}\. [`"]/);
+    });
+
+    void it("with primary at usage limit and Copilot returning malformed result, Claude is tried next without restarting at primary", async () => {
+      const reservedModels: string[] = [];
+      const codexTransport = Object.assign(
+        preResponseFailingTransport("cliExit.1", "You've hit your usage limit"),
+        { storedModelId: "codex-cli:gpt-5.6-sol@high", providerLabel: "Codex" }
+      );
+      const copilotTransport = Object.assign(
+        malformedTransport("empty or malformed response"),
+        { storedModelId: "copilot:gpt-6-sol", providerLabel: "Copilot" }
+      );
+      const claudeTransport = Object.assign(
+        envelopeTransport((correlation) => frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "success" },
+        })),
+        { storedModelId: "claude-cli:claude-opus-5-5@high", providerLabel: "Claude" }
+      );
+
+      const harness = makeHarness([codexTransport, copilotTransport, claudeTransport]);
+      const wrapped = withMalformedResultRetryV1(harness.coordinator, 3);
+      const outcome = await wrapped.executeAction({
+        ...baseRequest(),
+        onCandidateInvokedV1: (info) => reservedModels.push(info.storedModelId),
+      });
+
+      assert.equal(outcome.kind, "completed");
+      assert.deepEqual(reservedModels, [
+        "codex-cli:gpt-5.6-sol@high",
+        "copilot:gpt-6-sol",
+        "claude-cli:claude-opus-5-5@high",
+      ]);
+    });
+
+    void it("with 3 candidates, A malformed and B hitting network fault, B is not retried and C is tried; failure names all three", async () => {
+      const transportA = Object.assign(
+        malformedTransport("bad frame"),
+        { storedModelId: "model-a", providerLabel: "Provider A" }
+      );
+      const transportB = Object.assign(
+        networkFaultAlways(),
+        { storedModelId: "model-b", providerLabel: "Provider B" }
+      );
+      const transportC = Object.assign(
+        preResponseFailingTransport("cliExit.1", "fatal error"),
+        { storedModelId: "model-c", providerLabel: "Provider C" }
+      );
+
+      const harness = makeHarness([transportA, transportB, transportC]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+
+      // The last failure (C's transport failure) is the outcome, not A's
+      // earlier malformed result, so C's label and reason are never lost.
+      assert.equal(outcome.kind, "failed");
+      assert.equal(harness.selection.reserved, 3);
+      if (outcome.kind === "failed") {
+        assert.equal(outcome.code, "cliExit.1");
+        assert.equal(outcome.provider?.providerLabel, "Provider C");
+        assert.equal(outcome.priorRejectedAttemptsV1?.length, 2);
+        const formatted = describeTaskActionFailureV1(outcome);
+        assert.match(formatted, /Provider A/);
+        assert.match(formatted, /Provider B/);
+        assert.match(formatted, /Provider C/);
+      }
+    });
+
+    void it("a stage with five enabled candidates that all return malformed results tries each once and names all five", async () => {
+      const transports = [1, 2, 3, 4, 5].map((i) =>
+        Object.assign(malformedTransport(`malformed from ${i}`), {
+          storedModelId: `model-${i}`,
+          providerLabel: `Model ${i}`,
+        })
+      );
+      const harness = makeHarness(transports);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+
+      assert.equal(outcome.kind, "malformedResult");
+      assert.equal(harness.selection.reserved, 5);
+      if (outcome.kind === "malformedResult") {
+        assert.equal(outcome.priorRejectedAttemptsV1?.length, 4);
+        assert.equal(outcome.provider?.providerLabel, "Model 5");
+        const formatted = describeTaskActionFailureV1(outcome);
+        assert.match(formatted, /Model 1/);
+        assert.match(formatted, /Model 2/);
+        assert.match(formatted, /Model 3/);
+        assert.match(formatted, /Model 4/);
+        assert.match(formatted, /Model 5/);
+      }
+    });
+
+    void it("a single-candidate stage keeps its network-fault retry and its cap of 3", async () => {
+      let invocations = 0;
+      const transport: AgentTransportV1 = {
+        runnerId: "test-runner",
+        invoke: (request, output) => {
+          invocations++;
+          if (invocations === 1) {
+            return Promise.resolve({
+              kind: "transportFailure" as const,
+              code: "copilotEmptyResponse",
+              networkFault: true,
+            });
+          }
+          output.write(
+            frame({
+              version: 1,
+              correlation: request.correlation,
+              kind: "completed",
+              content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+            })
+          );
+          return Promise.resolve({
+            kind: "completed" as const,
+          });
+        },
+      };
+
+      const harness = makeHarness([transport], {}, [], undefined, undefined, undefined, undefined, 1);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "completed");
+      assert.equal(invocations, 2, "single candidate retried once on network fault");
+      assert.equal(harness.selection.reserved, 1);
+    });
+
+    void it("one user press never exceeds max(3, enabled candidate count) invocations across outer retry", async () => {
+      const transports = [1, 2, 3].map((i) =>
+        Object.assign(malformedTransport(`err ${i}`), {
+          storedModelId: `m-${i}`,
+          providerLabel: `M${i}`,
+        })
+      );
+      const harness = makeHarness(transports);
+      const wrapped = withMalformedResultRetryV1(harness.coordinator, 10);
+      const outcome = await wrapped.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      assert.equal(harness.selection.reserved, 3);
+    });
+
+    void it("a disabled backup is neither tried nor counted", async () => {
+      // With candidate count = 2 (disabled backups not included in selection opener),
+      // only the 2 enabled candidates are reserved and tried
+      const candidate1 = Object.assign(malformedTransport("c1"), { storedModelId: "c1", providerLabel: "C1" });
+      const candidate2 = Object.assign(malformedTransport("c2"), { storedModelId: "c2", providerLabel: "C2" });
+
+      const harness = makeHarness([candidate1, candidate2], {}, [], undefined, undefined, undefined, undefined, 2);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+      assert.equal(outcome.kind, "malformedResult");
+      assert.equal(harness.selection.reserved, 2, "disabled candidate must not be reserved or counted");
+    });
+  });
+
+  void describe("RC6 Part B: running-model visibility (item 4)", () => {
+    void it("observer receives the backup's id when primary fails and backup runs", async () => {
+      const invokedModels: string[] = [];
+      const primary = Object.assign(
+        preResponseFailingTransport("cliExit.1", "failed"),
+        { storedModelId: "primary-model-id", providerLabel: "Primary Provider" }
+      );
+      const backup = Object.assign(
+        envelopeTransport((correlation) => frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+        })),
+        { storedModelId: "backup-model-id", providerLabel: "Backup Provider" }
+      );
+
+      const harness = makeHarness([primary, backup]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onCandidateInvokedV1: (info) => {
+          invokedModels.push(info.storedModelId);
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      assert.deepEqual(invokedModels, ["primary-model-id", "backup-model-id"]);
+      assert.equal(invokedModels[invokedModels.length - 1], "backup-model-id");
+    });
+
+    void it("candidate reserved but refused before provider invocation is not reported to observer", async () => {
+      const invokedModels: string[] = [];
+      const candidate1 = Object.assign(
+        malformedTransport(),
+        { storedModelId: "c1", providerLabel: "C1" }
+      );
+      const candidate2 = Object.assign(
+        envelopeTransport((correlation) => frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+        })),
+        { storedModelId: "c2", providerLabel: "C2" }
+      );
+
+      const harness = makeHarness([candidate1, candidate2]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        priorAttemptHistoryV1: [
+          { attemptId: "prev-1", code: "cliExit.1", storedModelId: "c1", providerLabel: "C1", skipOnRetry: true },
+        ],
+        onCandidateInvokedV1: (info) => {
+          invokedModels.push(info.storedModelId);
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      assert.deepEqual(invokedModels, ["c2"]);
+    });
+
+    void it("the final reported candidate equals the run log's provider", async () => {
+      let finalReportedModelId: string | undefined;
+      const primary = Object.assign(
+        preResponseFailingTransport("cliExit.1", "failed"),
+        { storedModelId: "primary-model-id", providerLabel: "Primary Provider" }
+      );
+      const backup = Object.assign(
+        envelopeTransport((correlation) => frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+        })),
+        { storedModelId: "backup-model-id", providerLabel: "Backup Provider" }
+      );
+
+      const harness = makeHarness([primary, backup]);
+      const outcome = await harness.coordinator.executeAction({
+        ...baseRequest(),
+        onCandidateInvokedV1: (info) => {
+          finalReportedModelId = info.storedModelId;
+        },
+      });
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind === "completed") {
+        assert.equal(finalReportedModelId, outcome.provider?.storedModelId);
+        const logLine = describeTaskActionOutcomeForLogV1(outcome);
+        assert.match(logLine, /Backup Provider/);
+      }
+    });
+  });
 });

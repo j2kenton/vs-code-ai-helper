@@ -69,7 +69,7 @@ import { TaskProgress, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
-import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { MalformedResultAttemptRecordV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import * as vscode from "vscode";
 
@@ -259,6 +259,47 @@ function lazyProductionActionConversationOrchestratorV1(): ActionConversationOrc
  */
 const SHARED_MALFORMED_RESULT_INVOCATION_BUDGET_V1 = 3;
 
+function retrySeededRequestV1<T extends Omit<TaskActionRequestV1, "actionKey">>(
+  request: T,
+  malformedInvocationsAlreadyUsedV1: number,
+  priorAttemptHistoryV1: readonly MalformedResultAttemptRecordV1[] | undefined
+): T {
+  return malformedInvocationsAlreadyUsedV1 > 0 || priorAttemptHistoryV1 !== undefined
+    ? {
+        ...request,
+        ...(malformedInvocationsAlreadyUsedV1 > 0 ? { malformedInvocationsAlreadyUsedV1 } : {}),
+        ...(priorAttemptHistoryV1 !== undefined ? { priorAttemptHistoryV1 } : {}),
+      }
+    : request;
+}
+
+/**
+ * Every attempt a terminal outcome's operation made (RC6 item 2): the earlier
+ * ones it lists plus the one it reports itself. The next fresh operation is
+ * seeded with this so it skips candidates that already failed before any
+ * response and its final failure still names every model tried.
+ */
+function attemptHistoryOfOutcomeV1(outcome: TaskActionOutcomeV1): MalformedResultAttemptRecordV1[] | undefined {
+  if (outcome.kind !== "malformedResult" && outcome.kind !== "failed") {
+    return undefined;
+  }
+  const own: MalformedResultAttemptRecordV1[] =
+    outcome.attemptId !== undefined
+      ? [
+          {
+            attemptId: outcome.attemptId,
+            code: outcome.code,
+            ...(outcome.detail !== undefined ? { detail: outcome.detail } : {}),
+            ...(outcome.provider !== undefined
+              ? { providerLabel: outcome.provider.providerLabel, storedModelId: outcome.provider.storedModelId }
+              : {}),
+          },
+        ]
+      : [];
+  const history = [...(outcome.priorRejectedAttemptsV1 ?? []), ...own];
+  return history.length > 0 ? history : undefined;
+}
+
 async function retryOnMalformedResultV1(
   /**
    * Called with the malformed-invocation budget already spent by an EARLIER
@@ -269,7 +310,10 @@ async function retryOnMalformedResultV1(
    * could spend up to its own full 3-invocation budget, reaching 5-6 total
    * invocations per user press instead of the approved shared cap of 3.
    */
-  run: (malformedInvocationsAlreadyUsedV1: number) => Promise<TaskActionOutcomeV1>,
+  run: (
+    malformedInvocationsAlreadyUsedV1: number,
+    priorAttemptHistoryV1?: readonly MalformedResultAttemptRecordV1[]
+  ) => Promise<TaskActionOutcomeV1>,
   maxAttempts: number
 ): Promise<TaskActionOutcomeV1> {
   let outcome = await run(0);
@@ -292,10 +336,14 @@ async function retryOnMalformedResultV1(
     outcome.correlation.actionKey !== EDIT_EXECUTION_ACTION_KEY_V1 &&
     (sharedInvocationsUsedV1 === undefined
       ? attempts < maxAttempts
-      : sharedInvocationsUsedV1 < SHARED_MALFORMED_RESULT_INVOCATION_BUDGET_V1)
+      : sharedInvocationsUsedV1 <
+        Math.max(
+          SHARED_MALFORMED_RESULT_INVOCATION_BUDGET_V1,
+          outcome.malformedInvocationBudgetV1 ?? 0
+        ))
   ) {
     attempts++;
-    outcome = await run(sharedInvocationsUsedV1 ?? 0);
+    outcome = await run(sharedInvocationsUsedV1 ?? 0, attemptHistoryOfOutcomeV1(outcome));
     if (outcome.kind === "malformedResult" && sharedInvocationsUsedV1 !== undefined) {
       sharedInvocationsUsedV1 = outcome.malformedInvocationsUsedV1 ?? sharedInvocationsUsedV1;
     }
@@ -323,22 +371,18 @@ export function withMalformedResultRetryV1(
     ...coordinator,
     executeAction: (request: TaskActionRequestV1) =>
       retryOnMalformedResultV1(
-        (malformedInvocationsAlreadyUsedV1) =>
+        (malformedInvocationsAlreadyUsedV1, priorAttemptHistoryV1) =>
           coordinator.executeAction(
-            malformedInvocationsAlreadyUsedV1 > 0
-              ? { ...request, malformedInvocationsAlreadyUsedV1 }
-              : request
+            retrySeededRequestV1(request, malformedInvocationsAlreadyUsedV1, priorAttemptHistoryV1)
           ),
         maxAttempts
       ),
     executeRoute: (routeId: string, request: Omit<TaskActionRequestV1, "actionKey">) =>
       retryOnMalformedResultV1(
-        (malformedInvocationsAlreadyUsedV1) =>
+        (malformedInvocationsAlreadyUsedV1, priorAttemptHistoryV1) =>
           coordinator.executeRoute(
             routeId,
-            malformedInvocationsAlreadyUsedV1 > 0
-              ? { ...request, malformedInvocationsAlreadyUsedV1 }
-              : request
+            retrySeededRequestV1(request, malformedInvocationsAlreadyUsedV1, priorAttemptHistoryV1)
           ),
         maxAttempts
       ),
@@ -376,9 +420,9 @@ export async function admitAndContinueWithMalformedResultRetryV1(
   request: TaskActionRequestV1,
   maxAttempts = 2
 ): Promise<TaskActionOutcomeV1> {
-  return retryOnMalformedResultV1(async (malformedInvocationsAlreadyUsedV1) => {
+  return retryOnMalformedResultV1(async (malformedInvocationsAlreadyUsedV1, priorAttemptHistoryV1) => {
     const admission = await coordinator.admitAction(
-      malformedInvocationsAlreadyUsedV1 > 0 ? { ...request, malformedInvocationsAlreadyUsedV1 } : request
+      retrySeededRequestV1(request, malformedInvocationsAlreadyUsedV1, priorAttemptHistoryV1)
     );
     return admission.kind === "settled"
       ? admission.outcome

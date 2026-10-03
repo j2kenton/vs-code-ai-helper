@@ -103,7 +103,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
     // proving the fallback is reached only when the failure-kind check does
     // not match, not the other way around.
     const namedCauseIndex = branchSlice.indexOf(
-      "`Apply Review failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`"
+      "`${ffFailedStepV1} failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`"
     );
     const genericFallbackIndex = branchSlice.indexOf(
       '"the review did not produce a new, comparable result"'
@@ -139,7 +139,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
       "each attempt's probe runnerFailure must be kept for the stop message"
     );
     const runnerIndex = branchSlice.indexOf(
-      "`Apply Review failed: ${ffRunnerFailureV1.providerLabel}: ${ffRunnerFailureV1.message}`"
+      "`${ffFailedStepV1} failed: ${ffRunnerFailureV1.providerLabel}: ${ffRunnerFailureV1.message}`"
     );
     const genericIndex = branchSlice.indexOf('"the review did not produce a new, comparable result"');
     assert.ok(runnerIndex >= 0, "the stalled branch must render the provider label and message");
@@ -147,8 +147,17 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
     assert.ok(runnerIndex < genericIndex, "the runner-failure wording must win over the generic fallback");
     assert.match(
       branchSlice,
-      /:\s*ffRunnerFailureV1\s*\?\s*`Apply Review failed:/,
+      /:\s*ffRunnerFailureV1\s*\?\s*`\$\{ffFailedStepV1\} failed:/,
       "the runner-failure wording must be gated on ffRunnerFailureV1 being set"
+    );
+    // RC6 item 2: a failed review must read "Review failed", not "Apply
+    // Review failed" — the step label is tracked per failure.
+    assert.match(source, /let ffFailedStepV1: "Review" \| "Apply Review" = "Apply Review";/);
+    assert.match(source, /ffFailedStepV1 = "Review";/, "the initial review must label its failure \"Review\"");
+    assert.match(
+      source,
+      /options\.dispatchProbe\.failedStepV1 = "Review";/,
+      "a chained re-review's outcome must be labelled \"Review\""
     );
   });
 
