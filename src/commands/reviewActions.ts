@@ -3687,6 +3687,14 @@ export async function handleReviewRoutingOutcome(options: {
       "preImplementationRouting",
       "a new review has landed for this stage, superseding the routing recommendation this card was based on"
     );
+    // RC9 item 2: a "Run Review" / "Run Publish Review" card asks for work that
+    // has now run by some route. Chat-action offers key their canonical id on
+    // the raw task folder path.
+    await withdrawWorkflowDecisionsByKeyV1(
+      { taskFolderPath: folderUri.fsPath, canonicalId: folderUri.fsPath },
+      "chatActionOffer:runReviewWithAI",
+      "a review has landed for this stage"
+    );
     // wf10 continuation item 18: "when a review re-raises a blocker the plan
     // declares out of scope, say so" — the run log above already records it,
     // but a run log is not somewhere the user is looking. `terminalizeRoundV1`
@@ -5112,7 +5120,10 @@ async function routeReviewOutcomeV1(
                 // work, not a verification owed to an already-committed
                 // transition.
                 let dropReason: "duplicate-chain" | "automation-disabled" | "root-operation-unsuccessful" | undefined;
-                const reviewHandOver = next === "publish" ? undefined : trackHandOver("review");
+                // RC9 item 2: tracked for Publish too, so the run that moved on
+                // reports the Publish review as queued rather than "nothing was
+                // started there".
+                const reviewHandOver = trackHandOver("review");
                 const reviewChainScheduled = scheduleAutomationChain(
                   {
                     command: reviewCommand,
@@ -7089,6 +7100,139 @@ export function isUnusableAsExistingReview(content: string): boolean {
 }
 
 /**
+ * RC9 item 2: what a Fast Forward run knew about a stage's recorded review
+ * attempts just before it dispatched the initial review. A readable
+ * `task-progress.json` gives the exact attempt ids already recorded; any failed
+ * read (a missing file included) falls back to the dispatch time, so an old
+ * entry is never mistaken for this dispatch's.
+ */
+export type ReviewAttemptBaselineV1 =
+  | { readonly kind: "ids"; readonly ids: ReadonlySet<string> }
+  | { readonly kind: "afterTime"; readonly afterMs: number };
+
+/** @internal exported for testing */
+export function reviewAttemptBaselineV1(
+  readResult: { readonly ok: true; readonly decoded: { readonly progress: TaskProgress } } | { readonly ok: false },
+  stage: TaskStage,
+  dispatchStartedAtMs: number
+): ReviewAttemptBaselineV1 {
+  if (!readResult.ok) {
+    return { kind: "afterTime", afterMs: dispatchStartedAtMs };
+  }
+  const progress = readResult.decoded.progress;
+  const ids = new Set<string>();
+  for (const entry of progress.reviewScoreHistory ?? []) {
+    if (entry.stage === stage) {
+      ids.add(entry.attemptId);
+    }
+  }
+  for (const entry of progress.reviewRejections ?? []) {
+    if (entry.stage === stage) {
+      ids.add(entry.attemptId);
+    }
+  }
+  return { kind: "ids", ids };
+}
+
+/** The review attempt a dispatch recorded for its stage. */
+export interface CompletedReviewAttemptV1 {
+  readonly attemptId: string;
+  readonly score: number | null;
+  readonly rejected: boolean;
+}
+
+/**
+ * The latest attempt for `stage` that THIS dispatch recorded (in either the
+ * score history or the rejections), or undefined when none did or nothing was
+ * dispatched.
+ * @internal exported for testing
+ */
+export function completedReviewAttemptSinceV1(
+  progress: TaskProgress,
+  stage: TaskStage,
+  baseline: ReviewAttemptBaselineV1,
+  dispatched: boolean
+): CompletedReviewAttemptV1 | undefined {
+  if (!dispatched) {
+    return undefined;
+  }
+  const isNew = (attemptId: string, at: string): boolean => {
+    if (baseline.kind === "ids") {
+      return !baseline.ids.has(attemptId);
+    }
+    const atMs = Date.parse(at);
+    return Number.isFinite(atMs) && atMs > baseline.afterMs;
+  };
+  const candidates: Array<CompletedReviewAttemptV1 & { atMs: number }> = [];
+  for (const entry of progress.reviewScoreHistory ?? []) {
+    if (entry.stage === stage && isNew(entry.attemptId, entry.at)) {
+      candidates.push({ attemptId: entry.attemptId, score: entry.score, rejected: false, atMs: Date.parse(entry.at) });
+    }
+  }
+  for (const entry of progress.reviewRejections ?? []) {
+    if (entry.stage === stage && isNew(entry.attemptId, entry.at)) {
+      candidates.push({ attemptId: entry.attemptId, score: null, rejected: true, atMs: Date.parse(entry.at) });
+    }
+  }
+  if (candidates.length === 0) {
+    return undefined;
+  }
+  // Stable: on equal or unparseable times the later-listed entry wins.
+  let latest = candidates[0]!;
+  for (const candidate of candidates) {
+    if (!(candidate.atMs < latest.atMs)) {
+      latest = candidate;
+    }
+  }
+  return { attemptId: latest.attemptId, score: latest.score, rejected: latest.rejected };
+}
+
+export type PublishInitialRereadV1 =
+  | { readonly kind: "usable" }
+  | { readonly kind: "notRun" }
+  | {
+      readonly kind: "ranButUnusable";
+      readonly score: number | null;
+      readonly rejected: boolean;
+      readonly cause: "empty" | "stale" | "noReadiness";
+    };
+
+/**
+ * Classifies the re-read of publish-review.md after Fast Forward dispatched the
+ * initial Publish review: usable; unusable because the review never ran; or
+ * unusable although a review attempt was recorded for this dispatch.
+ * @internal exported for testing
+ */
+export function classifyPublishInitialRereadV1(
+  content: string | undefined,
+  completed: CompletedReviewAttemptV1 | undefined
+): PublishInitialRereadV1 {
+  if (content !== undefined && !isUnusableAsExistingReview(content)) {
+    return { kind: "usable" };
+  }
+  if (completed === undefined) {
+    return { kind: "notRun" };
+  }
+  const cause = content === undefined ? "empty" : isStaleReviewArtifactV1(content) ? "stale" : "noReadiness";
+  return { kind: "ranButUnusable", score: completed.score, rejected: completed.rejected, cause };
+}
+
+/** @internal exported for testing */
+export function describePublishRanButUnusableV1(
+  result: Extract<PublishInitialRereadV1, { kind: "ranButUnusable" }>
+): string {
+  const causeText =
+    result.cause === "empty"
+      ? "publish-review.md is empty"
+      : result.cause === "stale"
+        ? "publish-review.md still holds a stale placeholder or banner"
+        : "publish-review.md has no Readiness line";
+  return result.score !== null
+    ? `the Publish review scored ${result.score}/10 but ${causeText}`
+    : `the Publish review ran but produced no Readiness score, and ${causeText}`;
+}
+
+/**
  * Fast Forward Review's "no usable review to start from" message, tailored
  * to name the actual cause when it is the common one: a prior implementation
  * round was rejected by the summary shape gate (impl-summary.md still holds
@@ -7775,7 +7919,7 @@ export async function runReviewWithAI(
       return;
     }
     if (reconciled.outcome === "userPaused") {
-      await showPausedTaskRefusalV1("running a review", resolved.folderUri.fsPath);
+      await showPausedTaskRefusalV1("running a review", resolved.folderUri.fsPath, resolved.progress.displayName);
       return;
     }
     if (reconciled.outcome === "reversed") {
@@ -8022,7 +8166,9 @@ export async function applyReviewWithAI(
     return false;
   }
   if (reconciled.outcome === "userPaused") {
-    await showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath, resolved.progress.displayName, {
+      automatic: options.parentOperation !== undefined,
+    });
     return false;
   }
   if (reconciled.outcome === "reversed") {
@@ -8747,7 +8893,7 @@ export async function fastForwardReviewWithAI(
     return;
   }
   if (ffReconciled.outcome === "userPaused") {
-    await showPausedTaskRefusalV1("fast-forwarding", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("fast-forwarding", resolved.folderUri.fsPath, resolved.progress.displayName);
     return;
   }
   if (ffReconciled.outcome === "reversed") {
@@ -8954,6 +9100,18 @@ export async function fastForwardReviewWithAI(
     const ffInitialReviewProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
       dispatched: false,
     };
+    // RC9 item 2: at Publish, note which review attempts were already recorded
+    // so a review this dispatch completes can be told apart from an old one.
+    // Strict read, never the advisory helper: its `undefined` cannot say why.
+    const publishProgressReadOptions = { expectedTaskFolder: path.basename(resolved.folderUri.fsPath) };
+    let publishBaseline: ReviewAttemptBaselineV1 | undefined;
+    let publishBaselineFailure: string | undefined;
+    if (targetStage === "publish") {
+      const dispatchStartedAtMs = Date.now();
+      const baselineRead = await readTaskProgressStrictV1(resolved.folderUri, publishProgressReadOptions);
+      publishBaseline = reviewAttemptBaselineV1(baselineRead, targetStage, dispatchStartedAtMs);
+      publishBaselineFailure = baselineRead.ok ? undefined : baselineRead.reason;
+    }
     await vscode.window.withProgress(
       {
         location: vscode.ProgressLocation.Window,
@@ -8980,6 +9138,63 @@ export async function fastForwardReviewWithAI(
     }
     ffCoordinatorOutcomeForAdmissionV1 = ffInitialReviewProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
     initialContent = await readNonEmptyText(reviewUri);
+    if (
+      publishBaseline !== undefined &&
+      (initialContent === undefined || isUnusableAsExistingReview(initialContent))
+    ) {
+      // RC9 item 2: a Publish review that completed must never be reported as
+      // "did not produce usable output". One fresh progress read and one more
+      // read of publish-review.md decide whether a review ran for this dispatch.
+      const freshRead = await readTaskProgressStrictV1(resolved.folderUri, publishProgressReadOptions);
+      const completed = freshRead.ok
+        ? completedReviewAttemptSinceV1(
+            freshRead.decoded.progress,
+            targetStage,
+            publishBaseline,
+            ffInitialReviewProbe.dispatched
+          )
+        : undefined;
+      const reread = await readNonEmptyText(reviewUri);
+      const classified = classifyPublishInitialRereadV1(reread, completed);
+      console.log(
+        `[fast-forward] Publish initial review re-read: ${classified.kind}` +
+          (classified.kind !== "usable"
+            ? ` (cause: ${
+                classified.kind === "ranButUnusable"
+                  ? classified.cause
+                  : reread === undefined
+                    ? "empty"
+                    : isStaleReviewArtifactV1(reread)
+                      ? "stale"
+                      : "noReadiness"
+              })`
+            : "") +
+          `; baseline ${publishBaseline.kind}` +
+          (publishBaselineFailure !== undefined ? ` (baseline read failed: ${publishBaselineFailure})` : "") +
+          `; fresh progress read ${freshRead.ok ? "succeeded" : "failed"}` +
+          (completed !== undefined ? `; attempt ${completed.attemptId}` : "")
+      );
+      if (classified.kind === "usable") {
+        initialContent = reread;
+      } else if (classified.kind === "ranButUnusable") {
+        const reason = describePublishRanButUnusableV1(classified);
+        const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath);
+        op.settleAs("failed", reason);
+        const warningText = `${taskLabel}: ${reason}. Open publish-review.md to check it, or run the Publish review again.`;
+        const pointer = await offerActionInChatV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          taskLabel,
+          actionLabel: "Run Publish Review",
+          command: "vs-code-ai-helper.runReviewWithAI",
+          args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+          noticeText: warningText,
+        });
+        if (!classified.rejected) {
+          NotificationRouter.showWarning(warningText, undefined, undefined, undefined, pointer);
+        }
+        return false;
+      }
+    }
     // Same unusable check as the pre-dispatch read above (line ~3209) — the
     // review just dispatched by runReviewForFolder can be refused outright
     // (e.g. impl-summary.md is still the rejected-round stamp, so there are
@@ -11380,7 +11595,7 @@ export async function generateImplementationWithAI(
   // identical check for why this must use the resolver rather than the raw
   // `status` field.
   if (await isEffectivelyPausedV1(resolved.folderUri.fsPath, resolved.progress)) {
-    await showPausedTaskRefusalV1("generating implementation notes", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("generating implementation notes", resolved.folderUri.fsPath, resolved.progress.displayName);
     return;
   }
 
@@ -14688,7 +14903,7 @@ export async function runImplementationWithAI(
   // `resolved.progress.status` stale at "active" and slip past a raw
   // `resolved.progress.status === "paused"` fallback check.
   if (reconciled.outcome === "userPaused") {
-    await showPausedTaskRefusalV1("running implementation", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("running implementation", resolved.folderUri.fsPath, resolved.progress.displayName);
     return false;
   }
   if (reconciled.outcome === "reversed") {
@@ -15731,7 +15946,9 @@ export async function applyReviewEditWithAI(
     return false;
   }
   if (reconciled.outcome === "userPaused") {
-    await showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath, resolved.progress.displayName, {
+      automatic: options.parentOperation !== undefined,
+    });
     return false;
   }
   if (reconciled.outcome === "reversed") {

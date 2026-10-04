@@ -61,10 +61,11 @@ function withFsBridge<T>(run: () => Promise<T>): Promise<T> {
 }
 
 const OFFERS = [
-  { label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", holdsTaskPaused: false },
-  { label: "Run Publish Review", command: "vs-code-ai-helper.runReviewWithAI", holdsTaskPaused: false },
-  { label: "Run Review", command: "vs-code-ai-helper.runReviewWithAI", holdsTaskPaused: false },
-  { label: "Resume", command: "vs-code-ai-helper.resumeTask", holdsTaskPaused: true },
+  { label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", holdsTaskPaused: false, optional: false },
+  { label: "Run Publish Review", command: "vs-code-ai-helper.runReviewWithAI", holdsTaskPaused: false, optional: false },
+  { label: "Run Review", command: "vs-code-ai-helper.runReviewWithAI", holdsTaskPaused: false, optional: false },
+  // RC9 item 3: the paused-refusal Resume offer is optional and holds nothing.
+  { label: "Resume", command: "vs-code-ai-helper.resumeTask", holdsTaskPaused: false, optional: true },
 ];
 
 void describe("offerActionInChatV1 (RC7 item 4)", () => {
@@ -87,6 +88,7 @@ void describe("offerActionInChatV1 (RC7 item 4)", () => {
             args: [{ taskFolderPath: dir }],
             noticeText: "the notification text",
             holdsTaskPaused: offer.holdsTaskPaused,
+            ...(offer.optional ? { optional: true as const } : {}),
           })
         );
         assert.equal(pointer?.command, "vs-code-ai-helper.openWorkflowDecision");
@@ -103,7 +105,7 @@ void describe("offerActionInChatV1 (RC7 item 4)", () => {
         assert.equal(decision.options.find((o) => o.optionId === "notNow")?.effect.kind, "doNothing");
         assert.equal(decision.recommendation.kind === "option" && decision.recommendation.optionId, "runAction");
         assert.equal(decision.gating?.holdsTaskPaused, offer.holdsTaskPaused);
-        assert.equal(decision.gating?.unblocksProgress, true);
+        assert.equal(decision.gating?.unblocksProgress, !offer.optional);
         assert.ok((decision.gating?.detail ?? "").length > 0);
       } finally {
         __extensionContextV1TestOnly.reset();
@@ -125,11 +127,44 @@ void describe("offerActionInChatV1 (RC7 item 4)", () => {
     assert.equal(pointer, undefined);
   });
 
-  void it("only Resume holds the task paused", () => {
+  void it("no offer holds the task paused; the paused-refusal Resume offer is optional", () => {
     assert.deepEqual(
       OFFERS.filter((o) => o.holdsTaskPaused).map((o) => o.label),
+      []
+    );
+    assert.deepEqual(
+      OFFERS.filter((o) => o.optional).map((o) => o.label),
       ["Resume"]
     );
+  });
+
+  void it("an optional offer posts holdsTaskPaused: false, unblocksProgress: false (RC9 item 3)", async () => {
+    const dir = makeTask("offer-optional-gating");
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    try {
+      await withFsBridge(() =>
+        offerActionInChatV1({
+          taskFolderPath: dir,
+          actionLabel: "Resume",
+          command: "vs-code-ai-helper.resumeTask",
+          noticeText: "paused",
+          optional: true,
+        })
+      );
+      const decision = new WorkflowDecisionStoreV1(memento)
+        .listPending()
+        .find((d) => d.decisionKey.startsWith("chatActionOffer:"));
+      assert.equal(decision?.gating?.holdsTaskPaused, false);
+      assert.equal(decision?.gating?.unblocksProgress, false);
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
   });
 });
 
@@ -180,5 +215,13 @@ void describe("converted call sites (RC7 item 4)", () => {
         (c) => c.includes("actionLabel: nextStepOffer.action.title") && c.includes("command: nextStepOffer.action.command")
       )
     );
+    // RC9 item 2: the parent-operation (Fast Forward) arm posts no card; the
+    // only offer sits in the manual `else` arm.
+    const parentArm = caller.indexOf("parentOperation !== undefined && nextStepOffer.action.command");
+    const elseArm = caller.indexOf("} else {", parentArm);
+    const offerAt = caller.indexOf("offerActionInChatV1({", parentArm);
+    assert.ok(parentArm >= 0 && elseArm > parentArm, "parent/manual split present");
+    assert.ok(offerAt > elseArm, "no offer inside the parent-operation arm");
+    assert.match(caller.slice(parentArm, elseArm), /Fast Forward runs the Publish review next/);
   });
 });

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { isViewerHostV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "../state/hostRoleV1";
 import { TaskInventory } from "../state/taskInventory";
+import { runWithAutomaticOriginV1 } from "../state/automationDispatchContextV1";
 import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   RUNS_DIRNAME,
@@ -575,7 +576,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         const firing = runWithNotificationTaskContextV1(
           this.taskNames.get(taskFolderPath),
           taskFolderPath,
-          () => this.fire(taskFolderPath, canonicalId, run.runAt, run.stage),
+          () => runWithAutomaticOriginV1(() => this.fire(taskFolderPath, canonicalId, run.runAt, run.stage)),
           run.stage
         );
         this.inFlightFiresForTestV1.add(firing);

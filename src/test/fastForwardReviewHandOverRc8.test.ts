@@ -352,6 +352,28 @@ void describe("RC8 item 5: Fast Forward review-to-review hand-over", () => {
     assert.equal(run.dispatched.filter((d) => d.command === "vs-code-ai-helper.fastForwardReviewWithAI").length, 1);
   });
 
+  void it("into Publish (RC9 item 2): the run that moved on reports the Publish review as queued, with no warning", async () => {
+    const run = await routeReviewUnderRoot("into-publish-rc9", "impl-low-review");
+    const { op, texts } = (() => {
+      const attempt = taskOperations.begin(run.root.key, {
+        label: "Fast Forward attempt",
+        stage: run.root.stage,
+        kind: "review",
+        parent: run.root,
+        taskName: DISPLAY_NAME,
+      });
+      assert.ok(attempt);
+      return { op: attempt, texts: reportOf(attempt).texts };
+    })();
+    reportFastForwardMovedOnV1({ op, folderUri: run.folderUri, displayName: DISPLAY_NAME, landedStage: "publish" });
+    assert.equal(texts.length, 1);
+    assert.match(texts[0]!, /queued and starts when this run ends/);
+    assert.deepEqual(warnings(run), []);
+    taskOperations.end(run.root);
+    await settle();
+    assert.equal(run.dispatched.filter((d) => d.command === "vs-code-ai-helper.fastForwardReviewWithAI").length, 1);
+  });
+
   void it("into Implementation (RC5 item 1): the Implementation round is scheduled behind the root and dispatched once", async () => {
     const run = await routeReviewUnderRoot("into-impl", "plan-low-review");
     await settle();

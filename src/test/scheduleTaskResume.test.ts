@@ -3008,3 +3008,17 @@ void test("Run now whose downstream dispatch declines reports refused, keeps the
     scheduler.dispose();
   }
 });
+
+void test("the timer path runs fire() with automatic origin and Run now does not (RC9 item 3)", () => {
+  const source = fs.readFileSync(path.join(process.cwd(), "src", "commands", "scheduleTaskResume.ts"), "utf8");
+  const timerAt = source.indexOf("this.inFlightFiresForTestV1.add(firing)");
+  assert.ok(timerAt > 0);
+  assert.match(
+    source.slice(Math.max(0, timerAt - 400), timerAt),
+    /runWithAutomaticOriginV1\(\(\) => this\.fire\(/,
+    "the timer path wraps fire()"
+  );
+  const runNowAt = source.indexOf("async runNow(");
+  assert.ok(runNowAt > 0);
+  assert.doesNotMatch(source.slice(runNowAt, runNowAt + 1500), /runWithAutomaticOriginV1/, "the owner's Run now is not automatic");
+});

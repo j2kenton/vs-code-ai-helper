@@ -501,6 +501,12 @@ export async function resumePausedTask(
             "the task was resumed, ending the pause this escalation was holding"
           );
         }
+        // RC9 item 2: a "Resume" offer card asks for work that has now run.
+        await withdrawWorkflowDecisionsByKeyV1(
+          { taskFolderPath: resolvedTask.taskFolderPath, canonicalId: resolvedTask.canonicalId },
+          "chatActionOffer:resumeTask",
+          "the task was resumed"
+        );
       }
     );
   } catch (error) {

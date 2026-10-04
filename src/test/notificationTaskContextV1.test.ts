@@ -105,6 +105,53 @@ void describe("notification task context", () => {
     );
     assert.equal(seen, '"alpha" — x');
   });
+
+  void it("labels a nested call that names a different stage with that stage (RC9 item 1)", async () => {
+    const seen = await runWithNotificationTaskContextV1(
+      "rc8",
+      "/w/a",
+      () =>
+        runWithNotificationTaskContextV1(
+          "rc8",
+          "/w/a",
+          () =>
+            Promise.resolve([
+              attributeNotificationMessageV1("Review score 8/10 reached the auto-advance threshold. Auto-advancing stage..."),
+              attributeNotificationMessageV1("Review accepted. Advanced to Low-Level Review (Plan)."),
+            ]),
+          "plan-high-review"
+        ),
+      "desc"
+    );
+    assert.equal(
+      seen[0],
+      '"rc8" (High-Level Review (Plan)) — Review score 8/10 reached the auto-advance threshold. Auto-advancing stage...'
+    );
+    assert.equal(seen[1], '"rc8" (High-Level Review (Plan)) — Review accepted. Advanced to Low-Level Review (Plan).');
+  });
+
+  void it("keeps the outer stage for a nested call with no stage", async () => {
+    const seen = await runWithNotificationTaskContextV1(
+      "rc8",
+      "/w/a",
+      () => runWithNotificationTaskContextV1("rc8", "/w/a", () => Promise.resolve(attributeNotificationMessageV1("x"))),
+      "plan-high-review"
+    );
+    assert.equal(seen, '"rc8" (High-Level Review (Plan)) — x');
+  });
+
+  void it("does not attribute a message raised after the nested call settles to the derived context", async () => {
+    const seen = await runWithNotificationTaskContextV1(
+      "rc8",
+      "/w/a",
+      async () => {
+        await runWithNotificationTaskContextV1("rc8", "/w/a", () => Promise.resolve(), "plan-high-review");
+        return attributeNotificationMessageV1("x");
+      },
+      "desc"
+    );
+    assert.equal(seen, '"rc8" (Task Description) — x');
+  });
 });
 
 void describe("terminal notification stage attribution", () => {

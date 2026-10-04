@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { runWithAutomaticOriginV1 } from "../state/automationDispatchContextV1";
 import { taskOperations, TaskOperationHandle } from "./taskOperations";
 import {
   announceAutoStartBestEffortV1,
@@ -501,7 +502,7 @@ export function scheduleAutomationChain(
           setPendingAutomationRoundIntentV1(dispatch.taskKey, id);
         }
       })
-      .then(() => deps.execute(dispatch.command, dispatch.arg))
+      .then(() => runWithAutomaticOriginV1(() => deps.execute(dispatch.command, dispatch.arg)))
       .then(
         (executed) => {
           release();
@@ -593,7 +594,7 @@ export function scheduleAutomationChain(
             }
           })
           .then(() => {
-            Promise.resolve(deps.execute(dispatch.command, dispatch.arg)).then(
+            Promise.resolve(runWithAutomaticOriginV1(() => deps.execute(dispatch.command, dispatch.arg))).then(
               (executed) => {
                 release();
                 // Same fix as the immediate-dispatch branch above: a

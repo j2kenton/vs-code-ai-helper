@@ -20,6 +20,7 @@ import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
 import { COMMIT_AND_PUSH_COMMAND_V1, publishNextStepOfferV1 } from "../utils/publishStageActionsV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import {
   runTrackedOperation,
@@ -582,31 +583,47 @@ export async function runPublishChecks(
               // use: a check that failed only on a quarantined known flake is a pass.
               if (result.passedModuloKnownFlakes ?? result.passed) {
                 const nextStepOffer = publishNextStepOfferV1();
-                const passedNotice = `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}`;
-                // RC7 item 4: the button only opens the chat. The review step
-                // is offered there as an option; Commit & Push is not moved
-                // to the chat in this task, so that variant has no button.
-                NotificationRouter.showInformation(
-                  passedNotice,
-                  undefined,
-                  undefined,
-                  undefined,
-                  nextStepOffer.action.command === COMMIT_AND_PUSH_COMMAND_V1
-                    ? undefined
-                    : await offerActionInChatV1({
-                        taskFolderPath: taskFolderUri.fsPath,
-                        actionLabel: nextStepOffer.action.title,
-                        command: nextStepOffer.action.command,
-                        args: [{ taskFolderPath: taskFolderUri.fsPath }],
-                        noticeText: passedNotice,
-                      })
-                );
+                if (parentOperation !== undefined && nextStepOffer.action.command !== COMMIT_AND_PUSH_COMMAND_V1) {
+                  // RC9 item 2: a parent operation (Fast Forward) runs the
+                  // Publish review next on its own, so no card asks the owner
+                  // to do what is about to happen.
+                  NotificationRouter.showInformation(
+                    `Publish checks passed. Report saved to ${publishReviewFilename}. Fast Forward runs the Publish review next.`
+                  );
+                } else {
+                  const passedNotice = `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}`;
+                  // RC7 item 4: the button only opens the chat. The review step
+                  // is offered there as an option; Commit & Push is not moved
+                  // to the chat in this task, so that variant has no button.
+                  NotificationRouter.showInformation(
+                    passedNotice,
+                    undefined,
+                    undefined,
+                    undefined,
+                    nextStepOffer.action.command === COMMIT_AND_PUSH_COMMAND_V1
+                      ? undefined
+                      : await offerActionInChatV1({
+                          taskFolderPath: taskFolderUri.fsPath,
+                          actionLabel: nextStepOffer.action.title,
+                          command: nextStepOffer.action.command,
+                          args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                          noticeText: passedNotice,
+                        })
+                  );
+                }
               } else {
                 NotificationRouter.showWarning(
                   `Publish checks found issues: ${result.summary} ` +
                     'Use "Fix Linting & Code Errors" to address the report.'
                 );
               }
+              // RC9 item 2: a "Run Publish Checks" card asks for work that has
+              // now run (pass or fail), so it is withdrawn once the result is saved.
+              await withdrawWorkflowDecisionsByKeyV1(
+                { taskFolderPath: taskFolderUri.fsPath, canonicalId: taskFolderUri.fsPath },
+                "chatActionOffer:runPublishChecks",
+                "Publish checks have run"
+              );
               // v1 fixes 2, item 8/33: the checks are done and the next step
               // (Commit & Push, or fixing what they found) is the user's.
               // Recorded here so a task that entered Publish with automation

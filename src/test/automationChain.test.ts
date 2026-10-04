@@ -20,6 +20,7 @@ import {
   type AutomationChainDeps,
   type AutomationChainEndSnapshot,
 } from "../utils/automationChain";
+import { hasAutomaticOriginV1 } from "../state/automationDispatchContextV1";
 import { resolveRoundV1 } from "../utils/taskProgressTransforms";
 import { TaskProgress } from "../types/taskProgress";
 import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
@@ -91,6 +92,27 @@ void test("defers until the root operation ends, then dispatches on success", as
   assert.equal(await pending, true);
   assert.equal(chain.executed.length, 1);
   assert.equal(chain.listenerCount(), 0, "listener must be disposed after the root ends");
+});
+
+void test("dispatched commands run with automatic origin, immediate and deferred (RC9 item 3)", async () => {
+  const origins: boolean[] = [];
+  const deps: AutomationChainDeps = {
+    onDidEnd: (listener): { dispose(): void } => {
+      endListener = listener;
+      return { dispose: (): void => undefined };
+    },
+    execute: (): Promise<unknown> => {
+      origins.push(hasAutomaticOriginV1());
+      return Promise.resolve();
+    },
+  };
+  let endListener: ((s: AutomationChainEndSnapshot) => void) | undefined;
+  await scheduleAutomationChain({ command: "x.review" }, undefined, deps);
+  const pending = scheduleAutomationChain({ command: "x.review2" }, { id: "root-9" }, deps);
+  endListener?.({ id: "root-9", state: "succeeded" });
+  await pending;
+  assert.deepEqual(origins, [true, true]);
+  assert.equal(hasAutomaticOriginV1(), false, "the test's own scope is not automatic");
 });
 
 void test("drops the chain when the root operation failed or was cancelled", async () => {

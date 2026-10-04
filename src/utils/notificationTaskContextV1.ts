@@ -92,8 +92,20 @@ export async function runWithNotificationTaskContextV1<T>(
   stage?: TaskStage
 ): Promise<T> {
   const name = notificationTaskDisplayNameV1(taskName, taskPath);
-  if (!name || storage.getStore()?.ended === false) {
-    return fn();
+  const outer = storage.getStore();
+  if (!name || outer?.ended === false) {
+    // A nested call naming a different stage (a review routing its outcome
+    // inside a chain that began elsewhere) labels its notices for that stage;
+    // otherwise it keeps the enclosing root's context.
+    if (!name || !outer || stage === undefined || outer.stage === stage) {
+      return fn();
+    }
+    const derived: NotificationTaskContextV1 = { taskName: outer.taskName, stage, ended: false };
+    try {
+      return await storage.run(derived, fn);
+    } finally {
+      derived.ended = true;
+    }
   }
   const context: NotificationTaskContextV1 = { taskName: name, ...(stage !== undefined ? { stage } : {}), ended: false };
   try {

@@ -30,6 +30,29 @@ export function isAutomationDispatchContextV1(): boolean {
 }
 
 /**
+ * RC9 item 3: a second, separate scope marking a call tree as started by
+ * automation (an automation-chain dispatch or a scheduler timer fire), used
+ * ONLY to decide whether a refusal message needs to reach a person.
+ * Deliberately not `isAutomationDispatchContextV1()`, which changes what work
+ * does (it suppresses dialogs); this one must never gate work.
+ */
+const automaticOrigin = new AsyncLocalStorage<true>();
+
+/** Run `body` as work started automatically. Nestable; scoped to this call tree. */
+export function runWithAutomaticOriginV1<T>(body: () => T): T {
+  return automaticOrigin.run(true, body);
+}
+
+/**
+ * True when the owner did not click this: inside `runWithAutomaticOriginV1` or
+ * an automation dispatch. Answers only "should a refusal message be shown?" —
+ * it must not gate work.
+ */
+export function hasAutomaticOriginV1(): boolean {
+  return automaticOrigin.getStore() === true || isAutomationDispatchContextV1();
+}
+
+/**
  * Wrap a command handler so an invocation carrying the exact literal
  * `automationDispatch: true` marker runs inside the automation context. Any
  * other argument (including every UI-supplied one) leaves the handler untouched.

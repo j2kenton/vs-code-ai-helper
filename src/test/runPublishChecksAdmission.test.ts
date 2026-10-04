@@ -43,8 +43,11 @@ import {
 } from "../state/workAdmissionV1";
 import { STALLED_ACTIVE_TASK_PAUSE_REASON_V1 } from "../utils/taskWatchdogV1";
 import { safeRemoveDir } from "./testFsUtils";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { runFastForwardPublishChecksV1 } from "../utils/fastForwardPublishChecksV1";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
+import { taskOperations } from "../utils/taskOperations";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-checks-admission-"));
@@ -1049,3 +1052,70 @@ void describe(
     );
   }
 );
+
+void describe("runPublishChecks pass notice (RC9 item 2, b)", () => {
+  async function runPassing(
+    name: string,
+    withParent: boolean
+  ): Promise<{ surface: RecordingSurface; cards: number }> {
+    const taskFolderPath = makeTaskFolder(name);
+    const progress = fixtureProgress(taskFolderPath, { currentStage: "publish" });
+    writeProgress(taskFolderPath, progress);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const memento = fakeStatefulMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const run = stubPublishChecksRun();
+    const modelsStub = stubOpenAiModelsCommand();
+    const parent = withParent
+      ? taskOperations.begin(taskFolderPath, {
+          label: "Fast Forward Review",
+          stage: "publish",
+          taskName: "rc9",
+          kind: "review",
+        } as never)
+      : undefined;
+    try {
+      const arg = applyCurrentStageActionDispatchArg(taskFolderPath, progress);
+      await runPublishChecks(makeInventory(taskFolderPath, progress), arg as never, parent ?? undefined);
+      assert.equal(run.lintCalls(), 1, "the checks ran to a pass");
+      const cards = new WorkflowDecisionStoreV1(memento)
+        .listPending()
+        .filter((d) => d.decisionKey === "chatActionOffer:runReviewWithAI").length;
+      return { surface, cards };
+    } finally {
+      __extensionContextV1TestOnly.reset();
+      taskOperations.end(parent, "succeeded");
+      modelsStub.restore();
+      run.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  }
+
+  void it("with a parent operation the pass notice says the review runs next", async () => {
+    const { surface, cards } = await runPassing("rc9-pass-parent", true);
+    assert.equal(cards, 0, "Fast Forward runs the review itself, so no Run Publish Review card is posted");
+    const passed = surface.entries.filter((e) => /Publish checks passed/.test(e.message));
+    assert.equal(passed.length, 1, JSON.stringify(surface.entries));
+    assert.match(passed[0]?.message ?? "", /Fast Forward runs the Publish review next\./);
+    assert.doesNotMatch(passed[0]?.message ?? "", /Request a Publish review/);
+  });
+
+  void it("without a parent operation today's wording is kept", async () => {
+    const { surface, cards } = await runPassing("rc9-pass-no-parent", false);
+    assert.equal(cards, 1, "a manual run still posts the Run Publish Review card");
+    // The card's own "Decision needed" warning repeats the notice text; the pass notice itself is the info entry.
+    const passed = surface.entries.filter((e) => e.level === "info" && /Publish checks passed/.test(e.message));
+    assert.equal(passed.length, 1, JSON.stringify(surface.entries));
+    assert.doesNotMatch(passed[0]?.message ?? "", /Fast Forward runs the Publish review next/);
+  });
+});

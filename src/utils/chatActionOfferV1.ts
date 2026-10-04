@@ -22,6 +22,8 @@ export interface ChatActionOfferInputV1 {
   readonly noticeText: string;
   /** True only for a "Resume" offer: the task stays paused until the action is chosen. */
   readonly holdsTaskPaused?: boolean;
+  /** RC9 item 3: an optional offer holds nothing and blocks nothing; it is only a convenience. */
+  readonly optional?: true;
   /** The task name the notice already uses, when the caller has it; defaults to the one read from progress. */
   readonly taskLabel?: string;
 }
@@ -84,7 +86,7 @@ export async function offerActionInChatV1(
       },
       gating: {
         holdsTaskPaused: input.holdsTaskPaused === true,
-        unblocksProgress: true,
+        unblocksProgress: input.optional !== true,
         detail: `Choosing "${input.actionLabel}" runs it now; "Not now" leaves the task as it is.`,
       },
     },

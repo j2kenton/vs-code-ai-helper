@@ -11,8 +11,10 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
   describeAutomationDefaultV1,
+  hasAutomaticOriginV1,
   isAutomationDispatchContextV1,
   runAsAutomationDispatchV1,
+  runWithAutomaticOriginV1,
   withAutomationDispatchContextV1,
 } from "../state/automationDispatchContextV1";
 
@@ -27,6 +29,22 @@ void describe("automationDispatchContextV1", () => {
       assert.equal(isAutomationDispatchContextV1(), true);
     });
     assert.equal(isAutomationDispatchContextV1(), false);
+  });
+
+  void it("automatic origin is a separate scope that never marks an automation dispatch (RC9 item 3)", async () => {
+    assert.equal(hasAutomaticOriginV1(), false);
+    await runWithAutomaticOriginV1(async () => {
+      assert.equal(hasAutomaticOriginV1(), true);
+      assert.equal(isAutomationDispatchContextV1(), false);
+      await tick();
+      assert.equal(hasAutomaticOriginV1(), true);
+    });
+    await runAsAutomationDispatchV1(async () => {
+      await tick();
+      assert.equal(hasAutomaticOriginV1(), true);
+      assert.equal(isAutomationDispatchContextV1(), true);
+    });
+    assert.equal(hasAutomaticOriginV1(), false);
   });
 
   void it("the command wrapper opens the context only for the exact literal marker", () => {

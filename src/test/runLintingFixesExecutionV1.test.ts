@@ -38,7 +38,10 @@ const aiConsentModule = require("../utils/aiConsent") as Record<string, unknown>
 const reviewActionsModule = require("../commands/reviewActions") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
-const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lint-fixes-exec-"));
+// One level down, so this file's session lock (kept in the root's parent) is
+// its own and never collides with the other lint-fix test files run in parallel.
+const REAL_ROOT = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lint-fixes-exec-")), "workspace");
+fs.mkdirSync(REAL_ROOT, { recursive: true });
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
