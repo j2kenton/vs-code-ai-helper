@@ -51,8 +51,8 @@ Every "with AI" command consumes quota or usage from the AI subscription you hav
 | Gemini CLI | Your Google account Gemini subscription or API quota |
 | Antigravity CLI | Your Google account Gemini/Antigravity subscription or API quota |
 | Kiro CLI | Your Kiro subscription, plus a `KIRO_API_KEY` for headless use |
-| opencode | Whichever model provider(s) you sign into through `opencode providers login` (or configure via that provider's API key env var) — opencode itself does not bill you directly |
-| Cline CLI | Your ClinePass subscription ($9.99/mo) |
+| opencode | Whichever model provider(s) you sign into through `/connect` inside `opencode` (or configure via that provider's API key env var) — opencode itself does not bill you directly |
+| Cline CLI | Your ClinePass subscription (see Cline's pricing page) |
 | Kimi Code CLI | Your Moonshot AI / Kimi Code account subscription or API quota |
 | devpass-code | Your LLM Gateway DevPass credential |
 
