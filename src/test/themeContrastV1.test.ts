@@ -50,7 +50,7 @@ function settingsHtml(): string {
 /** Body of the first CSS rule whose selector list contains `selector` verbatim. */
 function ruleBody(html: string, selector: string): string {
   const escaped = selector.replace(/[.#[\]]/g, "\\$&");
-  const match = new RegExp(`(?:^|[\\s,}])${escaped}\\s*\\{([^}]*)\\}`).exec(html);
+  const match = new RegExp(`(?:^|[\\s,}])${escaped}\\s*(?:,[^{}]*)?\\{([^}]*)\\}`).exec(html);
   assert.ok(match, `expected a ${selector} CSS rule`);
   return match[1]!;
 }
@@ -125,6 +125,27 @@ void describe("settings webview — info/disabled text contrast tokens", () => {
     assert.match(secondaryDisabled, /opacity:\s*1/);
     assert.match(secondaryDisabled, /color:\s*var\(--ensemble-disabled-foreground\)/);
     assert.match(ruleBody(html, "button:disabled"), /opacity:\s*0\.7/);
+  });
+});
+
+void describe("settings webview — dark provider button background", () => {
+  void it("gives provider buttons a color-mix grey on dark themes with a distinct hover", () => {
+    const html = settingsHtml();
+    for (const cls of ["provider-usage", "provider-signin"]) {
+      const rest = ruleBody(html, `body.vscode-dark button.${cls}`);
+      assert.match(rest, /background-color:\s*color-mix\(/);
+      assert.match(rest, /--vscode-foreground/);
+      assert.match(rest, /--vscode-editor-background/);
+    }
+    const rest = ruleBody(html, "body.vscode-dark button.provider-usage");
+    const hover = ruleBody(html, "body.vscode-dark button.provider-usage:hover");
+    assert.match(hover, /background-color:\s*color-mix\(/);
+    assert.notEqual(hover.trim(), rest.trim());
+  });
+
+  void it("adds no light or high-contrast rules for provider buttons", () => {
+    const html = settingsHtml();
+    assert.doesNotMatch(html, /body\.vscode-(?:light|high-contrast)[^{}]*provider-(?:signin|usage)/);
   });
 });
 
