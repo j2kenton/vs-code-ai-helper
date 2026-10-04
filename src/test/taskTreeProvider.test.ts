@@ -1372,6 +1372,30 @@ void describe("StageNode — implementation row percentage", () => {
     assert.strictEqual(node.description, "40%");
   });
 
+  // RC8 item 6: the row shows the percentage over the baseline-adjusted counts
+  // and the tooltip says how many items were closed before Implementation.
+  void it("tooltip names the items closed before Implementation started", () => {
+    const task = makeTask("impl");
+    const tooltipOf = (progress: { complete: number; total: number; closedBeforeImplementation?: number }): string => {
+      const node = new StageNode(task, "impl", "current", undefined, undefined, false, false, false, false, undefined, progress);
+      return (node.tooltip as vscode.MarkdownString).value;
+    };
+    assert.match(
+      tooltipOf({ complete: 0, total: 16, closedBeforeImplementation: 2 }),
+      /2 items closed before Implementation started — not counted in the percentage\./
+    );
+    assert.match(
+      tooltipOf({ complete: 0, total: 16, closedBeforeImplementation: 1 }),
+      /1 item closed before Implementation started/
+    );
+    assert.doesNotMatch(tooltipOf({ complete: 0, total: 16 }), /closed before Implementation/);
+    const node = new StageNode(
+      task, "impl", "current", undefined, undefined, false, false, false, false, undefined,
+      { complete: 0, total: 16, closedBeforeImplementation: 2 }
+    );
+    assert.strictEqual(node.description, "0%");
+  });
+
   void it("renders nothing when the impl stage has no checklist yet", () => {
     const task = makeTask("impl");
     const node = new StageNode(task, "impl", "current", undefined, undefined, false, false, false, false, undefined, undefined);

@@ -4610,7 +4610,11 @@ void describe("checklistProgressUnreliable — gating and reporting surfaces", (
       qualified.includes(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1),
       "a latched task's count must say it is unverified"
     );
-    assert.match(qualified, /needs reconciliation/);
+    assert.match(qualified, /the plan checklist is behind/);
+    // RC8 item 4: with unticked items the notice never sends the owner to
+    // "Mark Plan Checklist Reconciled", which would re-arm the completeness hold.
+    assert.doesNotMatch(qualified, /Mark Plan Checklist Reconciled/);
+    assert.doesNotMatch(UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1, /Mark Plan Checklist Reconciled/);
 
     const plain = buildStayingOnStageNoticeV1(8, { complete: 3, total: 5 }, "", false);
     assert.equal(

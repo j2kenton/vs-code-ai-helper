@@ -324,6 +324,40 @@ export function isExcludedChecklistItemText(itemText: string): boolean {
 }
 
 /**
+ * Placed immediately BEFORE the trailing {@link EXCLUDED_CHECKLIST_ITEM_MARKER_V1}
+ * on an item that was already closed without doing when Implementation first
+ * started (RC8 item 6), e.g.
+ *
+ *   - [ ] Light theme looks the same as before <!-- ensemble:closed-before-implementation --> <!-- ensemble:excluded -->
+ *
+ * The excluded marker stays LAST, so a version that does not know this one
+ * still reads the item as excluded. Display only: the Implementation row's
+ * percentage leaves such items out of both sides. Counts, completeness gates,
+ * tick matching and the item-set comparison ignore it (identity keys strip it).
+ */
+export const CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1 = "<!-- ensemble:closed-before-implementation -->";
+
+/** Matches the closed-before-implementation marker plus the whitespace before it. */
+const CLOSED_BEFORE_IMPLEMENTATION_STRIP_RE = /[ \t]*<!-- ensemble:closed-before-implementation -->/g;
+
+/**
+ * True when `itemText` is an excluded item whose trailing excluded marker is
+ * immediately preceded by {@link CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1}.
+ */
+export function isClosedBeforeImplementationChecklistItemTextV1(itemText: string): boolean {
+  if (!isExcludedChecklistItemText(itemText)) {
+    return false;
+  }
+  const trimmed = itemText.trimEnd();
+  const before = trimmed.slice(0, trimmed.length - EXCLUDED_CHECKLIST_ITEM_MARKER_V1.length).trimEnd();
+  if (!before.endsWith(CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1)) {
+    return false;
+  }
+  const base = before.slice(0, before.length - CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1.length);
+  return base.trim().length > 0 && /\s$/.test(base);
+}
+
+/**
  * Reverses the over-escaping a checklist line can pick up from a round-trip
  * through a JSON-encoded field (the checklist echo travels inside the
  * `<<<ENSEMBLE_AI_RESULT_V1>>>` frame's `"markdown"` string, and the plan of
@@ -362,7 +396,7 @@ export function unescapeChecklistItemTextV1(text: string): string {
  * whitespace/case folding.
  */
 export function normalizeChecklistItemTextV1(text: string): string {
-  const unescaped = unescapeChecklistItemTextV1(text);
+  const unescaped = unescapeChecklistItemTextV1(text).replace(CLOSED_BEFORE_IMPLEMENTATION_STRIP_RE, "");
   return unescaped.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
@@ -916,7 +950,7 @@ export interface OpenPlanItemRecordV1 {
 function exactItemKeyV1(text: string): string {
   // Exact identity: only unescape and trim; case and inner whitespace are
   // significant, so an edited line is never mistaken for the original.
-  return unescapeChecklistItemTextV1(text).trim();
+  return unescapeChecklistItemTextV1(text).replace(CLOSED_BEFORE_IMPLEMENTATION_STRIP_RE, "").trim();
 }
 
 function occurrenceKeyV1(text: string, settled: boolean): string {
@@ -1541,6 +1575,14 @@ export interface ChecklistProgressV1 {
   /** @deprecated Alias for `closedWithoutDoing`, kept for one release so
    * callers migrate on their own schedule. Identical value. */
   readonly excluded: number;
+  /**
+   * Top-level items already closed without doing when Implementation first
+   * started (they carry {@link CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1}). A
+   * subset of `closedWithoutDoing`, so `total`/`settled`/`remaining` are
+   * unchanged. Display only: the Implementation row's percentage leaves these
+   * out of both sides. Absent on values built from older records.
+   */
+  readonly closedBeforeImplementation?: number;
 }
 
 /**
@@ -1803,6 +1845,7 @@ export function countChecklistProgressV1(
   }
   let checked = 0;
   let closedWithoutDoing = 0;
+  let closedBeforeImplementation = 0;
   for (let i = 0; i < items.length; i++) {
     const item = items[i]!;
     if (item.nested) {
@@ -1817,6 +1860,9 @@ export function countChecklistProgressV1(
     }
     if (item.excluded) {
       closedWithoutDoing++;
+      if (isClosedBeforeImplementationChecklistItemTextV1(item.text)) {
+        closedBeforeImplementation++;
+      }
     } else if (item.checked && allChildrenSettled) {
       checked++;
     }
@@ -1829,7 +1875,89 @@ export function countChecklistProgressV1(
     settled,
     remaining: topLevelCount - settled,
     excluded: closedWithoutDoing,
+    ...(closedBeforeImplementation > 0 ? { closedBeforeImplementation } : {}),
   };
+}
+
+/**
+ * Rewrites every top-level excluded item of the latest rendering that does not
+ * yet carry {@link CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1}, inserting the
+ * marker and a space immediately before the trailing excluded marker. Done
+ * once, when the plan is first promoted for Implementation (RC8 item 6), so
+ * the items closed during planning or plan review are recorded in
+ * `plan-final.md` itself.
+ *
+ * Byte-preserving and scoped like {@link mergeChecklistProgressV1}: only the
+ * matched lines of the latest rendering change; indentation, bullets, prose,
+ * line endings and any older copy earlier in the document are untouched.
+ * Nested (indented) items and fenced examples are never marked.
+ */
+export function markClosedBeforeImplementationV1(content: string): string {
+  return rewriteClosedBeforeImplementationV1(content, () => true);
+}
+
+/**
+ * Re-promotion for a plan revision: marks a top-level excluded item only when
+ * an item with the same identity key carried the marker in `priorContent`
+ * (counted per key, so duplicate wording is matched copy for copy). Marks
+ * nothing else, so an item excluded after the first freeze is not newly
+ * marked and progress made since then stays in the count.
+ */
+export function carryClosedBeforeImplementationMarkersV1(newContent: string, priorContent: string): string {
+  const remainingByKey = new Map<string, number>();
+  for (const item of itemsInLatestRendering(priorContent)) {
+    if (!item.nested && isClosedBeforeImplementationChecklistItemTextV1(item.text)) {
+      const key = normalizeChecklistItemTextV1(item.text);
+      remainingByKey.set(key, (remainingByKey.get(key) ?? 0) + 1);
+    }
+  }
+  if (remainingByKey.size === 0) {
+    return newContent;
+  }
+  return rewriteClosedBeforeImplementationV1(newContent, (text) => {
+    const key = normalizeChecklistItemTextV1(text);
+    const left = remainingByKey.get(key) ?? 0;
+    if (left <= 0) {
+      return false;
+    }
+    remainingByKey.set(key, left - 1);
+    return true;
+  });
+}
+
+function rewriteClosedBeforeImplementationV1(content: string, shouldMark: (itemText: string) => boolean): string {
+  const { found, prefix, region } = scopeToLatestChecklistV1(content);
+  if (!found) {
+    return content;
+  }
+  let changed = false;
+  const rewritten = walkLinesV1(region)
+    .map((line) => {
+      if (line.fenced) {
+        return line.raw;
+      }
+      return line.raw.replace(
+        ITEM_LINE,
+        (whole, open: string, state: string, close: string, text: string, trailing: string) => {
+          if (
+            /^[ \t]/.test(open) ||
+            !isExcludedChecklistItemText(text) ||
+            isClosedBeforeImplementationChecklistItemTextV1(text) ||
+            !shouldMark(text)
+          ) {
+            return whole;
+          }
+          const markerAt = text.lastIndexOf(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
+          changed = true;
+          return (
+            `${open}${state}${close}${text.slice(0, markerAt)}` +
+            `${CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1} ${text.slice(markerAt)}${trailing}`
+          );
+        }
+      );
+    })
+    .join("");
+  return changed ? `${prefix}${rewritten}` : content;
 }
 
 /**
@@ -1841,6 +1969,24 @@ export function countChecklistProgressV1(
  * as finished) or "100%" (which would make the checklist a liar). `total
  * <= 0` (no checklist) reads as 0%, matching a fresh/empty progress state.
  */
+/**
+ * The counts the Implementation percentage is shown over (RC8 item 6):
+ * `settled - closedBeforeImplementation` over `total - closedBeforeImplementation`,
+ * so a task's first Implementation run starts at 0%. Display only — every
+ * gate keeps the full counts. When every item was closed before Implementation
+ * the row reads 0 of 0 (0%), matching the empty-checklist display.
+ */
+export function implementationDisplayCountsV1(
+  counts: Pick<ChecklistProgressV1, "settled" | "total" | "closedBeforeImplementation">
+): { complete: number; total: number; closedBeforeImplementation: number } {
+  const closedBefore = counts.closedBeforeImplementation ?? 0;
+  return {
+    complete: counts.settled - closedBefore,
+    total: counts.total - closedBefore,
+    closedBeforeImplementation: closedBefore,
+  };
+}
+
 export function formatChecklistPercentV1(settled: number, total: number): number {
   if (total <= 0) {
     return 0;

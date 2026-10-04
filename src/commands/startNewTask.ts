@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { createTaskProgressV1, writeTaskProgressV1 } from "../services/taskProgressWriterV1";
@@ -229,6 +228,17 @@ export function allMetaRootPaths(primaryMetaFolderPath: string): string[] {
  * style race window rather than one this check newly closes.
  */
 export async function hasActiveTaskOnDisk(metaFolderPaths: readonly string[]): Promise<boolean> {
+  return (await findActiveTaskOnDiskV1(metaFolderPaths)) !== undefined;
+}
+
+/**
+ * Same scan as {@link hasActiveTaskOnDisk}, returning the first active task's
+ * label (its display name, else its folder name) so the "created paused"
+ * notice can name the task that is holding the active slot (RC8 item 7).
+ */
+export async function findActiveTaskOnDiskV1(
+  metaFolderPaths: readonly string[]
+): Promise<string | undefined> {
   for (const metaFolderPath of metaFolderPaths) {
     const root = vscode.Uri.file(metaFolderPath);
     let entries: [string, vscode.FileType][];
@@ -242,11 +252,11 @@ export async function hasActiveTaskOnDisk(metaFolderPaths: readonly string[]): P
       if (type !== vscode.FileType.Directory) continue;
       const result = await readTaskProgressStrictV1(vscode.Uri.joinPath(root, name));
       if (result.ok && result.decoded.progress.status === "active") {
-        return true;
+        return result.decoded.progress.displayName?.trim() || name;
       }
     }
   }
-  return false;
+  return undefined;
 }
 
 /**
@@ -366,9 +376,8 @@ async function createTask(
     // and this task's status write happen in the same locked section, so two
     // windows can never both see "nothing active" and both create an active
     // task.
-    const initialStatus: TaskStatus = (await hasActiveTaskOnDisk(metaFolderPaths))
-      ? "paused"
-      : "active";
+    const activeTaskLabel = await findActiveTaskOnDiskV1(metaFolderPaths);
+    const initialStatus: TaskStatus = activeTaskLabel !== undefined ? "paused" : "active";
     const dateStr = formatDate(new Date());
     const taskNumber = await getNextTaskNumber(metaFolderPath, dateStr);
     const taskFolderName = `${dateStr}_task_${taskNumber}`;
@@ -476,9 +485,9 @@ async function createTask(
     await journalCreationStep("recordProgressCommitted", taskFolderName, () =>
       recordProgressCommittedV1(metaFolderPath, taskFolderPath, finalProgressEntry ? [finalProgressEntry] : [])
     );
-    return { taskFolderName, taskFolderPath, taskFileUri, initialStatus };
+    return { taskFolderName, taskFolderPath, taskFileUri, initialStatus, activeTaskLabel };
   });
-  const { taskFolderName, taskFolderPath, taskFileUri, initialStatus } = created;
+  const { taskFolderName, taskFolderPath, taskFileUri, initialStatus, activeTaskLabel } = created;
 
   await journalCreationStep("resolveTaskCreation", taskFolderName, () =>
     resolveTaskCreationV1(metaFolderPath, taskFolderPath)
@@ -523,24 +532,13 @@ async function createTask(
     NotificationRouter.showInformation(`${folderName} created and set as the active task.`);
   } else {
     // An existing active task remains the target of shortcuts and in-flight
-    // operations. The explicit argument is essential; a bare resume command
-    // would instead resume the older current task.
-    const folderName = taskFolderName;
-    const pausedNotice = `${folderName}: task created in paused state.`;
-    NotificationRouter.showWarning(
-      pausedNotice,
-      undefined,
-      undefined,
-      undefined,
-      await offerActionInChatV1({
-        taskFolderPath,
-        taskLabel: folderName,
-        actionLabel: "Resume",
-        command: "vs-code-ai-helper.resumeTask",
-        args: [{ taskFolderPath }],
-        noticeText: pausedNotice,
-        holdsTaskPaused: true,
-      })
+    // operations. This is routine, not a decision: nothing needs the owner's
+    // answer, so the notice is informational (RC8 item 7) — no chat decision
+    // card, and the tree shows the task as paused, not as waiting for the
+    // owner. Resume stays on the task's own row.
+    NotificationRouter.showInformation(
+      `${taskFolderName} created paused, because ${activeTaskLabel ?? "another task"} is the active task. ` +
+        "Resume it when you want to work on it."
     );
   }
 

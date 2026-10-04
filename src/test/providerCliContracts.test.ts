@@ -1455,6 +1455,20 @@ void describe("provider CLI contracts", () => {
     assert.match(kiro.loginHint, /KIRO_API_KEY/i);
   });
 
+  void it("Gemini hints say it needs a paid plan, GEMINI_API_KEY or Vertex AI, and point free accounts at Antigravity CLI", () => {
+    const gemini = getCliProvider("gemini-cli");
+    assert.ok(gemini, "expected gemini-cli provider definition");
+
+    for (const hint of [gemini.installHint, gemini.loginHint]) {
+      assert.match(hint, /GEMINI_API_KEY/);
+      assert.match(hint, /Antigravity/);
+      assert.match(hint, /Vertex AI/);
+      assert.doesNotMatch(hint, /sign in with your Google account/i);
+    }
+    assert.match(gemini.signInGuidance ?? "", /Antigravity/);
+    assert.match(gemini.signInGuidance ?? "", /\/auth/, "the /auth note is kept");
+  });
+
   void it("argv prompt transport providers require shell=false", () => {
     for (const provider of CLI_PROVIDERS) {
       if (provider.promptTransport === "argv") {

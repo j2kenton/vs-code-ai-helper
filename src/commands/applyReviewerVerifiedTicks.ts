@@ -430,6 +430,59 @@ export async function applyReviewerVerifiedTicks(
   }
 }
 
+export type WriteVerifiedTicksResultV1 =
+  | { readonly kind: "applied"; readonly count: number }
+  | { readonly kind: "noChecklist" }
+  | { readonly kind: "notMerged" }
+  | { readonly kind: "refused" };
+
+/**
+ * The write half of applying the reviewer's verified-complete ticks, shared by
+ * the confirmed command above and by the review router when the checklist is
+ * flagged unreliable (RC8 item 4: ticks the review already confirmed are
+ * counted before the stage decision). Reads the plan of record fresh, merges
+ * the synthetic summary, writes through the unchanged-content primitive and
+ * withdraws the pending card. Never notifies; the caller words the outcome.
+ */
+export async function writeVerifiedTicksToPlanV1(
+  folderUri: vscode.Uri,
+  derivation: VerifiedTicksDerivationV1
+): Promise<WriteVerifiedTicksResultV1> {
+  const { reviewStage: resolvedStage, reviewFilename, applicable } = derivation;
+  const freshPlan = await readPlanOfRecordV1(folderUri);
+  if (!freshPlan.hasChecklist || !freshPlan.text) {
+    return { kind: "noChecklist" };
+  }
+  const evidence = `verified by reviewer in ${resolvedStage} review (${reviewFilename})`;
+  const synthetic = buildSyntheticVerifiedCompleteSummaryV1(applicable, evidence);
+  const merged = mergeChecklistProgressV1(freshPlan.text, synthetic);
+  if (merged.kind !== "merged") {
+    return { kind: "notMerged" };
+  }
+  const written = await writeTextFileIfUnchangedV1(
+    getCanonicalImplementationUri(folderUri),
+    freshPlan.text,
+    merged.content
+  );
+  if (!written) {
+    return { kind: "refused" };
+  }
+  // Part 11 item 13c (event-driven half): the normal path here is the
+  // decision option's own effect command, which the resolve flow already
+  // takes off "pending" before this runs — but this command is ALSO
+  // independently registered (e.g. reachable from the Command Palette
+  // without ever clicking the card), so a pending `applyReviewerVerifiedTicks`
+  // card for this task may still exist and now describes a tick state that
+  // no longer holds. Best-effort withdraw covers that path; it is a no-op
+  // when the decision was already resolved by the normal click.
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+    "applyReviewerVerifiedTicks",
+    "plan-final.md's checklist ticks changed, superseding the pending tick-application card"
+  );
+  return { kind: "applied", count: applicable.length };
+}
+
 /**
  * Executes the "Apply" option chosen for an `applyReviewerVerifiedTicks`
  * decision (case 2). Re-derives the review content, the verified-complete
@@ -440,15 +493,16 @@ export async function applyReviewerVerifiedTicks(
  * text-matched (module doc comment above): recomputing against whatever is on
  * disk right now can never lose a tick or apply the wrong one.
  *
- * The final write goes through {@link writeTextFileIfUnchangedV1} rather than
- * an unconditional `writeTextFile` (review-flagged 2026-08-25, task-fixable
- * blocker `739cfbbb-…-1`: this was the one remaining in-process writer of
- * `plan-final.md` that bypassed that primitive's FIFO queue and revision
- * check, named explicitly in `reconcilePlanChecklist.ts`'s Guard 3 comment as
- * the known gap). `freshPlan.text`, already read immediately above as the
- * basis for the merge, is passed as the expected content, so this call now
- * queues behind any other in-process writer of the same uri and is refused —
- * rather than silently overwriting — if the file changed underneath it.
+ * The final write goes through {@link writeTextFileIfUnchangedV1}
+ * (`writeVerifiedTicksToPlanV1`) rather than an unconditional `writeTextFile`
+ * (review-flagged 2026-08-25, task-fixable blocker `739cfbbb-…-1`: this was
+ * the one remaining in-process writer of `plan-final.md` that bypassed that
+ * primitive's FIFO queue and revision check, named explicitly in
+ * `reconcilePlanChecklist.ts`'s Guard 3 comment as the known gap). The text
+ * read as the basis for the merge is passed as the expected content, so the
+ * write queues behind any other in-process writer of the same uri and is
+ * refused — rather than silently overwriting — if the file changed
+ * underneath it.
  */
 export async function applyReviewerVerifiedTicksConfirmedV1(
   inventory: TaskInventory,
@@ -489,51 +543,28 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
     }
     return;
   }
-  const { reviewStage: resolvedStage, reviewFilename, applicable } = derived.derivation;
+  const { applicable } = derived.derivation;
 
-  const freshPlan = await readPlanOfRecordV1(folderUri);
-  if (!freshPlan.hasChecklist || !freshPlan.text) {
+  const applied = await writeVerifiedTicksToPlanV1(folderUri, derived.derivation);
+  if (applied.kind === "noChecklist") {
     NotificationRouter.showWarning(
       `${taskLabel}: plan-final.md changed while this was being applied and no longer has a checklist to tick.`
     );
     return;
   }
-
-  const evidence = `verified by reviewer in ${resolvedStage} review (${reviewFilename})`;
-  const synthetic = buildSyntheticVerifiedCompleteSummaryV1(applicable, evidence);
-  const merged = mergeChecklistProgressV1(freshPlan.text, synthetic);
-  if (merged.kind !== "merged") {
+  if (applied.kind === "notMerged") {
     NotificationRouter.showWarning(
       `${taskLabel}: applying the reviewer's ticks did not change plan-final.md — the items no longer match the plan of record.`
     );
     return;
   }
-
-  const written = await writeTextFileIfUnchangedV1(
-    getCanonicalImplementationUri(folderUri),
-    freshPlan.text,
-    merged.content
-  );
-  if (!written) {
+  if (applied.kind === "refused") {
     NotificationRouter.showWarning(
       `${taskLabel}: plan-final.md changed while these ticks were being applied — nothing was written. Re-open the decision ` +
         "and try again."
     );
     return;
   }
-  // Part 11 item 13c (event-driven half): the normal path here is the
-  // decision option's own effect command, which the resolve flow already
-  // takes off "pending" before this runs — but this command is ALSO
-  // independently registered (e.g. reachable from the Command Palette
-  // without ever clicking the card), so a pending `applyReviewerVerifiedTicks`
-  // card for this task may still exist and now describes a tick state that
-  // no longer holds. Best-effort withdraw covers that path; it is a no-op
-  // when the decision was already resolved by the normal click.
-  await withdrawWorkflowDecisionsByKeyV1(
-    { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
-    "applyReviewerVerifiedTicks",
-    "plan-final.md's checklist ticks changed, superseding the pending tick-application card"
-  );
   await inventory.refresh();
   NotificationRouter.showInformation(
     `${taskLabel}: Applied ${applicable.length} reviewer-verified tick(s) to plan-final.md.`

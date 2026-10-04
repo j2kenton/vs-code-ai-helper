@@ -1252,14 +1252,14 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     label: "Gemini CLI",
     command: "gemini",
     installHint:
-      "Install the Gemini CLI (npm i -g @google/gemini-cli), then run `gemini` once to sign in with your Google account.",
+      "Install the Gemini CLI (npm i -g @google/gemini-cli). It needs a paid Google AI plan (Pro/Ultra), a Gemini API key (set GEMINI_API_KEY) or Vertex AI. Free Google accounts can no longer use it; use Antigravity CLI instead.",
     loginHint:
-      "Run `gemini` in a terminal and complete the Google sign-in, then try again.",
+      "Run `gemini` in a terminal and sign in with a Google AI Pro/Ultra account, or set GEMINI_API_KEY (or configure Vertex AI), then try again. Free Google accounts should use Antigravity CLI instead.",
     authErrorMarkers: ["login", "authenticate", "credentials", "api key"],
     signInCommand: "gemini",
     signInLabel: "Sign in / Switch account",
     signInGuidance:
-      "Complete the Google sign-in in the terminal. If already signed in, use the /auth command inside the CLI to switch the auth method or account.",
+      "Sign in in the terminal with a Google AI Pro/Ultra account, or set GEMINI_API_KEY (or configure Vertex AI); free Google accounts should use Antigravity CLI instead. If already signed in, use the /auth command inside the CLI to switch the auth method or account.",
     // Per the approved capability matrix the Gemini CLI's usage surface is
     // its in-session /stats slash command (model breakdown), not a /usage
     // command. Carried as "unverified" until re-confirmed against the

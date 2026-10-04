@@ -1025,6 +1025,14 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
         /starts an Implementation round there; the review follows per your auto-review setting/
       );
       assert.doesNotMatch(buildRemaining.consequence, /continues fast-forwarding/);
+      // RC8 item 5 guard: the option moves the task to Implementation and never
+      // dispatches Fast Forward Review (which refuses at Implementation).
+      assert.equal(buildRemaining.effect.kind, "command");
+      if (buildRemaining.effect.kind === "command") {
+        assert.equal(buildRemaining.effect.command, "vs-code-ai-helper.resumeAndSetTaskStage");
+        assert.notEqual(buildRemaining.effect.command, "vs-code-ai-helper.fastForwardReviewWithAI");
+        assert.equal((buildRemaining.effect.args?.[0] as { stage?: string }).stage, "impl");
+      }
     } finally {
       clearFastForwardRunActiveV1(folderUri.fsPath);
       deactivateNotificationRouter();

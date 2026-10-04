@@ -29,7 +29,12 @@ import {
   markChecklistChangeProposalDiscardedV1,
 } from "../utils/taskProgressTransforms";
 import {
+  CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1,
+  countChecklistProgressV1,
+  formatChecklistPercentV1,
   formatPlanRevisionProposalVariableV1,
+  implementationDisplayCountsV1,
+  isExcludedChecklistItemText,
   listCheckedChecklistItemTextsV1,
 } from "../utils/implementationChecklist";
 import {
@@ -1238,5 +1243,144 @@ void describe("reviseChecklistChangeProposalConfirmedV1 / discardChecklistChange
       ws.restore();
       fsBridge.restore();
     }
+  });
+});
+
+// RC8 item 6: the checklist freezes once, at the first promotion of plan.md
+// to plan-final.md, and marks the items already closed without doing.
+void describe("preparePlanPromotion — RC8 item 6: closed-before-implementation freeze", () => {
+  const EXCLUDED = "<!-- ensemble:excluded -->";
+  const FROZEN_EXCLUDED_SUFFIX = `${CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1} ${EXCLUDED}`;
+
+  /** An 18-item plan whose last two items (owner hand-off checks) were excluded while planning. */
+  function eighteenItemPlan(extra: readonly string[] = []): string {
+    const items = Array.from({ length: 16 }, (_, i) => `- [ ] Item ${i + 1}`);
+    items.push(`- [ ] Provider buttons are visible on a dark theme ${EXCLUDED}`);
+    items.push(`- [ ] Light theme looks the same as before ${EXCLUDED}`);
+    return ["<!-- ensemble:implementation-checklist -->", "", ...items, ...extra, ""].join("\n");
+  }
+
+  function shown(content: string): { complete: number; total: number; percent: number } {
+    const counts = countChecklistProgressV1(content)!;
+    const display = implementationDisplayCountsV1(counts);
+    return {
+      complete: display.complete,
+      total: display.total,
+      percent: formatChecklistPercentV1(display.complete, display.total),
+    };
+  }
+
+  async function promote(folderUri: vscode.Uri): Promise<void> {
+    const promotion = await preparePlanPromotion(folderUri);
+    assert.equal(promotion.ready, true);
+    assert.ok(promotion.ready && promotion.publish, "expected a publish() closure");
+    await (promotion as { publish: () => Promise<void> }).publish();
+  }
+
+  void it("first promotion marks the closed items, starts at 0%, and shows 1 of 16 (6%) after one tick", async () => {
+    const fsBridge = installFsBridge();
+    const ws = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("freeze-first", { currentStage: "plan-low-review" });
+      fs.writeFileSync(path.join(folderPath, "plan.md"), eighteenItemPlan(), "utf8");
+      await promote(folderUri);
+
+      const frozen = readPlanFinal(folderPath);
+      const markedLines = frozen.split("\n").filter((line) => line.endsWith(FROZEN_EXCLUDED_SUFFIX));
+      assert.equal(markedLines.length, 2, "both excluded lines carry the closed-before marker, excluded marker last");
+      for (const line of markedLines) {
+        assert.equal(isExcludedChecklistItemText(line.replace(/^- \[ \] /, "")), true, "older versions still read it as excluded");
+      }
+      const counts = countChecklistProgressV1(frozen)!;
+      assert.equal(counts.total, 18);
+      assert.equal(counts.settled, 2);
+      assert.deepEqual(shown(frozen), { complete: 0, total: 16, percent: 0 });
+
+      const ticked = frozen.replace("- [ ] Item 1\n", "- [x] Item 1\n");
+      assert.deepEqual(shown(ticked), { complete: 1, total: 16, percent: 6 });
+      assert.equal(readProgress(folderPath).currentStage, "plan-low-review", "no field was added or changed in task-progress.json");
+    } finally {
+      ws.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("re-entering Implementation without a revision leaves plan-final.md byte-identical", async () => {
+    const fsBridge = installFsBridge();
+    const ws = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("freeze-reenter", { currentStage: "plan-low-review" });
+      fs.writeFileSync(path.join(folderPath, "plan.md"), eighteenItemPlan(), "utf8");
+      await promote(folderUri);
+      const afterTick = readPlanFinal(folderPath).replace("- [ ] Item 1\n", "- [x] Item 1\n");
+      fs.writeFileSync(path.join(folderPath, "plan-final.md"), afterTick, "utf8");
+
+      const again = await preparePlanPromotion(folderUri);
+      assert.equal(again.ready, true);
+      assert.equal(again.ready && again.publish, undefined, "nothing to publish: no re-freeze");
+      assert.equal(readPlanFinal(folderPath), afterTick);
+      assert.deepEqual(shown(readPlanFinal(folderPath)), { complete: 1, total: 16, percent: 6 });
+    } finally {
+      ws.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("a plan revision keeps the old markers and does not mark an item excluded since the first freeze", async () => {
+    const fsBridge = installFsBridge();
+    const ws = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("freeze-revision", { currentStage: "plan-low-review" });
+      fs.writeFileSync(path.join(folderPath, "plan.md"), eighteenItemPlan(), "utf8");
+      await promote(folderUri);
+      // Progress after the first freeze: one tick, and Item 2 excluded afterwards.
+      const worked = readPlanFinal(folderPath)
+        .replace("- [ ] Item 1\n", "- [x] Item 1\n")
+        .replace("- [ ] Item 2\n", `- [ ] Item 2 ${EXCLUDED}\n`);
+      fs.writeFileSync(path.join(folderPath, "plan-final.md"), worked, "utf8");
+      assert.deepEqual(shown(worked), { complete: 2, total: 16, percent: 12 }, "excluding after the freeze raises the percentage");
+
+      // The revised draft restates the plan with the marker-free excluded lines.
+      const revisedDraft = eighteenItemPlan().replace("- [ ] Item 2\n", `- [ ] Item 2 ${EXCLUDED}\n`);
+      fs.writeFileSync(path.join(folderPath, "plan.md"), revisedDraft, "utf8");
+      const progress = readProgress(folderPath);
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify(
+          {
+            ...progress,
+            checklistChangeProposals: [{ ...PENDING_PROPOSAL, status: "revising" }],
+            planRevision: {
+              proposalAt: PENDING_PROPOSAL.at,
+              startedAt: "2026-08-28T00:01:00.000Z",
+              stage: "impl",
+              discardedItems: [],
+              removedItems: [],
+              reason: "restated",
+            },
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+      await promote(folderUri);
+
+      const republished = readPlanFinal(folderPath);
+      assert.equal(republished.split("\n").filter((l) => l.endsWith(FROZEN_EXCLUDED_SUFFIX)).length, 2);
+      assert.match(republished, /- \[ \] Item 2 <!-- ensemble:excluded -->\n/, "the item excluded after the freeze is not newly marked");
+      assert.match(republished, /- \[x\] Item 1\n/, "ticks carry over");
+      assert.deepEqual(shown(republished), { complete: 2, total: 16, percent: 12 });
+    } finally {
+      ws.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("a plan frozen before this change (no marker) shows today's percentage", () => {
+    const legacy = eighteenItemPlan();
+    const counts = countChecklistProgressV1(legacy)!;
+    assert.equal(counts.closedBeforeImplementation, undefined);
+    assert.deepEqual(shown(legacy), { complete: 2, total: 18, percent: 11 });
   });
 });

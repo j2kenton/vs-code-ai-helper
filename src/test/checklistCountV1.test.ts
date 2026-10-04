@@ -9,12 +9,18 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
+  carryClosedBeforeImplementationMarkersV1,
+  CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1,
   countChecklistProgressV1,
   EXCLUDED_CHECKLIST_ITEM_MARKER_V1,
   formatChecklistProgressForReviewerV1,
   formatImplementationProgressLabelV1,
+  implementationDisplayCountsV1,
+  isClosedBeforeImplementationChecklistItemTextV1,
   isExcludedChecklistItemText,
+  markClosedBeforeImplementationV1,
 } from "../utils/implementationChecklist";
+import { readyToAdvanceStage, reconcileProgressWithChecklistV1 } from "../utils/reviewReadiness";
 
 const M = EXCLUDED_CHECKLIST_ITEM_MARKER_V1;
 
@@ -90,5 +96,86 @@ void describe("the Implementation row label", () => {
 
   void it("never reads as finished until every item is settled", () => {
     assert.equal(formatImplementationProgressLabelV1(242, 243, true), "99% · unverified");
+  });
+});
+
+// RC8 item 6: closed-before-implementation marker — display only.
+void describe("closed-before-implementation marker", () => {
+  const CBI = CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1;
+  const lines = (marked: boolean): string[] => [
+    "- [x] Build it",
+    "- [ ] Wire it",
+    "- [ ] Test it",
+    `- [ ] Owner checks dark theme ${marked ? `${CBI} ` : ""}${M}`,
+    `- [ ] Owner checks light theme ${marked ? `${CBI} ` : ""}${M}`,
+  ];
+
+  void it("is recognised only directly before the trailing excluded marker", () => {
+    assert.equal(isClosedBeforeImplementationChecklistItemTextV1(`Owner check ${CBI} ${M}`), true);
+    assert.equal(isClosedBeforeImplementationChecklistItemTextV1(`Owner check ${M}`), false);
+    assert.equal(isClosedBeforeImplementationChecklistItemTextV1(`Owner check ${CBI}`), false);
+    assert.equal(isClosedBeforeImplementationChecklistItemTextV1(`Owner check${CBI} ${M}`), false);
+    assert.equal(isExcludedChecklistItemText(`Owner check ${CBI} ${M}`), true);
+  });
+
+  void it("counts differ only in the display field: total, settled, closedWithoutDoing, remaining are equal", () => {
+    const marked = countChecklistProgressV1(plan(lines(true)))!;
+    const plain = countChecklistProgressV1(plan(lines(false)))!;
+    assert.equal(marked.closedBeforeImplementation, 2);
+    assert.equal(plain.closedBeforeImplementation, undefined);
+    for (const key of ["total", "settled", "checked", "closedWithoutDoing", "remaining", "excluded"] as const) {
+      assert.equal(marked[key], plain[key], key);
+    }
+    assert.deepEqual(implementationDisplayCountsV1(marked), { complete: 1, total: 3, closedBeforeImplementation: 2 });
+    assert.deepEqual(implementationDisplayCountsV1(plain), { complete: 3, total: 5, closedBeforeImplementation: 0 });
+  });
+
+  void it("the completeness gate gives the same result with and without the marker", () => {
+    const marked = countChecklistProgressV1(plan(lines(true)))!;
+    const plain = countChecklistProgressV1(plan(lines(false)))!;
+    for (const review of [null, { complete: 29, total: 90 }]) {
+      assert.deepEqual(reconcileProgressWithChecklistV1(review, marked), reconcileProgressWithChecklistV1(review, plain));
+    }
+    assert.equal(
+      readyToAdvanceStage(9, 8, reconcileProgressWithChecklistV1(null, marked)),
+      readyToAdvanceStage(9, 8, reconcileProgressWithChecklistV1(null, plain))
+    );
+  });
+
+  void it("when every item was closed before Implementation the row reads 0 of 0", () => {
+    const allClosed = countChecklistProgressV1(
+      plan([`- [ ] A ${CBI} ${M}`, `- [ ] B ${CBI} ${M}`])
+    )!;
+    assert.deepEqual(implementationDisplayCountsV1(allClosed), { complete: 0, total: 0, closedBeforeImplementation: 2 });
+  });
+
+  void it("mark inserts the marker before the excluded marker, byte-preserving everything else", () => {
+    const original = plan(lines(false)).replace(/\n/g, "\r\n");
+    const marked = markClosedBeforeImplementationV1(original);
+    assert.equal(marked, plan(lines(true)).replace(/\n/g, "\r\n"));
+    assert.equal(markClosedBeforeImplementationV1(marked), marked, "idempotent");
+    assert.equal(markClosedBeforeImplementationV1(plan(["- [ ] Open", "- [x] Done"])), plan(["- [ ] Open", "- [x] Done"]));
+  });
+
+  void it("mark leaves nested items and fenced examples alone", () => {
+    const content = plan([
+      "- [ ] Parent",
+      `  - [ ] Nested closed ${M}`,
+      "```",
+      `- [ ] Fenced example ${M}`,
+      "```",
+    ]);
+    assert.equal(markClosedBeforeImplementationV1(content), content);
+  });
+
+  void it("carry marks only items that carried the marker in the prior content", () => {
+    const prior = plan([`- [ ] Old closed ${CBI} ${M}`, "- [ ] Later excluded", "- [ ] Open"]);
+    const revised = plan([`- [ ] Old closed ${M}`, `- [ ] Later excluded ${M}`, "- [ ] Open", `- [ ] Brand new ${M}`]);
+    const carried = carryClosedBeforeImplementationMarkersV1(revised, prior);
+    assert.equal(
+      carried,
+      plan([`- [ ] Old closed ${CBI} ${M}`, `- [ ] Later excluded ${M}`, "- [ ] Open", `- [ ] Brand new ${M}`])
+    );
+    assert.equal(carryClosedBeforeImplementationMarkersV1(revised, plan(["- [ ] Old closed", "- [ ] Open"])), revised);
   });
 });

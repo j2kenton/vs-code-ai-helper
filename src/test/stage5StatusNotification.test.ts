@@ -866,17 +866,15 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         // The Resume offer is now a non-blocking internal notification with an
         // inline action, not a modal — so nothing auto-executes resumeTask.
         assert.deepEqual(commands, []);
-        // RC7 item 4: the notice's button only ever opens the chat — it never
-        // carries `resumeTask` itself. (Here the new task's progress is not
-        // readable through the stubbed filesystem and no extension context is
-        // wired, so no chat pointer is attached at all.)
-        const pausedEntry = entries.find((e) => /task created in paused state/.test(e.message));
+        // RC8 item 7: creating a task while another is active is routine, not a
+        // decision — an informational notice naming the active task, with no
+        // action and no chat decision behind it.
+        const pausedEntry = entries.find((e) => /created paused, because .+ is the active task/.test(e.message));
         assert.ok(pausedEntry, "expected an internal notification that the task was created paused");
-        assert.equal(pausedEntry?.level, "warning");
-        assert.ok(
-          pausedEntry?.actionCommand === undefined ||
-            pausedEntry.actionCommand.command === "vs-code-ai-helper.openWorkflowDecision"
-        );
+        assert.equal(pausedEntry?.level, "info");
+        assert.match(pausedEntry.message, /Resume it when you want to work on it\./);
+        assert.equal(pausedEntry?.actionCommand, undefined, "the notice carries no action button");
+        assert.equal(entries.some((e) => /task created in paused state/.test(e.message)), false);
         assert.equal(
           entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.resumeTask"),
           false

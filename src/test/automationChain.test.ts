@@ -863,3 +863,38 @@ void test("an automation-dispatched review reuses the generic row (one identity,
     safeRemoveDir(fixture.folder);
   }
 });
+
+void test("RC8 item 5: onDeclined fires exactly once when the executed command resolves false, on both branches, and not for any other settlement", async () => {
+  async function run(result: "false" | "true" | "undefined" | "reject", deferred: boolean): Promise<number> {
+    resetAutomationChainGuards();
+    let declined = 0;
+    const chain = makeFakeChain();
+    const deps: AutomationChainDeps = {
+      onDidEnd: (listener) => chain.deps.onDidEnd(listener),
+      execute: (): Promise<unknown> =>
+        result === "reject"
+          ? Promise.reject(new Error("boom"))
+          : Promise.resolve(result === "false" ? false : result === "true" ? true : undefined),
+    };
+    const scheduled = scheduleAutomationChain(
+      { command: "x.review", taskKey: `/t-declined-${result}-${deferred}`, onDeclined: () => void (declined += 1) },
+      deferred ? { id: "root-1" } : undefined,
+      deps
+    );
+    if (deferred) {
+      chain.end({ id: "root-1", state: "succeeded" });
+    }
+    await scheduled.catch(() => undefined);
+    // Let the settle callbacks of the fire-and-forget deferred dispatch run.
+    for (let i = 0; i < 10; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+    return declined;
+  }
+  for (const deferred of [false, true]) {
+    assert.equal(await run("false", deferred), 1, `declined fires once (deferred=${deferred})`);
+    assert.equal(await run("true", deferred), 0, `not for true (deferred=${deferred})`);
+    assert.equal(await run("undefined", deferred), 0, `not for undefined (deferred=${deferred})`);
+    assert.equal(await run("reject", deferred), 0, `not for a rejection (deferred=${deferred})`);
+  }
+});

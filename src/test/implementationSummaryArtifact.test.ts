@@ -47,6 +47,7 @@ import {
   AcceptedNonGoalItemV1,
   appendAcceptedNonGoalV1,
   areAllUnmatchedChecklistClaimsAlreadySettledV1,
+  CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1,
   collectCheckedChecklistCountsV1,
   collectChecklistItemKeysV1,
   collectPlanItemReasonsV1,
@@ -538,6 +539,40 @@ void describe("detectChecklistItemSetMutationV1 — the checklist-mutation guard
     assert.equal(mutation.kind, "added");
     assert.deepEqual(mutation.addedItems, ["Present the remaining sites to a human reviewer"]);
     assert.deepEqual(mutation.removedItems, []);
+  });
+
+  // RC8 item 6: the closed-before-implementation marker is display-only, so
+  // the item-set comparison and tick matching read a marked line as the same item.
+  void it("ignores the closed-before-implementation marker: it is not an added/removed item", () => {
+    const EX = EXCLUDED_CHECKLIST_ITEM_MARKER_V1;
+    const before = ["## Plan", "", "- [ ] Add the resolver", `- [ ] Owner checks the dark theme ${EX}`].join("\n");
+    const after = [
+      "## Plan",
+      "",
+      "- [ ] Add the resolver",
+      `- [ ] Owner checks the dark theme ${CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1} ${EX}`,
+    ].join("\n");
+    assert.equal(detectChecklistItemSetMutationV1(before, after), undefined);
+    assert.equal(detectChecklistItemSetMutationV1(after, before), undefined);
+    assert.deepEqual([...collectChecklistItemKeysV1(before)], [...collectChecklistItemKeysV1(after)]);
+  });
+
+  void it("an echoed tick matches a plan line with or without the closed-before-implementation marker", () => {
+    const EX = EXCLUDED_CHECKLIST_ITEM_MARKER_V1;
+    const marked = ["<!-- ensemble:implementation-checklist -->", "", "- [ ] Add the resolver", `- [ ] Owner check ${CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1} ${EX}`, ""].join("\n");
+    const plain = marked.replace(`${CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1} `, "");
+    for (const planText of [marked, plain]) {
+      const merged = mergeChecklistProgressV1(
+        planText,
+        ["## Plan Item Checklist", "", `- [x] Owner check ${EX}`, ""].join("\n")
+      );
+      assert.equal(merged.kind, "merged");
+      if (merged.kind === "merged") {
+        assert.match(merged.content, /- \[x\] Owner check/, "the echoed tick lands on the marked or plain line itself");
+        assert.match(merged.content, /- \[ \] Add the resolver/, "the unrelated line is untouched");
+        assert.equal(merged.content.includes(CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1), planText === marked);
+      }
+    }
   });
 
   void it("detects a pure removal", () => {

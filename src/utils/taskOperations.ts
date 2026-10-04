@@ -794,6 +794,26 @@ export class TaskOperationRegistry implements vscode.Disposable {
   }
 
   /**
+   * Read-only: the id of the root operation `id` descends from (walking
+   * parentId within the same task, same walk as `setResultTargetUri`), or
+   * `id` itself when it is a root. Undefined when `id` is not registered
+   * (unknown or already ended).
+   */
+  rootOperationIdOf(id: string): string | undefined {
+    for (const keyMap of this.operations.values()) {
+      let op = keyMap.get(id);
+      if (!op) {continue;}
+      while (op.parentId !== undefined) {
+        const parent = keyMap.get(op.parentId);
+        if (!parent) {break;}
+        op = parent;
+      }
+      return op.id;
+    }
+    return undefined;
+  }
+
+  /**
    * Same as `setResultTargetUri`, addressed by task path instead of operation
    * id, for code deep in the stack that never received the operation handle
    * (mirrors `report`/`tokenFor` above). Finds the task's exclusive (root)

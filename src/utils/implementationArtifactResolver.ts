@@ -31,6 +31,8 @@ import {
   declaresNoChecklistChangeV1,
   hasImplementationChecklistV1,
   hasPlanItemChecklistClaimV1,
+  carryClosedBeforeImplementationMarkersV1,
+  markClosedBeforeImplementationV1,
   mergeChecklistProgressV1,
   splitSummaryAtEchoV1,
 } from "./implementationChecklist";
@@ -1700,7 +1702,18 @@ export async function preparePlanPromotion(
         // the freshly-revised plan.md, so items the revision left unchanged
         // keep their checked state (item 7's explicit requirement).
         const merged = priorContent !== undefined ? mergeChecklistProgressV1(planContent, priorContent) : undefined;
-        const finalContent = merged?.kind === "merged" ? merged.content : planContent;
+        const mergedContent = merged?.kind === "merged" ? merged.content : planContent;
+        // RC8 item 6: the checklist freezes ONCE, at the first promotion of
+        // plan.md to plan-final.md. Items already closed without doing at that
+        // moment get the closed-before-implementation marker (the excluded
+        // marker stays last, so older versions still read them as excluded).
+        // A later re-promotion (plan revision) only carries forward markers the
+        // prior copy already had, so nothing closed since is newly marked and
+        // no progress made after the first freeze leaves the count.
+        const finalContent =
+          priorContent === undefined
+            ? markClosedBeforeImplementationV1(mergedContent)
+            : carryClosedBeforeImplementationMarkersV1(mergedContent, priorContent);
         const nextBytes = new TextEncoder().encode(finalContent);
         // Report the exact raw bytes this write is about to replace, from
         // INSIDE this lock hold — the only point at which "what's on disk

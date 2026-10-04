@@ -309,7 +309,11 @@ import {
   stageActionRequirementMessageV1,
 } from "../utils/stageArtifactRequirementsV1";
 import { describeOwedContinuationRefusalV1 } from "../utils/owedContinuationRefusalV1";
-import { deriveApplicableVerifiedTicksV1, postApplyReviewerVerifiedTicksDecisionV1 } from "./applyReviewerVerifiedTicks";
+import {
+  deriveApplicableVerifiedTicksV1,
+  postApplyReviewerVerifiedTicksDecisionV1,
+  writeVerifiedTicksToPlanV1,
+} from "./applyReviewerVerifiedTicks";
 import { postChecklistChangeProposedDecisionV1 } from "./planRevisionV1";
 import {
   postReconcilePlanChecklistDecisionV1,
@@ -531,6 +535,115 @@ export async function validateReleaseTaskOwnership(
   return { ok: true, progress: repairedProgress };
 }
 
+/** Why an automatic hand-over into the next stage did not start. */
+export type HandOverNotStartedCauseV1 =
+  | "duplicate-chain"
+  | "automation-disabled"
+  | "root-operation-unsuccessful"
+  | "declined";
+
+type HandOverKindV1 = "review" | "implementation";
+
+const HAND_OVER_CAUSE_TEXT_V1: Record<HandOverNotStartedCauseV1, string> = {
+  "duplicate-chain": "another automatic follow-up is already pending for this task",
+  "automation-disabled": "automation was turned off before it could start",
+  "root-operation-unsuccessful": "the run it was queued behind did not finish successfully",
+  declined: "the command declined to start (its own notice says why)",
+};
+
+function handOverManualStepV1(stage: TaskStage, kind: HandOverKindV1): string {
+  return kind === "implementation"
+    ? `Run Implementation on ${STAGE_DISPLAY_NAMES[stage]}.`
+    : `Run Review with AI on ${STAGE_DISPLAY_NAMES[stage]}.`;
+}
+
+/**
+ * The one warning for an automatic hand-over into the next stage that did not
+ * start. Names the task, the stage, the real cause and the manual step.
+ */
+export function warnHandOverNotStartedV1(
+  folderUri: vscode.Uri,
+  displayName: string | undefined,
+  stage: TaskStage,
+  cause: HandOverNotStartedCauseV1,
+  kind: HandOverKindV1 = "review"
+): void {
+  NotificationRouter.showWarning(
+    `${formatNotificationTaskLabelV1(displayName, folderUri.fsPath)}: auto-advance reached ${STAGE_DISPLAY_NAMES[stage]}, ` +
+      `but its ${kind === "implementation" ? "Implementation round" : "review"} did not start because ` +
+      `${HAND_OVER_CAUSE_TEXT_V1[cause]}. ${handOverManualStepV1(stage, kind)}`
+  );
+}
+
+export interface FastForwardHandOverRecordV1 {
+  stage: TaskStage;
+  kind: HandOverKindV1;
+  state: "queued" | "dropped";
+  /** True when `warnHandOverNotStartedV1` already raised the drop warning. */
+  warned: boolean;
+}
+
+/**
+ * In-memory: what the auto-advance tail scheduled behind a run, keyed by the
+ * id of the operation the follow-up is anchored to. Read once by the Fast
+ * Forward run's closing report so it only says work is queued when it is.
+ */
+const fastForwardHandOversV1 = new Map<string, FastForwardHandOverRecordV1>();
+
+/** Record a queued hand-over; the record is dropped when its anchor ends. */
+function recordFastForwardHandOverV1(
+  anchorId: string,
+  stage: TaskStage,
+  kind: HandOverKindV1
+): FastForwardHandOverRecordV1 {
+  const record: FastForwardHandOverRecordV1 = { stage, kind, state: "queued", warned: false };
+  fastForwardHandOversV1.set(anchorId, record);
+  const sub = taskOperations.onDidEnd((snapshot) => {
+    if (snapshot.id !== anchorId) {
+      return;
+    }
+    sub.dispose();
+    if (fastForwardHandOversV1.get(anchorId) === record) {
+      fastForwardHandOversV1.delete(anchorId);
+    }
+  });
+  return record;
+}
+
+/**
+ * The Fast Forward closing report for a task that left the review's stage
+ * during the run. Reports "queued" only when the hand-over really is queued;
+ * otherwise says nothing was started and what to do, with one warning (unless
+ * the drop already raised its own).
+ */
+export function reportFastForwardMovedOnV1(args: {
+  op: Pick<TaskOperationHandle, "id" | "report">;
+  folderUri: vscode.Uri;
+  displayName: string | undefined;
+  landedStage: TaskStage;
+}): void {
+  const { op, folderUri, displayName, landedStage } = args;
+  const anchorId = taskOperations.rootOperationIdOf(op.id) ?? op.id;
+  const record = fastForwardHandOversV1.get(anchorId);
+  fastForwardHandOversV1.delete(anchorId);
+  const landedName = STAGE_DISPLAY_NAMES[landedStage];
+  if (record && record.stage === landedStage && record.state === "queued") {
+    op.report(
+      `advanced to ${landedName} — its ${
+        record.kind === "implementation" ? "Implementation round" : "review"
+      } is queued and starts when this run ends`
+    );
+    return;
+  }
+  const kind: HandOverKindV1 =
+    record && record.stage === landedStage ? record.kind : landedStage === "impl" ? "implementation" : "review";
+  const text = `advanced to ${landedName} — nothing was started there. ${handOverManualStepV1(landedStage, kind)}`;
+  op.report(text);
+  if (!(record && record.stage === landedStage && record.state === "dropped" && record.warned)) {
+    NotificationRouter.showWarning(`${formatNotificationTaskLabelV1(displayName, folderUri.fsPath)}: ${text}`);
+  }
+}
+
 /** The plan-review automation gate; manual stage completion never calls it. */
 export function shouldScheduleAutomaticImplementation(
   nextStage: TaskStage | undefined,
@@ -549,7 +662,11 @@ export function scheduleAutomaticImplementationAfterReview(
   nextStage: TaskStage | undefined,
   autoImplementEnabled: boolean,
   taskFolderPath: string,
-  parentOperation: TaskOperationHandle | undefined
+  parentOperation: Pick<TaskOperationHandle, "id"> | undefined,
+  callbacks?: {
+    onDropped?: (reason: HandOverNotStartedCauseV1) => void;
+    onDeclined?: () => void;
+  }
 ): boolean {
   if (!shouldScheduleAutomaticImplementation(nextStage, autoImplementEnabled)) {
     return false;
@@ -563,6 +680,8 @@ export function scheduleAutomaticImplementationAfterReview(
       // Re-checked at fire time: the review that scheduled this can run for
       // minutes, and the user may disable auto-implement in the meantime.
       stillEnabled: () => isAutoImplementAfterReviewEnabled(),
+      ...(callbacks?.onDropped ? { onDropped: callbacks.onDropped } : {}),
+      ...(callbacks?.onDeclined ? { onDeclined: callbacks.onDeclined } : {}),
       intent: {
         trigger: "auto-implement after review completes",
         settingKey: "ensemble.autoImplementAfterReview",
@@ -1996,8 +2115,8 @@ export async function selectReconciliationInstruction(
  * @internal exported for testing
  */
 export const UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1 =
-  " — count unverified: the plan checklist is not a complete record and needs reconciliation " +
-  "(run Ensemble: Mark Plan Checklist Reconciled once the missed items are ticked)";
+  " — count unverified: the plan checklist is behind (rounds built work they did not tick), " +
+  "so this count is not a reliable measure of what is left";
 
 /**
  * Sibling to {@link UNVERIFIED_CHECKLIST_COUNT_QUALIFIER_V1} for the case
@@ -2817,6 +2936,22 @@ function setMechanicalBlockersForStage(
 
 function getMechanicalBlockersForStage(folderUri: vscode.Uri, targetStage: TaskStage): ReviewBlocker[] {
   return mechanicalBlockersByTaskStage.get(mechanicalBlockersCacheKey(folderUri, targetStage)) ?? [];
+}
+
+/**
+ * True when this review names no blockers at all: the same parse (plus the
+ * mechanical blockers) that fills the round's history `blockerCount`, so a
+ * line that could not be parsed counts as "not clean". Used before the
+ * round's history entry is written; the entry's count can only be lower
+ * (exclusions), never higher, so this errs toward holding the stage.
+ */
+function reviewNamesNoBlockersV1(folderUri: vscode.Uri, targetStage: TaskStage, content: string): boolean {
+  const evidence = parseReviewBlockersDetailed(content);
+  return (
+    evidence.blockers.length === 0 &&
+    evidence.malformedLines.length === 0 &&
+    getMechanicalBlockersForStage(folderUri, targetStage).length === 0
+  );
 }
 
 /**
@@ -4492,8 +4627,36 @@ async function routeReviewOutcomeV1(
           }
         }
         const score = parseReadiness(content).score;
-        await notifyReviewerVerifiedTicksV1(folderUri, targetStage);
         const autoAdvanceThreshold = getAutoAdvanceScoreThreshold();
+        // RC8 item 4: read the under-recording latch once, up front. While it
+        // is set the ticks this review already confirmed are applied BEFORE
+        // the stage decision (so they are counted), instead of waiting on a
+        // card; unlatched, the card is posted as before.
+        const checklistLatched =
+          !isPlanReviewStage(targetStage) &&
+          (await readTaskProgressAdvisoryV1(folderUri))?.checklistProgressUnreliable === true;
+        let verifiedTicksHandled = false;
+        if (checklistLatched) {
+          const derivedTicks = await deriveApplicableVerifiedTicksV1(folderUri, targetStage);
+          if (derivedTicks.kind !== "ok") {
+            verifiedTicksHandled = true; // Nothing applicable: no card either way.
+          } else {
+            try {
+              const appliedTicks = await writeVerifiedTicksToPlanV1(folderUri, derivedTicks.derivation);
+              if (appliedTicks.kind === "applied") {
+                verifiedTicksHandled = true;
+                NotificationRouter.showInformation(
+                  `Applied ${appliedTicks.count} reviewer-verified tick(s) to plan-final.md.`
+                );
+              }
+            } catch {
+              // Best-effort: a failed write falls back to offering the card.
+            }
+          }
+        }
+        if (!verifiedTicksHandled) {
+          await notifyReviewerVerifiedTicksV1(folderUri, targetStage);
+        }
         // A high score no longer implies the plan is finished. Before the
         // progress marker existed, the review prompts capped a mid-plan
         // score below the threshold, so "score >= threshold" doubled as an
@@ -4521,9 +4684,19 @@ async function routeReviewOutcomeV1(
         // progress file still throws and notifies instead of advancing on
         // state that could not be read.
         const progress = await effectiveReviewProgressV1(folderUri, targetStage, content, "strict");
-        const planIncomplete = isPlanIncomplete(progress);
+        // RC8 item 4: while the checklist is flagged unreliable its count is
+        // known to be wrong, so a clean review (threshold met, no blockers,
+        // real file scope) is not held by it. Every unlatched task, and every
+        // latched review with a blocker, keeps today's gate.
+        const latchedCleanReview =
+          checklistLatched &&
+          !noTrackedFileSet &&
+          meetsAutoAdvanceThreshold(score, autoAdvanceThreshold) &&
+          reviewNamesNoBlockersV1(folderUri, targetStage, content);
+        const planIncomplete = !latchedCleanReview && isPlanIncomplete(progress);
         const meetsThreshold =
-          readyToAdvanceStage(score, autoAdvanceThreshold, progress) && !noTrackedFileSet;
+          readyToAdvanceStage(score, autoAdvanceThreshold, latchedCleanReview ? null : progress) &&
+          !noTrackedFileSet;
         if (noTrackedFileSet) {
           NotificationRouter.showWarning(
             `${STAGE_DISPLAY_NAMES[targetStage]} scored ${score ?? "unscored"}/10, but this task has no tracked ` +
@@ -4682,9 +4855,7 @@ async function routeReviewOutcomeV1(
           // so the count below is the review's own self-reported marker —
           // qualified as unverified rather than presented as a live measure
           // of remaining work (finding 3).
-          const checklistCountUnverified =
-            !isPlanReviewStage(targetStage) &&
-            (await readTaskProgressAdvisoryV1(folderUri))?.checklistProgressUnreliable === true;
+          const checklistCountUnverified = checklistLatched;
           // The `progress` reconciled above falls back to the review's own
           // raw marker while the latch is set (readEffectivePlanChecklistProgressV1
           // stands the checklist down), so `progress.complete < progress.total`
@@ -4707,6 +4878,11 @@ async function routeReviewOutcomeV1(
           );
         }
         if (!escalated && isAutoAdvanceEnabled() && meetsThreshold) {
+          if (latchedCleanReview && ((await readPlanOfRecordV1(folderUri)).counts?.remaining ?? 0) > 0) {
+            NotificationRouter.showInformation(
+              `${formatNotificationTaskLabelV1(outcomeRoutingProgress?.displayName, folderUri.fsPath)}: Advancing: the review is clean; the plan checklist is behind and is not used to hold the stage.`
+            );
+          }
           NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Auto-advancing stage...`);
           const configuredStages = await resolveConfiguredReviewStages(folderUri);
           const next = computeNextStage(targetStage, configuredStages);
@@ -4789,11 +4965,48 @@ async function routeReviewOutcomeV1(
               // exclusive operation lock, which this review still holds — so
               // the chain scheduler defers it until this root operation has
               // ended successfully.
+              //
+              // RC8 item 5: anchor the follow-ups to the task's live root
+              // operation. Under Fast Forward this review's `operation` is a
+              // CHILD of the run's root, which keeps the task's lock after the
+              // child ends; chaining behind the child would dispatch the
+              // follow-up while the root still holds the lock, and its own
+              // predecessor would refuse it.
+              const liveRootId = taskOperations.rootOperationIdFor(folderUri.fsPath);
+              let followUpAnchor: Pick<TaskOperationHandle, "id"> | undefined = operation;
+              let anchoredToLiveRoot = false;
+              if (operation && liveRootId) {
+                if (liveRootId === operation.id) {
+                  anchoredToLiveRoot = true;
+                } else if (taskOperations.rootOperationIdOf(operation.id) === liveRootId) {
+                  followUpAnchor = { id: liveRootId };
+                  anchoredToLiveRoot = true;
+                }
+              }
+              const handOverDisplayName = outcomeRoutingProgress?.displayName;
+              const trackHandOver = (kind: "review" | "implementation"): FastForwardHandOverRecordV1 | undefined =>
+                followUpAnchor ? recordFastForwardHandOverV1(followUpAnchor.id, next, kind) : undefined;
+              let implementationHandOver: FastForwardHandOverRecordV1 | undefined;
+              if (shouldScheduleAutomaticImplementation(next, isAutoImplementAfterReviewEnabled())) {
+                implementationHandOver = trackHandOver("implementation");
+              }
               const automaticImplementationScheduled = scheduleAutomaticImplementationAfterReview(
                 next,
                 isAutoImplementAfterReviewEnabled(),
                 folderUri.fsPath,
-                operation
+                followUpAnchor,
+                {
+                  onDropped: (reason) => {
+                    if (implementationHandOver) {
+                      implementationHandOver.state = "dropped";
+                      implementationHandOver.warned = true;
+                    }
+                    warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason, "implementation");
+                  },
+                  onDeclined: () => {
+                    warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined", "implementation");
+                  },
+                }
               );
               if (!automaticImplementationScheduled && next === "impl") {
                 NotificationRouter.showInformation(
@@ -4879,10 +5092,7 @@ async function routeReviewOutcomeV1(
                 // with no operation handle) — the existing duplicate-chain
                 // guard must keep protecting a genuinely separate pending
                 // chain in that case.
-                if (
-                  operation &&
-                  taskOperations.rootOperationIdFor(folderUri.fsPath) === operation.id
-                ) {
+                if (anchoredToLiveRoot) {
                   releaseAutomationChain(folderUri.fsPath, "auto-review");
                 }
                 // wf10 item 14 / Part 7 step 17: `next === "publish"` marks
@@ -4902,6 +5112,7 @@ async function routeReviewOutcomeV1(
                 // work, not a verification owed to an already-committed
                 // transition.
                 let dropReason: "duplicate-chain" | "automation-disabled" | "root-operation-unsuccessful" | undefined;
+                const reviewHandOver = next === "publish" ? undefined : trackHandOver("review");
                 const reviewChainScheduled = scheduleAutomationChain(
                   {
                     command: reviewCommand,
@@ -4931,6 +5142,18 @@ async function routeReviewOutcomeV1(
                     dispatchEvenIfRootFails: next === "publish",
                     onDropped: (reason) => {
                       dropReason = reason;
+                      if (reviewHandOver) {
+                        reviewHandOver.state = "dropped";
+                        reviewHandOver.warned = true;
+                      }
+                      if (next !== "publish") {
+                        warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason);
+                      }
+                    },
+                    onDeclined: () => {
+                      if (next !== "publish") {
+                        warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined");
+                      }
                     },
                     intent: {
                       trigger: "auto-review after advancing to the next stage",
@@ -4940,7 +5163,7 @@ async function routeReviewOutcomeV1(
                       retryNote: "Not retried automatically if dropped — run the review manually.",
                     },
                   },
-                  operation
+                  followUpAnchor
                 );
                 if (next === "publish") {
                   // Of the three drop reasons, only "duplicate-chain" can
@@ -4977,16 +5200,10 @@ async function routeReviewOutcomeV1(
                   });
                 } else {
                   // A plain review-to-review handoff (e.g. plan-high-review ->
-                  // plan-low-review) — still warn if it was dropped, or the
-                  // task is silently left parked on the new review stage
-                  // with nothing running and no way for the user to notice.
-                  void reviewChainScheduled.then((scheduled) => {
-                    if (!scheduled) {
-                      NotificationRouter.showWarning(
-                        `Auto-advance reached ${STAGE_DISPLAY_NAMES[next]} for ${folderUri.fsPath}, but its review could not be started automatically because another review is already in progress for this task. Run the review manually.`
-                      );
-                    }
-                  });
+                  // plan-low-review): `onDropped`/`onDeclined` above warn
+                  // with the real cause, so the task is never silently left
+                  // parked on the new review stage with nothing running.
+                  void reviewChainScheduled.catch(() => undefined);
                 }
               }
               // wf10 item 14 / Part 7 step 17: previously this branch nudged
@@ -8847,7 +9064,12 @@ export async function fastForwardReviewWithAI(
       return false;
     }
     if (ffStageNow && ffStageDrift === "movedOn") {
-      op.report(`advanced to ${STAGE_DISPLAY_NAMES[ffStageNow]} — continuing there`);
+      reportFastForwardMovedOnV1({
+        op,
+        folderUri: resolved.folderUri,
+        displayName: resolved.progress.displayName,
+        landedStage: ffStageNow,
+      });
       return;
     }
   }
@@ -9368,7 +9590,12 @@ export async function fastForwardReviewWithAI(
   if (ffStageLeftForV1) {
     // The task left the review's stage during the run — hand over to the
     // follow-up run for the new stage rather than reporting a stall.
-    op.report(`advanced to ${STAGE_DISPLAY_NAMES[ffStageLeftForV1]} — continuing there`);
+    reportFastForwardMovedOnV1({
+      op,
+      folderUri: resolved.folderUri,
+      displayName: resolved.progress.displayName,
+      landedStage: ffStageLeftForV1,
+    });
     return;
   }
   if (outcome.escalationDeferred) {

@@ -95,6 +95,12 @@ export interface AutomationDispatch {
    */
   onDropped?: (reason: "duplicate-chain" | "automation-disabled" | "root-operation-unsuccessful") => void;
   /**
+   * Fires once when the dispatched command ran but resolved `false` (it
+   * declined to start any work), beside the ledger `dropped` write. Lets a
+   * caller report that a hand-over it scheduled did not actually start.
+   */
+  onDeclined?: () => void;
+  /**
    * Hand-off metadata for the scheduling-intent ledger (task: "Actionable
    * Hand-offs", PART 6) — what caused this dispatch, the `ensemble.*`
    * setting (if any) that controls it, roughly when it is expected, and
@@ -505,6 +511,9 @@ export function scheduleAutomationChain(
           // ended the same way a chain drop does: nothing ran, so the
           // ledger records `"dropped"`, never a clean ending it never had.
           const declined = executed === false;
+          if (declined) {
+            dispatch.onDeclined?.();
+          }
           void intentIdPromise.then((id) => {
             void recordTerminalIntentBestEffortV1(id, declined ? "cancelled" : "completed");
             terminalizeGenericAutomationRoundBestEffortV1(
@@ -590,6 +599,9 @@ export function scheduleAutomationChain(
                 // Same fix as the immediate-dispatch branch above: a
                 // declined (`false`) resolve is not a clean ending.
                 const declined = executed === false;
+                if (declined) {
+                  dispatch.onDeclined?.();
+                }
                 void intentIdPromise.then((id) => {
                   void recordTerminalIntentBestEffortV1(id, declined ? "cancelled" : "completed");
                   terminalizeGenericAutomationRoundBestEffortV1(

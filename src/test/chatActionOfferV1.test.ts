@@ -137,7 +137,6 @@ void describe("converted call sites (RC7 item 4)", () => {
   // Every converted notification call, with the action it must offer in the chat.
   const SITES: ReadonlyArray<{ file: string; label: string; command: string; count: number }> = [
     { file: "utils/pausedTaskRefusalV1.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 1 },
-    { file: "commands/startNewTask.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 1 },
     { file: "commands/taskCreationRecovery.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 2 },
     { file: "commands/runLintingFixes.ts", label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", count: 2 },
     { file: "commands/reviewActions.ts", label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", count: 1 },
@@ -163,6 +162,14 @@ void describe("converted call sites (RC7 item 4)", () => {
       );
     });
   }
+
+  // RC8 item 7: creating a task while another is active is routine, so it
+  // raises an informational notice and no chat decision.
+  void it("commands/startNewTask.ts raises no chat decision for a task created paused", () => {
+    const source = fs.readFileSync(path.join(root, "commands/startNewTask.ts"), "utf8");
+    assert.doesNotMatch(source, /offerActionInChatV1\(/);
+    assert.doesNotMatch(source, /holdsTaskPaused/);
+  });
 
   void it("Run Publish Review reaches the chat through the Publish Checks caller, not a direct button", () => {
     const steps = fs.readFileSync(path.join(root, "utils/publishStageActionsV1.ts"), "utf8");

@@ -50,6 +50,7 @@ import {
   formatChecklistItemGlyphV1,
   formatChecklistPercentV1,
   formatImplementationProgressLabelV1,
+  implementationDisplayCountsV1,
   listOutstandingManualVerificationItemsV1,
   listUncheckedChecklistItemTextsV1,
 } from "../utils/implementationChecklist";
@@ -736,7 +737,14 @@ export class StageNode extends vscode.TreeItem {
      * numbers that used to compete on one review row: implementation owns
      * the percentage, review owns the score. `undefined` for every other
      * stage, and for `impl` itself whenever the task carries no checklist. */
-    implementationProgress?: { complete: number; total: number; unverified?: boolean },
+    implementationProgress?: {
+      complete: number;
+      total: number;
+      unverified?: boolean;
+      /** Items closed without doing before Implementation first started,
+       * already left out of `complete`/`total` (RC8 item 6) — named in the tooltip. */
+      closedBeforeImplementation?: number;
+    },
     /**
      * How many pending workflow decisions are scoped to THIS stage — the
      * chat is holding that many questions for the user here.
@@ -1107,6 +1115,12 @@ export class StageNode extends vscode.TreeItem {
         ? "\n\n⏳ Review in progress: re-evaluating this artifact against the current HEAD."
         : `\n\n⚠ This review examined commit ${readiness.staleReviewedSha}, which is no longer HEAD — ` +
           "re-run Review with AI to assess the current state.";
+    }
+    if (stage === "impl" && (implementationProgress?.closedBeforeImplementation ?? 0) > 0) {
+      const closedBefore = implementationProgress!.closedBeforeImplementation!;
+      tooltipStr +=
+        `\n\n${closedBefore} item${closedBefore === 1 ? "" : "s"} closed before Implementation started — ` +
+        "not counted in the percentage.";
     }
     if (missingPrerequisite) {
       tooltipStr +=
@@ -2037,14 +2051,26 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // mid-edit in. Unlike the ForDisplay twin it still reports a latched
       // task's count, flagged `unverified`, so the tree qualifies the number
       // instead of hiding it (merge of `ui 12` into `v1 f2`, 2026-09-21).
-      let implementationProgress: { complete: number; total: number; unverified?: boolean } | undefined;
+      let implementationProgress:
+        | { complete: number; total: number; unverified?: boolean; closedBeforeImplementation?: number }
+        | undefined;
       if (stage === "impl") {
         const display = await readDisplayPlanChecklistProgressV1(task.folderUri);
         if (display) {
+          // RC8 item 6: items already closed without doing when Implementation
+          // first started are left out of both sides, so a task's first
+          // Implementation run starts at 0%. Display only — gates and counts
+          // elsewhere keep the full `settled`/`total`. When every item was
+          // closed before Implementation there is nothing to measure, so the
+          // full counts are shown rather than a meaningless 0 of 0.
+          const shown = implementationDisplayCountsV1(display.counts);
           implementationProgress = {
-            complete: display.counts.settled,
-            total: display.counts.total,
-            ...(display.unverified ? { unverified: true } : {})
+            complete: shown.complete,
+            total: shown.total,
+            ...(display.unverified ? { unverified: true } : {}),
+            ...(shown.closedBeforeImplementation > 0
+              ? { closedBeforeImplementation: shown.closedBeforeImplementation }
+              : {})
           };
         }
       }

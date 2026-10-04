@@ -22,6 +22,8 @@ import {
   StatusSurface,
 } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { safeRemoveDir } from "./testFsUtils";
 
 function installConfigStub(configuredTaskRoot: string): { restore: () => void } {
@@ -217,12 +219,50 @@ void describe("startNewTask — active/paused lifecycle", () => {
       );
       await harness.currentTaskStore.set(normalizePath(existingTaskPath));
 
-      const folderName = await startNewTask(
-        harness.inventory,
-        vscode.Uri.file(harness.workspaceRoot),
-        harness.currentTaskStore
-      );
+      // RC8 item 7: wire an extension context the way the chat offers do, so a
+      // posted workflow decision for the new task would be observable.
+      const memento = makeMemento();
+      __extensionContextV1TestOnly.set({
+        subscriptions: [],
+        extensionUri: vscode.Uri.file(harness.workspaceRoot),
+        workspaceState: memento,
+        globalState: memento,
+      } as unknown as vscode.ExtensionContext);
+      const notices: Array<{ message: string; level: string; actionCommand?: unknown }> = [];
+      initNotificationRouter({
+        addEntry(
+          message: string,
+          level: string,
+          _filePath?: string,
+          _resultTargetUri?: string,
+          _sourceOperationId?: string,
+          actionCommand?: unknown
+        ): void {
+          notices.push({ message, level, actionCommand });
+        },
+      } as unknown as Parameters<typeof initNotificationRouter>[0]);
+
+      let folderName: string | undefined;
+      try {
+        folderName = await startNewTask(
+          harness.inventory,
+          vscode.Uri.file(harness.workspaceRoot),
+          harness.currentTaskStore
+        );
+      } finally {
+        __extensionContextV1TestOnly.reset();
+      }
       assert.ok(folderName);
+
+      assert.deepEqual(
+        new WorkflowDecisionStoreV1(memento).listPending(),
+        [],
+        "creating a task while another is active raises no workflow decision card"
+      );
+      const pausedNotice = notices.find((n) => /created paused, because 2026-01-01_task_1 is the active task/.test(n.message));
+      assert.ok(pausedNotice, "an informational notice names the active task");
+      assert.equal(pausedNotice.level, "info");
+      assert.equal(pausedNotice.actionCommand, undefined);
 
       const taskFolderPath = path.join(harness.metaFolderPath, folderName);
       const progress = readProgress(taskFolderPath);
