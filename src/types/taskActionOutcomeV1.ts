@@ -35,6 +35,19 @@ export interface MalformedResultAttemptRecordV1 {
   readonly attemptId: string;
   readonly code: string;
   readonly detail?: string;
+  /**
+   * Provider display label of the candidate this attempt ran on (RC6 item 2),
+   * so a failure message can name every model tried and why each failed.
+   */
+  readonly providerLabel?: string;
+  /** Stored model id of the candidate this attempt ran on. */
+  readonly storedModelId?: string;
+  /**
+   * True for an attempt that failed before any response (usage limit, CLI
+   * exit, network fault): the outer retry's fresh operation skips this
+   * candidate instead of re-reserving it.
+   */
+  readonly skipOnRetry?: boolean;
 }
 
 export type RecoveryRequiredCodeV1 =
@@ -236,6 +249,8 @@ export type TaskActionOutcomeV1 =
        * outer wrapper's pre-existing fixed-attempt behavior unchanged.
        */
       readonly malformedInvocationsUsedV1?: number;
+      /** The coordinator's per-round budget, `max(3, enabled candidate count)`; the outer retry stops at this same value. */
+      readonly malformedInvocationBudgetV1?: number;
       /**
        * Every OTHER attempt this operation's malformed-result
        * candidate-advancement loop rejected before this outcome's own
@@ -480,15 +495,29 @@ function decodeOptionalPriorRejectedAttemptsV1(
       typeof (entry as Record<string, unknown>).code !== "string" ||
       (entry as Record<string, unknown>).code === "" ||
       (((entry as Record<string, unknown>).detail !== undefined) &&
-        typeof (entry as Record<string, unknown>).detail !== "string")
+        typeof (entry as Record<string, unknown>).detail !== "string") ||
+      (((entry as Record<string, unknown>).providerLabel !== undefined) &&
+        typeof (entry as Record<string, unknown>).providerLabel !== "string") ||
+      (((entry as Record<string, unknown>).storedModelId !== undefined) &&
+        typeof (entry as Record<string, unknown>).storedModelId !== "string")
     ) {
       return `invalid ${fieldLabel} "priorRejectedAttemptsV1" entry: ${JSON.stringify(entry)}`;
     }
-    const record = entry as { attemptId: string; code: string; detail?: string };
+    const record = entry as {
+      attemptId: string;
+      code: string;
+      detail?: string;
+      providerLabel?: string;
+      storedModelId?: string;
+      skipOnRetry?: unknown;
+    };
     decoded.push({
       attemptId: record.attemptId,
       code: record.code,
       ...(record.detail !== undefined ? { detail: record.detail } : {}),
+      ...(record.providerLabel !== undefined ? { providerLabel: record.providerLabel } : {}),
+      ...(record.storedModelId !== undefined ? { storedModelId: record.storedModelId } : {}),
+      ...(record.skipOnRetry === true ? { skipOnRetry: true } : {}),
     });
   }
   return decoded;
@@ -758,6 +787,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           "detail",
           "provider",
           "malformedInvocationsUsedV1",
+          "malformedInvocationBudgetV1",
           "priorRejectedAttemptsV1",
           "attemptId",
         ]),
@@ -810,6 +840,11 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           ...(provider !== undefined ? { provider } : {}),
           ...(raw.malformedInvocationsUsedV1 !== undefined
             ? { malformedInvocationsUsedV1: raw.malformedInvocationsUsedV1 }
+            : {}),
+          ...(typeof raw.malformedInvocationBudgetV1 === "number" &&
+          Number.isInteger(raw.malformedInvocationBudgetV1) &&
+          raw.malformedInvocationBudgetV1 > 0
+            ? { malformedInvocationBudgetV1: raw.malformedInvocationBudgetV1 }
             : {}),
           ...(priorRejectedAttemptsV1 !== undefined ? { priorRejectedAttemptsV1 } : {}),
           ...(raw.attemptId !== undefined ? { attemptId: raw.attemptId } : {}),

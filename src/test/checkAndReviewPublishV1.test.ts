@@ -27,7 +27,7 @@ void describe("checkAndReviewPublishV1", () => {
   void it("runs the review directly when the checks are already fresh", async () => {
     const { calls, deps } = makeDeps([true]);
     const result = await checkAndReviewPublishV1({ taskFolderPath: "/t/one" }, deps);
-    assert.equal(result, "reviewed");
+    assert.equal(result, "review-dispatched");
     assert.deepEqual(
       calls.map((c) => c.command),
       ["vs-code-ai-helper.runReviewWithAI"]
@@ -37,7 +37,7 @@ void describe("checkAndReviewPublishV1", () => {
   void it("runs the checks first, then the review, when the checks are missing or stale", async () => {
     const { calls, deps } = makeDeps([false, true]);
     const result = await checkAndReviewPublishV1({ taskFolderPath: "/t/one" }, deps);
-    assert.equal(result, "reviewed");
+    assert.equal(result, "review-dispatched");
     assert.deepEqual(
       calls.map((c) => c.command),
       ["vs-code-ai-helper.runPublishChecks", "vs-code-ai-helper.runReviewWithAI"]

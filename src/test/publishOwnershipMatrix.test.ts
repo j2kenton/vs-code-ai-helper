@@ -3273,3 +3273,60 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
     assert.equal(automation.invokeCount, 1, "a real change since the last review must always dispatch");
   });
 });
+
+void describe("Publish review — stale-commit stamp is refused at entry (RC6 item 6, Step 13)", () => {
+  void it("a stamp verified against a different commit than HEAD is refused through runReviewForFolder with no model call and names both commits", async () => {
+    const { folderPath } = makeTaskFolder(`stale-commit-${Math.floor(Math.random() * 1e9)}`, "publish");
+    const staleSha = REAL_ROOT_HEAD_SHA.startsWith("a") ? "b".repeat(40) : "a".repeat(40);
+    const stampFile = path.join(folderPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME);
+    fs.writeFileSync(
+      stampFile,
+      `${renderPublishChecksFreshnessStamp({
+        formatVersion: 1,
+        runId: "00000000-0000-4000-8000-000000000001",
+        verifiedCommitSha: staleSha,
+        completedAt: "2026-01-01T00:00:00.000Z",
+        scopeId: computePublishScopeId(path.dirname(folderPath)),
+      })}\n`,
+      "utf8"
+    );
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    let invokeCount = 0;
+    const countingTransport: AgentTransportV1 = {
+      runnerId: "stub-runner",
+      invoke: (): Promise<{ kind: "transportFailure"; code: string }> => {
+        invokeCount += 1;
+        return Promise.resolve({ kind: "transportFailure" as const, code: "mustNotRun" });
+      },
+    };
+    const contextPack = path.join(folderPath, "context-pack.md");
+    fs.writeFileSync(contextPack, "# Context\n", "utf8");
+    const workspaceRoot = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 } as vscode.WorkspaceFolder;
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
+      stubV1RunnerSelection([countingTransport]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () => Promise.resolve(vscode.Uri.file(contextPack))),
+    ];
+    try {
+      await runReviewForFolder(vscode.Uri.file(REAL_ROOT), vscode.Uri.file(folderPath), workspaceRoot, "publish", true, {});
+      assert.equal(invokeCount, 0, "a stale-commit stamp must be refused before any model call");
+      const warning = provider
+        .getEntries()
+        .find((entry) => entry.message.includes(staleSha.slice(0, 12)) && entry.message.includes(REAL_ROOT_HEAD_SHA.slice(0, 12)));
+      assert.ok(warning, "expected the staleCommit refusal naming both commits");
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+});

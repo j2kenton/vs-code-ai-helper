@@ -3,7 +3,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
-import { parseReadiness } from "./reviewReadiness";
+import {
+  parseReadiness,
+  upsertArtifactChangeStaleBannerV1,
+  upsertNoteBelowArtifactChangeBannerV1,
+} from "./reviewReadiness";
 import { publishNextStepAfterChecksV1 } from "./stageArtifactRequirementsV1";
 
 /**
@@ -639,6 +643,67 @@ export async function writePublishChecksFreshnessStampV1(
       mergePublishChecksFreshnessStamp(existing, section)
     );
   });
+}
+
+/**
+ * RC6 item 5: mark `publish-review.md` stale at once when a fix starts
+ * changing the code it describes, so it is never shown as current. Runs under
+ * the same per-report lock as every other writer; copies every line except
+ * the banner unchanged (stamp, status line, managed sections), and writes
+ * nothing when the file has no Readiness line (no review to supersede).
+ */
+export async function markPublishReviewStaleV1(
+  taskFolderUri: vscode.Uri,
+  changedArtifact: string,
+  atIso: string
+): Promise<void> {
+  await withPublishChecksReportLockV1(taskFolderUri, async () => {
+    const existing = await readPublishChecksFile(taskFolderUri);
+    if (parseReadiness(existing).score === null) {
+      return;
+    }
+    const updated = upsertArtifactChangeStaleBannerV1(existing, changedArtifact, atIso);
+    if (updated !== existing) {
+      await writeFileAtomicV1(publishChecksPath(taskFolderUri), updated);
+    }
+  });
+}
+
+/** Note prefixes `writePublishFixNoteV1` replaces in place. */
+const PUBLISH_FIX_NOTE_PREFIXES_V1 = [
+  "> Publish Checks still fail after the fix:",
+  "> Publish Checks pass after the fix",
+] as const;
+
+/**
+ * RC6 item 5: one note line directly below the stale banner saying what the
+ * fix ended with. `stillWanted` is checked inside the report lock so a note
+ * that became untrue while this write waited is never written.
+ */
+export async function writePublishFixNoteV1(
+  taskFolderUri: vscode.Uri,
+  note: string,
+  stillWanted: () => boolean = () => true
+): Promise<boolean> {
+  let wanted = false;
+  await withPublishChecksReportLockV1(taskFolderUri, async () => {
+    if (!stillWanted()) {
+      return;
+    }
+    const existing = await readPublishChecksFile(taskFolderUri);
+    // Recheck after the awaited read: the note may have become untrue meanwhile.
+    if (!stillWanted()) {
+      return;
+    }
+    wanted = true;
+    const updated = upsertNoteBelowArtifactChangeBannerV1(existing, PUBLISH_FIX_NOTE_PREFIXES_V1, note);
+    if (updated !== existing) {
+      await writeFileAtomicV1(publishChecksPath(taskFolderUri), updated);
+    }
+  });
+  // A change during the atomic write also withdraws the claim, so callers do
+  // not announce a note that is already obsolete.
+  return wanted && stillWanted();
 }
 
 /** Read and parse the freshness stamp currently on disk, if any. */

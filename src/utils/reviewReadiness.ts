@@ -1004,6 +1004,36 @@ export function hasArtifactChangeStaleBannerV1(content: string): boolean {
 }
 
 /**
+ * Put one note line directly below the artifact-change stale banner (RC6
+ * item 5), replacing an existing note there — recognized by one of
+ * `replacePrefixes` — in place. Every other line (banner, review body,
+ * managed sections) is copied unchanged. Returns `content` itself when there
+ * is no banner to anchor to.
+ * @internal exported for testing
+ */
+export function upsertNoteBelowArtifactChangeBannerV1(
+  content: string,
+  replacePrefixes: readonly string[],
+  note: string
+): string {
+  const lines = content.split("\n");
+  const bannerIndex = lines.findIndex((line) => ARTIFACT_CHANGE_STALE_BANNER_TEXT_RE_V1.test(line));
+  if (bannerIndex === -1) {
+    return content;
+  }
+  const eol = lines[bannerIndex]!.endsWith("\r") ? "\r" : "";
+  let removeCount = 0;
+  while (
+    bannerIndex + 1 + removeCount < lines.length &&
+    replacePrefixes.some((prefix) => lines[bannerIndex + 1 + removeCount]!.startsWith(prefix))
+  ) {
+    removeCount++;
+  }
+  lines.splice(bannerIndex + 1, removeCount, note + eol);
+  return lines.join("\n");
+}
+
+/**
  * The single, shared "is this review artifact stale" predicate (A1, 1.0.0
  * gate Part A3): true for the legacy `# Review Stale` full-content
  * placeholder (pre-upgrade data) OR content carrying the artifact-change

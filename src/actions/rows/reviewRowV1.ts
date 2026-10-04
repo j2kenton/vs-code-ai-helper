@@ -19,7 +19,11 @@ import { getWorkflowFileStoreV1 } from "../../services/workflowRuntimeServicesV1
 import { WorkflowFileRevisionV1 } from "../../services/workflowFileStoreV1";
 import { parseReadiness, withVisibleReviewedCommitLineV1 } from "../../utils/reviewReadiness";
 import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
-import { checkPublishChecksFreshnessV1 } from "../../utils/publishChecksFreshness";
+import {
+  checkPublishChecksFreshnessV1,
+  describePublishChecksFreshnessFailureV1,
+  type PublishChecksFreshnessCheckV1,
+} from "../../utils/publishChecksFreshness";
 import { stepProgressLabelV1 } from "../../utils/stepLabelsV1";
 import { extractCompletionChecksSectionV1, mergeCompletionChecksSection } from "../../utils/completionLint";
 import { extractScopeCheckSectionV1, mergeScopeCheckSection } from "../../utils/publishScopeCheck";
@@ -138,7 +142,8 @@ function isMarkdownArtifactV1(
   return content.contentType === "markdown-artifact.v1";
 }
 
-class ReviewPromotionErrorV1 extends Error {
+/** @internal exported for testing */
+export class ReviewPromotionErrorV1 extends Error {
   constructor(message: string) {
     super(message);
     this.name = "ReviewPromotionErrorV1";
@@ -193,11 +198,40 @@ async function revalidatePublishFreshnessOrThrowV1(
     check.stamp.runId === guard.runId &&
     check.stamp.verifiedCommitSha === guard.verifiedCommitSha;
   if (!stillValid) {
-    throw new ReviewPromotionErrorV1(
-      "Publish Checks changed (a new run or a new commit) while this review was being generated, so " +
-        "the review was not saved. Run Publish Checks again and retry the review."
+    throw new ReviewPromotionErrorV1(describePublishPromotionGuardFailureV1(guard, check));
+  }
+}
+
+/**
+ * RC6 item 6: say WHAT changed — the commit (X to Y), or a new Publish Checks
+ * run on the same commit — instead of one wording for every failure.
+ */
+export function describePublishPromotionGuardFailureV1(
+  guard: PublishReviewFreshnessGuardV1,
+  check: PublishChecksFreshnessCheckV1
+): string {
+  const retry = "Run Publish Checks again and retry the review.";
+  if (check.status === "valid") {
+    if (check.stamp.verifiedCommitSha !== guard.verifiedCommitSha) {
+      return (
+        `The commit changed from ${guard.verifiedCommitSha.slice(0, 12)} to ` +
+        `${check.stamp.verifiedCommitSha.slice(0, 12)} while this review was being generated, so the review ` +
+        `was not saved. ${retry}`
+      );
+    }
+    return (
+      "A new Publish Checks run finished while this review was being generated, so the review was not " +
+      `saved. ${retry}`
     );
   }
+  if (check.status === "staleCommit") {
+    return (
+      `The commit changed from ${guard.verifiedCommitSha.slice(0, 12)} to ` +
+      `${check.currentCommitSha.slice(0, 12)} while this review was being generated, so the review was not ` +
+      `saved. ${retry}`
+    );
+  }
+  return `${describePublishChecksFreshnessFailureV1(check)} The review was not saved.`;
 }
 
 /** Generous enough for any realistic publish-review.md; a read this size

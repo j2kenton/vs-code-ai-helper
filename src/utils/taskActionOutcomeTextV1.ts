@@ -77,7 +77,9 @@ function priorRejectedAttemptLinesV1(
   }
   return priorRejectedAttemptsV1.map(
     (attempt) =>
-      `Attempt ${attempt.attemptId} rejected (${attempt.code}${attempt.detail ? `: ${attempt.detail}` : ""})`
+      `Attempt ${attempt.attemptId} rejected (${attempt.code}${attempt.detail ? `: ${attempt.detail}` : ""})${
+        attempt.providerLabel ? ` [${attempt.providerLabel}]` : ""
+      }`
   );
 }
 
@@ -128,7 +130,10 @@ function summarizeRejectedAttemptChainV1(
   }
   return [
     ...priorRejectedAttemptsV1.map(
-      (attempt, index) => `attempt ${index + 1}: ${attempt.code}${attempt.detail ? `: ${attempt.detail}` : ""}`
+      (attempt, index) =>
+        `attempt ${index + 1}: ${attempt.code}${attempt.detail ? `: ${attempt.detail}` : ""}${
+          attempt.providerLabel ? ` [${attempt.providerLabel}]` : ""
+        }`
     ),
     `final attempt: ${finalReason}`,
   ].join("; ");

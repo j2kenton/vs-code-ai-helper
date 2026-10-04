@@ -462,6 +462,24 @@ export interface TaskActionRequestV1 {
    * outer retry wrapper.
    */
   readonly malformedInvocationsAlreadyUsedV1?: number;
+  /**
+   * Every attempt an EARLIER, now-terminal operation of this same user press
+   * made (RC6 item 2), carried by the outer retry wrapper into its fresh
+   * operation. The fresh operation (a) seeds its own attempt history with it
+   * so the final failure names every model tried, and (b) skips any
+   * candidate whose record has `skipOnRetry` instead of re-reserving a
+   * primary that already hit its usage limit.
+   */
+  readonly priorAttemptHistoryV1?: readonly MalformedResultAttemptRecordV1[];
+  /**
+   * Fires immediately before each candidate's provider invocation (RC6 item
+   * 4), so the caller can show the model that is actually running. Reports
+   * only; never changes selection. A throwing observer is swallowed.
+   */
+  readonly onCandidateInvokedV1?: (info: {
+    readonly storedModelId: string;
+    readonly providerLabel: string;
+  }) => void;
 }
 
 /**
@@ -507,6 +525,8 @@ export interface TaskActionResumeRequestV1 {
   readonly onPromptAssembled?: TaskActionRequestV1["onPromptAssembled"];
   /** See `TaskActionRequestV1.onAttemptAllocated` — identical Resume-drive meaning. */
   readonly onAttemptAllocated?: TaskActionRequestV1["onAttemptAllocated"];
+  /** See `TaskActionRequestV1.onCandidateInvokedV1` — identical Resume-drive meaning. */
+  readonly onCandidateInvokedV1?: TaskActionRequestV1["onCandidateInvokedV1"];
 }
 
 /**
@@ -1275,8 +1295,11 @@ function attachPriorRejectedAttemptsV1(
   if ((outcome.kind !== "malformedResult" && outcome.kind !== "failed") || history.length === 0) {
     return outcome;
   }
-  const finalAttempt = history[history.length - 1]!;
-  const prior = history.slice(0, -1);
+  const isOutcomeLatest = outcome.attemptId === history[history.length - 1]?.attemptId;
+  const finalAttempt = isOutcomeLatest ? history[history.length - 1]! : outcome;
+  const prior = isOutcomeLatest
+    ? history.slice(0, -1)
+    : history.filter((a) => a.attemptId !== outcome.attemptId);
   return {
     ...outcome,
     attemptId: finalAttempt.attemptId,
@@ -1703,7 +1726,11 @@ export function createTaskActionCoordinatorV1(
      * of leaving it for reconciliation, silently losing the only evidence
      * this invocation ever ran).
      */
-    settlementSignalOutV1?: { attempted: boolean }
+    settlementSignalOutV1?: { attempted: boolean },
+    /** See `TaskActionRequestV1.priorAttemptHistoryV1`. */
+    priorAttemptHistoryV1?: readonly MalformedResultAttemptRecordV1[],
+    /** See `TaskActionRequestV1.onCandidateInvokedV1`. */
+    onCandidateInvokedV1?: TaskActionRequestV1["onCandidateInvokedV1"]
   ): Promise<TaskActionOutcomeV1> {
     const terminalSettlementAttemptedV1 = settlementSignalOutV1 ?? { attempted: false };
     const attachmentFailureOutcomeV1 = (
@@ -1866,7 +1893,25 @@ export function createTaskActionCoordinatorV1(
     // own reservation, so `recoverLastAiResponse` (most-recent-wins) surfaces
     // the LAST candidate's rejected text after an exhausted advance chain,
     // not necessarily the best one among the candidates tried.
-    const MAX_MALFORMED_RESULT_INVOCATIONS_V1 = 3;
+    //
+    // RC6 item 2: the budget is `max(3, enabled candidate count)` so a stage
+    // with five enabled candidates can try each once. Confirmed cause of the incident
+    // (2026-10-01, impl-high-review):
+    // 1. In `copilotLanguageModelRunner.ts` / `languageModelToolSessionV1.ts`, Copilot's
+    //    empty last round (0 result bytes, no tool calls) is classified as a transport
+    //    failure with `code: 'copilotEmptyResponse'` and `networkFault: true`, which takes
+    //    the same-candidate retry path. If retried and failing again or returning an unusable
+    //    frame, the coordinator surfaces `malformedResult`.
+    // 2. The outer `withMalformedResultRetryV1` opened a fresh coordinator operation, which
+    //    called `openV1RunnerSelection`. The registry ranks from the top again because it does
+    //    not inspect active quota parks (`recordQuotaObservationAndClearParkV1`). Codex primary
+    //    was re-reserved and failed on its usage limit (`cliExit.1`), which counted against the
+    //    shared budget, exhausting it and returning only Codex's error without trying Claude Opus.
+    // To fix this, the fresh operation carries `priorAttemptHistoryV1` and skips already-failed
+    // candidates (`skipOnRetryStoredIdsV1`), while the budget `max(3, candidateCount)` guarantees
+    // every enabled candidate gets its first attempt before any repeat.
+    const candidateCountV1 = selection.candidateCount ?? 0;
+    const MAX_MALFORMED_RESULT_INVOCATIONS_V1 = Math.max(3, candidateCountV1);
     const malformedRetryEligibleV1 =
       row.providerMode === "text" && row.actionKey !== EDIT_EXECUTION_ACTION_KEY_V1;
     let malformedInvocationCountV1 = malformedInvocationsAlreadyUsedV1 ?? 0;
@@ -1879,7 +1924,31 @@ export function createTaskActionCoordinatorV1(
     // valid JSON, so they went through the content-contract branch, not the
     // malformed-envelope-parse branch — a history scoped to only the latter
     // would have missed exactly the attempts the report was about.
-    const malformedAttemptHistoryV1: MalformedResultAttemptRecordV1[] = [];
+    const malformedAttemptHistoryV1: MalformedResultAttemptRecordV1[] = [...(priorAttemptHistoryV1 ?? [])];
+    // Candidates an earlier operation of this press already failed on before
+    // any response (usage limit, CLI exit, network fault): never re-reserved.
+    // While an enabled candidate is still untried, EVERY candidate already
+    // tried in this press is skipped (candidate-first); once all have been
+    // tried, only those that failed before any response stay skipped.
+    const triedStoredIdsV1 = new Set(
+      (priorAttemptHistoryV1 ?? [])
+        .filter((record) => record.storedModelId !== undefined)
+        .map((record) => record.storedModelId as string)
+    );
+    const untriedRemainV1 = candidateCountV1 > 0 && triedStoredIdsV1.size < candidateCountV1;
+    const skipOnRetryStoredIdsV1 = new Set(
+      (priorAttemptHistoryV1 ?? [])
+        .filter(
+          (record) => record.storedModelId !== undefined && (untriedRemainV1 || record.skipOnRetry === true)
+        )
+        .map((record) => record.storedModelId as string)
+    );
+    // Fresh reservations this operation has taken (the admitted initial
+    // candidate included): the network-fault same-candidate retry below must
+    // leave budget for every candidate not yet reserved.
+    let freshCandidatesReservedV1 = initialCandidate ? 1 : 0;
+    const attachHistoryIfPriorV1 = (outcome: TaskActionOutcomeV1): TaskActionOutcomeV1 =>
+      malformedAttemptHistoryV1.length > 1 ? attachPriorRejectedAttemptsV1(outcome, malformedAttemptHistoryV1) : outcome;
     // Armed once a malformed result has been seen for this row — either in
     // this operation or a prior fresh operation whose count was seeded in
     // via `malformedInvocationsAlreadyUsedV1` (only ever stamped for
@@ -1975,6 +2044,37 @@ export function createTaskActionCoordinatorV1(
           // owner that dispatched the round.
           session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
           if (lastMalformedOutcomeV1 !== undefined) {
+            const latestRecordV1 = malformedAttemptHistoryV1[malformedAttemptHistoryV1.length - 1];
+            if (
+              latestRecordV1 !== undefined &&
+              latestRecordV1.skipOnRetry === true &&
+              lastMalformedOutcomeV1.kind === "malformedResult" &&
+              latestRecordV1.attemptId !== lastMalformedOutcomeV1.attemptId
+            ) {
+              // The last candidate failed before invocation (setup refusal):
+              // report that failure, not an earlier malformed candidate's,
+              // with every earlier attempt in the history.
+              return attachPriorRejectedAttemptsV1(
+                {
+                  kind: "failed",
+                  correlation: lastMalformedOutcomeV1.correlation,
+                  attemptId: latestRecordV1.attemptId,
+                  code: latestRecordV1.code,
+                  retryable: true,
+                  ...(latestRecordV1.detail !== undefined ? { detail: latestRecordV1.detail } : {}),
+                  ...(latestRecordV1.providerLabel !== undefined &&
+                  latestRecordV1.storedModelId !== undefined
+                    ? {
+                        provider: {
+                          providerLabel: latestRecordV1.providerLabel,
+                          storedModelId: latestRecordV1.storedModelId,
+                        },
+                      }
+                    : {}),
+                },
+                malformedAttemptHistoryV1
+              );
+            }
             return attachPriorRejectedAttemptsV1(lastMalformedOutcomeV1, malformedAttemptHistoryV1);
           }
           const enrichedChain =
@@ -2020,6 +2120,15 @@ export function createTaskActionCoordinatorV1(
           modelId: next.reserved.handle.modelId,
         };
         networkFaultRetriesUsedV1 = 0;
+        freshCandidatesReservedV1++;
+      }
+
+      // RC6 item 2: an earlier operation of this press already failed on this
+      // candidate before any response (e.g. a usage limit) — settle the
+      // reservation unused and take the next ranked candidate.
+      if (skipOnRetryStoredIdsV1.has(reserved.storedModelId)) {
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        continue;
       }
 
       const correlation = reserved.handle.correlation;
@@ -2131,7 +2240,19 @@ export function createTaskActionCoordinatorV1(
       let prepared: PreparedAgentInvocationV1;
       try {
         prepared = prepareAgentInvocationV1(executionRequest, claimed, reserved.createTransport(toolHandler));
-      } catch {
+      } catch (preparationError) {
+        // Step 3b: a pre-invocation failure joins the round's history so the
+        // all-model failure message names this candidate too.
+        malformedAttemptHistoryV1.push({
+          attemptId,
+          code: "providerUnavailablePreInvocation",
+          detail: `setup failed: ${
+            preparationError instanceof Error ? preparationError.message : String(preparationError)
+          }`.slice(0, 240),
+          providerLabel: reserved.providerLabel,
+          storedModelId: reserved.storedModelId,
+          skipOnRetry: true,
+        });
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
         continue;
       }
@@ -2155,6 +2276,16 @@ export function createTaskActionCoordinatorV1(
 
       if (prepared.kind === "prepared") {
         malformedInvocationCountV1++;
+        // RC6 item 4: tell the caller which model is about to run (best
+        // effort; never alters selection).
+        try {
+          onCandidateInvokedV1?.({
+            storedModelId: reserved.storedModelId,
+            providerLabel: reserved.providerLabel,
+          });
+        } catch {
+          // an observer failure must never affect the round
+        }
         // Keep the previously-stamped malformed outcome's count current as
         // later invocations (including transport-failure advances) consume
         // more of the shared budget. Without this, a return of
@@ -2171,6 +2302,7 @@ export function createTaskActionCoordinatorV1(
           lastMalformedOutcomeV1 = {
             ...lastMalformedOutcomeV1,
             malformedInvocationsUsedV1: malformedInvocationCountV1,
+            malformedInvocationBudgetV1: MAX_MALFORMED_RESULT_INVOCATIONS_V1,
           };
         }
       }
@@ -2254,20 +2386,40 @@ export function createTaskActionCoordinatorV1(
           const transportEvidence = raw.detail !== undefined
             ? `${raw.code}: ${raw.detail}${networkFaultAttemptSuffixV1}`
             : `${raw.code}${networkFaultAttemptSuffixV1}`;
+          // RC6 item 2: every failure kind lands in the per-round history with
+          // its provider label, so the final message names every model tried.
+          const transportDetailV1 =
+            raw.detail !== undefined ? boundedDiagnosticDetailV1(raw.detail) : undefined;
+          malformedAttemptHistoryV1.push({
+            attemptId,
+            code: raw.code,
+            ...(transportDetailV1 !== undefined ? { detail: transportDetailV1 } : {}),
+            providerLabel: reserved.providerLabel,
+            storedModelId: reserved.storedModelId,
+            ...(raw.responseStarted ? {} : { skipOnRetry: true }),
+          });
+          // RC6 item 2: every enabled candidate gets a first attempt before the
+          // round fails, so a response-started failure or a deadline only ends
+          // the round once no untried candidate remains within the budget.
+          const untriedCandidateAheadV1 =
+            candidateCountV1 > freshCandidatesReservedV1 &&
+            malformedInvocationCountV1 < MAX_MALFORMED_RESULT_INVOCATIONS_V1;
           if (raw.responseStarted) {
             session.reportAttemptOutcome(
               attemptId,
               "transportFailureResponseStarted",
               transportEvidence
             );
-            return {
+            // Terminal: the session settles closed once a response has
+            // started, so no further candidate can be allocated.
+            return attachHistoryIfPriorV1({
               kind: "failed",
               correlation,
               code: raw.code,
               retryable: false,
               ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
               ...(context.provider ? { provider: context.provider } : {}),
-            };
+            });
           }
           session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", transportEvidence);
           // Item 2 / Step 55: a wall-clock invocation deadline is a terminal
@@ -2281,16 +2433,19 @@ export function createTaskActionCoordinatorV1(
           // candidate attempted" the plan requires this NOT do. Reported
           // `retryable: true` (a human/task-level retry may reissue the whole
           // operation) but never automatically advanced within this drive.
+          if (raw.code === "invocationDeadlineExceeded" && untriedCandidateAheadV1) {
+            continue;
+          }
           if (raw.code === "invocationDeadlineExceeded") {
             await settleTerminalInvocationV1(correlation.operationId, "timedOut");
-            return {
+            return attachHistoryIfPriorV1({
               kind: "failed",
               correlation,
               code: raw.code,
               retryable: true,
               ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
               ...(context.provider ? { provider: context.provider } : {}),
-            };
+            });
           }
           // Item 14: a transport-flagged network fault (dropped connection,
           // DNS failure, TLS handshake failure, HTTP/2 protocol error) is a
@@ -2308,7 +2463,12 @@ export function createTaskActionCoordinatorV1(
             raw.networkFault === true &&
             networkFaultRetriesUsedV1 < MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 &&
             currentCandidateIdentityV1 !== undefined &&
-            !(malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1)
+            !(malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1) &&
+            // RC6 item 2: candidate-first. A repeat of an already-tried
+            // candidate never pre-empts an untried one, and always fits the
+            // per-round budget (Step 2c).
+            MAX_MALFORMED_RESULT_INVOCATIONS_V1 - malformedInvocationCountV1 - 1 >=
+              Math.max(0, candidateCountV1 - freshCandidatesReservedV1)
           ) {
             networkFaultRetriesUsedV1++;
             // A dropped connection or empty reply usually clears within a
@@ -2349,17 +2509,23 @@ export function createTaskActionCoordinatorV1(
           // 3-invocation cap. In that case report the honest diagnosis
           // (the last malformed outcome, if this row produced one) instead
           // of masking it behind an unbounded transport-failure walk.
-          if (malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1) {
-            return (
-              lastMalformedOutcomeV1 ?? {
-                kind: "failed",
-                correlation,
-                code: raw.code,
-                retryable: true,
-                ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
-                ...(context.provider ? { provider: context.provider } : {}),
-              }
-            );
+          // RC6 item 2: the per-round bound applies to every invocation, armed
+          // or not (first attempts are reserved out of the budget, so an
+          // untried enabled candidate is never starved by this check).
+          if (malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1) {
+            // The current (last) failure is the outcome, with every earlier
+            // attempt in the history, so the final message names the last
+            // model and its reason instead of repeating an earlier malformed
+            // outcome.
+            return attachHistoryIfPriorV1({
+              kind: "failed",
+              correlation,
+              attemptId,
+              code: raw.code,
+              retryable: true,
+              ...(raw.detail !== undefined ? { detail: raw.detail } : {}),
+              ...(context.provider ? { provider: context.provider } : {}),
+            });
           }
           continue;
         }
@@ -2457,6 +2623,7 @@ export function createTaskActionCoordinatorV1(
         const malformedOutcomeV1: TaskActionOutcomeV1 = {
           kind: "malformedResult",
           correlation,
+          attemptId,
           code: parsed.code,
           ...(detailParts.length > 0 ? { detail: detailParts.join("; ") } : {}),
           ...(context.provider ? { provider: context.provider } : {}),
@@ -2466,12 +2633,19 @@ export function createTaskActionCoordinatorV1(
           // stops at the same 3-invocation total instead of adding its own
           // fixed retries on top. See this field's own doc comment in
           // `taskActionOutcomeV1.ts`.
-          ...(malformedRetryEligibleV1 ? { malformedInvocationsUsedV1: malformedInvocationCountV1 } : {}),
+          ...(malformedRetryEligibleV1
+            ? {
+                malformedInvocationsUsedV1: malformedInvocationCountV1,
+                malformedInvocationBudgetV1: MAX_MALFORMED_RESULT_INVOCATIONS_V1,
+              }
+            : {}),
         };
         malformedAttemptHistoryV1.push({
           attemptId,
           code: parsed.code,
           ...(reasonDetail !== undefined ? { detail: reasonDetail } : {}),
+          providerLabel: reserved.providerLabel,
+          storedModelId: reserved.storedModelId,
         });
         // Advance to the next ranked candidate instead of surfacing this
         // outcome immediately — see the budget/eligibility doc comment
@@ -2531,6 +2705,7 @@ export function createTaskActionCoordinatorV1(
           const contractOutcomeV1: TaskActionOutcomeV1 = {
             kind: "failed",
             correlation,
+            attemptId,
             code: "contentContractFailed",
             retryable: false,
             detail: [reasonDetail, preservationDetailFragmentV1(preservationResult)]
@@ -2547,9 +2722,11 @@ export function createTaskActionCoordinatorV1(
             attemptId,
             code: "contentContractFailed",
             ...(reasonDetail !== undefined ? { detail: reasonDetail } : {}),
+            providerLabel: reserved.providerLabel,
+            storedModelId: reserved.storedModelId,
           });
           if (willAdvanceContractV1) {
-            malformedInvocationCountV1++;
+            // (this invocation was already counted when it was made)
             lastMalformedOutcomeV1 = contractOutcomeV1;
             continue;
           }
@@ -2926,6 +3103,20 @@ export function createTaskActionCoordinatorV1(
     } finally {
       start.release();
     }
+    const candidateCountV1 = selection.candidateCount ?? 0;
+    const triedStoredIdsV1 = new Set(
+      (request.priorAttemptHistoryV1 ?? [])
+        .filter((record) => record.storedModelId !== undefined)
+        .map((record) => record.storedModelId as string)
+    );
+    const untriedRemainV1 = candidateCountV1 > 0 && triedStoredIdsV1.size < candidateCountV1;
+    const skipOnRetryStoredIdsV1 = new Set(
+      (request.priorAttemptHistoryV1 ?? [])
+        .filter(
+          (record) => record.storedModelId !== undefined && (untriedRemainV1 || record.skipOnRetry === true)
+        )
+        .map((record) => record.storedModelId as string)
+    );
 
     let initialCandidate: AdmittedProviderActionTicketV1["initialCandidate"] | undefined;
     for (;;) {
@@ -3024,6 +3215,10 @@ export function createTaskActionCoordinatorV1(
       }
       if (next.kind === "candidateUnavailable") {
         reportCandidateSkipped(deps, next, request.taskStage);
+        continue;
+      }
+      if (skipOnRetryStoredIdsV1.has(next.reserved.storedModelId)) {
+        session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
         continue;
       }
       initialCandidate = { attemptId, reserved: next.reserved };
@@ -3166,7 +3361,9 @@ export function createTaskActionCoordinatorV1(
           ticket.operationId,
           ticket.request.onAttemptAllocated,
           ticket.request.taskBinding,
-          terminalSettlementAttemptedV1
+          terminalSettlementAttemptedV1,
+          ticket.request.priorAttemptHistoryV1,
+          ticket.request.onCandidateInvokedV1
         );
       } catch (err) {
         console.error("continueAdmittedAction error:", err);
@@ -3523,7 +3720,10 @@ export function createTaskActionCoordinatorV1(
         request.onPromptAssembled,
         operationRef.operationId,
         request.onAttemptAllocated,
-        request.taskBinding
+        request.taskBinding,
+        undefined,
+        undefined,
+        request.onCandidateInvokedV1
       );
       // Best-effort durable mirror of the claimed invocation's terminal
       // outcome (plan §3.1 / AC-RUNNER-03): makes it recoverable by a later

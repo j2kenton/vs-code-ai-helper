@@ -213,7 +213,7 @@ export async function applyOpenPlanItemsFormSubmissionV1(input: {
     (s) => `"${truncateChecklistItemTextV1(textById.get(s.itemId) ?? s.itemText, 60)}" — ${s.reason}`
   );
   const summary =
-    (parts.length > 0 ? `${parts.join(", ")} in plan-final.md.` : "No items were changed.") +
+    (parts.length > 0 ? `${parts.join(", ")} in plan-final.md.` : "No items were changed. Nothing will run; the items stay open. Fix what blocks them, then use Fast Forward or Apply Review.") +
     (skippedLines.length > 0 ? ` ${skippedLines.join("; ")}.` : "");
   NotificationRouter.showInformation(`${taskName}: ${summary}`);
   if (changed) {
@@ -394,8 +394,10 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
     consequence:
       "Shows a form in this chat with every open item — exclude it with a reason, tick it because you already " +
       "did it, or leave it open — and writes your choices to plan-final.md in one pass when you press Apply, " +
-      "with a dated Accepted Non-Goals entry for anything excluded. Items you leave open stay open. Then " +
-      "builds whatever is still open, or offers Advance once nothing is.",
+      "with a dated Accepted Non-Goals entry for anything excluded. Items you leave open stay open. If " +
+      "you change at least one item, it then builds whatever is still open, or offers Advance once nothing " +
+      "is. If you leave every item open, nothing runs and the task waits until you fix what blocks them and " +
+      "use Fast Forward or Apply Review.",
     effect: {
       kind: "command",
       command: "vs-code-ai-helper.decideOpenPlanItems",
