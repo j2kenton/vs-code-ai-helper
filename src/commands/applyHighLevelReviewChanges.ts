@@ -92,7 +92,7 @@ export async function applyHighLevelReviewChanges(
     // identical check for why this must use the resolver rather than the raw
     // `status` field.
     if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
-      showPausedTaskRefusalV1("applying review changes", resolvedTask.taskFolderPath);
+      await showPausedTaskRefusalV1("applying review changes", resolvedTask.taskFolderPath);
       return false;
     }
 
@@ -114,7 +114,7 @@ export async function applyHighLevelReviewChanges(
   // identical check for why this must use the resolver rather than the raw
   // `status` field.
   if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
-    showPausedTaskRefusalV1("applying review changes", resolvedTask.taskFolderPath);
+    await showPausedTaskRefusalV1("applying review changes", resolvedTask.taskFolderPath);
     return false;
   }
 

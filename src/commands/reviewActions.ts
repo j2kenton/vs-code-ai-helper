@@ -261,6 +261,7 @@ import * as cp from "child_process";
 import * as fs from "fs";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { describeChainExhaustionTailV1 } from "../utils/chainExhaustionMessageV1";
 import {
   describeAutomationDefaultV1,
@@ -283,6 +284,7 @@ import {
   LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
   readChatDocumentIdentityV1,
 } from "../utils/chatHistoryStore";
+import { runFastForwardPublishChecksV1 } from "../utils/fastForwardPublishChecksV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
@@ -426,6 +428,7 @@ import {
   rubricCapLikelyBlockedAdvance,
   shouldEscalateChurnCeiling,
   shouldTripNoProgressBreaker,
+  runningImplementationRecommendedOptionV1,
   STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD,
 } from "../utils/reviewRouting";
 import { detectPlanArtifactDisagreementV1 } from "../utils/planArtifactMismatchV1";
@@ -2411,16 +2414,20 @@ async function requirePublishChecksFreshnessOrWarnV1(
       },
     };
   }
+  const freshnessNotice = `${formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath)} — ${describePublishChecksFreshnessFailureV1(check)}`;
   NotificationRouter.showWarning(
-    `${formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath)} — ${describePublishChecksFreshnessFailureV1(check)}`,
+    freshnessNotice,
     undefined,
     undefined,
     undefined,
-    {
+    await offerActionInChatV1({
+      taskFolderPath: folderUri.fsPath,
+      taskLabel: formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath),
+      actionLabel: "Run Publish Checks",
       command: "vs-code-ai-helper.runPublishChecks",
-      title: "Run Publish Checks",
       args: [{ taskFolderPath: folderUri.fsPath }],
-    }
+      noticeText: freshnessNotice,
+    })
   );
   return { ok: false };
 }
@@ -7551,7 +7558,7 @@ export async function runReviewWithAI(
       return;
     }
     if (reconciled.outcome === "userPaused") {
-      showPausedTaskRefusalV1("running a review", resolved.folderUri.fsPath);
+      await showPausedTaskRefusalV1("running a review", resolved.folderUri.fsPath);
       return;
     }
     if (reconciled.outcome === "reversed") {
@@ -7798,7 +7805,7 @@ export async function applyReviewWithAI(
     return false;
   }
   if (reconciled.outcome === "userPaused") {
-    showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
     return false;
   }
   if (reconciled.outcome === "reversed") {
@@ -8523,7 +8530,7 @@ export async function fastForwardReviewWithAI(
     return;
   }
   if (ffReconciled.outcome === "userPaused") {
-    showPausedTaskRefusalV1("fast-forwarding", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("fast-forwarding", resolved.folderUri.fsPath);
     return;
   }
   if (ffReconciled.outcome === "reversed") {
@@ -8663,28 +8670,34 @@ export async function fastForwardReviewWithAI(
       // otherwise race this function's already-live marker and be refused
       // `busy` rather than adopt it.
       const publishChecksHandoffToken = authorizeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
+      let checksRefused = false;
       try {
-        await vscode.commands.executeCommand("vs-code-ai-helper.runPublishChecks", {
-          taskFolderPath: resolved.folderUri.fsPath,
-          admissionHandoffTokenV1: publishChecksHandoffToken,
-          // Without the parent, the checks ask for a second root and this
-          // run's own lock refuses them.
-          parentOperation: op,
-        });
+        // On refusal the helper settles the operation with the reason (the
+        // notice `runPublishChecks` raised, or a fixed fallback), so the
+        // terminal row never reads as a bare refusal.
+        checksRefused = !(await runFastForwardPublishChecksV1({
+          runChecks: () =>
+            vscode.commands.executeCommand("vs-code-ai-helper.runPublishChecks", {
+              taskFolderPath: resolved.folderUri.fsPath,
+              admissionHandoffTokenV1: publishChecksHandoffToken,
+              // Without the parent, the checks ask for a second root and this
+              // run's own lock refuses them.
+              parentOperation: op,
+            }) as Promise<unknown>,
+          isFreshAfterChecks: async () =>
+            (
+              await checkPublishChecksFreshnessV1(
+                resolved.folderUri,
+                publishScopeFolder,
+                await resolveHeadCommitSha(publishScopeFolder)
+              )
+            ).status === "valid",
+          op,
+        }));
       } finally {
         revokeWorkAdmissionHandoffV1(resolved.folderUri.fsPath);
       }
-      const freshnessAfterChecks = await checkPublishChecksFreshnessV1(
-        resolved.folderUri,
-        publishScopeFolder,
-        await resolveHeadCommitSha(publishScopeFolder)
-      );
-      if (freshnessAfterChecks.status !== "valid") {
-        // `runPublishChecks` already reported why (checks failed, was
-        // cancelled, no model configured, ...) with its own specific
-        // notification — this is a genuine refusal, never "did not
-        // produce usable output", and no review round was ever claimed,
-        // so there is nothing here to terminalize as completed.
+      if (checksRefused) {
         return false;
       }
     }
@@ -11140,7 +11153,7 @@ export async function generateImplementationWithAI(
   // identical check for why this must use the resolver rather than the raw
   // `status` field.
   if (await isEffectivelyPausedV1(resolved.folderUri.fsPath, resolved.progress)) {
-    showPausedTaskRefusalV1("generating implementation notes", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("generating implementation notes", resolved.folderUri.fsPath);
     return;
   }
 
@@ -12699,11 +12712,15 @@ async function executeImplementationRun(
             undefined,
             undefined,
             uncheckedItemsWithoutClearingReview
-              ? {
+              ? await offerActionInChatV1({
+                  taskFolderPath: folderUri.fsPath,
+                  actionLabel: "Run Review",
                   command: "vs-code-ai-helper.runReviewWithAI",
-                  title: "Run Review",
-                  args: [{ taskFolderPath: folderUri.fsPath }]
-                }
+                  args: [{ taskFolderPath: folderUri.fsPath }],
+                  noticeText:
+                    "Implementation finished with no workspace file changes, and plan items are still unchecked. " +
+                    "Run this stage's review next.",
+                })
               : undefined
           );
         }
@@ -14444,7 +14461,7 @@ export async function runImplementationWithAI(
   // `resolved.progress.status` stale at "active" and slip past a raw
   // `resolved.progress.status === "paused"` fallback check.
   if (reconciled.outcome === "userPaused") {
-    showPausedTaskRefusalV1("running implementation", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("running implementation", resolved.folderUri.fsPath);
     return false;
   }
   if (reconciled.outcome === "reversed") {
@@ -14821,11 +14838,13 @@ export async function runImplementationWithAI(
     // command on an explicit request is its own kind of opaque. Non-modal so
     // it cannot block an unattended chain; defaulting to proceeding keeps
     // every existing automated caller behaving exactly as before.
+    const preRunPlanOfRecord = await readPlanOfRecordV1(resolved.folderUri);
+    const preRunOpenItems = preRunPlanOfRecord.counts?.remaining ?? 0;
     const preRunDecision = decidePostReviewActionV1({
       history: resolved.progress.reviewScoreHistory,
       stages: IMPL_REVIEW_STAGES_V1,
-      hasUntickedChecklistItems:
-        ((await readPlanOfRecordV1(resolved.folderUri)).counts?.remaining ?? 0) > 0,
+      hasUntickedChecklistItems: preRunOpenItems > 0,
+      planOfRecord: preRunPlanOfRecord.text,
       continuationOwed: resolved.progress.implRecovery !== undefined,
       pendingImplReviewFilesCount: resolved.progress.pendingImplReviewFiles?.length ?? 0,
     });
@@ -14886,18 +14905,29 @@ export async function runImplementationWithAI(
       // those steps still queued and actionable, and the user correctly
       // overrode the recommendation.
       const bothValid = preRunDecision.action === "both";
-      const whatHappenedSuffix = bothValid
+      // The review's task-fixable blockers are unbuilt work this very round builds.
+      const blockersAreUnbuilt = bothValid && preRunDecision.recommendLetItRun === true;
+      const whatHappenedSuffix = blockersAreUnbuilt
+        ? " Implementation is running now anyway — the review's task-fixable blockers describe work that is " +
+          "still unbuilt, which this round builds from the unticked checklist items."
+        : bothValid
         ? " Implementation is running now anyway — it can still make progress on the unticked checklist " +
           "items, but will not fix the problems the review found."
         : " Implementation is running now anyway — it will most likely change nothing.";
-      const whyUserNeeded = bothValid
+      const whyUserNeeded = blockersAreUnbuilt
+        ? "The newest review's findings describe unbuilt work, so Implementation can fix them; Go to Review & " +
+          "Apply would cancel the running round and throw its work away."
+        : bothValid
         ? "Both actions are valid here: Implementation can still land real, queued checklist work, but only " +
           "Apply Review can fix what the newest review found — this lets you choose which to prioritize " +
           "instead of assuming one makes the other pointless."
         : "Implementation only reads the plan checklist, so it cannot fix what the newest review still " +
           "reports — this offers a shortcut to the review stage instead of leaving you to notice, after " +
           "the round finishes having changed nothing, that Apply Review was the action you needed.";
-      const letItRunConsequence = bothValid
+      const letItRunConsequence = blockersAreUnbuilt
+        ? "Does nothing further. Implementation keeps running as already started and builds the unticked " +
+          "checklist items the review's blockers describe; a fresh review runs after it."
+        : bothValid
         ? "Does nothing further. Implementation keeps running as already started, and can still make " +
           "progress on the unticked checklist items — it just will not fix the problems the newest review found."
         : "Does nothing further. Implementation keeps running as already started, and will most " +
@@ -14908,7 +14938,9 @@ export async function runImplementationWithAI(
           "them to compound."
         : "Apply Review is the only action that can fix what the newest review still reports; " +
           "Implementation is structurally blind to it and will most likely change nothing.";
-      const fallbackNoticeSuffix = bothValid
+      const fallbackNoticeSuffix = blockersAreUnbuilt
+        ? " Implementation is building the unticked checklist items the review's blockers describe."
+        : bothValid
         ? " Implementation can still make progress on the checklist, but will not fix what the review found."
         : " Running Implementation now will most likely change nothing.";
       const decision = await postWorkflowDecisionV1(
@@ -14925,7 +14957,10 @@ export async function runImplementationWithAI(
               label: "Go to Review & Apply",
               consequence:
                 `Moves the task to ${STAGE_DISPLAY_NAMES[targetReviewStage]} and opens Apply Review, which ` +
-                "can fix the blockers Implementation cannot see (Implementation only reads the plan checklist). " +
+                (blockersAreUnbuilt
+                  ? "can fix defects in landed work, but those blockers are unbuilt work that Implementation is " +
+                    "already building. "
+                  : "can fix the blockers Implementation cannot see (Implementation only reads the plan checklist). ") +
                 "Moving stages first requests the Implementation round already running to cancel — a task " +
                 "never has two automations running against it at once — so this also stops the current run.",
               effect: {
@@ -14949,11 +14984,21 @@ export async function runImplementationWithAI(
               effect: { kind: "doNothing" },
             },
           ],
-          recommendation: {
-            kind: "option",
-            optionId: "goToReviewAndApply",
-            reasoning: recommendationReasoning,
-          },
+          recommendation:
+            runningImplementationRecommendedOptionV1(preRunDecision) === "letItRun"
+              ? {
+                  kind: "option",
+                  optionId: "letItRun",
+                  reasoning:
+                    `${preRunOpenItems} plan ${preRunOpenItems === 1 ? "item is" : "items are"} still open and ` +
+                    "the task-fixable blockers are unbuilt work, which this Implementation round builds. A fresh " +
+                    "review runs after Implementation, and Go to Review & Apply would cancel this round.",
+                }
+              : {
+                  kind: "option",
+                  optionId: "goToReviewAndApply",
+                  reasoning: recommendationReasoning,
+                },
           gating: {
             holdsTaskPaused: false,
             unblocksProgress: false,
@@ -15459,7 +15504,7 @@ export async function applyReviewEditWithAI(
     return false;
   }
   if (reconciled.outcome === "userPaused") {
-    showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
+    await showPausedTaskRefusalV1("applying a review", resolved.folderUri.fsPath);
     return false;
   }
   if (reconciled.outcome === "reversed") {

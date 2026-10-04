@@ -95,7 +95,7 @@ const CLINE_LIKE: CliProviderDefinition = {
   label: "Cline CLI",
   command: "cline",
   installHint: "Install the Cline CLI.",
-  loginHint: "Run `cline auth cline-pass` and sign in.",
+  loginHint: "Run `cline auth` and choose ClinePass in its wizard.",
   authErrorMarkers: [
     "not logged in",
     "login",
@@ -1019,7 +1019,7 @@ void describe("toFriendlyError — Cline", () => {
     const friendly = toFriendlyError(CLINE_LIKE, "cline-pass/deepseek-v4-pro", 1, "", stdout);
 
     assert.equal(friendly.authFailure, true);
-    assert.match(friendly.message, /cline auth cline-pass/);
+    assert.match(friendly.message, /cline auth/);
   });
 });
 

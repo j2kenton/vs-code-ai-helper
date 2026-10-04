@@ -541,9 +541,33 @@ void describe("describeEditActionOutcomeFailureV1 (candidatesExhausted vs provid
     const message = result.errorMessage;
     assert.ok(message);
     assert.match(message, /candidatesExhausted/);
-    assert.match(message, /Every configured model was tried and failed/);
+    assert.match(message, /Every configured model that could run was tried and failed/);
     assert.match(message, /claude-sonnet-4\.6 \(GitHub Copilot\)/);
     assert.doesNotMatch(message, /was unavailable/);
+  });
+
+  void it("names a provider-disabled candidate with its reason", () => {
+    const outcome: TaskActionOutcomeV1 = {
+      kind: "unavailable",
+      code: "candidatesExhausted",
+      chainExhaustion: {
+        stage: "impl",
+        candidates: [
+          ...EXHAUSTION.candidates,
+          {
+            storedModelId: "claude-cli:claude-sonnet-5-5@high",
+            providerLabel: "Claude Code",
+            runnerId: "claude-cli",
+            reason: "provider disabled",
+          },
+        ],
+      },
+    };
+    const message = describeEditActionOutcomeFailureV1(outcome, "copilot-lm").errorMessage;
+    assert.ok(message);
+    assert.match(message, /Claude Code\): provider disabled/);
+    assert.match(message, /Not tried: .*provider disabled/);
+    assert.doesNotMatch(message, /Every configured model was tried and failed/);
   });
 
   void it("reports 'no model was available' for providerModeUnavailable, never implying an invocation happened", () => {

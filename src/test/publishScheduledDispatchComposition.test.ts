@@ -315,4 +315,41 @@ void describe("applyCurrentStageAction records the downstream command's own stat
       deactivateNotificationRouter();
     }
   });
+
+  void it("a Publish dispatch that declines with no notice records that it declined without saying why (RC7 item 5)", async () => {
+    const taskFolderPath = makeTaskFolder("declined-downstream-silent");
+    const progress = fixtureProgress(taskFolderPath);
+    writeProgress(taskFolderPath, progress);
+
+    const inventory = makeInventory(taskFolderPath, progress);
+    const currentTaskStore = new CurrentTaskStore(fakeMemento());
+    initNotificationRouter(new RecordingSurface());
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const model = installPublishModelSetting();
+
+    const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+    const original = commands.executeCommand;
+    commands.executeCommand = ((id: string): Promise<unknown> =>
+      Promise.resolve(id === "vs-code-ai-helper.runPublishChecks" ? false : undefined)) as typeof commands.executeCommand;
+
+    try {
+      clearStageActionRefusalReasonV1(taskFolderPath);
+      const dispatched = await applyCurrentStageAction(inventory, currentTaskStore, {
+        taskFolderPath,
+        canonicalId: taskFolderPath,
+      } as never);
+      assert.equal(dispatched, false);
+      assert.equal(
+        takeStageActionRefusalReasonV1(taskFolderPath),
+        "runPublishChecks declined to start without saying why"
+      );
+    } finally {
+      commands.executeCommand = original;
+      model.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
 });

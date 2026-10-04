@@ -40,14 +40,14 @@ Ensemble can also drive vendor CLIs that authenticate against your existing subs
 | Provider | Install | Account |
 |---|---|---|
 | **Gemini CLI** | `npm i -g @google/gemini-cli`, then run `gemini` once | Google account; free tier available |
-| **Claude Code** | `npm i -g @anthropic-ai/claude-code`, then run `claude` once | Claude Pro or Max subscription |
+| **Claude Code** | `curl -fsSL https://claude.ai/install.sh \| bash` (`npm i -g @anthropic-ai/claude-code` is still supported), then run `claude` once | Claude Pro or Max subscription |
 | **Codex CLI** | `npm i -g @openai/codex`, then `codex login` | ChatGPT Plus or Pro subscription |
 | **Antigravity** | Install the Antigravity CLI, then run `agy` once | Google account |
-| **Kiro CLI** | Install from [kiro.dev/cli](https://kiro.dev/cli/) | Kiro login **and** a `KIRO_API_KEY` environment variable — `kiro-cli login` alone is not sufficient for headless runs |
+| **Kiro CLI** | `curl -fsSL https://cli.kiro.dev/install \| bash` | Kiro login **and** a `KIRO_API_KEY` environment variable — `kiro-cli login` alone is not sufficient for headless runs |
 | **OpenCode Zen / Go** | `npm i -g opencode-ai`, then run `opencode` and use `/connect` | Zen and Go share an OpenCode account/API key, but are separate services: Zen needs its own billing and Go needs an active Go subscription |
-| **Cline CLI** | `npm i -g cline`, then `cline auth cline-pass` | [ClinePass](https://docs.cline.bot/getting-started/clinepass) subscription ($9.99/mo) — a curated open-weights model catalog (DeepSeek, GLM, Kimi, MiniMax, MiMo, Qwen) |
+| **Cline CLI** | `npm i -g cline`, then `cline auth` and choose ClinePass in its wizard | [ClinePass](https://docs.cline.bot/getting-started/clinepass) subscription ($9.99/mo) — a curated open-weights model catalog (DeepSeek, GLM, Kimi, MiniMax, MiMo, Qwen) |
 | **Kimi Code CLI** | Official installer only — `irm https://code.kimi.com/kimi-code/install.ps1 \| iex` (Windows) or `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` (macOS/Linux), then `kimi login`. Do **not** install via `npm i -g @moonshot-ai/kimi-code` — see the note below. | Moonshot AI / Kimi Code account (OAuth device-code sign-in) |
-| **devpass-code** | Install devpass-code, then `devpass-code providers login` | LLM Gateway DevPass credential — a single account fronting a large model catalog (Claude, GPT, Gemini, GLM, Grok, DeepSeek, Qwen, Kimi, and more) |
+| **devpass-code** | Install devpass-code, then `devpass-code auth login` | LLM Gateway DevPass credential — a single account fronting a large model catalog (Claude, GPT, Gemini, GLM, Grok, DeepSeek, Qwen, Kimi, and more) |
 
 OpenCode appears as two separate provider rows in Ensemble: **OpenCode Zen** for `opencode/...` models and **OpenCode Go** for `opencode-go/...` models. They use the same `opencode` CLI and can use the same OpenCode key, but enabling or connecting one does not grant access to the other. Choose the tier explicitly; a Zen/Go backup is only used when you explicitly select it as a backup model.
 

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { createHash } from "crypto";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
 import { createTaskProgressV1, writeTaskProgressV1 } from "../services/taskProgressWriterV1";
@@ -296,11 +297,14 @@ export async function retryTaskCreation(
             undefined,
             undefined,
             undefined,
-            {
+            await offerActionInChatV1({
+              taskFolderPath,
+              actionLabel: "Resume",
               command: "vs-code-ai-helper.resumeTask",
-              title: "Resume",
               args: [{ taskFolderPath }],
-            }
+              noticeText: "Task creation resumed in paused state.",
+              holdsTaskPaused: true,
+            })
           );
         }
 
@@ -558,11 +562,14 @@ export async function adoptAndRetryTaskCreation(
             undefined,
             undefined,
             undefined,
-            {
+            await offerActionInChatV1({
+              taskFolderPath,
+              actionLabel: "Resume",
               command: "vs-code-ai-helper.resumeTask",
-              title: "Resume",
               args: [{ taskFolderPath }],
-            }
+              noticeText: "Task creation resumed in paused state; task.md preserved.",
+              holdsTaskPaused: true,
+            })
           );
         }
 

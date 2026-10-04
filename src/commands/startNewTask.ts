@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { TASK_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "../types/taskProgress";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { createTaskProgressV1, writeTaskProgressV1 } from "../services/taskProgressWriterV1";
@@ -525,16 +526,21 @@ async function createTask(
     // operations. The explicit argument is essential; a bare resume command
     // would instead resume the older current task.
     const folderName = taskFolderName;
+    const pausedNotice = `${folderName}: task created in paused state.`;
     NotificationRouter.showWarning(
-      `${folderName}: task created in paused state.`,
+      pausedNotice,
       undefined,
       undefined,
       undefined,
-      {
+      await offerActionInChatV1({
+        taskFolderPath,
+        taskLabel: folderName,
+        actionLabel: "Resume",
         command: "vs-code-ai-helper.resumeTask",
-        title: "Resume",
         args: [{ taskFolderPath }],
-      }
+        noticeText: pausedNotice,
+        holdsTaskPaused: true,
+      })
     );
   }
 

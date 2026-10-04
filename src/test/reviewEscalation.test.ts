@@ -2118,6 +2118,276 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     assert.match(decision.evidence?.find((e) => e.label === "The round's evidence")?.detail ?? "", /No evidence on file/);
   });
 
+  // RC7 items 1 and 3: plan-review narrowing cards, owner-decision
+  // recommendations, and unbuilt-work recommendations.
+  const RC7_PLAN_MD = [
+    "# Plan",
+    "",
+    "## Part D",
+    "",
+    "1. Step 11: Run the automatic Publish review after a successful fix",
+    "2. Step 12: Something else",
+    "",
+  ].join("\n");
+
+  async function postRc7Card(
+    name: string,
+    stage: "plan-high-review" | "impl-high-review",
+    files: { planMd?: string; planFinal?: string },
+    reviewContent: string,
+    blockers: ReviewBlocker[],
+    taskFixableCount: number
+  ): Promise<ReturnType<WorkflowDecisionStoreV1["listPending"]>[number] | undefined> {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    initNotificationRouter(new RecordingSurface());
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri(name);
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({ status: "active", currentStage: stage, reviewAttemptId: "attempt-rc7" })
+    );
+    if (files.planMd !== undefined) {
+      store.set(vscode.Uri.joinPath(folderUri, "plan.md").toString(), files.planMd);
+    }
+    if (files.planFinal !== undefined) {
+      store.set(vscode.Uri.joinPath(folderUri, "plan-final.md").toString(), files.planFinal);
+    }
+    try {
+      await escalateReviewToHuman(folderUri, stage, "plateau", "stuck", "attempt-rc7", undefined, false, undefined, {
+        content: reviewContent,
+        blockers,
+        taskFixableCount,
+      });
+      return new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  }
+
+  const recommended = (decision: { recommendation: { kind: string; optionId?: string } } | undefined): string | undefined =>
+    decision?.recommendation.kind === "option" ? decision.recommendation.optionId : undefined;
+
+  const PLAN_NARROWING =
+    "Narrowing needs an owner decision: Part D Step 11 skips the required automatic Publish review after a successful fix";
+
+  void it("a plan-review card whose only blocker is a narrowing offers both options, shows the item and recommends Accept (RC7 item 1)", async () => {
+    const decision = await postRc7Card(
+      "rc7-plan-narrowing",
+      "plan-high-review",
+      { planMd: RC7_PLAN_MD },
+      "Readiness: 6/10\n\nStep 11 skips the publish review when admission is held.\n\nUnrelated paragraph.",
+      [{ category: "completion", resolver: "environmental", description: PLAN_NARROWING }],
+      0
+    );
+    assert.ok(decision);
+    assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing"));
+    assert.ok(decision.options.some((o) => o.optionId === "keepItemOpen"));
+    assert.match(decision.evidence?.find((e) => e.label === "Plan item")?.detail ?? "", /Step 11/);
+    assert.match(decision.evidence?.find((e) => e.label === "The round's evidence")?.detail ?? "", /admission is held/);
+    assert.match(
+      decision.evidence?.find((e) => e.label === "The round's reason")?.detail ?? "",
+      /skips the required automatic Publish review/
+    );
+    assert.equal(recommended(decision), "acceptNarrowing");
+    const accept = decision.options.find((o) => o.optionId === "acceptNarrowing");
+    assert.match(accept?.consequence ?? "", /plan\.md/);
+  });
+
+  void it("a narrowing that cannot be located names neither option and is not an Advance recommendation", async () => {
+    const decision = await postRc7Card(
+      "rc7-plan-narrowing-unlocatable",
+      "plan-high-review",
+      { planMd: RC7_PLAN_MD },
+      "Readiness: 6/10\n",
+      [
+        {
+          category: "completion",
+          resolver: "environmental",
+          description: "Narrowing needs an owner decision: Step 99 of nothing in the plan",
+        },
+      ],
+      0
+    );
+    assert.ok(decision);
+    assert.equal(decision.options.some((o) => o.optionId === "acceptNarrowing" || o.optionId === "keepItemOpen"), false);
+    const clears = decision.evidence?.find((e) => e.label === "What clears this")?.detail ?? "";
+    assert.doesNotMatch(clears, /Accept this narrowing|Keep the item open/);
+    assert.match(clears, /Accepted Non-Goals/);
+    assert.equal(recommended(decision), "handleMyself");
+  });
+
+  void it("an unlocatable narrowing plus another environmental blocker never names the narrowing options", async () => {
+    const decision = await postRc7Card(
+      "rc7-unlocatable-plus-env",
+      "plan-high-review",
+      { planMd: RC7_PLAN_MD },
+      "Readiness: 6/10\n",
+      [
+        { category: "completion", resolver: "environmental", description: "Narrowing needs an owner decision: Step 99 of nothing in the plan" },
+        { category: "completion", resolver: "environmental", description: "The sandbox has no network access" },
+      ],
+      0
+    );
+    assert.ok(decision);
+    assert.equal(decision.options.some((o) => o.optionId === "acceptNarrowing" || o.optionId === "keepItemOpen"), false);
+    const text = JSON.stringify(decision.evidence ?? []);
+    assert.doesNotMatch(text, /Accept this narrowing|Keep the item open/);
+  });
+
+  void it("the Box C shape (owner evidence plus an unlocatable narrowing) recommends leaving it paused, never Advance", async () => {
+    const decision = await postRc7Card(
+      "rc7-box-c",
+      "plan-high-review",
+      { planMd: RC7_PLAN_MD },
+      "Readiness: 6/10\n",
+      [
+        { category: "completion", resolver: "environmental", description: "Owner evidence needed: run `claude --version`" },
+        { category: "completion", resolver: "environmental", description: "Owner evidence needed: check the docs page" },
+        { category: "completion", resolver: "environmental", description: "Owner evidence needed: confirm the install hint" },
+        { category: "completion", resolver: "environmental", description: "Narrowing needs an owner decision: nothing locatable" },
+      ],
+      0
+    );
+    assert.ok(decision);
+    assert.equal(recommended(decision), "handleMyself");
+  });
+
+  void it("a mixed plan-review plateau recommends Accept and still names the owner-evidence action", async () => {
+    const decision = await postRc7Card(
+      "rc7-mixed",
+      "plan-high-review",
+      { planMd: RC7_PLAN_MD },
+      "Readiness: 6/10\n",
+      [
+        { category: "completion", resolver: "environmental", description: PLAN_NARROWING },
+        { category: "completion", resolver: "environmental", description: "Owner evidence needed: check the docs page" },
+      ],
+      0
+    );
+    assert.ok(decision);
+    assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing"));
+    assert.equal(recommended(decision), "acceptNarrowing");
+    assert.match(
+      (decision.recommendation as { reasoning?: string }).reasoning ?? "",
+      /Every remaining blocker clears only through an owner decision/
+    );
+    const clears = decision.evidence?.find((e) => e.label === "What clears this")?.detail ?? "";
+    assert.match(clears, /Accept this narrowing/);
+    assert.match(clears, /Owner evidence|evidence only you can gather/);
+  });
+
+  const RC7_IMPL_PLAN = [
+    "<!-- ensemble:implementation-checklist -->",
+    "## Part A: handlers",
+    "- [ ] Step 1: add the A handler",
+    "## Part B: reader",
+    "- [x] Step 4: fix the stage reader",
+    "- [ ] Step 13: investigate the previous HEAD cause-first",
+    "",
+  ].join("\n");
+  const UNBUILT =
+    "Step 13's previous-HEAD, cause-first investigation and specified targeted Parts A and B tests remain incomplete;";
+
+  void it("open plan items with only an unbuilt-work completion blocker recommend building them (RC7 item 3)", async () => {
+    const decision = await postRc7Card(
+      "rc7-build",
+      "impl-high-review",
+      { planFinal: RC7_IMPL_PLAN },
+      "Readiness: 5/10\n",
+      [{ category: "completion", resolver: "task-fixable", description: UNBUILT, origin: "reviewer" }],
+      1
+    );
+    assert.ok(decision);
+    assert.equal(recommended(decision), "buildRemaining");
+    const reasoning = decision.recommendation.kind === "option" ? decision.recommendation.reasoning : "";
+    assert.match(reasoning, /plan items are still open and the remaining blocker is unbuilt work/);
+    assert.match(decision.evidence?.find((e) => e.label === "What clears this")?.detail ?? "", /Build the \d+ open plan items/);
+  });
+
+  void it("a defect, an architectural blocker, or no open items keep recommending Keep iterating", async () => {
+    for (const [name, blockers, planFinal] of [
+      [
+        "rc7-keep-defect",
+        [{ category: "completion", resolver: "task-fixable", description: "Step 4's fix is wrong" }],
+        RC7_IMPL_PLAN,
+      ],
+      [
+        "rc7-keep-architectural",
+        [{ category: "architectural", resolver: "task-fixable", description: UNBUILT }],
+        RC7_IMPL_PLAN,
+      ],
+      [
+        "rc7-keep-no-open",
+        [{ category: "completion", resolver: "task-fixable", description: UNBUILT }],
+        RC7_IMPL_PLAN.replace(/- \[ \]/g, "- [x]"),
+      ],
+    ] as const) {
+      const decision = await postRc7Card(
+        name,
+        "impl-high-review",
+        { planFinal },
+        "Readiness: 5/10\n",
+        blockers.map((b) => ({ ...b, origin: "reviewer" as const })) as ReviewBlocker[],
+        1
+      );
+      assert.ok(decision, name);
+      assert.equal(recommended(decision), "keepIterating", name);
+    }
+  });
+
+  void it("an added mechanical blocker still recommends building; unbuilt-work fallbacks keep iterating (RC7 item 3)", async () => {
+    const cases: Array<[string, Array<Record<string, string>>, string]> = [
+      [
+        "rc7-mech-added",
+        [
+          { category: "completion", resolver: "task-fixable", description: UNBUILT, origin: "reviewer" },
+          { category: "completion", resolver: "task-fixable", description: "Lint fails on src/a.ts", origin: "mechanical" },
+        ],
+        "buildRemaining",
+      ],
+      [
+        "rc7-missing-word",
+        [
+          {
+            category: "completion",
+            resolver: "task-fixable",
+            description: "Part A's handler is missing empty-list handling",
+            origin: "reviewer",
+          },
+        ],
+        "keepIterating",
+      ],
+      [
+        "rc7-no-plan-item",
+        [{ category: "completion", resolver: "task-fixable", description: "The docs remain incomplete", origin: "reviewer" }],
+        "keepIterating",
+      ],
+      [
+        "rc7-mechanical-only",
+        [{ category: "completion", resolver: "task-fixable", description: "Lint fails on src/a.ts", origin: "mechanical" }],
+        "keepIterating",
+      ],
+    ];
+    for (const [name, blockers, expected] of cases) {
+      const decision = await postRc7Card(
+        name,
+        "impl-high-review",
+        { planFinal: RC7_IMPL_PLAN },
+        "Readiness: 5/10\n",
+        blockers as unknown as ReviewBlocker[],
+        1
+      );
+      assert.ok(decision, name);
+      assert.equal(recommended(decision), expected, name);
+    }
+  });
+
   void it("a first, non-plateau review with only the narrowing blocker is routed to escalate and posts the card", async () => {
     const store = new Map<string, string>();
     installMemStore(store);

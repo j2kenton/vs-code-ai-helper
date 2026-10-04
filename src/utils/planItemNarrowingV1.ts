@@ -30,7 +30,11 @@ const NO_REASON_TEXT = "The round left no reason on file.";
 const NO_EVIDENCE_TEXT = "No evidence on file; the blocker text above is all the reviewer recorded.";
 const EVIDENCE_CAP = 600;
 
-export type NarrowingSourceV1 = "the round's refused checklist rewording" | "impl-summary.md" | "none";
+export type NarrowingSourceV1 =
+  | "the round's refused checklist rewording"
+  | "impl-summary.md"
+  | `the plan review (${string})`
+  | "none";
 
 export interface NarrowingBlockerV1 {
   itemText: string;
@@ -172,4 +176,128 @@ export function findNarrowingBlockerV1(
   }
 
   return { itemText, itemTicked, blocker: blockerText, reason, reasonSource, evidence, evidenceSource };
+}
+
+// Unindented only: nested (indented) child bullets are not plan items.
+const PLAN_LIST_LINE = /^((?:[-*]|\d+[.)])[ \t]+)(?:\[[ xX]\][ \t]+)?(.*\S)[ \t]*\r?$/;
+
+/** Top-level lines of `plan.md` that read as plan items (bulleted, numbered or checkbox), in file order. */
+function planStageItemLines(
+  planMd: string
+): { text: string; marker: string; part: string | undefined }[] {
+  const items: { text: string; marker: string; part: string | undefined }[] = [];
+  let part: string | undefined;
+  for (const line of planMd.split("\n")) {
+    const heading = /^#{1,6}[ \t]+(.*\S)/.exec(line);
+    if (heading !== null) {
+      part = /\bPart[ \t]+([A-Z0-9]+)\b/i.exec(heading[1] ?? "")?.[1]?.toUpperCase();
+      continue;
+    }
+    const match = PLAN_LIST_LINE.exec(line);
+    if (match !== null) {
+      items.push({ text: (match[2] ?? "").trim(), marker: match[1] ?? "", part });
+    }
+  }
+  return items;
+}
+
+function startsWithStep(line: { text: string; marker: string }, step: string): boolean {
+  // The list marker carries a numbered line's own number ("11. "); try the
+  // line with it and without it ("1. Step 11: …").
+  const re = new RegExp(`^(?:step[ \\t]+${step}\\b|${step}[.)])`, "i");
+  const bare = line.text.replace(/^[*_]+/, "");
+  const withMarker = `${/^\d/.test(line.marker) ? line.marker : ""}${line.text}`.replace(/^[*_]+/, "");
+  return re.test(bare) || re.test(withMarker);
+}
+
+function findPlanStageItem(description: string, planMd: string): string | undefined {
+  const lines = planStageItemLines(planMd);
+  const rest = norm(description.trim().replace(NARROWING_PREFIX_RE, ""));
+  const contained = lines.filter((line) => {
+    const n = norm(line.text);
+    return n.length > 0 && rest.includes(n);
+  });
+  if (contained.length > 0) {
+    const longest = Math.max(...contained.map((line) => norm(line.text).length));
+    const best = contained.filter((line) => norm(line.text).length === longest);
+    if (best.length === 1) {
+      return best[0]!.text;
+    }
+  }
+  const span = backtickedSpans(description)[0];
+  if (span !== undefined) {
+    const wanted = norm(span);
+    const exact = lines.filter((line) => norm(line.text) === wanted);
+    if (exact.length === 1) {
+      return exact[0]!.text;
+    }
+  }
+  const step = /\bstep[ \t]+(\d+)\b/i.exec(description)?.[1];
+  if (step !== undefined) {
+    const partName = /\bPart[ \t]+([A-Z0-9]+)\b/i.exec(description)?.[1]?.toUpperCase();
+    const hits = lines.filter(
+      (line) => startsWithStep(line, step) && (partName === undefined || line.part === partName)
+    );
+    if (hits.length === 1) {
+      return hits[0]!.text;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Plan-stage twin of {@link findNarrowingBlockerV1}: at a plan review neither
+ * `plan-final.md` nor an implementation summary exists, so the item comes
+ * from `plan.md` and the reason and evidence from the blocker and the plan
+ * review. Only narrowing-prefixed blockers qualify, and an item that cannot
+ * be located uniquely returns undefined (no options are then offered).
+ */
+export function findPlanStageNarrowingBlockerV1(
+  blockers: readonly { description: string }[],
+  planMd: string | undefined,
+  planReview: string | undefined,
+  planReviewFileName: string,
+): NarrowingBlockerV1 | undefined {
+  if (planMd === undefined || planMd.trim() === "") {
+    return undefined;
+  }
+  for (const b of blockers) {
+    if (!NARROWING_PREFIX_RE.test(b.description.trim())) {
+      continue;
+    }
+    const itemText = findPlanStageItem(b.description, planMd);
+    if (itemText === undefined) {
+      continue;
+    }
+    const reasonText = b.description.trim().replace(NARROWING_PREFIX_RE, "").trim();
+    const stepRef = /\bstep[ \t]+\d+\b/i.exec(b.description)?.[0];
+    const tokens = [...backtickedSpans(itemText), ...backtickedSpans(b.description)];
+    const paragraphs = (planReview ?? "")
+      .split(/\n\s*\n/)
+      .map((p) => p.trim())
+      .filter(
+        (p) =>
+          p.length > 0 &&
+          ((stepRef !== undefined && p.toLowerCase().includes(stepRef.toLowerCase())) ||
+            tokens.some((t) => p.includes(t)))
+      );
+    const source: NarrowingSourceV1 = `the plan review (${planReviewFileName})`;
+    let evidence = NO_EVIDENCE_TEXT;
+    let evidenceSource: NarrowingSourceV1 = "none";
+    if (paragraphs.length > 0) {
+      const joined = paragraphs.join("\n\n");
+      evidence = joined.length > EVIDENCE_CAP ? `${joined.slice(0, EVIDENCE_CAP - 1)}…` : joined;
+      evidenceSource = source;
+    }
+    return {
+      itemText,
+      itemTicked: false,
+      blocker: b.description,
+      reason: reasonText.length > 0 ? reasonText : NO_REASON_TEXT,
+      reasonSource: reasonText.length > 0 ? source : "none",
+      evidence,
+      evidenceSource,
+    };
+  }
+  return undefined;
 }

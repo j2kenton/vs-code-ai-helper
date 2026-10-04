@@ -499,7 +499,10 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     // A concrete follow-up (e.g. "Publish Anyway") is exposed as a separate
     // inline button, never as the row's click target — the click always
     // navigates to the notification's full text/target above.
-    if (element.actionCommand) {
+    // RC7 item 4: the inline button only ever opens the chat, so only a
+    // chat pointer gets it; any other direct action carries no button (the
+    // notification text already says what to do).
+    if (element.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision") {
       contextTokens.push("ensemble-notification-actionable");
       const actionTitle = element.actionCommand.title;
       const baseTooltip = item.tooltip instanceof vscode.MarkdownString

@@ -849,7 +849,7 @@ export async function draftTaskWithAI(
     // this command — only a watchdog-provenance pause is reversible, and
     // that reversal already happened above, before the allowPaused gate.
     if (reconcileOutcomeCapturedV1?.outcome === "userPaused" || reconcileOutcomeCapturedV1?.outcome === "unreadable") {
-      showPausedTaskRefusalV1("using Draft Task with AI", resolvedTask.taskFolderPath, resolvedTask.progress.displayName);
+      await showPausedTaskRefusalV1("using Draft Task with AI", resolvedTask.taskFolderPath, resolvedTask.progress.displayName);
       return;
     }
 

@@ -8,7 +8,7 @@
  */
 import * as vscode from "vscode";
 import * as path from "path";
-import { TaskStage } from "../types/taskProgress";
+import { isPlanReviewStage, STAGE_ARTIFACT_FILENAMES, TaskStage } from "../types/taskProgress";
 import { WorkflowDecisionCommandResultV1 } from "../types/workflowDecisionV1";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -75,17 +75,25 @@ export async function acceptPlanItemNarrowingV1(
     return { outcome: "refused", message: "This decision is missing its item or blocker; nothing was written." };
   }
   const taskName = formatNotificationTaskLabelV1(undefined, arg.taskFolderPath);
-  const planUri = getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath));
+  // RC7 item 1: at a plan review the decision belongs in plan.md, the plan of
+  // record at that point; plan-final.md does not exist yet.
+  const atPlanStage = isPlanReviewStage(arg.stage);
+  const planFileName = atPlanStage ? (STAGE_ARTIFACT_FILENAMES.plan ?? "plan.md") : "plan-final.md";
+  const planUri = atPlanStage
+    ? vscode.Uri.joinPath(vscode.Uri.file(arg.taskFolderPath), planFileName)
+    : getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath));
   const plan = await readTextIfExists(planUri);
   const stalePlanMessage =
     "the plan changed since this card was posted, or the item is open again; nothing was written";
   if (plan === undefined) {
-    return { outcome: "refused", message: `plan-final.md could not be read; ${stalePlanMessage}.` };
+    return { outcome: "refused", message: `${planFileName} could not be read; ${stalePlanMessage}.` };
   }
   const wanted = norm(arg.itemText);
-  const record = listOpenPlanItemRecordsV1(plan).find((r) => norm(r.itemText) === wanted);
-  const ticked = listCheckedChecklistItemTextsV1(plan).some((t) => norm(t) === wanted);
-  if (!record || !ticked) {
+  const stillPresent = atPlanStage
+    ? norm(plan).includes(wanted)
+    : listOpenPlanItemRecordsV1(plan).some((r) => norm(r.itemText) === wanted) &&
+      listCheckedChecklistItemTextsV1(plan).some((t) => norm(t) === wanted);
+  if (!stillPresent) {
     return { outcome: "refused", message: `Plan changed, try again: ${stalePlanMessage}.` };
   }
 
@@ -103,7 +111,7 @@ export async function acceptPlanItemNarrowingV1(
       heading
     );
     if (!(await writeTextFileIfUnchangedV1(planUri, plan, updated))) {
-      return { outcome: "refused", message: "Plan changed, try again: plan-final.md changed while writing; nothing was written." };
+      return { outcome: "refused", message: `Plan changed, try again: ${planFileName} changed while writing; nothing was written.` };
     }
   }
 
@@ -113,20 +121,20 @@ export async function acceptPlanItemNarrowingV1(
     const current = await deps.readCurrentStage(arg.taskFolderPath);
     if (current === undefined || REVIEW_TARGETS[current] !== arg.stage) {
       NotificationRouter.showWarning(
-        `${taskName}: the decision was written to plan-final.md, but the task has since moved past the stage this ` +
+        `${taskName}: the decision was written to ${planFileName}, but the task has since moved past the stage this ` +
           "card was about, so the review was not re-run."
       );
     } else {
       if (!(await deps.rerunReview(arg.taskFolderPath, arg.stage))) {
         NotificationRouter.showWarning(
-          `${taskName}: the decision was written to plan-final.md, but the review was not re-run ` +
+          `${taskName}: the decision was written to ${planFileName}, but the review was not re-run ` +
             "(the task could not be resumed or is busy). Run the review again to apply it."
         );
       }
     }
   } catch (error) {
     NotificationRouter.showWarning(
-      `${taskName}: the decision was written to plan-final.md, but re-running the review failed: ` +
+      `${taskName}: the decision was written to ${planFileName}, but re-running the review failed: ` +
         `${error instanceof Error ? error.message : String(error)}`
     );
   }

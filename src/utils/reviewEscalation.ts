@@ -23,7 +23,13 @@ import {
   stampFastForwardResumeProvenanceV1,
 } from "./activeFastForwardRunsV1";
 import { readTextIfExists } from "./fileUtils";
-import { hasNarrowingPrefixV1, findNarrowingBlockerV1 } from "./planItemNarrowingV1";
+import {
+  hasNarrowingPrefixV1,
+  findNarrowingBlockerV1,
+  findPlanStageNarrowingBlockerV1,
+} from "./planItemNarrowingV1";
+import { taskFixableAreAllUnbuiltWorkV1 } from "./reviewRouting";
+import { resolveBlockerPlanReferencesV1 } from "./implementationChecklist";
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import * as path from "path";
@@ -553,6 +559,21 @@ export interface EscalationPlateauContextV1 {
    */
   readonly planItemsOpen: number;
   /**
+   * RC7 item 1: at least one blocker remains and every one clears only
+   * through an owner decision (a narrowing, or owner evidence). The card
+   * then never recommends Advance.
+   */
+  readonly allBlockersNeedOwnerDecision?: boolean;
+  /**
+   * RC7 item 3: every reviewer-raised task-fixable blocker is a
+   * `[completion]` blocker naming plan work that is still unbuilt
+   * (`taskFixableAreAllUnbuiltWorkV1`).
+   */
+  readonly taskFixableAllUnbuiltWork?: boolean;
+  /** The specific open plan items (`Step N` or item text) that qualified
+   * `taskFixableAllUnbuiltWork`; named in the recommendation's reason. */
+  readonly unbuiltWorkReferences?: readonly string[];
+  /**
    * RC4 item 3: set when a blocker asks the owner to narrow a plan item
    * (`findNarrowingBlockerV1`). Adds the item, the round's reason and its
    * evidence to the card, plus the "Accept this narrowing" / "Keep the item
@@ -629,6 +650,9 @@ export function buildEscalationDecisionV1(
       dispatchModeEvidence,
       planItemsOpen,
       narrowing,
+      allBlockersNeedOwnerDecision = false,
+      taskFixableAllUnbuiltWork = false,
+      unbuiltWorkReferences = [],
     } = plateauContext;
     const options: WorkflowDecisionOptionV1[] = [
       ...(nextStage
@@ -689,7 +713,7 @@ export function buildEscalationDecisionV1(
               label: "Accept this narrowing",
               resumeKind: "continue" as const,
               consequence:
-                "Records the owner decision under Accepted Non-Goals in plan-final.md, resumes the task and runs " +
+                `Records the owner decision under Accepted Non-Goals in ${isPlanReviewStage(stage) ? "plan.md" : "plan-final.md"}, resumes the task and runs ` +
                 `${stageName} again against the same workspace with that decision on record (the review's input ` +
                 "changed, so its verdict can differ); the blocker is treated as settled from then on.",
               effect: {
@@ -751,6 +775,32 @@ export function buildEscalationDecisionV1(
               "The remaining blocker here matches a removal the last implementation round already declined, " +
               "citing rule 7 — no owner approval is recorded in the task's own Task Description. Another round " +
               "will decline it again; this needs a human decision, not more automated iteration.",
+          }
+        : // RC7 item 1: every remaining blocker clears only through an owner
+          // decision, so Advance would skip the decision and the same blocker
+          // would block Publish later.
+          allBlockersNeedOwnerDecision
+        ? {
+            kind: "option",
+            optionId: narrowing ? "acceptNarrowing" : "handleMyself",
+            reasoning:
+              "Every remaining blocker clears only through an owner decision, so advancing would skip the " +
+              "decision and the same blocker would block Publish later.",
+          }
+        : // RC7 item 3: open plan items and only unbuilt-work completion
+          // blockers — another review-driven round cannot build them.
+          planItemsOpen > 0 && taskFixableCount > 0 && taskFixableAllUnbuiltWork
+        ? {
+            kind: "option",
+            optionId: "buildRemaining",
+            reasoning:
+              `${planItemsOpen} plan ${planItemsOpen === 1 ? "item is" : "items are"} still open and the ` +
+              `remaining ${taskFixableCount === 1 ? "blocker is" : "blockers are"} unbuilt work` +
+              (unbuiltWorkReferences.length > 0
+                ? ` (it says ${unbuiltWorkReferences.join(", ")} ${unbuiltWorkReferences.length === 1 ? "is" : "are"} ` +
+                  `not done, and ${unbuiltWorkReferences.length === 1 ? "that item is" : "those items are"} still open)`
+                : "") +
+              ", which Implementation builds and another review round does not.",
           }
         : taskFixableCount > 0
         ? {
@@ -1327,15 +1377,20 @@ function classifyEnvironmentalBlockerV1(description: string): "owner-decision" |
 function describeResolverClearingActionV1(
   resolver: BlockerResolver,
   description: string,
-  stageName: string
+  stageName: string,
+  narrowingOffered = true
 ): string {
   const namedCommand = extractCorrelatedCommandV1(description);
   // RC4 item 3: a narrowing is an owner decision answered on the card itself.
+  // RC7 item 1: only when the card really offers the two options; otherwise
+  // say how to record the decision instead of naming options that are absent.
   if ((resolver === "environmental" || resolver === "task-fixable") && hasNarrowingPrefixV1(description)) {
-    return (
-      'an owner decision on the plan item named above — choose "Accept this narrowing" or ' +
-      '"Keep the item open" on this card'
-    );
+    return narrowingOffered
+      ? 'an owner decision on the plan item named above — choose "Accept this narrowing" or ' +
+          '"Keep the item open" on this card'
+      : "an owner decision on the plan item this blocker names — write the decision under `## Accepted " +
+          "Non-Goals` in plan.md (or plan-final.md once Implementation has started), quoting the blocker, " +
+          `then choose "Keep iterating" to have ${stageName} re-review`;
   }
   // RC4 item 4: a blocker filed with the literal "Owner evidence needed"
   // prefix names evidence rounds cannot gather. It is an owner decision
@@ -1550,6 +1605,30 @@ async function postReviewPlateauDecisionV1(
   // RC4 item 3: best effort, never fails the escalation.
   let narrowing: EscalationPlateauContextV1["narrowing"];
   try {
+    if (isPlanReviewStage(stage)) {
+      // RC7 item 1: no plan-final.md or implementation summary exists yet;
+      // the item comes from plan.md, the reason and evidence from the review.
+      const planMd = await readTextIfExists(
+        vscode.Uri.joinPath(folderUri, STAGE_ARTIFACT_FILENAMES.plan ?? "plan.md")
+      );
+      const reviewFileName = STAGE_ARTIFACT_FILENAMES[stage] ?? "the plan review";
+      const foundAtPlan = findPlanStageNarrowingBlockerV1(
+        normalized.blockers,
+        planMd,
+        evidence.content,
+        reviewFileName
+      );
+      if (foundAtPlan) {
+        narrowing = {
+          itemText: foundAtPlan.itemText,
+          blockerDescription: foundAtPlan.blocker,
+          reason: foundAtPlan.reason,
+          reasonSource: foundAtPlan.reasonSource,
+          evidence: foundAtPlan.evidence,
+          evidenceSource: foundAtPlan.evidenceSource,
+        };
+      }
+    } else {
     const planFinal = await readTextIfExists(getCanonicalImplementationUri(folderUri));
     // Not `STAGE_ARTIFACT_FILENAMES.impl`: that is the plan of record, not the round's summary.
     const implSummary = await readTextIfExists(vscode.Uri.joinPath(folderUri, IMPLEMENTATION_SUMMARY_FILENAME));
@@ -1569,17 +1648,64 @@ async function postReviewPlateauDecisionV1(
         evidenceSource: found.evidenceSource,
       };
     }
+    }
   } catch {
     narrowing = undefined;
   }
+  // RC7 item 1: every remaining blocker is a narrowing or owner evidence.
+  const allBlockersNeedOwnerDecision =
+    normalized.blockers.length > 0 &&
+    normalized.blockers.every(
+      (b) =>
+        hasNarrowingPrefixV1(b.description) ||
+        OWNER_EVIDENCE_PREFIX_RE.test(b.description) ||
+        classifyEnvironmentalBlockerV1(b.description) === "owner-evidence"
+    );
+  // RC7 item 3: open plan items and only unbuilt-work completion blockers.
+  const planOfRecordText = isPlanReviewStage(stage)
+    ? undefined
+    : await readTextIfExists(getCanonicalImplementationUri(folderUri));
+  const taskFixableAllUnbuiltWork =
+    planItemsOpen > 0 &&
+    evidence.taskFixableCount > 0 &&
+    taskFixableAreAllUnbuiltWorkV1(normalized.blockers, planOfRecordText);
+  const unbuiltWorkReferences =
+    taskFixableAllUnbuiltWork && planOfRecordText !== undefined
+      ? [
+          ...new Set(
+            normalized.blockers
+              .filter((b) => b.resolver === "task-fixable" && b.origin !== "mechanical")
+              .flatMap((b) =>
+                resolveBlockerPlanReferencesV1(b.description, planOfRecordText)
+                  .filter((r) => r.kind !== "part" && r.open > 0)
+                  .map((r) => r.reference)
+              )
+          ),
+        ]
+      : [];
+  const ownerDecisionClearing = allBlockersNeedOwnerDecision
+    ? [
+        ...new Set(
+          normalized.blockers.map((b) =>
+            describeResolverClearingActionV1(b.resolver, b.description, stageName, narrowing !== undefined)
+          )
+        ),
+      ].join("; and ")
+    : undefined;
   const clearingNote =
-    evidence.taskFixableCount > 0
+    ownerDecisionClearing !== undefined
+      ? `Clears via: ${ownerDecisionClearing}`
+      : taskFixableAllUnbuiltWork
+        ? `Clears via: choose "Build the ${planItemsOpen} open plan ${planItemsOpen === 1 ? "item" : "items"}" ` +
+          `below — the remaining ${evidence.taskFixableCount === 1 ? "blocker is" : "blockers are"} work not yet ` +
+          `built, which Implementation does and another ${stageName} round does not.`
+    : evidence.taskFixableCount > 0
       ? `Clears via: choose "Keep iterating" below — it resumes the task and runs Apply Review against the ` +
         `${evidence.taskFixableCount} task-fixable ${evidence.taskFixableCount === 1 ? "blocker" : "blockers"}, ` +
         `editing the workspace to address ${evidence.taskFixableCount === 1 ? "it" : "them"}, then re-reviews ` +
         `${stageName} for a fresh verdict.`
       : primaryBlocker
-        ? `Clears via: ${describeResolverClearingActionV1(primaryBlocker.resolver, primaryBlocker.description, stageName)}`
+        ? `Clears via: ${describeResolverClearingActionV1(primaryBlocker.resolver, primaryBlocker.description, stageName, narrowing !== undefined)}`
         : "Clears via: an action outside this task — no command in this product can resolve it. Once done, " +
           `"Keep iterating" resumes the task and re-runs ${stageName} to confirm.`;
 
@@ -1633,6 +1759,9 @@ async function postReviewPlateauDecisionV1(
       clearingNote,
       dispatchModeEvidence,
       planItemsOpen,
+      allBlockersNeedOwnerDecision,
+      taskFixableAllUnbuiltWork,
+      unbuiltWorkReferences,
       ...(narrowing ? { narrowing } : {}),
     }),
     target

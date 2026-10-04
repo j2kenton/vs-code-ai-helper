@@ -38,7 +38,7 @@ export async function reviewCurrentTask(
   // command self-checks"): see fastForwardCurrentTaskReview.ts's identical
   // check for why this must use the resolver rather than the raw field.
   if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
-    showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath);
+    await showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath);
     return;
   }
 

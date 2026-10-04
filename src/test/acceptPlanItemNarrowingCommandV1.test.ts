@@ -264,6 +264,125 @@ void describe("acceptPlanItemNarrowingV1", () => {
     assert.ok(withNarrowing.options.some((o) => o.optionId === "keepItemOpen"));
   });
 
+  void it("at a plan review the entry goes to plan.md and plan-final.md is untouched (RC7 item 1)", async () => {
+    const planItem = "Step 11: Run the automatic Publish review after a successful fix";
+    const planMd = ["# Plan", "", "## Part D", "", `1. ${planItem}`, "2. Step 12: something else", ""].join("\n");
+    const folder = makeFolder(PLAN);
+    nodeFs.writeFileSync(nodePath.join(folder, "plan.md"), planMd, "utf8");
+    const blocker = `Narrowing needs an owner decision: Part D ${planItem} is skipped`;
+    const { deps, reruns, rerunStages } = makeDeps("plan-high-review");
+    const result = await acceptPlanItemNarrowingV1(
+      {
+        taskFolderPath: folder,
+        stage: "plan-high-review",
+        itemText: planItem,
+        reason: "admission stays held",
+        blockerDescription: blocker,
+      },
+      deps
+    );
+    assert.equal(result.outcome, "done");
+    const written = nodeFs.readFileSync(nodePath.join(folder, "plan.md"), "utf8");
+    assert.match(written, /## Accepted Non-Goals/);
+    assert.match(written, /### Narrowing accepted by the owner \(owner decision, \d{4}-\d{2}-\d{2}\)/);
+    assert.ok(written.includes(`Settles the review blocker: "${blocker}"`));
+    assert.equal(read(folder), PLAN, "plan-final.md is not touched at a plan stage");
+    assert.deepEqual(rerunStages, ["plan-high-review"]);
+    assert.equal(reruns.length, 1);
+  });
+
+  void it("at a plan review an item that is gone from plan.md is refused and nothing is written", async () => {
+    const folder = makeFolder(PLAN);
+    nodeFs.writeFileSync(nodePath.join(folder, "plan.md"), "# Plan\n\n1. Something else\n", "utf8");
+    const { deps, reruns } = makeDeps("plan-high-review");
+    const result = await acceptPlanItemNarrowingV1(
+      {
+        taskFolderPath: folder,
+        stage: "plan-high-review",
+        itemText: "Step 11: Run the automatic Publish review",
+        reason: "r",
+        blockerDescription: "Narrowing needs an owner decision: Step 11",
+      },
+      deps
+    );
+    assert.equal(result.outcome, "refused");
+    assert.equal(nodeFs.readFileSync(nodePath.join(folder, "plan.md"), "utf8"), "# Plan\n\n1. Something else\n");
+    assert.equal(reruns.length, 0);
+  });
+
+  void it("RC7 recommendation chain: owner decisions never recommend Advance, and unbuilt work recommends building", () => {
+    const base = {
+      blockersCount: 1,
+      primaryBlockerDescription: BLOCKER,
+      allBlockerDescriptions: [BLOCKER],
+      narrowedNote: "",
+      progressNote: "",
+      taskFixableCount: 0,
+      hasSpecDefect: false,
+      hasDeclinedBlocker: false,
+      hasNonFixableBlocker: true,
+      nextStageHasRun: false,
+      clearingNote: "",
+      dispatchModeEvidence: [],
+      planItemsOpen: 0,
+    };
+    const target = { canonicalId: "c", taskFolderPath: "/t" };
+    const narrowing = {
+      itemText: "Step 11: Run the automatic Publish review",
+      blockerDescription: BLOCKER,
+      reason: "r",
+      reasonSource: "the plan review (plan-high-review.md)",
+      evidence: "e",
+      evidenceSource: "the plan review (plan-high-review.md)",
+    };
+    // Plan-review card with a located narrowing.
+    const planCard = buildEscalationDecisionV1("plateau", "plan-high-review", "plateau", target, {
+      ...base,
+      allBlockersNeedOwnerDecision: true,
+      narrowing,
+    });
+    assert.equal(planCard.recommendation.kind === "option" && planCard.recommendation.optionId, "acceptNarrowing");
+    assert.ok(planCard.options.some((o) => o.optionId === "keepItemOpen"));
+    const accept = planCard.options.find((o) => o.optionId === "acceptNarrowing");
+    assert.match(accept?.consequence ?? "", /plan\.md/);
+    assert.doesNotMatch(accept?.consequence ?? "", /plan-final\.md/);
+    assert.match(
+      planCard.recommendation.kind === "option" ? planCard.recommendation.reasoning : "",
+      /owner decision/
+    );
+    // Box C shape: only owner decisions, nothing located, next stage not yet run.
+    const boxC = buildEscalationDecisionV1("plateau", "plan-high-review", "plateau", target, {
+      ...base,
+      blockersCount: 4,
+      allBlockersNeedOwnerDecision: true,
+    });
+    assert.equal(boxC.recommendation.kind === "option" && boxC.recommendation.optionId, "handleMyself");
+    assert.equal(boxC.options.some((o) => o.optionId === "acceptNarrowing"), false);
+    // Unbuilt work with open plan items.
+    const build = buildEscalationDecisionV1("plateau", "impl-high-review", "plateau", target, {
+      ...base,
+      taskFixableCount: 1,
+      planItemsOpen: 74,
+      taskFixableAllUnbuiltWork: true,
+    });
+    assert.equal(build.recommendation.kind === "option" && build.recommendation.optionId, "buildRemaining");
+    assert.match(build.recommendation.kind === "option" ? build.recommendation.reasoning : "", /74 plan items are still open/);
+    const noOpen = buildEscalationDecisionV1("plateau", "impl-high-review", "plateau", target, {
+      ...base,
+      taskFixableCount: 1,
+      planItemsOpen: 0,
+      taskFixableAllUnbuiltWork: true,
+    });
+    assert.equal(noOpen.recommendation.kind === "option" && noOpen.recommendation.optionId, "keepIterating");
+    const defect = buildEscalationDecisionV1("plateau", "impl-high-review", "plateau", target, {
+      ...base,
+      taskFixableCount: 1,
+      planItemsOpen: 74,
+      taskFixableAllUnbuiltWork: false,
+    });
+    assert.equal(defect.recommendation.kind === "option" && defect.recommendation.optionId, "keepIterating");
+  });
+
   void it("the command file never asks through a pop-up", () => {
     const source = nodeFs.readFileSync(
       nodePath.join(__dirname, "..", "..", "src", "commands", "acceptPlanItemNarrowingV1.ts"),

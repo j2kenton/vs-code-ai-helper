@@ -60,7 +60,7 @@ export async function fastForwardCurrentTaskReview(
   // later admission acquisition finishes the barrier and repairs it. A user
   // or quota pause is unaffected: the resolver always treats those as real.
   if (await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress)) {
-    showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath);
+    await showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath);
     return;
   }
 

@@ -292,9 +292,9 @@
       },
       {
         "command": "vs-code-ai-helper.runNotificationAction",
-        "title": "Run Notification Action",
+        "title": "Open in Chat",
         "category": "Ensemble",
-        "icon": "$(play)"
+        "icon": "$(comment-discussion)"
       },
       {
         "command": "vs-code-ai-helper.applyCurrentStageAction",

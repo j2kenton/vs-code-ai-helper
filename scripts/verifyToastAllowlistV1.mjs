@@ -256,6 +256,9 @@ function findDirectActionCommandCalls(filePath) {
     if (args.length < 5) continue; // no actionCommand argument at all
     const actionArg = args[4].trim();
     if (actionArg === "" || actionArg === "undefined") continue;
+    // RC7 item 4: a pointer built by `offerActionInChatV1` is a chat pointer
+    // by construction (the action it names runs only from the chat card).
+    if (actionArg.includes("offerActionInChatV1(")) continue;
     const commandMatch = actionArg.match(/command:\s*["']([^"']+)["']/);
     if (!commandMatch) continue; // not a recognizable { command: ... } literal
     const command = commandMatch[1];

@@ -1178,9 +1178,9 @@ void describe("provider CLI contracts", () => {
       "antigravity-cli": { command: "agy" },
       "kiro-cli": { command: "kiro-cli logout; kiro-cli login" },
       "opencode-cli": { command: "opencode" },
-      "cline-cli": { command: "cline auth cline-pass" },
+      "cline-cli": { command: "cline auth" },
       "kimi-cli": { command: "kimi login" },
-      "devpass-cli": { command: "devpass-code providers login" },
+      "devpass-cli": { command: "devpass-code auth login" },
     };
 
     for (const provider of CLI_PROVIDERS) {

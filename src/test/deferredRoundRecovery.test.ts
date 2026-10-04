@@ -979,7 +979,14 @@ void describe("Apply Review continuation reconstruction (item 17b, fail-closed)"
 
     // The round must never have been dispatched under the wrong mandate.
     assert.equal(run.prompts.length, 0, "the checklist-driven prompt must never be assembled");
-    assert.equal(readRunLogs(folderPath).length, 0, "no run log — the round never ran");
+    // The only run-log entry allowed is the round-less "declined" note the
+    // no-op continuation settle writes (best-effort, possibly still landing);
+    // a provider-run log would mean the round actually ran.
+    const runLogs = readRunLogs(folderPath);
+    assert.ok(
+      runLogs.every((log) => /Continuation Round Ended Without Changes/.test(log)),
+      `the round never ran, so no provider run log may exist; got: ${JSON.stringify(runLogs)}`
+    );
 
     // The continuation stays owed, exactly as it was, for a retry once the
     // review artifact is restored.

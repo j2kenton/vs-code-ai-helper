@@ -134,7 +134,7 @@ async function applyCurrentStageActionCore(
       : await isEffectivelyPausedV1(resolvedTask.taskFolderPath, resolvedTask.progress);
     if (stillPaused) {
       refusal.reason = "the task is paused, and nothing has resumed it";
-      showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath, resolvedTask.progress.displayName);
+      await showPausedTaskRefusalV1("using this shortcut", resolvedTask.taskFolderPath, resolvedTask.progress.displayName);
       return false;
     }
   }

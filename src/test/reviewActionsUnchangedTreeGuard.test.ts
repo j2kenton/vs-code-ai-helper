@@ -26,6 +26,7 @@ import { fastForwardReviewWithAI, runReviewForFolder } from "../commands/reviewA
 import { rerunReviewAfterUnchangedTreeCardV1 } from "../commands/rerunReviewAfterUnchangedTreeCardV1";
 import { computeWorkingTreeFingerprintV1 } from "../utils/gitRepoInfo";
 import {
+  NotificationRouter,
   initNotificationRouter,
   deactivateNotificationRouter,
   StatusSurface,
@@ -48,6 +49,7 @@ import {
 import { safeRemoveDir } from "./testFsUtils";
 import { computePublishScopeId, renderPublishChecksFreshnessStamp } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
@@ -1052,12 +1054,24 @@ function makePublishTaskFolderNoChecksV1(name: string): { folderPath: string } {
  */
 void describe("fastForwardReviewWithAI — Publish Checks gate (RC3 item 6 / Step 8)", () => {
   void it("runs Publish Checks first, never attempts the Publish review, and never reports the refusal as 'did not produce usable output'", async () => {
+    await runPublishRefusalCaseV1(undefined, "Publish Checks declined to start without saying why");
+  });
+
+  void it("a Publish Checks refusal that raised a warning names that warning in the terminal row (RC7 item 5)", async () => {
+    await runPublishRefusalCaseV1(
+      "lint is not configured for this workspace",
+      "Publish Checks declined to start: lint is not configured for this workspace"
+    );
+  });
+
+  async function runPublishRefusalCaseV1(raisedWarning: string | undefined, expectedReason: string): Promise<void> {
     const { folderPath } = makePublishTaskFolderNoChecksV1(
       `ff-publish-no-checks-${Math.floor(Math.random() * 1e9)}`
     );
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
     const recorder = installNotificationRecorder();
+    const bridge = installOperationNotificationBridge();
     const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
     const gatePatches = installEditActionGatesAlwaysOkV1();
     const context = makeFastForwardExtensionContext();
@@ -1074,6 +1088,9 @@ void describe("fastForwardReviewWithAI — Publish Checks gate (RC3 item 6 / Ste
     const executed: { id: string; args: unknown[] }[] = [];
     commandsObj._executeCommandOverride = (id: string, ...args: unknown[]): Promise<unknown> => {
       executed.push({ id, args });
+      if (raisedWarning !== undefined) {
+        NotificationRouter.showWarning(raisedWarning);
+      }
       // Simulate a real `runPublishChecks` invocation that ran but left the
       // checks still not fresh (e.g. a real lint failure) — proving this
       // never gets misreported as an unusable review output.
@@ -1098,6 +1115,14 @@ void describe("fastForwardReviewWithAI — Publish Checks gate (RC3 item 6 / Ste
         false,
         "the Publish review must never be attempted (and so never write its artifact) before Publish Checks have passed"
       );
+      // RC7 item 5: the refusal reason reaches the emitted terminal row.
+      assert.equal(
+        recorder.notifications.some(
+          (n) => /refused — nothing was started \(/.test(n.message) && n.message.includes(expectedReason)
+        ),
+        true,
+        `expected the Publish terminal row to carry "${expectedReason}"; got: ${JSON.stringify(recorder.notifications)}`
+      );
       const progress = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as {
         roundLedger?: unknown[];
       };
@@ -1111,11 +1136,12 @@ void describe("fastForwardReviewWithAI — Publish Checks gate (RC3 item 6 / Ste
       for (const p of patches.reverse()) { p.restore(); }
       for (const p of gatePatches.reverse()) { p.restore(); }
       admissionPatch.restore();
+      bridge.dispose();
       recorder.restore();
       wsStub.restore();
       fsBridge.restore();
     }
-  });
+  }
 
   /**
    * 2026-09-30 review follow-up (RC3 item 6 / Step 8 completion blocker):

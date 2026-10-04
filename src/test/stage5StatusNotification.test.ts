@@ -274,8 +274,8 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         undefined,
         undefined,
         {
-          command: "vs-code-ai-helper.commitAndPushTask",
-          title: "Publish Anyway",
+          command: "vs-code-ai-helper.openWorkflowDecision",
+          title: "Open in Chat",
           args: [{ taskFolderPath: "/dev/task_1" }],
         }
       );
@@ -286,12 +286,12 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       assert.equal(item.command?.command, "vscode.open");
       const uri = item.command?.arguments?.[0] as vscode.Uri;
       assert.equal(uri.scheme, "ensemble-notification");
-      // The follow-up is available as a separate inline context-menu action.
+      // The chat pointer is available as a separate inline context-menu action.
       assert.match(item.contextValue ?? "", /\bensemble-notification-actionable\b/);
 
       let invokedArgs: unknown[] | undefined;
       const registration = vscode.commands.registerCommand(
-        "vs-code-ai-helper.commitAndPushTask",
+        "vs-code-ai-helper.openWorkflowDecision",
         (...args: unknown[]) => { invokedArgs = args; }
       );
       try {
@@ -300,6 +300,20 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         registration.dispose();
       }
       assert.deepEqual(invokedArgs, [{ taskFolderPath: "/dev/task_1" }]);
+      deactivateNotificationRouter();
+    });
+
+    void it("RC7 item 4: a row whose action is not the chat pointer has no inline button", () => {
+      const surface = new StatusTreeProvider();
+      initNotificationRouter(surface);
+      NotificationRouter.showWarning("Publish checks need a look.", undefined, undefined, undefined, {
+        command: "vs-code-ai-helper.commitAndPushTask",
+        title: "Publish Anyway",
+        args: [{ taskFolderPath: "/dev/task_1" }],
+      });
+      const [entry] = surface.getEntries();
+      const item = surface.getTreeItem(requireValue(entry, "missing entry"));
+      assert.doesNotMatch(item.contextValue ?? "", /ensemble-notification-actionable/);
       deactivateNotificationRouter();
     });
 
@@ -852,10 +866,22 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         // The Resume offer is now a non-blocking internal notification with an
         // inline action, not a modal — so nothing auto-executes resumeTask.
         assert.deepEqual(commands, []);
-        const resumeEntry = entries.find((e) => e.actionCommand?.command === "vs-code-ai-helper.resumeTask");
-        assert.ok(resumeEntry, "expected an internal notification offering to Resume");
-        assert.equal(resumeEntry?.level, "warning");
-        assert.deepEqual(resumeEntry?.actionCommand?.args, [{ taskFolderPath }]);
+        // RC7 item 4: the notice's button only ever opens the chat — it never
+        // carries `resumeTask` itself. (Here the new task's progress is not
+        // readable through the stubbed filesystem and no extension context is
+        // wired, so no chat pointer is attached at all.)
+        const pausedEntry = entries.find((e) => /task created in paused state/.test(e.message));
+        assert.ok(pausedEntry, "expected an internal notification that the task was created paused");
+        assert.equal(pausedEntry?.level, "warning");
+        assert.ok(
+          pausedEntry?.actionCommand === undefined ||
+            pausedEntry.actionCommand.command === "vs-code-ai-helper.openWorkflowDecision"
+        );
+        assert.equal(
+          entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.resumeTask"),
+          false
+        );
+        assert.ok(taskFolderPath.length > 0);
       } finally {
         creationFilesystem.restore();
         commandApi.executeCommand = origExecuteCommand;

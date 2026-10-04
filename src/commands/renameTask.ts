@@ -622,7 +622,7 @@ export async function renameTaskWithAI(
     // must stop this command, exactly as runPublishChecks/
     // completeCommitAndPushTask already do.
     if (reconcileOutcomeCapturedV1?.outcome === "userPaused" || reconcileOutcomeCapturedV1?.outcome === "unreadable") {
-      showPausedTaskRefusalV1("renaming with AI", task.taskFolderPath, task.progress.displayName);
+      await showPausedTaskRefusalV1("renaming with AI", task.taskFolderPath, task.progress.displayName);
       return;
     }
 

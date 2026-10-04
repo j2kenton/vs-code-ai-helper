@@ -416,7 +416,7 @@ export async function generatePlanWithAI(
       return;
     }
     if (reconciled.outcome === "userPaused") {
-      showPausedTaskRefusalV1("generating a plan", taskFolderUri.fsPath);
+      await showPausedTaskRefusalV1("generating a plan", taskFolderUri.fsPath);
       return;
     }
 

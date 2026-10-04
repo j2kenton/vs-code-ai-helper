@@ -77,11 +77,6 @@
   "directActionEntriesNote": "Every NotificationRouter.show(Information/Warning/Error) call under src/ whose actionCommand dispatches a workflow command directly (rather than the chat-pointer vs-code-ai-helper.openWorkflowDecision) must either be converted to point at a WorkflowDecisionV1 in the chat, or be listed here with a reason it is NOT a hidden workflow decision (task 'stage chat as a record of work', item 13 / Part 12 step 35e, review round 2). Two shapes qualify: (1) a synchronous gate/nudge inline in the user-invoked command it belongs to, pointing at a command already reachable another way (Command Palette, another button) and never the only record of a background round's outcome; (2) a best-effort fallback for when a WorkflowDecisionV1 could not be posted to chat (no activating extension context), degrading to a single pointer at the same option the decision would have recommended. Entries are keyed by file plus a `snippet` — a normalized prefix of the call's own source text — not by line number (1.0 plan item 14), same convention as `entries` above.",
   "directActionEntries": [
     {
-      "file": "src/utils/pausedTaskRefusalV1.ts",
-      "reason": "RC1 item 11: shape (1) — a synchronous refusal inline in the user-invoked command it belongs to (review, Fast Forward, implementation, plan generation, or a shortcut), shown the instant the command is declined because the task is paused. Offers 'Resume' for exactly that task, the same resumeTask command already reachable from the task tree and Command Palette; never the only record of a background round's outcome.",
-      "snippet": "NotificationRouter.showWarning( `${taskLabel} is paused. Resume it before ${action}.`,"
-    },
-    {
       "file": "src/commands/resumeTask.ts",
       "reason": "(Line moved 753 -> 754: this round's fix updating the stale dispatchesAutomationWork doc comment above added 1 line, net.) v1 fixes 2, items 14 + 25: direct synchronous refusal in showResumeStaysPausedV1, shared by resumeAndApplyCurrentStageActionV1, resumeAndRerunReviewV1 and resumeAndDispatchImplementationV1 — shown the instant a user-invoked Resume is declined because the Review it would arrange would be refused (the last round left the implementation summary unusable). Offers restoreRejectedImplementationRoundV1, the same deterministic artifact restore the review-dispatch refusal offers; no rerun command is passed because the task stays paused. Not a review/round outcome posted from a background round.",
       "snippet": "NotificationRouter.showWarning( `\"${taskName}\" stays paused: ${precondition}`, undefined, undefined, undefined, restoreSummary ? { command: \"vs-code-ai-helper.r"
@@ -158,21 +153,6 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "reason": "(Line moved 2259 -> ... -> 2271 -> 2272: the fixes noted in prior revisions of this entry, landing at 2272, then a prior round's import-block addition (a new `shouldOfferRunImplementationForUnusableSummaryV1` import for the Part 4 Step 12 fix) added 1 more line above it, net, landing at 2273, then a prior round's `shouldLogNoOpContinuationRoundV1` import addition (also above it) added 1 more line, net, landing at 2274, then this round's own new import additions earlier in the file (2026-09-24 review, narrowed completion blocker fix decoupling the unusable-summary refusal toasts' 'offer Run Implementation' condition from restorability) added 1 more line above it, net, landing at 2275; call is unchanged, verified by content match.) Direct synchronous gate inline in the Publish-checks freshness guard — points to Run Publish Checks, the same user-owned action the message names. Not a review/round outcome. (Line moved 2214 -> ... -> 2259, see reviewActions.ts:8232's note.)",
-      "snippet": "NotificationRouter.showWarning( `${formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath)} — ${describePublishChecksFreshnessFailureV1(check)"
-    },
-    {
-      "file": "src/commands/runLintingFixes.ts",
-      "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when Publish Checks have not run (no recorded result) — points to Run Publish Checks, the action the message names. Not a review/round outcome.",
-      "snippet": "NotificationRouter.showWarning( `${taskLabel}: Publish Checks have not run yet. Run them first.`, undefined, undefined, undefined,"
-    },
-    {
-      "file": "src/commands/runLintingFixes.ts",
-      "reason": "Direct synchronous gate inline in the user-invoked 'AI final fixes' command when the persisted Publish verification scope is stale — points to Run Publish Checks to choose a new scope. Not a review/round outcome.",
-      "snippet": "NotificationRouter.showWarning( `${taskLabel}: no valid Publish verification scope could be resolved (the saved scope `"
-    },
-    {
-      "file": "src/commands/reviewActions.ts",
       "reason": "(Line moved 3009 -> ... -> 3080 -> 3081, see reviewActions.ts:2275's note, landing at 3081.) Same-model retry offered after every configured backup has also failed to produce a parseable review this episode — a one-click retry of the exact action that just ran, not a fallback-chain choice (remains available regardless of the Never switch setting, Part 5 step 15). (Line moved 2954 -> ... -> 3009, see reviewActions.ts:2259's note; the fixes noted in prior revisions of this entry, landing at 3081, then a prior round's import-block addition (a new `shouldOfferRunImplementationForUnusableSummaryV1` import for the Part 4 Step 12 fix) added 1 more line above it, net, landing at 3082, then a prior round's `shouldLogNoOpContinuationRoundV1` import addition (also above it) added 1 more line, net, landing at 3083, then this round's own new import additions earlier in the file (see reviewActions.ts:2275's note) added 1 more line above it, net, landing at 3084; call is unchanged, verified by content match.)",
       "snippet": "NotificationRouter.showWarning( `${degenerateBackupTaskLabel} — ${rejectionReason} Every configured backup for this stage has also failed"
     },
@@ -198,11 +178,6 @@
     },
     {
       "file": "src/commands/reviewActions.ts",
-      "reason": "(Line moved 10611 -> ... -> 11143 -> 11144, see reviewActions.ts:9695's note, landing at 11144.) Nudge to run this stage's review after an Implementation round reported nothing to fix — the round's own outcome is recorded in the run log and chat ledger; this toast only points at the single follow-up command (Run Review) already named in the message text. (Line moved 10096 -> ... -> 10611, see reviewActions.ts:8329's note; the fixes noted in prior revisions of this entry, landing at 11144, then a prior round's Part 4 Step 12 fix (offering 'Run Implementation' on the unusable-summary refusal path, earlier in this file) added 34 more lines above it, net, landing at 11178, then a prior round's same 2-line shift as reviewActions.ts:9132's entry landing at 11180, then this round's same 18-line shift as reviewActions.ts:9132's entry landing at 11198; call is unchanged, verified by content match.)",
-      "snippet": "NotificationRouter.showWarning( uncheckedItemsWithoutClearingReview ? \"Implementation reported nothing to fix, but the plan checklist still has \" + `${remaining"
-    },
-    {
-      "file": "src/commands/reviewActions.ts",
       "reason": "(Line moved 10816 -> ... -> 11348 -> 11349, see reviewActions.ts:10732's note, landing at 11349.) Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision (no activating extension context) — the checklist-under-recording case (the checklist still shows unfinished items even though the most recent review already scored full marks with zero blockers). (Line moved 10290 -> ... -> 10816, see reviewActions.ts:10611's note; the fixes noted in prior revisions of this entry, landing at 11349, then a prior round's Part 4 Step 12 fix (offering 'Run Implementation' on the unusable-summary refusal path, earlier in this file) added 34 more lines above it, net, landing at 11383, then a prior round's same 2-line shift as reviewActions.ts:9132's entry landing at 11385, then this round's same 18-line shift as reviewActions.ts:9132's entry landing at 11403; call is unchanged, verified by content match.)",
       "snippet": "NotificationRouter.showWarning( \"⚠️ The plan checklist still shows unfinished items, but the most recent review already scored \" + \"this stage at full marks wit"
     },
@@ -215,21 +190,6 @@
       "file": "src/commands/reviewActions.ts",
       "reason": "(Line moved 11566 -> ... -> 12199 -> 12217, see reviewActions.ts:10732's note, landing at 12217.) Best-effort fallback for when postReconcilePlanChecklistDecisionV1 could not post the chat decision — the unverified-step-counts case. (Line moved 11185 -> ... -> 11566, see reviewActions.ts:10611's note; the fixes noted in prior revisions of this entry, landing at 12217, then this round's fix refreshing the stage-entry recovery lock source scan's exact-line allowlist (2026-09-24 review, narrowed completion blocker `04617511-d1ba-4902-adb7-87371ca86dbf-1`) found this entry itself stale by +21 lines against the already-present working-tree edits it was tracking — no lines were added by this round's own change; landing at 12238; call is unchanged, verified by content match.)",
       "snippet": "NotificationRouter.showWarning( (rejectionLeadNote ? `${rejectionLeadNote} Separately: ` : \"⚠️ \") + \"The plan checklist is not a complete record for this task —"
-    },
-    {
-      "file": "src/commands/startNewTask.ts",
-      "reason": "(Line moved 516 -> 525: the 2026-09-17 v1 fixes 2 Wave I review-fix round's nextActor chokepoint write at task creation added a setNextActorV1 import and a multi-line writeTaskProgressV1 call above it.) Direct synchronous notice inline in the user-invoked Start New Task command that the new task landed paused because another task is already active — 'Resume' is the one-click follow-up to the command that just ran, not a background round decision.",
-      "snippet": "NotificationRouter.showWarning( `${folderName}: task created in paused state.`,"
-    },
-    {
-      "file": "src/commands/taskCreationRecovery.ts",
-      "reason": "Direct synchronous notice inline in the user-invoked task-creation Retry command that the resumed task landed paused (see startNewTask.ts:516 for the same pattern).",
-      "snippet": "NotificationRouter.showWarning( \"Task creation resumed in paused state.\", undefined, undefined, undefined, { command: \"vs-code-ai-helper.resumeTask\", title: \"Re"
-    },
-    {
-      "file": "src/commands/taskCreationRecovery.ts",
-      "reason": "Direct synchronous notice inline in the user-invoked task-creation Adopt-and-Retry command that the resumed task landed paused (see startNewTask.ts:516 for the same pattern).",
-      "snippet": "NotificationRouter.showWarning( \"Task creation resumed in paused state; task.md preserved.\", undefined, undefined, undefined, { command: \"vs-code-ai-helper.resu"
     },
     {
       "file": "src/views/chatView.ts",

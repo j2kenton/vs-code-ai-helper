@@ -1197,6 +1197,17 @@ function collectPlanItemsUnderPartHeadingV1(
   planOfRecord: string,
   partNumber: string
 ): string[] {
+  return checklistMatchesUnderPartHeadingV1(planOfRecord, partNumber).map((match) => match[3] ?? "");
+}
+
+/**
+ * Every checklist line (nested ones included, with its indent in group 1)
+ * under the `Part <partNumber>` heading's range, in document order.
+ */
+function checklistMatchesUnderPartHeadingV1(
+  planOfRecord: string,
+  partNumber: string
+): RegExpExecArray[] {
   const scoped = scopeToLatestChecklistV1(planOfRecord).region;
   const all = headingsV1(scoped);
   const partPattern = new RegExp(`^Part\\s+${partNumber}\\b`, "i");
@@ -1214,7 +1225,7 @@ function collectPlanItemsUnderPartHeadingV1(
       break;
     }
   }
-  const items: string[] = [];
+  const items: RegExpExecArray[] = [];
   for (let i = heading.line + 1; i < end; i++) {
     const line = lines[i];
     if (!line || line.fenced) {
@@ -1222,10 +1233,113 @@ function collectPlanItemsUnderPartHeadingV1(
     }
     const match = ANY_ITEM_LINE.exec(line.text);
     if (match) {
-      items.push(match[3] ?? "");
+      items.push(match);
     }
   }
   return items;
+}
+
+/** One plan reference found in a blocker's text, with the plan's state for it (RC7 item 3). */
+export interface BlockerPlanReferenceV1 {
+  readonly kind: "item" | "step" | "part";
+  readonly reference: string;
+  /** Top-level items the reference resolves to that are still open. */
+  readonly open: number;
+  /** Top-level items it resolves to that are ticked or excluded. */
+  readonly settled: number;
+}
+
+const PART_REFERENCE_RE =
+  /\b[Pp]arts?\s+((?:[A-Z]|\d+)(?![A-Za-z0-9])(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+|\s*&\s*)(?:[A-Z]|\d+)(?![A-Za-z0-9]))*)/g;
+const STEP_REFERENCE_RE = /\b(?:[Pp]art\s+([A-Z]|\d+)[,:\s]+)?[Ss]tep\s+(\d+)\b/g;
+const QUOTED_SPAN_RE = /`([^`]+)`|"([^"]+)"|“([^”]+)”/g;
+
+function stepRecordMatches(itemText: string, step: string): boolean {
+  const plain = itemText.replace(/^[\s*_`]+/, "");
+  return new RegExp(`^(?:step\\s+${step}(?!\\d)|${step}[.)])`, "i").test(plain);
+}
+
+/**
+ * RC7 item 3: the plan items a blocker's text points at, each with its
+ * open/settled counts of top-level items. Item references are backticked or
+ * quoted spans that name exactly one item; `Step N` names the one top-level
+ * item starting with that step number (inside the named Part, when the text
+ * gives one); `Part X` (also lists like "Parts A, B and D") covers the
+ * top-level checklist lines under the Part heading — an open nested child
+ * never makes a Part count as open. A reference that matches nothing, or an
+ * item span that matches several items, is dropped.
+ */
+export function resolveBlockerPlanReferencesV1(
+  text: string,
+  planOfRecord: string
+): readonly BlockerPlanReferenceV1[] {
+  const references: BlockerPlanReferenceV1[] = [];
+  const records = listOpenPlanItemRecordsV1(planOfRecord);
+  const partTopLevel = (part: string): { text: string; settled: boolean }[] =>
+    checklistMatchesUnderPartHeadingV1(planOfRecord, part)
+      .filter((match) => (match[1] ?? "").length === 0)
+      .map((match) => {
+        const itemText = match[3] ?? "";
+        return { text: itemText, settled: match[2]?.toLowerCase() === "x" || isExcludedChecklistItemText(itemText) };
+      });
+
+  for (const match of text.matchAll(QUOTED_SPAN_RE)) {
+    const span = normalizeChecklistItemTextV1(match[1] ?? match[2] ?? match[3] ?? "");
+    if (span.length < 12) {
+      continue;
+    }
+    const exact = records.filter((record) => normalizeChecklistItemTextV1(record.itemText) === span);
+    const hits =
+      exact.length > 0
+        ? exact
+        : records.filter((record) => normalizeChecklistItemTextV1(record.itemText).startsWith(span));
+    if (hits.length === 1) {
+      references.push({
+        kind: "item",
+        reference: hits[0]!.itemText,
+        open: hits[0]!.settled ? 0 : 1,
+        settled: hits[0]!.settled ? 1 : 0,
+      });
+    }
+  }
+
+  const consumedParts = new Set<string>();
+  for (const match of text.matchAll(STEP_REFERENCE_RE)) {
+    const part = match[1];
+    const step = match[2]!;
+    if (part !== undefined) {
+      consumedParts.add(part.toUpperCase());
+    }
+    const candidates =
+      part !== undefined
+        ? partTopLevel(part.toUpperCase())
+        : records.map((record) => ({ text: record.itemText, settled: record.settled }));
+    const hits = candidates.filter((candidate) => stepRecordMatches(candidate.text, step));
+    if (hits.length === 1) {
+      references.push({
+        kind: "step",
+        reference: `Step ${step}`,
+        open: hits[0]!.settled ? 0 : 1,
+        settled: hits[0]!.settled ? 1 : 0,
+      });
+    }
+  }
+
+  for (const match of text.matchAll(PART_REFERENCE_RE)) {
+    for (const part of (match[1] ?? "").split(/\s*(?:,|\band\b|&)\s*/).filter((p) => p.length > 0)) {
+      const key = part.toUpperCase();
+      if (consumedParts.has(key)) {
+        continue;
+      }
+      const items = partTopLevel(key);
+      if (items.length === 0) {
+        continue;
+      }
+      const settled = items.filter((item) => item.settled).length;
+      references.push({ kind: "part", reference: `Part ${key}`, open: items.length - settled, settled });
+    }
+  }
+  return references;
 }
 
 /**

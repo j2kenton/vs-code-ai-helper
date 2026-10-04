@@ -191,8 +191,9 @@ function isNonEmptyLmTextPartV1(vscodeModule: VscodeLmModuleV1, part: unknown): 
  * Build a user `LanguageModelChatMessage` whose content is an array of
  * parts. Same 1.93-vs-runtime rationale as `createLmAssistantMessageWithPartsV1`.
  *
- * RC2 item 14: if none of `parts` is a non-empty `LanguageModelTextPart`,
- * prepend one (`TOOL_RESULTS_USER_TEXT_V1`) so a Copilot `auto` request
+ * Tool-result parts come first (Anthropic requires the tool results
+ * immediately after the tool call). RC2 item 14: if none of `parts` is a
+ * non-empty `LanguageModelTextPart`, append one (`TOOL_RESULTS_USER_TEXT_V1`) so a Copilot `auto` request
  * built from this message never has an empty-text last User message. This
  * applies to every Copilot model (harmless for a named model, which does
  * not route on message text).
@@ -204,10 +205,22 @@ export function createLmUserMessageWithPartsV1(
   const messageClass = vscodeModule.LanguageModelChatMessage as {
     User(content: unknown): vscodeTypes.LanguageModelChatMessage;
   };
-  const hasNonEmptyText = parts.some((part) => isNonEmptyLmTextPartV1(vscodeModule, part));
-  const content = hasNonEmptyText
-    ? parts
-    : [createLmTextPartV1(vscodeModule, TOOL_RESULTS_USER_TEXT_V1), ...parts];
+  const resultCtor = asConstructor(vscodeModule.LanguageModelToolResultPart);
+  const isToolResult = (part: unknown): boolean =>
+    resultCtor !== undefined && part instanceof resultCtor;
+  const toolResults = parts.filter(isToolResult);
+  // Empty text parts are dropped; every other part keeps its order.
+  const others = parts.filter(
+    (part) =>
+      !isToolResult(part) &&
+      (!isLmTextPartV1(vscodeModule, part) || isNonEmptyLmTextPartV1(vscodeModule, part))
+  );
+  const hasNonEmptyText = others.some((part) => isNonEmptyLmTextPartV1(vscodeModule, part));
+  const content = [
+    ...toolResults,
+    ...others,
+    ...(hasNonEmptyText ? [] : [createLmTextPartV1(vscodeModule, TOOL_RESULTS_USER_TEXT_V1)]),
+  ];
   return messageClass.User(content);
 }
 

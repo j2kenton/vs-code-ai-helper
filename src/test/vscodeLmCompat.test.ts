@@ -171,35 +171,34 @@ void describe("vscodeLmCompat", () => {
   });
 
   void describe("createLmUserMessageWithPartsV1 (RC2 item 14: Copilot auto needs a non-empty text part)", () => {
-    void it("prepends TOOL_RESULTS_USER_TEXT_V1 when every supplied part is a tool-result part (no text part at all)", () => {
+    void it("appends TOOL_RESULTS_USER_TEXT_V1 after the tool results when no text part is supplied", () => {
       const toolResult = createLmToolResultPartV1(vscode, "call-1", "the result");
       const message = createLmUserMessageWithPartsV1(vscode, [toolResult]);
       const content = message.content as unknown as unknown[];
       assert.equal(content.length, 2);
-      assert.ok(content[0] instanceof lmClasses.LanguageModelTextPart);
-      assert.equal((content[0] as { value: string }).value, TOOL_RESULTS_USER_TEXT_V1);
-      assert.equal(content[1], toolResult);
+      assert.equal(content[0], toolResult);
+      assert.ok(content[1] instanceof lmClasses.LanguageModelTextPart);
+      assert.equal((content[1] as { value: string }).value, TOOL_RESULTS_USER_TEXT_V1);
     });
 
-    void it("prepends TOOL_RESULTS_USER_TEXT_V1 when a supplied text part is present but empty", () => {
+    void it("drops an empty text part and appends TOOL_RESULTS_USER_TEXT_V1 last", () => {
       const emptyText = createLmTextPartV1(vscode, "");
       const toolResult = createLmToolResultPartV1(vscode, "call-2", "result");
       const message = createLmUserMessageWithPartsV1(vscode, [emptyText, toolResult]);
       const content = message.content as unknown as unknown[];
-      assert.equal(content.length, 3);
-      assert.equal((content[0] as { value: string }).value, TOOL_RESULTS_USER_TEXT_V1);
-      assert.equal(content[1], emptyText);
-      assert.equal(content[2], toolResult);
+      assert.equal(content.length, 2);
+      assert.equal(content[0], toolResult);
+      assert.equal((content[1] as { value: string }).value, TOOL_RESULTS_USER_TEXT_V1);
     });
 
-    void it("does NOT prepend anything when a supplied part already has non-empty text", () => {
+    void it("puts tool results first and adds no extra text when a supplied part has non-empty text", () => {
       const text = createLmTextPartV1(vscode, "please continue");
       const toolResult = createLmToolResultPartV1(vscode, "call-3", "result");
       const message = createLmUserMessageWithPartsV1(vscode, [text, toolResult]);
       const content = message.content as unknown as unknown[];
       assert.equal(content.length, 2);
-      assert.equal(content[0], text);
-      assert.equal(content[1], toolResult);
+      assert.equal(content[0], toolResult);
+      assert.equal(content[1], text);
     });
   });
 

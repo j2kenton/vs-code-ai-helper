@@ -43,6 +43,9 @@ import {
 } from "../state/workAdmissionV1";
 import { STALLED_ACTIVE_TASK_PAUSE_REASON_V1 } from "../utils/taskWatchdogV1";
 import { safeRemoveDir } from "./testFsUtils";
+import { runFastForwardPublishChecksV1 } from "../utils/fastForwardPublishChecksV1";
+import { terminalEntryFor } from "../utils/operationNotificationBridge";
+import type { TaskOperationSnapshot } from "../utils/taskOperations";
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-checks-admission-"));
 
@@ -68,6 +71,57 @@ class RecordingSurface {
   addEntry(message: string, level: "info" | "warning" | "error"): void {
     this.entries.push({ message, level });
   }
+}
+
+/**
+ * The "no model configured" guard fires `vs-code-ai-helper.openAiModels`
+ * without awaiting it; with nothing registered the stub host rejects it after
+ * the test has ended. Register a no-op for the test's duration.
+ */
+function stubOpenAiModelsCommand(): { restore: () => void } {
+  const registration = vscode.commands.registerCommand("vs-code-ai-helper.openAiModels", () => undefined);
+  return {
+    restore: (): void => {
+      registration.dispose();
+    },
+  };
+}
+
+/* eslint-disable @typescript-eslint/no-var-requires */
+const completionLintModule = require("../utils/completionLint") as Record<string, unknown>;
+const publishScopeCheckModule = require("../utils/publishScopeCheck") as Record<string, unknown>;
+const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
+const gitRepoInfoModule = require("../utils/gitRepoInfo") as Record<string, unknown>;
+
+/**
+ * Lets `runPublishChecks` run to a result without a model, git or real
+ * lint/test processes: the model guard passes and the check run is a counted
+ * stub, so a lint call proves the run got past the stage guard.
+ */
+function stubPublishChecksRun(): { lintCalls: () => number; restore: () => void } {
+  const originals = {
+    ensure: modelSelectionModule.ensureStageModelConfigured,
+    lint: completionLintModule.runCompletionLint,
+    scope: publishScopeCheckModule.runPublishScopeCheck,
+    sha: gitRepoInfoModule.resolveHeadCommitSha,
+  };
+  let lintCalls = 0;
+  modelSelectionModule.ensureStageModelConfigured = (): Promise<boolean> => Promise.resolve(true);
+  completionLintModule.runCompletionLint = (): Promise<unknown> => {
+    lintCalls += 1;
+    return Promise.resolve({ passed: true, summary: "stubbed checks passed" });
+  };
+  publishScopeCheckModule.runPublishScopeCheck = (): Promise<void> => Promise.resolve();
+  gitRepoInfoModule.resolveHeadCommitSha = (): Promise<undefined> => Promise.resolve(undefined);
+  return {
+    lintCalls: () => lintCalls,
+    restore: (): void => {
+      modelSelectionModule.ensureStageModelConfigured = originals.ensure;
+      completionLintModule.runCompletionLint = originals.lint;
+      publishScopeCheckModule.runPublishScopeCheck = originals.scope;
+      gitRepoInfoModule.resolveHeadCommitSha = originals.sha;
+    },
+  };
 }
 
 function writeProgress(folderPath: string, progress: TaskProgress): void {
@@ -225,6 +279,82 @@ void describe("runPublishChecks work admission against applyCurrentStageAction's
       assert.doesNotMatch(surface.entries[0]?.message ?? "", /busy|already/i);
     } finally {
       await outer.handle.release();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("passes the stage guard when the inventory still holds the previous stage but task-progress.json reads publish (RC7 item 5)", async () => {
+    const taskFolderPath = makeTaskFolder("acas-shape-stale-inventory-stage");
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, { currentStage: "publish" }));
+    const staleProgress = fixtureProgress(taskFolderPath, { currentStage: "impl-low-review" });
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const run = stubPublishChecksRun();
+    try {
+      const dispatched = await runPublishChecks(
+        makeInventory(taskFolderPath, staleProgress),
+        applyCurrentStageActionDispatchArg(taskFolderPath, staleProgress)
+      );
+      assert.equal(dispatched, true, `the checks should have run: ${JSON.stringify(surface.entries)}`);
+      assert.equal(run.lintCalls(), 1, "the check run reached its lint step");
+      assert.ok(
+        !surface.entries.some((entry) => /only available for tasks at the Publish stage/.test(entry.message)),
+        `unexpected stage refusal: ${JSON.stringify(surface.entries)}`
+      );
+    } finally {
+      run.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("Fast Forward's Publish dispatch over a stale inventory runs the real command and the refusal row carries its notice (RC7 item 5)", async () => {
+    const taskFolderPath = makeTaskFolder("acas-shape-ff-dispatch-refusal");
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, { currentStage: "publish" }));
+    const staleProgress = fixtureProgress(taskFolderPath, { currentStage: "impl-low-review" });
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const modelsStub = stubOpenAiModelsCommand();
+    try {
+      const settled: string[] = [];
+      const ok = await runFastForwardPublishChecksV1({
+        runChecks: () =>
+          runPublishChecks(
+            makeInventory(taskFolderPath, staleProgress),
+            applyCurrentStageActionDispatchArg(taskFolderPath, staleProgress)
+          ),
+        // No model is configured, so the checks leave no fresh result.
+        isFreshAfterChecks: () => Promise.resolve(false),
+        op: {
+          settleAs: (_state, reason) => settled.push(reason),
+          report: () => undefined,
+        },
+      });
+      assert.equal(ok, false);
+      assert.equal(settled.length, 1);
+      assert.match(settled[0] ?? "", /^Publish Checks declined to start: .*no AI model is configured/);
+      assert.doesNotMatch(settled[0] ?? "", /only available for tasks at the Publish stage/);
+      const row = terminalEntryFor({
+        id: "op-ff",
+        key: taskFolderPath,
+        label: "Fast Forward Review",
+        taskName: "rc7",
+        state: "refused",
+        detail: settled[0],
+        stage: "publish",
+      } as unknown as TaskOperationSnapshot);
+      assert.match(row?.message ?? "", /refused — nothing was started \(Publish Checks declined to start: .*no AI model is configured/);
+    } finally {
+      modelsStub.restore();
       rf.restore();
       ws.restore();
       deactivateNotificationRouter();

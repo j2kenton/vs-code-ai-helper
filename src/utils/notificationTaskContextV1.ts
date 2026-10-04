@@ -117,6 +117,14 @@ export async function captureRaisedNoticesV1<T>(fn: () => Promise<T>): Promise<{
   return { result, notices };
 }
 
+/** Reason for a Publish Checks dispatch that left no fresh result: the last notice, or a fixed fallback. */
+export function publishChecksDeclinedReasonV1(notices: readonly string[]): string {
+  const lastNotice = notices[notices.length - 1];
+  return lastNotice !== undefined
+    ? `Publish Checks declined to start: ${lastNotice}`
+    : "Publish Checks declined to start without saying why";
+}
+
 /** Called by the router for every warning/error; a no-op outside a capture. */
 export function recordRaisedNoticeV1(message: string): void {
   noticeCaptureStorage.getStore()?.push(message);

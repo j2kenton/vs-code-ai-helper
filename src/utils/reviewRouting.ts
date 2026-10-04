@@ -6,6 +6,106 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { BlockerResolver, meetsAutoAdvanceThreshold, ReviewBlocker } from "./reviewReadiness";
+import { resolveBlockerPlanReferencesV1 } from "./implementationChecklist";
+
+/**
+ * RC7 item 3: wording that says plan work is not done yet. "Missing" is
+ * deliberately absent — "X is missing Y" describes a defect in landed work.
+ */
+export const UNBUILT_WORK_PHRASES_V1: readonly RegExp[] = [
+  /\bstill open\b/i,
+  /\bremains?\s+(?:incomplete|open|outstanding|unbuilt)\b/i,
+  /\bnot yet\s+(?:implemented|built|written|added|done|started|present)\b/i,
+  /\b(?:has|have)\s+not\s+(?:yet\s+)?been\s+(?:implemented|built|written|added|started)\b/i,
+  /\bnot implemented\b/i,
+  /\bunimplemented\b/i,
+];
+
+/**
+ * RC7 item 3: words that describe a defect in work that has landed. Whole
+ * words only, and not inside a hyphenated compound ("failed-settlement test").
+ */
+export const DEFECT_TERMS_V1: readonly RegExp[] = [
+  /(?<![\w-])(?:breaks?|broke|broken|throws?|crash(?:es|ed)?|regression|regress(?:es|ed)?|incorrect|wrong|bug)(?![\w-])/i,
+  /(?<![\w-])fail(?:s|ed|ing)?(?![\w-])/i,
+  /(?<![\w-])instead of(?![\w-])/i,
+];
+
+const DONE_WORK_PHRASES_V1: readonly RegExp[] = [
+  /\bnow present\b/i,
+  /\bis now in place\b/i,
+  /\b(?:has|have) landed\b/i,
+  /\bis done\b/i,
+  /\bnow passes\b/i,
+];
+
+type BlockerSentenceKindV1 = "unbuilt" | "done" | "neutral" | "other";
+
+function matchesAny(patterns: readonly RegExp[], text: string): boolean {
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+function classifyBlockerSentenceV1(sentence: string, planOfRecord: string): BlockerSentenceKindV1 {
+  const hasDefect = matchesAny(DEFECT_TERMS_V1, sentence);
+  const references = resolveBlockerPlanReferencesV1(sentence, planOfRecord);
+  if (hasDefect) {
+    return "other";
+  }
+  const specific = references.filter((reference) => reference.kind !== "part");
+  if (matchesAny(UNBUILT_WORK_PHRASES_V1, sentence)) {
+    // An unbuilt claim must name a specific open item; one that resolves to
+    // nothing, or to settled/open-less references, cannot be counted as unbuilt
+    // work and must not pass as neutral either.
+    return specific.some((reference) => reference.open > 0) &&
+      references.every((reference) => reference.open > 0)
+      ? "unbuilt"
+      : "other";
+  }
+  if (matchesAny(DONE_WORK_PHRASES_V1, sentence)) {
+    return "done";
+  }
+  return references.length === 0 ? "neutral" : "other";
+}
+
+/**
+ * RC7 item 3: true when `description` says plan work is not built yet — at
+ * least one sentence names an open plan item or step with unbuilt-work
+ * wording and no defect term, and every other sentence either reports work
+ * as done or cites no plan item at all. Sentences split on sentence ends,
+ * never on `;`.
+ */
+export function isUnbuiltWorkBlockerV1(description: string, planOfRecord: string): boolean {
+  const sentences = description
+    .split(/(?<=[.!?])\s+(?=[A-Z"`'(“])/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence.length > 0);
+  const kinds = sentences.map((sentence) => classifyBlockerSentenceV1(sentence, planOfRecord));
+  return kinds.includes("unbuilt") && kinds.every((kind) => kind !== "other");
+}
+
+/**
+ * RC7 item 3: every reviewer-raised task-fixable blocker is a `[completion]`
+ * blocker that {@link isUnbuiltWorkBlockerV1} accepts. Mechanical blockers
+ * are neutral both ways; no reviewer-raised blocker, or no plan of record,
+ * is false.
+ */
+export function taskFixableAreAllUnbuiltWorkV1(
+  blockers: readonly (ReviewBlocker | ReviewBlockerIdentity)[],
+  planOfRecord: string | undefined
+): boolean {
+  if (planOfRecord === undefined) {
+    return false;
+  }
+  const reviewerRaised = blockers.filter((b) => b.resolver === "task-fixable" && b.origin !== "mechanical");
+  return (
+    reviewerRaised.length > 0 &&
+    reviewerRaised.every(
+      (b) =>
+        b.category === "completion" &&
+        isUnbuiltWorkBlockerV1(("description" in b ? b.description : undefined) ?? "", planOfRecord)
+    )
+  );
+}
 
 /** Default number of consecutive rounds with no new high-water-mark score
  * before a stage is considered plateaued. Configurable via
@@ -1121,6 +1221,13 @@ export interface PostReviewActionDecisionV1 {
    * Absent when no review has run yet.
    */
   readonly reviewStage?: TaskStage;
+  /**
+   * RC7 item 3: only ever true on `"both"`, when plan items are open and every
+   * reviewer-raised task-fixable blocker is unbuilt work — a running
+   * Implementation round is then what the blockers need, so a card raised
+   * while it runs recommends letting it run rather than cancelling it.
+   */
+  readonly recommendLetItRun?: boolean;
 }
 
 /**
@@ -1131,6 +1238,18 @@ export const IMPL_REVIEW_STAGES_V1: readonly TaskStage[] = [
   "impl-low-review",
   "impl-high-review",
 ];
+
+/**
+ * Which option the card raised while Implementation is running recommends:
+ * keep the running round only when the decision says the review's task-fixable
+ * blockers are unbuilt work; otherwise Review & Apply.
+ */
+export function runningImplementationRecommendedOptionV1(decision: {
+  readonly action: string;
+  readonly recommendLetItRun?: boolean;
+}): "letItRun" | "goToReviewAndApply" {
+  return decision.action === "both" && decision.recommendLetItRun === true ? "letItRun" : "goToReviewAndApply";
+}
 
 export function decidePostReviewActionV1(input: {
   history: readonly ReviewScoreHistoryEntry[] | undefined;
@@ -1147,6 +1266,8 @@ export function decidePostReviewActionV1(input: {
   stages: readonly TaskStage[];
   /** Whether the plan of record still has unticked checklist items. */
   hasUntickedChecklistItems: boolean;
+  /** The plan of record's text, for the unbuilt-work test behind `recommendLetItRun`. */
+  planOfRecord?: string;
   /**
    * Whether a continuation round is currently owed for this task
    * (`TaskProgress.implRecovery` present) — outranks blocker/checklist
@@ -1176,6 +1297,7 @@ export function decidePostReviewActionV1(input: {
         "A continuation round is owed for this task — a prior round's edits have not yet been reported. " +
         "Review, Apply Review, and Fast Forward will all refuse until it is drained. Implementation is the " +
         "only action that can claim and complete it.",
+      recommendLetItRun: false,
     };
   }
   const candidates = input.stages
@@ -1198,33 +1320,42 @@ export function decidePostReviewActionV1(input: {
     return input.hasUntickedChecklistItems
       ? {
           action: "implementation",
+          recommendLetItRun: false,
           reason: `No ${stageName} has run yet; the plan checklist still has unticked items.`,
         }
       : {
           action: "none",
+          recommendLetItRun: false,
           reason: `No ${stageName} has run yet and the plan checklist is complete.`,
         };
   }
   if (latest.taskFixableCount > 0) {
     if (input.hasUntickedChecklistItems) {
       // Two genuinely valid actions (module doc comment above): recommend
-      // Apply Review first, per the module's own precedence rule, but never
-      // claim Implementation would change nothing — real, queued checklist
-      // work is exactly what it would act on.
+      // Apply Review first, per the module's own precedence rule, unless the
+      // blockers are unbuilt work (`recommendLetItRun`), in which case let
+      // Implementation build them. Never claim Implementation would change
+      // nothing — real, queued checklist work is exactly what it would act on.
+      const recommendLetItRun = taskFixableAreAllUnbuiltWorkV1(latest.blockers ?? [], input.planOfRecord);
       return {
         action: "both",
         reviewStage: latest.stage,
-        reason:
-          `The ${stageName} found ${describeTaskFixableBlockersV1(latest.taskFixableCount, latest.blockers)} ` +
-          "in the code that still need fixing, and the plan checklist still has unticked items. Both are " +
-          "valid here: Apply Review can fix the problems the review found (Implementation cannot see them " +
-          "— it only reads the plan checklist), and Implementation can still make progress on the unticked " +
-          "checklist items.",
+        recommendLetItRun,
+        reason: recommendLetItRun
+          ? `The ${stageName} found ${describeTaskFixableBlockersV1(latest.taskFixableCount, latest.blockers)} ` +
+            "that are work not built yet, and the plan checklist still has unticked items. Both actions are " +
+            "valid here, but Implementation builds those open items, and a fresh review runs after it."
+          : `The ${stageName} found ${describeTaskFixableBlockersV1(latest.taskFixableCount, latest.blockers)} ` +
+            "in the code that still need fixing, and the plan checklist still has unticked items. Both are " +
+            "valid here: Apply Review can fix the problems the review found (Implementation cannot see them " +
+            "— it only reads the plan checklist), and Implementation can still make progress on the unticked " +
+            "checklist items.",
       };
     }
     return {
       action: "apply-review",
       reviewStage: latest.stage,
+      recommendLetItRun: false,
       // Plain language on purpose: this string is shown to the user in a
       // dialog they have to act on, and "task-fixable blockers are not
       // rendered into the implementation prompt" is a sentence that describes
@@ -1239,12 +1370,14 @@ export function decidePostReviewActionV1(input: {
     return {
       action: "implementation",
       reviewStage: latest.stage,
+      recommendLetItRun: false,
       reason: `The newest ${stageName} reports no task-fixable blockers; unticked checklist items remain.`,
     };
   }
   return {
     action: "none",
     reviewStage: latest.stage,
+    recommendLetItRun: false,
     reason: `The newest ${stageName} reports no task-fixable blockers and the plan checklist is complete.`,
   };
 }

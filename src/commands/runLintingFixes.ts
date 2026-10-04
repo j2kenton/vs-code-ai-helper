@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
@@ -618,16 +619,20 @@ export async function runLintingFixes(
   if (!lastReport) {
     // No usable lintPayload: checks never ran, or the recorded result did not
     // survive. One line either way, no AI work.
+    const notRunNotice = `${taskLabel}: Publish Checks have not run yet. Run them first.`;
     NotificationRouter.showWarning(
-      `${taskLabel}: Publish Checks have not run yet. Run them first.`,
+      notRunNotice,
       undefined,
       undefined,
       undefined,
-      {
+      await offerActionInChatV1({
+        taskFolderPath: resolvedTask.taskFolderPath,
+        taskLabel,
+        actionLabel: "Run Publish Checks",
         command: "vs-code-ai-helper.runPublishChecks",
-        title: "Run Publish Checks",
         args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
-      }
+        noticeText: notRunNotice,
+      })
     );
     return;
   }
@@ -661,18 +666,23 @@ export async function runLintingFixes(
   // the fallback dispatch below never contends with this action's own lock.
   const scope = resolvePublishScopeFolder(taskFolderUri, resolvedTask.progress);
   if (scope.stale) {
-    NotificationRouter.showWarning(
+    const staleScopeNotice =
       `${taskLabel}: no valid Publish verification scope could be resolved (the saved scope ` +
-        "or the task's project-root binding no longer exists). Re-run the " +
-        "Publish checks to choose a new scope before applying fixes.",
+      "or the task's project-root binding no longer exists). Re-run the " +
+      "Publish checks to choose a new scope before applying fixes.";
+    NotificationRouter.showWarning(
+      staleScopeNotice,
       undefined,
       undefined,
       undefined,
-      {
+      await offerActionInChatV1({
+        taskFolderPath: resolvedTask.taskFolderPath,
+        taskLabel,
+        actionLabel: "Run Publish Checks",
         command: "vs-code-ai-helper.runPublishChecks",
-        title: "Run Publish Checks",
         args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
-      }
+        noticeText: staleScopeNotice,
+      })
     );
     return;
   }

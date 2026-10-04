@@ -1010,7 +1010,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     label: "Claude Code",
     command: "claude",
     installHint:
-      "Install the Claude Code CLI (npm i -g @anthropic-ai/claude-code), then run `claude` once to sign in with your Anthropic account.",
+      "Install the Claude Code CLI (`curl -fsSL https://claude.ai/install.sh | bash`; `npm i -g @anthropic-ai/claude-code` is still supported), then run `claude` once to sign in with your Anthropic account.",
     loginHint:
       "Run `claude` in a terminal and complete the sign-in with your Anthropic (Claude) account, then try again.",
     authErrorMarkers: ["log in", "login", "authenticate", "api key", "oauth"],
@@ -1454,7 +1454,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     label: "Kiro CLI",
     command: "kiro-cli",
     installHint:
-      "Install Kiro CLI from https://kiro.dev/cli/ (or the Kiro installer), then set KIRO_API_KEY for headless mode. `kiro-cli login` alone is not enough for `chat --no-interactive`.",
+      "Install Kiro CLI (`curl -fsSL https://cli.kiro.dev/install | bash`), then set KIRO_API_KEY for headless mode. `kiro-cli login` alone is not enough for `chat --no-interactive`.",
     loginHint:
       "Set KIRO_API_KEY (required by Kiro headless mode), then try again. `kiro-cli login` does not satisfy `chat --no-interactive` auth.",
     authErrorMarkers: [
@@ -1640,9 +1640,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     label: "Cline CLI",
     command: "cline",
     installHint:
-      "Install the Cline CLI (npm i -g cline), then run `cline auth cline-pass` to sign in with ClinePass.",
+      "Install the Cline CLI (npm i -g cline), then run `cline auth` and choose ClinePass in its wizard.",
     loginHint:
-      "Run `cline auth cline-pass` in a terminal and complete the ClinePass sign-in, then try again.",
+      "Run `cline auth` in a terminal, choose ClinePass in its wizard and complete the sign-in, then try again.",
     // Best-effort list, NOT verified against a real unauthenticated cline
     // run: this dev environment's `cline` CLI was already signed in, and
     // deliberately signing it out to observe a genuine auth failure would
@@ -1659,13 +1659,13 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "401",
       "no credentials",
     ],
-    // `cline auth cline-pass` is a genuine one-shot CLI subcommand (not an
+    // `cline auth` is a genuine one-shot CLI subcommand (not an
     // in-session slash command) that drives an OAuth flow in the terminal —
     // verified via `cline auth --help` (`auth [options] [provider]`, with
     // `provider` documented as "positional shorthand for -p"). Matches
     // Codex's `codex login` terminal pattern rather than Claude's
     // launch-then-send /login pattern.
-    signInCommand: "cline auth cline-pass",
+    signInCommand: "cline auth",
     signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Completes ClinePass sign-in in the terminal (an OAuth flow opens in your browser). " +
@@ -1785,7 +1785,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     ],
     // A genuine one-shot CLI subcommand (verified via `kimi --help`'s
     // Commands list), not an in-session slash command — matches Codex's
-    // `codex login` / Cline's `cline auth cline-pass` terminal pattern.
+    // `codex login` / Cline's `cline auth` terminal pattern.
     signInCommand: "kimi login",
     signInLabel: "Sign in / Switch account",
     signInGuidance:
@@ -2006,9 +2006,9 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     label: "devpass-code",
     command: "devpass-code",
     installHint:
-      "Install devpass-code, then run `devpass-code providers login` and connect the LLM Gateway DevPass credential.",
+      "Install devpass-code, then run `devpass-code auth login` and connect the LLM Gateway DevPass credential.",
     loginHint:
-      "Run `devpass-code providers login` in a terminal and complete the LLM Gateway DevPass sign-in, then try again.",
+      "Run `devpass-code auth login` in a terminal and complete the LLM Gateway DevPass sign-in, then try again.",
     // Not verified against a genuine unauthenticated run (this environment's
     // CLI was already signed in) — matches the union of markers used by the
     // other OpenCode-shaped/multi-model CLI providers here.
@@ -2022,10 +2022,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       "no provider available",
       "401",
     ],
-    // `devpass-code providers login` is a genuine one-shot CLI subcommand
+    // `devpass-code auth login` is a genuine one-shot CLI subcommand
     // (verified via `devpass-code providers --help`), not an in-session
     // slash command like OpenCode's `/connect`.
-    signInCommand: "devpass-code providers login",
+    signInCommand: "devpass-code auth login",
     signInLabel: "Sign in / Switch account",
     signInGuidance:
       "Completes the LLM Gateway DevPass sign-in in the terminal. Whether re-running this while already " +

@@ -1346,9 +1346,17 @@ export function describeEditActionOutcomeFailureV1(
     parts.push(declaredDetail);
   }
   if (exhaustion !== undefined && exhaustion.candidates.length > 0) {
-    const candidateList = exhaustion.candidates
-      .map((c) => `${describeModelWithProviderV1(c.storedModelId)} — ${c.reason}`)
+    const disabledCandidates = exhaustion.candidates.filter((c) => c.reason === "provider disabled");
+    const triedCandidates = exhaustion.candidates.filter((c) => c.reason !== "provider disabled");
+    const skippedList = disabledCandidates
+      .map((c) => `${describeModelWithProviderV1(c.storedModelId)}: provider disabled`)
       .join("; ");
+    const candidateList =
+      triedCandidates.length > 0
+        ? triedCandidates
+            .map((c) => `${describeModelWithProviderV1(c.storedModelId)} — ${c.reason}`)
+            .join("; ")
+        : skippedList;
     // workflow 3 continuation, third item: `candidatesExhausted` (every
     // candidate was reserved, invoked, and failed) and `providerModeUnavailable`
     // (nothing was ever reserved) are opposite conditions with opposite
@@ -1357,7 +1365,10 @@ export function describeEditActionOutcomeFailureV1(
       code === "candidatesDeferred"
         ? `Every configured model is currently quota/entitlement-limited (deferred, not exhausted): ${candidateList}`
         : code === "candidatesExhausted"
-          ? `Every configured model was tried and failed: ${candidateList}`
+          ? triedCandidates.length > 0
+            ? `Every configured model that could run was tried and failed: ${candidateList}` +
+              (skippedList.length > 0 ? `. Not tried: ${skippedList}` : "")
+            : `No configured model could run (none was tried): ${skippedList}`
           : `No configured model was available: ${candidateList}`
     );
   }

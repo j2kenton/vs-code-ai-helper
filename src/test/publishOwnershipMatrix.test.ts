@@ -73,6 +73,8 @@ import {
 } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { safeRemoveDir } from "./testFsUtils";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -2191,6 +2193,24 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
     const dispatches: AutomationDispatch[] = [];
+    // RC7 item 4: the notice's button only opens the chat; "Run Publish
+    // Checks" is offered there as an option on a posted decision.
+    const backing = new Map<string, unknown>();
+    const memento = {
+      keys: (): readonly string[] => [...backing.keys()],
+      get: <T>(key: string, defaultValue?: T): T | undefined =>
+        backing.has(key) ? (backing.get(key) as T) : defaultValue,
+      update: (key: string, value: unknown): Thenable<void> => {
+        if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+        return Promise.resolve();
+      },
+    };
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
     try {
       const dispatchProbe = { dispatched: false };
       await runPassingReview(folderPath, dispatches, "Readiness: 9/10\n\n- Ready.\n", "publish", { dispatchProbe });
@@ -2200,9 +2220,22 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
         .getEntries()
         .find((entry) => /Publish Checks have not been run yet/.test(entry.message));
       assert.ok(refusal, "the refusal must name missing checks as the cause");
-      assert.equal(refusal?.actionCommand?.title, "Run Publish Checks");
-      assert.equal(refusal?.actionCommand?.command, "vs-code-ai-helper.runPublishChecks");
+      assert.equal(refusal?.actionCommand?.title, "Open in Chat");
+      assert.equal(refusal?.actionCommand?.command, "vs-code-ai-helper.openWorkflowDecision");
+      const offer = new WorkflowDecisionStoreV1(memento)
+        .listPending()
+        .find((d) => d.decisionKey === "chatActionOffer:runPublishChecks");
+      assert.ok(offer, "the chat carries the offer");
+      const run = offer.options.find((o) => o.optionId === "runAction");
+      assert.equal(run?.label, "Run Publish Checks");
+      assert.deepEqual(run?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.runPublishChecks",
+        args: [{ taskFolderPath: folderPath }],
+      });
+      assert.equal(offer.recommendation.kind === "option" && offer.recommendation.optionId, "runAction");
     } finally {
+      __extensionContextV1TestOnly.reset();
       wsStub.restore();
       fsBridge.restore();
       provider.dispose();

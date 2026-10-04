@@ -18,7 +18,8 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { handBackToHumanAfterPublishChecksV1 } from "../utils/taskProgressTransforms";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument } from "../utils/fileUtils";
-import { publishNextStepOfferV1 } from "../utils/publishStageActionsV1";
+import { COMMIT_AND_PUSH_COMMAND_V1, publishNextStepOfferV1 } from "../utils/publishStageActionsV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import {
   runTrackedOperation,
@@ -46,6 +47,7 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 /**
  * Per-task queue for `runPublishChecks` invocations (plan PART 2, step 6): a
@@ -437,7 +439,10 @@ export async function runPublishChecks(
     return dispatched;
   }
 
-  if (resolvedTask.progress.currentStage !== "publish") {
+  // The inventory snapshot can still hold the previous stage for a moment
+  // after an auto-advance, so the stage check reads progress from disk.
+  const freshProgress = await readTaskProgressStrictV1(vscode.Uri.file(resolvedTask.taskFolderPath));
+  if (!freshProgress.ok || freshProgress.decoded.progress.currentStage !== "publish") {
     NotificationRouter.showWarning(
       `${notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)}: Publish checks are only available for tasks at the Publish stage.`
     );
@@ -577,12 +582,24 @@ export async function runPublishChecks(
               // use: a check that failed only on a quarantined known flake is a pass.
               if (result.passedModuloKnownFlakes ?? result.passed) {
                 const nextStepOffer = publishNextStepOfferV1();
+                const passedNotice = `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}`;
+                // RC7 item 4: the button only opens the chat. The review step
+                // is offered there as an option; Commit & Push is not moved
+                // to the chat in this task, so that variant has no button.
                 NotificationRouter.showInformation(
-                  `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}`,
+                  passedNotice,
                   undefined,
                   undefined,
                   undefined,
-                  nextStepOffer.action
+                  nextStepOffer.action.command === COMMIT_AND_PUSH_COMMAND_V1
+                    ? undefined
+                    : await offerActionInChatV1({
+                        taskFolderPath: taskFolderUri.fsPath,
+                        actionLabel: nextStepOffer.action.title,
+                        command: nextStepOffer.action.command,
+                        args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                        noticeText: passedNotice,
+                      })
                 );
               } else {
                 NotificationRouter.showWarning(

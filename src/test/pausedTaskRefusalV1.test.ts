@@ -15,7 +15,7 @@ import {
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 
 void describe("showPausedTaskRefusalV1 (RC1 item 11)", () => {
-  void it("posts a warning whose Resume button targets this task's folder", () => {
+  void it("posts a warning with no button when the chat offer cannot be posted (RC7 item 4)", async () => {
     const entries: { message: string; level: string; actionCommand?: { command: string; title: string; args?: unknown[] } }[] = [];
     const surface: StatusSurface = {
       addEntry: (message, level, _filePath, _resultTargetUri, _sourceOperationId, actionCommand): void => {
@@ -24,18 +24,14 @@ void describe("showPausedTaskRefusalV1 (RC1 item 11)", () => {
     };
     initNotificationRouter(surface);
     try {
-      showPausedTaskRefusalV1("running a review", "/tmp/plans/task-a");
+      await showPausedTaskRefusalV1("running a review", "/tmp/plans/task-a");
     } finally {
       deactivateNotificationRouter();
     }
     assert.equal(entries.length, 1);
     assert.equal(entries[0]?.level, "warning");
     assert.match(entries[0]?.message ?? "", /"task-a" is paused\. Resume it before running a review\./);
-    assert.deepEqual(entries[0]?.actionCommand, {
-      command: "vs-code-ai-helper.resumeTask",
-      title: "Resume",
-      args: [{ taskFolderPath: "/tmp/plans/task-a" }],
-    });
+    assert.equal(entries[0]?.actionCommand, undefined, "no unreadable task, no pointer, and never a direct Resume");
   });
 
   void it("no command in src still refuses a paused task with an info message", () => {

@@ -668,7 +668,7 @@ export async function chatWithStage(
     // completeCommitAndPushTask already do.
     const chatReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
     if (chatReconcileOutcome.outcome === "userPaused" || chatReconcileOutcome.outcome === "unreadable") {
-      showPausedTaskRefusalV1("sending a message", task.taskFolderPath, task.progress.displayName);
+      await showPausedTaskRefusalV1("sending a message", task.taskFolderPath, task.progress.displayName);
       return;
     }
 

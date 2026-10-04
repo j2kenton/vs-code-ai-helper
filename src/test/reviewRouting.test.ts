@@ -1333,15 +1333,23 @@ void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (
       const marker = `decisionKey: "${decisionKey}"`;
       const index = source.indexOf(marker);
       assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
-      const slice = source.slice(index, index + 2200);
+      const slice = source.slice(index, index + (decisionKey === "preImplementationRouting" ? 6000 : 2200));
       assert.match(
         slice,
         /optionId:\s*"goToReviewAndApply"/,
         `${decisionKey} must offer a goToReviewAndApply option`
       );
+      // RC7 item 3: preImplementationRouting recommends "Keep running
+      // Implementation" only when plan items are open and the blockers are
+      // unbuilt work (runningImplementationRecommendedOptionV1); every other
+      // case still falls back to goToReviewAndApply.
+      const recommendationPattern =
+        decisionKey === "preImplementationRouting"
+          ? /recommendation:\s*runningImplementationRecommendedOptionV1\([\s\S]{0,900}optionId:\s*"goToReviewAndApply"/
+          : /recommendation:\s*\{\s*kind:\s*"option",\s*optionId:\s*"goToReviewAndApply"/;
       assert.match(
         slice,
-        /recommendation:\s*\{\s*kind:\s*"option",\s*optionId:\s*"goToReviewAndApply"/,
+        recommendationPattern,
         `${decisionKey} must recommend goToReviewAndApply, matching the corrected routing input (an owed ` +
           "continuation is checked before this dialog is ever reached — see decidePostReviewActionV1)"
       );

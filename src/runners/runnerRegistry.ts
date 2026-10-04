@@ -2165,9 +2165,34 @@ export function openV1RunnerSelection(options: {
           reason: `cannot satisfy the requested "${mode}" mode (skipped at selection time)`,
         }
   );
+  // Configured candidates skipped because their provider is switched off are
+  // never ranked, so name them explicitly: otherwise the failure message
+  // reads as if every configured model had been tried.
+  const rankedNormalized = new Set(rankedStoredIds.map((id) => normalizeQualifiedModelId(id)));
+  const disabledStatuses: typeof candidateStatuses = [];
+  if (options.stage !== undefined) {
+    const chain = resolveEffectiveStageChainV1(options.stage);
+    for (const configured of [chain.primary, ...chain.backups]) {
+      if (
+        configured === undefined ||
+        rankedNormalized.has(normalizeQualifiedModelId(configured)) ||
+        !isModelProviderDisabled(configured)
+      ) {
+        continue;
+      }
+      rankedNormalized.add(normalizeQualifiedModelId(configured));
+      const skippedProvider = parseModelSelection(configured).provider;
+      disabledStatuses.push({
+        storedModelId: configured,
+        providerLabel: getCliProvider(skippedProvider)?.label ?? "Copilot",
+        runnerId: skippedProvider,
+        reason: "provider disabled",
+      });
+    }
+  }
   const exhaustionEvidence = (): ProviderChainExhaustionV1 => ({
     ...(options.stage !== undefined ? { stage: options.stage } : {}),
-    candidates: candidateStatuses.map((status) => ({ ...status })),
+    candidates: [...candidateStatuses, ...disabledStatuses].map((status) => ({ ...status })),
   });
 
   return {
