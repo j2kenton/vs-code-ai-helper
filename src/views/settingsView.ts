@@ -771,6 +771,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           button.secondary:hover {
             background-color: var(--vscode-button-secondaryHoverBackground);
           }
+          /* Some dark themes give secondary buttons the same background as the
+             page, so mix in some of the theme text colour to get a grey that
+             always stands out. */
+          body.vscode-dark button.provider-signin,
+          body.vscode-dark button.provider-usage {
+            background-color: color-mix(in srgb, var(--vscode-foreground) 15%, var(--vscode-editor-background));
+          }
+          body.vscode-dark button.provider-signin:hover,
+          body.vscode-dark button.provider-usage:hover {
+            background-color: color-mix(in srgb, var(--vscode-foreground) 25%, var(--vscode-editor-background));
+          }
           .stage-row {
             padding: var(--ensemble-space-3) 0 var(--ensemble-space-2);
             border-bottom: var(--ensemble-border-width) solid var(--vscode-widget-border);
