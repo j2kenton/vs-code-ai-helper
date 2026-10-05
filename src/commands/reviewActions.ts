@@ -16,6 +16,7 @@ import {
   taskOperations,
   runTrackedOperation,
   linkCancellationTokens,
+  runResumedRoundOperationV1,
   TaskOperationHandle,
   cancelRunningOperationsForTask,
   hasActiveOperationTargetingStage,
@@ -11792,14 +11793,28 @@ export async function resumeGenerateImplementationInteractionV1(
     }
   }
 
-  const outcome = await coordinator.resumeAction({
-    interaction: interactionRef,
-    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: ownedTask.progress.status ?? "active",
-    taskStage: ownedTask.progress.currentStage,
-    resumeIdempotencyId,
-    cancellationToken,
-  });
+  // RC10 item 1: the provider round is a tracked operation (same label, stage
+  // and kind as the fresh path); the outcome handling below runs outside it.
+  const outcome = await runResumedRoundOperationV1(
+    ownedTask.taskFolderPath,
+    { label: "Generate Implementation", stage: "impl", kind: "generate-implementation", displayName: ownedTask.progress.displayName },
+    async (op) => {
+      const linked = linkCancellationTokens(cancellationToken, op.token);
+      try {
+        return await coordinator.resumeAction({
+          interaction: interactionRef,
+          taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+          taskStatus: ownedTask.progress.status ?? "active",
+          taskStage: ownedTask.progress.currentStage,
+          resumeIdempotencyId,
+          cancellationToken: linked.token,
+          onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+        });
+      } finally {
+        linked.dispose();
+      }
+    }
+  );
 
   const implementationUri = getCanonicalImplementationUri(taskFolderUri);
   await handleGenerateImplementationOutcomeV1(outcome, {
@@ -17130,13 +17145,27 @@ export async function resumeReviewInteractionV1(
     // See `runReviewForFolder`'s matching declaration and
     // `attachCoordinatorIdentityToRoundTrackingDegradationV1`'s doc comment.
     let identityAttachmentDegradedForOutcome: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
-    const outcome = await coordinator.resumeAction({
+    // RC10 item 1: the provider round is a tracked operation (same label,
+    // stage and kind as the fresh review) so the row and Notifications show it
+    // running; `handleReviewOutcomeV1` and the routing after it stay outside.
+    const outcome = await runResumedRoundOperationV1(
+      ownedTask.taskFolderPath,
+      {
+        label: stepNameV1("review"),
+        stage: currentStage,
+        kind: "review",
+        displayName: ownedTask.progress.displayName,
+      },
+      async (op) => {
+        const linked = linkCancellationTokens(cancellationToken, op.token);
+        try {
+          return await coordinator.resumeAction({
       interaction: interactionRef,
       taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
       taskStatus: ownedTask.progress.status ?? "active",
       taskStage: currentStage,
       resumeIdempotencyId,
-      cancellationToken,
+      cancellationToken: linked.token,
       // See `runReviewForFolder`'s matching `onAttemptAllocated` comment: an
       // in-memory-only (zero-I/O) collection of every attempt id, including one
       // that fails before `onPromptAssembled` ever fires for it, reaching disk
@@ -17161,15 +17190,15 @@ export async function resumeReviewInteractionV1(
       onPromptAssembled: (info) => {
         observedCoordinatorAttemptIds.push(info.attemptId);
       },
-      // RC6 item 4 (resume path): the resume has no operation handle of its
-      // own, so the running candidate is reported to the task's root one.
-      onCandidateInvokedV1: (info) => {
-        const rootId = taskOperations.rootOperationIdFor(ownedTask.taskFolderPath);
-        if (rootId) {
-          taskOperations.setModel(rootId, info.storedModelId);
-        }
-      },
+      // RC6 item 4 (resume path): the running candidate is reported to the
+      // resumed round's own operation row.
+      onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
     });
+        } finally {
+          linked.dispose();
+        }
+      }
+    );
 
     await handleReviewOutcomeV1(outcome, {
       extensionUri,
@@ -17249,14 +17278,34 @@ export async function resumeApplyReviewInteractionV1(
     sourceAttemptId: ref.sourceAttemptId,
   };
 
-  const outcome = await coordinator.resumeAction({
-    interaction: interactionRef,
-    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: ownedTask.progress.status ?? "active",
-    taskStage: ownedTask.progress.currentStage,
-    resumeIdempotencyId,
-    cancellationToken,
-  });
+  // RC10 item 1: only the provider round is a tracked operation, so the
+  // re-review and a follow-up question below run outside it.
+  const outcome = await runResumedRoundOperationV1(
+    ownedTask.taskFolderPath,
+    {
+      label: stepNameV1("apply-review"),
+      stage: "plan",
+      kind: "apply-review",
+      displayName: ownedTask.progress.displayName,
+      activity: stepProgressLabelV1("apply-review"),
+    },
+    async (op) => {
+      const linked = linkCancellationTokens(cancellationToken, op.token);
+      try {
+        return await coordinator.resumeAction({
+          interaction: interactionRef,
+          taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+          taskStatus: ownedTask.progress.status ?? "active",
+          taskStage: ownedTask.progress.currentStage,
+          resumeIdempotencyId,
+          cancellationToken: linked.token,
+          onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+        });
+      } finally {
+        linked.dispose();
+      }
+    }
+  );
 
   if (outcome.kind === "completed") {
     // Mirror the initial applyReviewWithAI completion path exactly: mark the

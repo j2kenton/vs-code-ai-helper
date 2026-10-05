@@ -6,6 +6,7 @@ Read the final plan below and produce an implementation checklist in Markdown:
 - Each item must be a single concrete, independently verifiable change (e.g. "Add X to file Y", "Handle case Z in function W") — not a vague activity.
 - Preserve the plan's ordering and dependencies between steps.
 - If a step is a deploy/toolchain/infra action, requires a human operator, or is explicitly optional/out-of-scope for this stage to perform (e.g. "Deploy the classifier change to production", "Rotate the API key", "Optional: add telemetry once the dashboard exists"), append `<!-- ensemble:excluded -->` to the end of that item's line, after its text. Marked items still appear on the checklist and must still be checked off if completed, but they do not count toward the plan's completion total — use this marker only for steps this implementation stage genuinely cannot or need not perform itself, never as a way to shrink the real scope of work.
+- A run of tests, lint, type-check or build is never an item a round must tick. When the plan writes it as "Verified by Publish Checks:", write it as one Verification item that keeps the command and test names and ends with `<!-- ensemble:excluded -->`; only runs the plan writes that way qualify. Any other run (uncovered, unconfirmed or unclassified) is a manual hand-off item with the five elements, excluded as today.
 - Every item requiring a human to manually check or verify something (as opposed to a deploy/toolchain step nobody needs to inspect) must carry all five hand-off elements in its own text, not just a restatement of what to do:
   - **What** to check — concrete and specific.
   - **Why** — what this confirms, in one sentence.
@@ -29,7 +30,7 @@ Read the final plan below and produce an implementation checklist in Markdown:
   > **Why it is high priority:** if it is wrong in production the damage is silent and compounds with every import.
 
   A LOW-priority item follows the same shape but ends by naming what is being traded off, e.g. "Priority: LOW — a failure here surfaces as an error dialog immediately; skipping this check only costs a rerun, never bad data."
-- End with a "Verification" section listing how to confirm the work is done (tests to run, behaviors to check). Evidence for a manual-verification item (a run log line, a file/line, a query result) is written below its guidance once it exists, never instead of the five elements above.
+- End with a "Verification" section listing how to confirm the work is done (behaviours to check; test runs appear only as "Verified by Publish Checks:" items or manual hand-off items). Evidence for a manual-verification item (a run log line, a file/line, a query result) is written below its guidance once it exists, never instead of the five elements above.
 
 Do not add work the plan does not call for. Do not create, write, or edit any file yourself — output ONLY the complete checklist document as your response text; it replaces the current plan-final.md content in place.
 

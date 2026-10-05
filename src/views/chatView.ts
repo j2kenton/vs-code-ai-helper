@@ -549,6 +549,45 @@ export function buildInteractionCopyTextV1(
   return lines.join("\n");
 }
 
+const ANSWERED_TEXT_SUMMARY_MAX_CHARS_V1 = 120;
+
+/**
+ * One-line summary of an interaction's recorded answers for the read-only
+ * "Answered: …" card (RC10 item 1): a single choice gives the option label,
+ * a multiple choice the labels joined with ", ", free text is cut to 120
+ * characters with "…", skipped answers are left out and questions are joined
+ * with "; ". Returns `undefined` unless every required question has a
+ * recorded answer, so a card never claims "Answered" for answers that did not
+ * land. Exported for direct unit testing.
+ */
+export function describeInteractionAnswersV1(interaction: {
+  readonly questions: readonly StructuredQuestionV1[];
+  readonly answers?: readonly StructuredAnswerV1[];
+}): string | undefined {
+  const answers = interaction.answers ?? [];
+  const parts: string[] = [];
+  for (const question of interaction.questions) {
+    const answer = answers.find((a) => a.questionId === question.questionId);
+    if (!answer || answer.state !== "answered") {
+      if (question.required) {
+        return undefined;
+      }
+      continue;
+    }
+    if (answer.kind === "text") {
+      parts.push(
+        answer.value.length > ANSWERED_TEXT_SUMMARY_MAX_CHARS_V1
+          ? `${answer.value.slice(0, ANSWERED_TEXT_SUMMARY_MAX_CHARS_V1)}…`
+          : answer.value
+      );
+    } else if (question.kind !== "text") {
+      const ids = answer.kind === "singleChoice" ? [answer.selectedOptionId] : answer.selectedOptionIds;
+      parts.push(ids.map((id) => question.options.find((o) => o.optionId === id)?.label ?? id).join(", "));
+    }
+  }
+  return parts.join("; ");
+}
+
 /** Merge durable transcript records and workspace-state decision cards by
  * their recorded time. A decision anchor wins over its `createdAt` fallback
  * and sits immediately after the message that announced it. */
@@ -687,6 +726,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * and must not regain, a reentrancy bypass.
    */
   private queues = new Map<string, Promise<void>>();
+  /**
+   * RC10 item 1, display only: interactions (`operationId:interactionId`)
+   * whose Confirm is being processed. While a key is here and its required
+   * questions all have recorded answers, the card renders as answered
+   * ("Answered: B · Resuming…") although the durable record stays
+   * `unresolved` until the resumed round settles it. Nothing persists.
+   */
+  private readonly confirmingInteractionsV1 = new Set<string>();
   /** Tracks which tasks already showed the "could not save" warning, so a
    * run of write failures surfaces one notice, not one per message. Cleared
    * the next time a write for that task succeeds. */
@@ -1018,14 +1065,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           // the user is never left staring at silence while a slow round
           // runs. `resumeInteraction`'s own message then reports only the
           // resume outcome, not a second "answer submitted" claim.
-          if (
-            await this.submitInteractionAnswers(
-              clientRef,
-              message.answers,
-              "Recorded: your answer was submitted. Resuming…"
-            )
-          ) {
-            await this.resumeInteraction(clientRef, "Resumed — the action is continuing.");
+          const confirmKey = `${clientRef.operationId}:${clientRef.interactionId}`;
+          const confirmTarget = this.target;
+          this.confirmingInteractionsV1.add(confirmKey);
+          try {
+            if (
+              await this.submitInteractionAnswers(
+                clientRef,
+                message.answers,
+                "Recorded: your answer was submitted. Resuming…"
+              )
+            ) {
+              await this.resumeInteraction(clientRef, "Resumed — the action is continuing.");
+            }
+          } finally {
+            this.confirmingInteractionsV1.delete(confirmKey);
+            if (confirmTarget && sameIdentity(this.target, confirmTarget)) {
+              await this.render();
+            }
           }
         } else {
           await this.resumeInteraction(clientRef);
@@ -1860,6 +1917,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * Confirm path overrides it, since submitInteractionAnswers has already
    * posted its own "your answer was submitted" acknowledgement immediately —
    * repeating that claim here would be redundant.
+   *
+   * The provider round itself runs outside the chat queue (RC10 item 1): only
+   * the interaction lookup and the settle write are queued, so the chat stays
+   * readable and writable — including by a follow-up question the resumed
+   * round raises — while the round runs.
    */
   private async resumeInteraction(
     clientRef: ChatInteractionClientRefV1,
@@ -1994,14 +2056,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       let resumed = false;
       let declineMessage: string | undefined;
       const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
-      await this.runQueued(identity.taskFolderPath, async () => {
-        try {
-          const ref = await this.resolveInteractionRef(identity, clientRef);
-          if (!ref) {
-            declineMessage = "Could not resume: no matching question exists in this task's chat.";
-            NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
-            return;
-          }
+      // RC10 item 1: the provider round runs OUTSIDE the chat queue. Holding
+      // `runQueued` for the whole round made every other write to this task's
+      // chat (a follow-up question the round raises, a render, an append) wait
+      // for the round itself, so a resumed round that asked again deadlocked.
+      // Only the two short chat reads/writes around it are queued.
+      try {
+        const ref = await this.runQueued(identity.taskFolderPath, () => this.resolveInteractionRef(identity, clientRef));
+        if (!ref) {
+          declineMessage = "Could not resume: no matching question exists in this task's chat.";
+          NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
+        } else {
           // Minted immediately before the dispatch it authorizes, matching
           // authorizeWorkAdmissionHandoffV1's "about to make exactly one
           // specific dispatch" contract — and revoked in the inner `finally`
@@ -2010,36 +2075,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const admissionHandoffTokenV1 = admissionHandle
             ? authorizeWorkAdmissionHandoffV1(unavailableIdentity.taskFolderPath)
             : undefined;
+          let result: ChatInteractionResumeResultV1;
           try {
-            const result = await resume(ref, crypto.randomBytes(16).toString("hex"), admissionHandoffTokenV1);
+            result = await resume(ref, crypto.randomBytes(16).toString("hex"), admissionHandoffTokenV1);
             coordinatorOutcomeV1 = result.coordinatorOutcome;
-            if (!result.ok) {
-              declineMessage = `Could not resume: ${result.reason}`;
-              NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
-              return;
-            }
-            // A viewer's Resume ran on the runner, which settles the shared
-            // mirror itself (extension.ts's relay executor) — so the record
-            // is settled even if this window's wait for the answer times out.
-            if (!isViewerHostV1()) {
-              await settleChatInteraction(
-                identity.taskFolderPath,
-                identity.canonicalId,
-                clientRef.interactionId,
-                result.settlement
-              );
-            }
-            resumed = true;
           } finally {
             if (admissionHandoffTokenV1) {
               revokeWorkAdmissionHandoffV1(unavailableIdentity.taskFolderPath);
             }
           }
-        } catch (error) {
-          declineMessage = `Could not resume this question. (${error instanceof Error ? error.message : String(error)})`;
-          NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
+          if (!result.ok) {
+            declineMessage = `Could not resume: ${result.reason}`;
+            NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
+          } else {
+            // A viewer's Resume ran on the runner, which settles the shared
+            // mirror itself (extension.ts's relay executor) — so the record
+            // is settled even if this window's wait for the answer times out.
+            if (!isViewerHostV1()) {
+              const settlement = result.settlement;
+              await this.runQueued(identity.taskFolderPath, () =>
+                settleChatInteraction(identity.taskFolderPath, identity.canonicalId, clientRef.interactionId, settlement)
+              );
+            }
+            resumed = true;
+          }
         }
-      });
+      } catch (error) {
+        declineMessage = `Could not resume this question. (${error instanceof Error ? error.message : String(error)})`;
+        NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
+      }
       if (resumed) {
         await this.append("assistant", successMessage, identity.stage, identity);
       } else if (declineMessage) {
@@ -3084,11 +3148,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       isBlockingDecision,
       };
     });
-    const displayInteractions = interactions.map((interaction) => ({
-      ...interaction,
-      ...formatDisplayTimestampPairV1(interaction.postedAt),
-      copyText: buildInteractionCopyTextV1(interaction),
-    }));
+    const displayInteractions = interactions.map((interaction) => {
+      const answeredSummary = this.confirmingInteractionsV1.has(`${interaction.operationId}:${interaction.interactionId}`)
+        ? describeInteractionAnswersV1(interaction)
+        : undefined;
+      return {
+        ...interaction,
+        ...formatDisplayTimestampPairV1(interaction.postedAt),
+        copyText: buildInteractionCopyTextV1(interaction),
+        ...(answeredSummary !== undefined ? { answeredSummary } : {}),
+      };
+    });
     // The ledger read/write below still runs for the global assistant's
     // consumers elsewhere (task tree, status bar): `recordOwedContinuation`
     // keeps their "what happens next" surfaces fresh even though this panel
@@ -3357,6 +3427,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
            user scanning the panel recognizes "something needs me" the same
            way regardless of which of the two answer channels raised it. */
         .interaction-title { font-weight: bold; margin-bottom: var(--ensemble-space-2); color: var(--vscode-inputValidation-warningForeground); }
+        .interaction-answered { border-left: 3px solid var(--vscode-panel-border); padding-left: var(--ensemble-space-2); margin-left: calc(-1 * var(--ensemble-space-2)); }
+        .interaction-answered .interaction-title { color: var(--vscode-foreground); }
         .interaction-question { margin-bottom: var(--ensemble-space-3); }
         .interaction-prompt { margin-bottom: var(--ensemble-space-1); }
         .interaction-help { font-size: 0.9em; color: var(--ensemble-info-foreground); margin-bottom: var(--ensemble-space-1); }
@@ -3486,6 +3558,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if(!append) ic.replaceChildren();
         if(!interaction){ ic.style.display='none'; return; }
         ic.style.display='block';
+        // RC10 item 1: Confirm is being processed and the answers are
+        // recorded — a read-only card, no inputs and no buttons, until the
+        // resumed round settles the question and it leaves this list.
+        if(typeof interaction.answeredSummary==='string'){
+          const done=document.createElement('div'); done.className='interaction-answered';
+          const doneTitle=document.createElement('div'); doneTitle.className='interaction-title';
+          doneTitle.textContent='Answered: '+interaction.answeredSummary;
+          done.appendChild(doneTitle);
+          const resuming=document.createElement('div'); resuming.className='interaction-help'; resuming.textContent='Resuming…';
+          done.appendChild(resuming);
+          done.appendChild(buildMsgMeta(interaction.copyText||'',interaction.atLabel,interaction.atTitle));
+          ic.appendChild(done);
+          return;
+        }
         const err=document.createElement('div'); err.className='interaction-error';
         ic.appendChild(err);
         const title=document.createElement('div'); title.className='interaction-title';

@@ -47,6 +47,7 @@ import {
 import { previousVersionUri } from "../utils/artifactBackups";
 import { computeWorkingTreeFingerprintV1 } from "../utils/gitRepoInfo";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
+import { taskOperations } from "../utils/taskOperations";
 import { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { getProductionActionConversationOrchestratorV1 } from "../actions/productionTaskActionRuntimeV1";
@@ -2781,10 +2782,18 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
       assert.equal(submitted.ok, true, "the clarifying answer must be accepted before Resume");
 
       const inventory = makeBindingInventoryStub(folderPath, "impl-low-review");
+      let duringResumedRound: ReturnType<typeof taskOperations.getTaskOperations> = [];
       const resumePatches: Patched[] = [
         patch(modelSelectionModule, "resolveFreshModelForStage", () =>
           Promise.resolve({ source: "settings", modelId: "stub:model" })),
-        stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n- Ready after clarification.\n")]),
+        // RC10 item 1: record the task's operations while the resumed
+        // transport runs — the row, spinner and Notifications read these.
+        stubV1RunnerSelection([
+          scriptedMarkdownTransportV1(() => {
+            duringResumedRound = taskOperations.getTaskOperations(folderPath).map((o) => ({ ...o }));
+            return "Readiness: 9/10\n\n- Ready after clarification.\n";
+          }),
+        ]),
       ];
       try {
         const result = await resumeReviewInteractionV1(
@@ -2800,6 +2809,12 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
         if (result.ok) {
           assert.equal(result.settlement, "resumed", "review.v1 declares sameOperation resume semantics");
         }
+        const resumedRoots = duringResumedRound.filter((o) => o.parentId === undefined);
+        assert.equal(resumedRoots.length, 1, "exactly one root operation while the resumed transport runs");
+        assert.equal(resumedRoots[0]!.label, "Review");
+        assert.equal(resumedRoots[0]!.stage, "impl-low-review");
+        assert.equal(resumedRoots[0]!.state, "running");
+        assert.deepEqual(taskOperations.getTaskOperations(folderPath), [], "no operation outlives the resume");
         assert.equal(
           fs.readFileSync(path.join(folderPath, "impl-low-review.md"), "utf8").includes("Ready after clarification"),
           true,

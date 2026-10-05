@@ -16,7 +16,9 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { generatePlanWithAI, resumeGeneratePlanInteractionV1 } from "../commands/generatePlanWithAI";
+import { resumeGenerateImplementationInteractionV1 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
+import { taskOperations } from "../utils/taskOperations";
 import { TaskProgress } from "../types/taskProgress";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
@@ -603,6 +605,7 @@ void describe("resumeGeneratePlanInteractionV1 auto-review admission handoff (v1
       state: "settled",
       settlement: "resumed",
     };
+    let duringResumedRound: ReturnType<typeof taskOperations.getTaskOperations> = [];
     const patches = [
       patchV1(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
       patchV1(modelSelectionModule, "resolveFreshModelForStage", () =>
@@ -618,7 +621,11 @@ void describe("resumeGeneratePlanInteractionV1 auto-review admission handoff (v1
         })
       ),
       patchV1(productionTaskActionRuntimeModule, "createProductionTaskActionCoordinatorV1", () => ({
-        resumeAction: () => Promise.resolve(terminalOutcome),
+        resumeAction: () => {
+          // RC10 item 1: the resumed round is a registered operation while it runs.
+          duringResumedRound = taskOperations.getTaskOperations(taskFolderPath);
+          return Promise.resolve(terminalOutcome);
+        },
       })),
       patchV1(productionTaskActionRuntimeModule, "getProductionActionConversationOrchestratorV1", () => ({
         loadInteraction: () => Promise.resolve({ kind: "ok", record: fakeRecord }),
@@ -648,6 +655,11 @@ void describe("resumeGeneratePlanInteractionV1 auto-review admission handoff (v1
       );
 
       assert.equal(result.ok, true, "the fake record reports a settled resume regardless of the coordinator outcome's own kind");
+      assert.equal(duringResumedRound.length, 1, "exactly one running root while the resumed coordinator runs");
+      assert.equal(duringResumedRound[0]!.label, "Generate Plan");
+      assert.equal(duringResumedRound[0]!.stage, "plan");
+      assert.equal(duringResumedRound[0]!.exclusive, false);
+      assert.deepEqual(taskOperations.getTaskOperations(taskFolderPath), [], "no operation outlives the resume");
       assert.deepEqual(
         result.coordinatorOutcome,
         terminalOutcome,
@@ -659,6 +671,96 @@ void describe("resumeGeneratePlanInteractionV1 auto-review admission handoff (v1
         { operationId: "op-under-test", trigger: "timedOut" },
         "an invocationDeadlineExceeded coordinator outcome must classify as a Step 57a 'timedOut' trigger, not be silently dropped"
       );
+    } finally {
+      for (const p of patches) { p.restore(); }
+      rf.restore();
+      deactivateNotificationRouter();
+    }
+  });
+});
+
+/** RC10 item 1, focused: the Generate Implementation resume registers its own operation. */
+void describe("resumeGenerateImplementationInteractionV1 registers its resumed round (RC10 item 1)", () => {
+  void it("runs the coordinator under one running non-exclusive 'Generate Implementation' root, ended afterwards", async () => {
+    const taskFolderPath = makeTaskFolder("resume-generate-implementation-rc10");
+    const taskBindingId = "binding-generate-implementation-rc10";
+    writeProgress(taskFolderPath, fixtureProgress(taskFolderPath, { currentStage: "impl", status: "active" }));
+
+    initNotificationRouter(new RecordingSurface());
+    const rf = installReadFileBridge();
+    let duringResumedRound: ReturnType<typeof taskOperations.getTaskOperations> = [];
+    const cancelledOutcome = {
+      kind: "cancelled" as const,
+      code: "cancelled" as const,
+      correlation: {
+        taskBindingId,
+        chatDocumentId: "chat-doc-under-test",
+        actionKey: "generateImplementation.v1",
+        operationId: "op-under-test",
+        attemptId: "attempt-under-test",
+      },
+    };
+    const fakeRecord = {
+      inputSnapshot: { canonicalJson: JSON.stringify({ prompt: "do the thing" }), sha256: "deadbeef" },
+      state: "settled",
+      settlement: "resumed",
+    };
+    const patches = [
+      patchV1(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })
+      ),
+      patchV1(runnerRegistryModule, "checkImplementationAvailabilityForModel", () =>
+        Promise.resolve({
+          availability: { available: true },
+          providerLabel: "Stub Provider",
+          provider: "stub",
+          modelId: "stub:model",
+          nativeModelId: "stub-native",
+        })
+      ),
+      patchV1(productionTaskActionRuntimeModule, "createProductionTaskActionCoordinatorV1", () => ({
+        resumeAction: () => {
+          duringResumedRound = taskOperations.getTaskOperations(taskFolderPath);
+          return Promise.resolve(cancelledOutcome);
+        },
+      })),
+      patchV1(productionTaskActionRuntimeModule, "getProductionActionConversationOrchestratorV1", () => ({
+        loadInteraction: () => Promise.resolve({ kind: "ok", record: fakeRecord }),
+      })),
+      patchV1(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+    ];
+    const inventory = {
+      getTaskByBindingId: (id: string) =>
+        id === taskBindingId
+          ? ({
+              taskFolderPath,
+              workspaceFolder: vscode.Uri.file(REAL_ROOT),
+              canonicalId: taskFolderPath,
+              progress: { status: "active", currentStage: "impl" },
+            } as unknown as ReturnType<TaskInventory["getTaskByBindingId"]>)
+          : undefined,
+    } as unknown as TaskInventory;
+
+    try {
+      const result = await resumeGenerateImplementationInteractionV1(
+        inventory,
+        dummyChatViewProvider,
+        {
+          operationId: "op-under-test",
+          interactionId: "interaction-under-test",
+          taskBindingId,
+          chatDocumentId: "chat-doc-under-test",
+          sourceAttemptId: "attempt-under-test",
+        },
+        "resume-idempotency-under-test",
+        new vscode.CancellationTokenSource().token
+      );
+      assert.equal(result.ok, true);
+      assert.equal(duringResumedRound.length, 1, "exactly one running root while the resumed coordinator runs");
+      assert.equal(duringResumedRound[0]!.label, "Generate Implementation");
+      assert.equal(duringResumedRound[0]!.stage, "impl");
+      assert.equal(duringResumedRound[0]!.exclusive, false);
+      assert.deepEqual(taskOperations.getTaskOperations(taskFolderPath), [], "no operation outlives the resume");
     } finally {
       for (const p of patches) { p.restore(); }
       rf.restore();

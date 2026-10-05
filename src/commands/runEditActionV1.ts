@@ -37,6 +37,12 @@ import {
   isSummaryOnlyDispatchAvailableV1,
   runSealedEditContinuationReportV1,
 } from "./implContinuationTextDispatchV1";
+import { stepNameV1 } from "../utils/stepLabelsV1";
+import {
+  linkCancellationTokens,
+  runResumedRoundOperationV1,
+  type ResumedRoundOperationSpecV1,
+} from "../utils/taskOperations";
 import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import {
@@ -1920,13 +1926,40 @@ export async function resumeEditPreflightInteractionV1(
     taskFolderPath: taskFolderUri.fsPath,
   });
 
-  const outcome = await coordinator.resumeAction({
-    interaction: interactionRef,
-    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: effectiveTaskStatus,
-    taskStage: ownedTask.progress.currentStage,
-    resumeIdempotencyId,
-    cancellationToken,
+  // RC10 item 1: only the preflight provider round is a tracked operation, so
+  // it never overlaps `continueSealedEditExecutionV1` below (which registers
+  // none of its own). Label, stage and kind follow the fresh path for the key.
+  const resumedRound: ResumedRoundOperationSpecV1 =
+    actionKey === LINT_ACTION_KEY_V1
+      ? { label: "Linting Fixes", stage: "publish", kind: "lint-fixes", displayName: ownedTask.progress.displayName }
+      : actionKey === APPLY_REVIEW_EDIT_ACTION_KEY_V1
+        ? {
+            label: stepNameV1("apply-review"),
+            stage: ownedTask.progress.currentStage,
+            kind: "apply-review",
+            displayName: ownedTask.progress.displayName,
+          }
+        : {
+            label: stepNameV1("implementation"),
+            stage: "impl",
+            kind: "run-implementation",
+            displayName: ownedTask.progress.displayName,
+          };
+  const outcome = await runResumedRoundOperationV1(ownedTask.taskFolderPath, resumedRound, async (op) => {
+    const linked = linkCancellationTokens(cancellationToken, op.token);
+    try {
+      return await coordinator.resumeAction({
+        interaction: interactionRef,
+        taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+        taskStatus: effectiveTaskStatus,
+        taskStage: ownedTask.progress.currentStage,
+        resumeIdempotencyId,
+        cancellationToken: linked.token,
+        onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+      });
+    } finally {
+      linked.dispose();
+    }
   });
   capturedResumeOutcomeV1 = outcome;
 

@@ -1326,6 +1326,56 @@ export async function runTrackedOperation<T>(
   }), spec.stage);
 }
 
+export interface ResumedRoundOperationSpecV1 {
+  label: string;
+  stage: TaskStage;
+  kind: OperationKind;
+  /** The task's `displayName`, if renamed; resolved for the Notifications row. */
+  displayName: string | undefined;
+  /** Initial activity text for the live row, e.g. "Applying review fixes". */
+  activity?: string;
+}
+
+/**
+ * RC10 item 1: registers the provider round of a chat-answered resume as a
+ * tracked, cancellable root operation so the task's row shows it running and
+ * Notifications lists it. Non-exclusive with no conflict keys: the resume is
+ * driven from the chat and must never be refused by (or refuse) the task's
+ * exclusive lock, and a follow-up exclusive operation started by the caller
+ * afterwards (or inside) is admitted as usual.
+ */
+export async function runResumedRoundOperationV1<T>(
+  taskPath: string,
+  spec: ResumedRoundOperationSpecV1,
+  fn: (handle: TaskOperationHandle) => Promise<T>
+): Promise<T> {
+  const result = await runTrackedOperation<T>(
+    taskPath,
+    {
+      label: spec.label,
+      stage: spec.stage,
+      kind: spec.kind,
+      taskName: resolveWorkflowRootTaskName(spec.displayName, taskPath),
+      exclusive: false,
+      cancellable: true,
+    },
+    (handle) => {
+      if (spec.activity) {
+        handle.reportActivity(spec.activity);
+      }
+      return fn(handle);
+    }
+  );
+  if (result === undefined) {
+    // runTrackedOperation resolves undefined only on a busy refusal, which a
+    // non-exclusive root without conflict keys is never given; a resume body
+    // never returns undefined either (ChatInteractionResumeResultV1 or a
+    // coordinator outcome). Fail loudly rather than add a refusal path.
+    throw new Error(`runResumedRoundOperationV1: "${spec.label}" produced no result (admission refused or body returned undefined)`);
+  }
+  return result;
+}
+
 /**
  * Request cancellation of every running operation for the task and wait
  * (bounded) for the operations to actually terminate. Shared by every

@@ -8,6 +8,8 @@ One plan is one task. A plan too large for a single round is delivered as ordere
 
 Owner evidence: when a plan step requires evidence that rounds cannot gather (a web page, provider documentation, or a live provider CLI probe) and the task description does not already contain it, that is a blocking issue: the plan is not ready, its score is below the ready threshold, and the machine-readable block carries `- [completion] [environmental] Owner evidence needed: <the exact evidence>` — never `task-fixable` or `needs-toolchain`.
 
+Publish Checks hand-off: an excluded "Verified by Publish Checks:" item (confirmed setting, covered run), or an excluded owner step for an unconfirmed setting, is correct and you must never file a blocker because such an item is excluded. File a task-fixable blocker when such an item claims a run the selected command does not cover (an uncovered run), or rests on an unconfirmed setting: a `.vscode/settings.json` value without the task's single-folder evidence, or the key's absence treated as confirmation.
+
 Evaluate new concerns separately. A new concern is blocking only when the plan still cannot be implemented responsibly or verified without resolving it. Refinements that can safely be settled during implementation are non-blocking.
 
 Score the readiness of the current revised plan. The score may stay the same or decrease when a material unresolved or newly discovered blocker justifies it, but explain that explicitly. Resolving previous blockers is progress and must be reflected in the progress assessment even if new blockers remain.

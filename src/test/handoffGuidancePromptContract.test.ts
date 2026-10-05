@@ -116,3 +116,49 @@ void describe("RC4 planning prompt rules (items 4 and 5)", () => {
     assert.match(prompt, /live provider CLIs/);
   });
 });
+
+void describe("RC10 item 2: test runs are Publish Checks hand-off items", () => {
+  void it("create-plan.md writes covered runs as excluded 'Verified by Publish Checks' items", async () => {
+    const prompt = await readPrompt("create-plan.md");
+    assert.match(prompt, /Verified by Publish Checks/);
+    assert.match(prompt, /<!-- ensemble:excluded -->/);
+    assert.match(prompt, /publishVerificationCommands/);
+    assert.match(prompt, /aggregate `verify` script/);
+    assert.match(prompt, /each member package's own scripts/);
+  });
+
+  void it("create-plan.md pins selection order, legacy-key precedence and item details", async () => {
+    const prompt = await readPrompt("create-plan.md");
+    assert.match(
+      prompt,
+      /effective `ensemble\.publishVerificationCommands` setting when it is non-empty, else a safe aggregate `verify` script, else the `lint`, `check-types`, `test` and `build` scripts/,
+    );
+    assert.match(prompt, /vs-code-ai-helper\.publishVerificationCommands/);
+    assert.match(prompt, /legacy key applies only when no `ensemble\.` value is set/);
+    assert.match(prompt, /explicit `\.vscode\/settings\.json` value together with the task's evidence that the project is opened as a single-folder window/);
+    assert.match(prompt, /names the covering command and the tests it covers, ends with `<!-- ensemble:excluded -->`, and needs no five-element fields/);
+  });
+
+  void it("create-plan.md confirms the effective setting only from evidence", async () => {
+    const prompt = await readPrompt("create-plan.md");
+    assert.match(prompt, /confirmed only by the task's evidence/);
+    assert.match(prompt, /single-folder window/);
+    assert.match(prompt, /multi-root window/);
+    assert.match(prompt, /absence never confirms/);
+  });
+
+  void it("create-plan.md makes unconfirmed or uncovered runs excluded owner steps", async () => {
+    const prompt = await readPrompt("create-plan.md");
+    assert.match(prompt, /excluded owner step/);
+    assert.match(prompt, /Commands that ran/);
+    assert.match(prompt, /A run the selected command does not cover/);
+    assert.match(prompt, /a suite Publish Checks do not run is written as an owner step/);
+  });
+
+  void it("create-implementation.md never asks a round to tick a test run", async () => {
+    const prompt = await readPrompt("create-implementation.md");
+    assert.match(prompt, /Verified by Publish Checks/);
+    assert.match(prompt, /only runs the plan writes that way qualify/);
+    assert.doesNotMatch(prompt, /tests to run/);
+  });
+});

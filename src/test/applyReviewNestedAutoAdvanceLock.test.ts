@@ -591,6 +591,17 @@ void describe("resumeApplyReviewInteractionV1 — production Resume delegate", (
       assert.equal(submitted.ok, true, "the clarifying answer must be accepted before Resume");
 
       const inventory = makeBindingInventoryStub(folderPath, "plan-high-review");
+      // RC10 item 1: the resumed provider round must be a registered operation
+      // while its transport runs (the row, spinner and Notifications read it).
+      const markdownTransport = markdownTransportV1("# Plan\n\n1. Do the thing (revised via Resume).\n");
+      let duringResumedRound: ReturnType<typeof taskOperations.getTaskOperations> = [];
+      const resumedTransport: AgentTransportV1 = {
+        runnerId: markdownTransport.runnerId,
+        invoke: (request, output) => {
+          duringResumedRound = taskOperations.getTaskOperations(folderPath).map((o) => ({ ...o }));
+          return markdownTransport.invoke(request, output);
+        },
+      };
       const resumePatches: Patched[] = [
         patch(settingsModule, "isAutoAdvanceEnabled", () => false),
         patch(modelSelectionModule, "resolveModelForStage", () =>
@@ -602,7 +613,7 @@ void describe("resumeApplyReviewInteractionV1 — production Resume delegate", (
         // First transport is the resumed applyReview.v1 attempt (rewrites
         // plan.md); the second is the completion path's own re-review.
         stubV1RunnerSelection([
-          markdownTransportV1("# Plan\n\n1. Do the thing (revised via Resume).\n"),
+          resumedTransport,
           markdownTransportV1("Readiness: 9/10\n\n- Ready.\n"),
         ]),
         patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
@@ -623,6 +634,13 @@ void describe("resumeApplyReviewInteractionV1 — production Resume delegate", (
         if (result.ok) {
           assert.equal(result.settlement, "resumed", "applyReview.v1 declares sameOperation resume semantics");
         }
+        const resumedRoots = duringResumedRound.filter((o) => o.parentId === undefined);
+        assert.equal(resumedRoots.length, 1, "exactly one root operation while the resumed transport runs");
+        assert.equal(resumedRoots[0]!.label, "Apply Review");
+        assert.equal(resumedRoots[0]!.stage, "plan");
+        assert.equal(resumedRoots[0]!.state, "running");
+        assert.equal(resumedRoots[0]!.exclusive, false);
+        assert.deepEqual(taskOperations.getTaskOperations(folderPath), [], "no operation outlives the resume");
         assert.equal(
           fs.readFileSync(path.join(folderPath, "plan.md"), "utf8"),
           "# Plan\n\n1. Do the thing (revised via Resume).\n",

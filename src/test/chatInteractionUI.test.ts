@@ -25,6 +25,7 @@ import {
   ChatInteractionServiceResultV1,
   ChatInteractionServicesV1,
   ChatViewProvider,
+  describeInteractionAnswersV1,
 } from "../views/chatView";
 import { readChatDocumentIdentityV1, readChatInteractions } from "../utils/chatHistoryStore";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
@@ -151,6 +152,186 @@ async function expectedFullRef(folder: string, client: ClientRef): Promise<ChatI
     sourceAttemptId: interaction.sourceAttemptId,
   };
 }
+
+void describe("Chat With AI — Confirm runs the resumed round outside the chat queue (RC10 item 1)", () => {
+  const OP = "0".repeat(32);
+  const IID = "9".repeat(32);
+
+  async function withConfirmHarness(
+    resume: NonNullable<ChatInteractionServicesV1["resume"]>,
+    body: (h: { folder: string; provider: ChatViewProvider; fake: FakeWebviewView; confirm: () => Promise<void> }) => Promise<void>
+  ): Promise<void> {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const cmds = installExecuteCommandCapture();
+    const notify = installNotificationRouterStub();
+    provider.setInteractionServices({
+      submitAnswers: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+      cancel: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+      resume,
+    });
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId: IID,
+          operationId: OP,
+          actionKey: "generatePlan.v1",
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+        },
+        true,
+        false
+      );
+      await body({
+        folder,
+        provider,
+        fake,
+        confirm: () => fake.send({ type: "confirmInteraction", operationId: OP, interactionId: IID, answers: VALID_ANSWERS }),
+      });
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  }
+
+  const posted = (fake: FakeWebviewView): Array<Record<string, unknown>> => fake.posted.filter((m) => m.type === "state");
+  const interactionsOf = (m: Record<string, unknown> | undefined): Array<Record<string, unknown>> =>
+    (m?.interactions as Array<Record<string, unknown>> | undefined) ?? [];
+  const withTimeout = (p: Promise<unknown>): Promise<string> =>
+    Promise.race([p.then(() => "done"), new Promise<string>((r) => setTimeout(() => r("timeout"), 5000))]);
+
+  void it("a resumed round that asks a follow-up question for the same task does not deadlock Confirm", async () => {
+    let folderForStub = "";
+    let providerForStub: ChatViewProvider | undefined;
+    await withConfirmHarness(
+      async () => {
+        await providerForStub!.askInteraction(
+          {
+            canonicalId: folderForStub,
+            taskFolderPath: folderForStub,
+            stage: "impl",
+            interactionId: "8".repeat(32),
+            operationId: "1".repeat(32),
+            actionKey: "generatePlan.v1",
+            sourceAttemptId: "d".repeat(32),
+            questions: QUESTIONS,
+            binding: { taskBindingId: bindingIdForOwnedFolder(folderForStub), chatDocumentId: "chat-document-id" },
+          },
+          true,
+          false
+        );
+        await providerForStub!.append("assistant", "follow-up", "impl", {
+          canonicalId: folderForStub,
+          taskFolderPath: folderForStub,
+        });
+        return { ok: true, settlement: "resumed" };
+      },
+      async ({ folder, provider, confirm, fake }) => {
+        folderForStub = folder;
+        providerForStub = provider;
+        assert.equal(await withTimeout(confirm()), "done", "Confirm must complete while the resumed round asks again");
+        const stored = await readChatInteractions(folder, folder, "impl");
+        assert.equal(stored.find((i) => i.interactionId === IID)?.state, "resumed");
+        assert.equal(stored.find((i) => i.interactionId === "8".repeat(32))?.state, "unresolved");
+        const secondPosted = interactionsOf(posted(fake).pop()).find((i) => i.interactionId === "8".repeat(32));
+        assert.ok(secondPosted, "the new question must be posted");
+        assert.equal(secondPosted.answeredSummary, undefined);
+      }
+    );
+  });
+
+  void it("the chat renders while the resumed round is running, and the card reads as answered", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    let entered!: () => void;
+    const inRound = new Promise<void>((resolve) => (entered = resolve));
+    await withConfirmHarness(
+      async () => {
+        entered();
+        await gate;
+        return { ok: true, settlement: "resumed" };
+      },
+      async ({ folder, provider, confirm, fake }) => {
+        const confirming = confirm();
+        await inRound;
+        const written = provider.append("assistant", "note while running", "impl", {
+          canonicalId: folder,
+          taskFolderPath: folder,
+        });
+        assert.equal(await withTimeout(written), "done", "a chat write must not wait for the provider round");
+        const during = interactionsOf(posted(fake).pop());
+        assert.equal(during.find((i) => i.interactionId === IID)?.answeredSummary, "plan.md");
+        release();
+        await confirming;
+        const after = interactionsOf(posted(fake).pop());
+        assert.equal(after.find((i) => i.interactionId === IID), undefined, "a settled interaction is no longer posted");
+      }
+    );
+  });
+
+  void it("a declined resume leaves the interaction posted without an answered summary", async () => {
+    await withConfirmHarness(
+      () => Promise.resolve({ ok: false, reason: "no model" }),
+      async ({ confirm, fake }) => {
+        await confirm();
+        const card = interactionsOf(posted(fake).pop()).find((i) => i.interactionId === IID);
+        assert.ok(card, "the unresolved interaction stays posted");
+        assert.equal(card.answeredSummary, undefined);
+      }
+    );
+  });
+
+  void it("describeInteractionAnswersV1 summarises single, multiple, long text and skipped answers", () => {
+    const questions: StructuredQuestionV1[] = [
+      { questionId: "s", kind: "singleChoice", prompt: "S", required: true, options: [{ optionId: "a", label: "Option A" }, { optionId: "b", label: "Option B" }] },
+      { questionId: "m", kind: "multipleChoice", prompt: "M", required: true, minSelections: 1, maxSelections: 2, options: [{ optionId: "x", label: "X" }, { optionId: "y", label: "Y" }] },
+      { questionId: "t", kind: "text", prompt: "T", required: false, allowBlank: true, maxLength: 4000 },
+      { questionId: "o", kind: "singleChoice", prompt: "O", required: false, options: [{ optionId: "p", label: "P" }, { optionId: "q", label: "Q" }] },
+    ];
+    assert.equal(
+      describeInteractionAnswersV1({
+        questions: questions.slice(0, 1),
+        answers: [{ questionId: "s", kind: "singleChoice", state: "answered", selectedOptionId: "b" }],
+      }),
+      "Option B"
+    );
+    assert.equal(
+      describeInteractionAnswersV1({
+        questions: questions.slice(1, 2),
+        answers: [{ questionId: "m", kind: "multipleChoice", state: "answered", selectedOptionIds: ["x", "y"] }],
+      }),
+      "X, Y"
+    );
+    assert.equal(
+      describeInteractionAnswersV1({
+        questions: questions.slice(2, 3),
+        answers: [{ questionId: "t", kind: "text", state: "answered", value: "z".repeat(300) }],
+      }),
+      `${"z".repeat(120)}…`
+    );
+    assert.equal(
+      describeInteractionAnswersV1({
+        questions,
+        answers: [
+          { questionId: "s", kind: "singleChoice", state: "answered", selectedOptionId: "a" },
+          { questionId: "m", kind: "multipleChoice", state: "answered", selectedOptionIds: ["y"] },
+          { questionId: "t", kind: "text", state: "skipped" },
+          { questionId: "o", kind: "singleChoice", state: "skipped" },
+        ],
+      }),
+      "Option A; Y"
+    );
+    assert.equal(describeInteractionAnswersV1({ questions: questions.slice(0, 1), answers: [] }), undefined);
+  });
+});
 
 void describe("Chat With AI — structured Answer/Resume/Cancel controls", () => {
   void it("askInteraction posts an unresolved interaction visible in the webview's rendered state", async () => {

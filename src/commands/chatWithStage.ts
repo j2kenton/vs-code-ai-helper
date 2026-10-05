@@ -24,7 +24,7 @@ import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
-import { runTrackedOperation, resolveWorkflowRootTaskName } from "../utils/taskOperations";
+import { runTrackedOperation, resolveWorkflowRootTaskName, linkCancellationTokens, runResumedRoundOperationV1 } from "../utils/taskOperations";
 import {
   readTextIfExists,
   statIfExists,
@@ -1195,14 +1195,28 @@ export async function resumeChatSendInteractionV1(
     sourceAttemptId: ref.sourceAttemptId,
   };
 
-  const outcome = await coordinator.resumeAction({
-    interaction: interactionRef,
-    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: ownedTask.progress.status ?? "active",
-    taskStage: ownedTask.progress.currentStage,
-    resumeIdempotencyId,
-    cancellationToken,
-  });
+  // RC10 item 1: the provider round is a tracked operation (same label, stage
+  // and kind as the fresh chat send); the outcome handling below runs outside it.
+  const outcome = await runResumedRoundOperationV1(
+    ownedTask.taskFolderPath,
+    { label: "Chat", stage: ownedTask.progress.currentStage, kind: "chat-send", displayName: ownedTask.progress.displayName },
+    async (op) => {
+      const linked = linkCancellationTokens(cancellationToken, op.token);
+      try {
+        return await coordinator.resumeAction({
+          interaction: interactionRef,
+          taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+          taskStatus: ownedTask.progress.status ?? "active",
+          taskStage: ownedTask.progress.currentStage,
+          resumeIdempotencyId,
+          cancellationToken: linked.token,
+          onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+        });
+      } finally {
+        linked.dispose();
+      }
+    }
+  );
 
   let proposedAction: StageChatActionProposal | undefined;
   let proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];

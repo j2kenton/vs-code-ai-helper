@@ -17,6 +17,7 @@ import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGa
 import { IncompleteTask } from "../types/incompleteTask";
 import {
   linkCancellationTokens,
+  runResumedRoundOperationV1,
   runTrackedOperation,
   taskOperations,
   TaskOperationHandle,
@@ -952,14 +953,28 @@ export async function resumeDraftInteractionV1(
     }
   }
 
-  const outcome = await coordinator.resumeAction({
-    interaction: interactionRef,
-    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: ownedTask.progress.status ?? "active",
-    taskStage: ownedTask.progress.currentStage,
-    resumeIdempotencyId,
-    cancellationToken,
-  });
+  // RC10 item 1: the provider round is a tracked operation (same label, stage
+  // and kind as the fresh path); the outcome handling below runs outside it.
+  const outcome = await runResumedRoundOperationV1(
+    ownedTask.taskFolderPath,
+    { label: "Draft Task with AI", stage: "desc", kind: "draft-task", displayName: ownedTask.progress.displayName },
+    async (op) => {
+      const linked = linkCancellationTokens(cancellationToken, op.token);
+      try {
+        return await coordinator.resumeAction({
+          interaction: interactionRef,
+          taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+          taskStatus: ownedTask.progress.status ?? "active",
+          taskStage: ownedTask.progress.currentStage,
+          resumeIdempotencyId,
+          cancellationToken: linked.token,
+          onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+        });
+      } finally {
+        linked.dispose();
+      }
+    }
+  );
 
   await handleDraftOutcomeV1(outcome, {
     taskRef: {

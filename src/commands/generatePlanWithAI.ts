@@ -53,6 +53,7 @@ import {
 import { scheduleAutomationChain } from "../utils/automationChain";
 import {
   linkCancellationTokens,
+  runResumedRoundOperationV1,
   runTrackedOperation,
   taskOperations,
   TaskOperationHandle,
@@ -1119,14 +1120,28 @@ export async function resumeGeneratePlanInteractionV1(
     }
   }
 
-  const outcome = await coordinator.resumeAction({
-    interaction: interactionRef,
-    taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
-    taskStatus: ownedTask.progress.status ?? "active",
-    taskStage: ownedTask.progress.currentStage,
-    resumeIdempotencyId,
-    cancellationToken,
-  });
+  // RC10 item 1: the provider round is a tracked operation (same label, stage
+  // and kind as the fresh path); the outcome handling below runs outside it.
+  const outcome = await runResumedRoundOperationV1(
+    ownedTask.taskFolderPath,
+    { label: "Generate Plan", stage: "plan", kind: "generate-plan", displayName: ownedTask.progress.displayName },
+    async (op) => {
+      const linked = linkCancellationTokens(cancellationToken, op.token);
+      try {
+        return await coordinator.resumeAction({
+          interaction: interactionRef,
+          taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
+          taskStatus: ownedTask.progress.status ?? "active",
+          taskStage: ownedTask.progress.currentStage,
+          resumeIdempotencyId,
+          cancellationToken: linked.token,
+          onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+        });
+      } finally {
+        linked.dispose();
+      }
+    }
+  );
 
   const handled = await handleGeneratePlanOutcomeV1(outcome, {
     taskRef: {

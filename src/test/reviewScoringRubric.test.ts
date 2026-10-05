@@ -218,6 +218,16 @@ void describe("review scoring rubric", () => {
         assert.match(raw, /\[environmental\]/);
       });
     }
+    for (const templateFile of planTemplates) {
+      void it(`${templateFile} never blocks on an excluded "Verified by Publish Checks" item (RC10 item 2)`, () => {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /Verified by Publish Checks/);
+        assert.match(raw, /never file a blocker because such an item is excluded/);
+        assert.match(raw, /claims a run the selected command does not cover/);
+        assert.match(raw, /rests on an unconfirmed setting/);
+        assert.match(raw, /single-folder/);
+      });
+    }
     void it("the rubric classifies owner evidence as environmental, not needs-toolchain", () => {
       assert.match(rubricText, /Owner evidence needed:/);
     });
