@@ -98,6 +98,8 @@ type RunPublishChecksArg =
       admissionHandoffTokenV1?: string;
       /** In-process only: the live Fast Forward root this run's checks nest under. */
       parentOperation?: TaskOperationHandle;
+      /** Set by `checkAndReviewPublishV1`, which starts the Publish review itself once the checks are fresh. */
+      reviewFollowsV1?: boolean;
     };
 
 /**
@@ -196,6 +198,19 @@ export function extractParentOperationV1(node: RunPublishChecksArg | undefined):
 }
 
 /**
+ * True only for the explicit-fields shape carrying `reviewFollowsV1: true`
+ * (RC11 item 1); the tree-row `{ task }` shape never does.
+ *
+ * @internal exported for testing
+ */
+export function extractReviewFollowsV1(node: RunPublishChecksArg | undefined): boolean {
+  if (!node || !("reviewFollowsV1" in node)) {
+    return false;
+  }
+  return node.reviewFollowsV1 === true;
+}
+
+/**
  * First Publish action: run the completion checks (lint/type/test against the
  * task's Publish verification scope, plus the AI-assisted plan-item
  * verification) and record the result as the Publish-stage report, spliced
@@ -221,6 +236,7 @@ export async function runPublishChecks(
   // admission guess below and the authoritative resolution inside the try
   // block, without normalizing `explicitArg` twice.
   const resolverArg = normalizeRunPublishChecksArg(explicitArg);
+  const reviewFollows = extractReviewFollowsV1(explicitArg);
 
   // ── Early work admission (v1 fixes item 1, Part 1a, "publish/complete
   // actions" route) ──────────────────────────────────────────────────────
@@ -544,7 +560,8 @@ export async function runPublishChecks(
 
               const verifiedFolder = result.verifiedFolder ?? scopeGuess;
               const afterSha = await resolveHeadCommitSha(verifiedFolder);
-              if (beforeSha && afterSha && beforeSha === afterSha) {
+              const freshStampWritten = Boolean(beforeSha && afterSha && beforeSha === afterSha);
+              if (freshStampWritten && afterSha) {
                 await writePublishChecksFreshnessStampV1(taskFolderUri, {
                   formatVersion: 1,
                   runId: crypto.randomUUID(),
@@ -589,6 +606,13 @@ export async function runPublishChecks(
                   // to do what is about to happen.
                   NotificationRouter.showInformation(
                     `Publish checks passed. Report saved to ${publishReviewFilename}. Fast Forward runs the Publish review next.`
+                  );
+                  // RC11 item 1: the caller starts the review next, so no card asks
+                  // for it; a run that left no fresh stamp keeps the card because
+                  // the caller will stop.
+                } else if (reviewFollows && freshStampWritten && nextStepOffer.action.command !== COMMIT_AND_PUSH_COMMAND_V1) {
+                  NotificationRouter.showInformation(
+                    `Publish checks passed. Report saved to ${publishReviewFilename}. The Publish review runs next.`
                   );
                 } else {
                   const passedNotice = `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}`;

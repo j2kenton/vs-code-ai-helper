@@ -615,7 +615,9 @@ function diffAgainstAllowlist(
   for (const file of collectSourceFiles(SRC_DIR)) {
     // Forward slashes always, so the map keys above are platform-independent.
     const srcRelativeKey = path.relative(SRC_DIR, file).split(path.sep).join("/");
-    const content = fs.readFileSync(file, "utf8");
+    // LF always, so a CRLF checkout (Windows, core.autocrlf) yields the same
+    // 150-character snippets as the LF files the allowlist was written from.
+    const content = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
     const sites = finder(content);
     const allowed = allowlist.get(srcRelativeKey) ?? [];
     if (allowlist.has(srcRelativeKey)) {

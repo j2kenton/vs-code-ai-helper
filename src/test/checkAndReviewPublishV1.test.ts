@@ -42,7 +42,8 @@ void describe("checkAndReviewPublishV1", () => {
       calls.map((c) => c.command),
       ["vs-code-ai-helper.runPublishChecks", "vs-code-ai-helper.runReviewWithAI"]
     );
-    assert.deepEqual(calls[0]?.args, [{ taskFolderPath: "/t/one" }]);
+    assert.deepEqual(calls[0]?.args, [{ taskFolderPath: "/t/one", reviewFollowsV1: true }]);
+    assert.deepEqual(calls[1]?.args, [{ taskFolderPath: "/t/one" }]);
   });
 
   void it("stops without a review when the checks did not produce fresh results", async () => {
@@ -62,5 +63,6 @@ void describe("checkAndReviewPublishV1", () => {
       calls.map((c) => c.command),
       ["vs-code-ai-helper.runReviewWithAI"]
     );
+    assert.deepEqual(calls[0]?.args, [undefined]);
   });
 });

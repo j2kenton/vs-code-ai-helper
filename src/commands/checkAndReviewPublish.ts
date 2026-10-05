@@ -37,7 +37,9 @@ function folderPathOfArgV1(arg: CheckAndReviewPublishArgV1): string | undefined 
  * the checks command has already said why, and the review command is still
  * available from the palette to retry on its own. `"review-dispatched"` means
  * the review command was started, not that a review was saved: the review
- * command reports its own outcome (refused, failed or completed).
+ * command reports its own outcome (refused, failed or completed). The checks
+ * are told the review follows, so a passed run posts no "Request a Publish
+ * review" card (RC11 item 1).
  */
 export async function checkAndReviewPublishV1(
   arg: CheckAndReviewPublishArgV1,
@@ -52,7 +54,7 @@ export async function checkAndReviewPublishV1(
   }
   const target = { taskFolderPath };
   if (!(await deps.isPublishChecksFresh(taskFolderPath))) {
-    await deps.executeCommand("vs-code-ai-helper.runPublishChecks", target);
+    await deps.executeCommand("vs-code-ai-helper.runPublishChecks", { taskFolderPath, reviewFollowsV1: true });
     if (!(await deps.isPublishChecksFresh(taskFolderPath))) {
       return "checks-not-fresh";
     }
