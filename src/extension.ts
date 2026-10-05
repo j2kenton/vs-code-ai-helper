@@ -18,6 +18,7 @@ import {
 import {
   createMirroredDecisionsMementoV1,
   HOST_DECISIONS_MIRROR_FILENAME_V1,
+  answeredDecisionsForMirrorV1,
   liveMirroredDecisionsV1,
   readRunnerDecisionsSnapshotV1,
   writeRunnerDecisionsSnapshotV1,
@@ -780,6 +781,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // A decision this window raised itself is still answered here; only the
     // runner's mirrored ones are relayed (hostDecisionMirrorV1.ts).
     chatViewProvider.configureRemoteDecisionPredicateV1((decisionId) => viewerDecisions.isMirrored(decisionId));
+    // The runner's answers, so a card answered in another window (or before
+    // this one reloaded) still collapses here.
+    chatViewProvider.configureMirroredAnsweredLookupV1((decisionId) => viewerDecisions.answeredFor(decisionId));
   }
   chatViewProvider.setInteractionServices(viewerHost ? viewerInteractionServices : runnerInteractionServices);
 
@@ -1605,21 +1609,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // without a store write.
     const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
     let lastDecisionsSignature: string | undefined;
-    const writeDecisions = (): void => {
+    // One signature over both lists: a store change that only resolves a
+    // decision must rewrite the snapshot, since that is what removes it from
+    // pending and adds it to answered in the same write.
+    const decisionsToMirror = () => {
       const pending = decisionStore.listPending();
-      const signature = JSON.stringify(pending);
+      const answered = answeredDecisionsForMirrorV1(
+        decisionStore.listResolvedV1(),
+        new Set(pending.map((decision) => decision.decisionId))
+      );
+      return { pending, answered, signature: JSON.stringify({ pending, answered }) };
+    };
+    const writeDecisions = (): void => {
+      const { pending, answered, signature } = decisionsToMirror();
       // The signature is only remembered once the write actually LANDED, and
       // a heartbeat rewrites it regardless, so a failed or superseded write
       // cannot leave a viewer showing a settled question forever (review,
       // 2026-09-17). Writes are serialized in hostMirrorWriteV1.ts.
-      void writeRunnerDecisionsSnapshotV1(relayDir, pending).then((written) => {
+      void writeRunnerDecisionsSnapshotV1(relayDir, pending, answered).then((written) => {
         if (written) {
           lastDecisionsSignature = signature;
         }
       });
     };
     const writeDecisionsIfChanged = (): void => {
-      if (JSON.stringify(decisionStore.listPending()) !== lastDecisionsSignature) {
+      if (decisionsToMirror().signature !== lastDecisionsSignature) {
         writeDecisions();
       }
     };
@@ -1817,7 +1831,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       // answer, so a stale snapshot shows nothing rather than a card that
       // waits out the relay timeout when pressed.
       const live = liveMirroredDecisionsV1(snapshot, Date.now(), RUNNER_OPERATIONS_STALE_MS_V1);
-      if (viewerDecisions?.setDecisions(live)) {
+      const pendingChanged = viewerDecisions?.setDecisions(live) === true;
+      // Answered entries are not gated on runner staleness (they are history,
+      // not an action), and an unreadable or torn snapshot keeps the last list.
+      const answeredChanged = snapshot !== undefined && viewerDecisions?.setAnswered(snapshot.answered) === true;
+      if (pendingChanged || answeredChanged) {
         notifyWorkflowDecisionsChangedV1(decisionsState);
       }
       // A question this window cannot render is still a question the round is

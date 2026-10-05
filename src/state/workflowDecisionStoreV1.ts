@@ -330,6 +330,21 @@ export class WorkflowDecisionStoreV1 {
     );
   }
 
+  /**
+   * Every decision the user answered (`resolved` with a recorded choice),
+   * optionally for one task. Read-only: the runner mirrors these to viewers
+   * so an answered card can be drawn collapsed there too.
+   */
+  listResolvedV1(taskCanonicalId?: string): readonly WorkflowDecisionV1[] {
+    const needle = taskCanonicalId !== undefined ? normalizePath(taskCanonicalId) : undefined;
+    return this.all().filter(
+      (decision) =>
+        decision.state === "resolved" &&
+        decision.resolvedOptionId !== undefined &&
+        (needle === undefined || normalizePath(decision.taskCanonicalId) === needle)
+    );
+  }
+
   get(decisionId: string): WorkflowDecisionV1 | undefined {
     return this.all().find((decision) => decision.decisionId === decisionId);
   }

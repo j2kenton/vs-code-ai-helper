@@ -37,6 +37,12 @@ export interface RunnerDecisionsSnapshotV1 {
   readonly writtenAt: number;
   readonly decisions: readonly WorkflowDecisionV1[];
   /**
+   * Decisions the runner has already answered, so a viewer can draw them as
+   * collapsed "Decided" cards. `[]` when the runner predates this field.
+   * Display-only: never answerable, never part of `decisions`.
+   */
+  readonly answered: readonly MirroredAnsweredDecisionV1[];
+  /**
    * Records in the snapshot this window could not decode. Dropping them
    * silently left a viewer showing "Waiting for your answer" with no card and
    * no way to learn that a question existed at all, so the count is reported
@@ -46,17 +52,65 @@ export interface RunnerDecisionsSnapshotV1 {
 }
 
 /**
- * Runner side: publish the pending decisions. Resolves false when the write
- * failed or was superseded, so the caller's heartbeat can retry rather than
- * caching a signature for state that never reached disk.
+ * A decision the runner has answered, projected to what a viewer needs to
+ * draw the collapsed "Decided" card. No options, no effect: a viewer can
+ * neither re-answer nor run anything from it.
+ */
+export interface MirroredAnsweredDecisionV1 {
+  readonly decisionId: string;
+  readonly taskCanonicalId: string;
+  readonly stage: string;
+  readonly createdAt: string;
+  readonly resolvedAt?: string;
+  readonly resolvedOptionId: string;
+  readonly chosenLabel: string;
+  readonly whatHappened: string;
+}
+
+/**
+ * Runner side: project the store's resolved records for the snapshot. A
+ * record that is also pending (reposted under the same id) is dropped, and
+ * so is one with no recorded choice: absence is never evidence of an answer.
+ */
+export function answeredDecisionsForMirrorV1(
+  resolved: readonly WorkflowDecisionV1[],
+  pendingIds: ReadonlySet<string>
+): readonly MirroredAnsweredDecisionV1[] {
+  const answered: MirroredAnsweredDecisionV1[] = [];
+  for (const decision of resolved) {
+    if (decision.state !== "resolved" || decision.resolvedOptionId === undefined || pendingIds.has(decision.decisionId)) {
+      continue;
+    }
+    const chosen = decision.options.find((option) => option.optionId === decision.resolvedOptionId);
+    answered.push({
+      decisionId: decision.decisionId,
+      taskCanonicalId: decision.taskCanonicalId,
+      stage: decision.stage,
+      createdAt: decision.createdAt,
+      ...(decision.resolvedAt !== undefined ? { resolvedAt: decision.resolvedAt } : {}),
+      resolvedOptionId: decision.resolvedOptionId,
+      chosenLabel: chosen?.label ?? decision.resolvedOptionId,
+      whatHappened: decision.whatHappened,
+    });
+  }
+  return answered;
+}
+
+/**
+ * Runner side: publish the pending decisions (and, for display only, the
+ * answered ones). Resolves false when the write failed or was superseded, so
+ * the caller's heartbeat can retry rather than caching a signature for state
+ * that never reached disk.
  */
 export async function writeRunnerDecisionsSnapshotV1(
   dir: string,
-  decisions: readonly WorkflowDecisionV1[]
+  decisions: readonly WorkflowDecisionV1[],
+  answered: readonly MirroredAnsweredDecisionV1[] = []
 ): Promise<boolean> {
   return writeMirrorSnapshotV1(dir, HOST_DECISIONS_MIRROR_FILENAME_V1, {
     writtenAt: Date.now(),
     decisions,
+    answered,
   });
 }
 
@@ -175,6 +229,43 @@ export function decodeMirroredDecisionV1(
 }
 
 /**
+ * One mirrored answered decision, structurally. Strict like the pending
+ * decode: an entry that fails any check is dropped, never half-shown.
+ */
+export function decodeMirroredAnsweredDecisionV1(
+  value: unknown,
+  isKnownStage: (stage: string) => boolean = () => true
+): MirroredAnsweredDecisionV1 | undefined {
+  if (typeof value !== "object" || value === null) {
+    return undefined;
+  }
+  const entry = value as Record<string, unknown>;
+  if (
+    !isNonEmptyString(entry.decisionId) ||
+    !isNonEmptyString(entry.taskCanonicalId) ||
+    !isNonEmptyString(entry.stage) ||
+    !isKnownStage(entry.stage) ||
+    !isNonEmptyString(entry.createdAt) ||
+    !isNonEmptyString(entry.resolvedOptionId) ||
+    !isNonEmptyString(entry.chosenLabel) ||
+    typeof entry.whatHappened !== "string" ||
+    (entry.resolvedAt !== undefined && typeof entry.resolvedAt !== "string")
+  ) {
+    return undefined;
+  }
+  return {
+    decisionId: entry.decisionId,
+    taskCanonicalId: entry.taskCanonicalId,
+    stage: entry.stage,
+    createdAt: entry.createdAt,
+    ...(typeof entry.resolvedAt === "string" ? { resolvedAt: entry.resolvedAt } : {}),
+    resolvedOptionId: entry.resolvedOptionId,
+    chosenLabel: entry.chosenLabel,
+    whatHappened: entry.whatHappened,
+  };
+}
+
+/**
  * Viewer side: the runner's snapshot, or undefined when there is none or it is
  * unreadable. `isKnownStage` is passed in (the stage list lives in the
  * extension's types) so this module stays VS Code-free and testable.
@@ -202,7 +293,19 @@ export async function readRunnerDecisionsSnapshotV1(
         undecodable += 1;
       }
     }
-    return { writtenAt: record.writtenAt, decisions, undecodable };
+    // Optional and lenient by design: a snapshot from a runner that predates
+    // `answered` simply has none, and a malformed entry costs only its own
+    // collapsed card, so it is dropped without counting as an unseen question.
+    const answered: MirroredAnsweredDecisionV1[] = [];
+    if (Array.isArray(record.answered)) {
+      for (const candidate of record.answered) {
+        const decoded = decodeMirroredAnsweredDecisionV1(candidate, isKnownStage);
+        if (decoded !== undefined) {
+          answered.push(decoded);
+        }
+      }
+    }
+    return { writtenAt: record.writtenAt, decisions, answered, undecodable };
   } catch {
     // No runner has written yet, or a torn read: nothing to show.
     return undefined;
@@ -217,7 +320,7 @@ export async function readRunnerDecisionsSnapshotV1(
  * never disagree about whether the runner is alive.
  */
 export function liveMirroredDecisionsV1(
-  snapshot: RunnerDecisionsSnapshotV1 | undefined,
+  snapshot: Omit<RunnerDecisionsSnapshotV1, "answered"> | undefined,
   now: number,
   staleMs: number
 ): readonly WorkflowDecisionV1[] {
@@ -233,6 +336,13 @@ export interface MirroredDecisionsMementoV1 {
   setDecisions(decisions: readonly WorkflowDecisionV1[]): boolean;
   /** Whether `decisionId` belongs to the runner (so its answer must be relayed). */
   isMirrored(decisionId: string): boolean;
+  /** Replace the mirrored answered decisions; true when they changed. */
+  setAnswered(answered: readonly MirroredAnsweredDecisionV1[]): boolean;
+  /**
+   * The runner's recorded answer for `decisionId`, or undefined. Always
+   * undefined for an id still mirrored as pending: pending wins.
+   */
+  answeredFor(decisionId: string): MirroredAnsweredDecisionV1 | undefined;
 }
 
 /**
@@ -249,6 +359,11 @@ export function createMirroredDecisionsMementoV1(base: vscode.Memento, decisions
   let mirrored: readonly WorkflowDecisionV1[] = [];
   let mirroredIds = new Set<string>();
   let signature = "[]";
+  // Kept out of the decisions key and out of `base` on purpose: they are
+  // display-only, and writing them anywhere a store reads would let a
+  // finished decision look answerable.
+  let answeredById = new Map<string, MirroredAnsweredDecisionV1>();
+  let answeredSignature = "[]";
   const memento: vscode.Memento = {
     keys: () => base.keys(),
     get: (<T>(key: string, defaultValue?: T): T | undefined => {
@@ -292,6 +407,18 @@ export function createMirroredDecisionsMementoV1(base: vscode.Memento, decisions
     },
     isMirrored(decisionId) {
       return mirroredIds.has(decisionId);
+    },
+    setAnswered(next) {
+      const nextSignature = JSON.stringify(next);
+      if (nextSignature === answeredSignature) {
+        return false;
+      }
+      answeredSignature = nextSignature;
+      answeredById = new Map(next.map((entry) => [entry.decisionId, entry]));
+      return true;
+    },
+    answeredFor(decisionId) {
+      return mirroredIds.has(decisionId) ? undefined : answeredById.get(decisionId);
     },
   };
 }

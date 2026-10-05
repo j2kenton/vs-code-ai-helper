@@ -80,7 +80,7 @@ void describe("chat webview — info/disabled text contrast tokens", () => {
 
   void it("keeps metadata/status text on the muted colour", () => {
     const html = chatHtml();
-    for (const selector of [".msg-meta", ".msg-copy", "#busy-indicator", "#empty-notice"]) {
+    for (const selector of [".msg-meta", ".msg-copy", ".msg-toggle", ".msg-preview", "#busy-indicator", "#empty-notice"]) {
       assert.match(ruleBody(html, selector), /color:\s*var\(--vscode-descriptionForeground\)/, selector);
     }
   });

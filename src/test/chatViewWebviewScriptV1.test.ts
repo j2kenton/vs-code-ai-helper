@@ -152,10 +152,12 @@ interface PanelHarness {
   readonly outbound: unknown[];
   /** Every string the panel wrote to `navigator.clipboard`. */
   readonly clipboardWrites: string[];
+  /** Every object the panel passed to `setState`, oldest first. */
+  readonly savedStates: unknown[];
 }
 
 /** Run every inline script of the panel over a DOM stub. */
-function runPanel(): PanelHarness {
+function runPanel(initialState?: unknown): PanelHarness {
   const elements = new Map<string, FakeElement>();
   for (const id of [
     "context",
@@ -181,6 +183,7 @@ function runPanel(): PanelHarness {
   const windowListeners = new Map<string, ((event: unknown) => void)[]>();
   const outbound: unknown[] = [];
   const clipboardWrites: string[] = [];
+  const savedStates: unknown[] = [];
   const documentElement = makeElement("html");
   const context = vm.createContext({
     console,
@@ -189,8 +192,8 @@ function runPanel(): PanelHarness {
     requestAnimationFrame: (callback: () => void) => callback(),
     acquireVsCodeApi: () => ({
       postMessage: (message: unknown) => void outbound.push(message),
-      getState: () => undefined,
-      setState: () => undefined,
+      getState: () => initialState,
+      setState: (state: unknown) => void savedStates.push(state),
     }),
     navigator: {
       clipboard: {
@@ -252,6 +255,7 @@ function runPanel(): PanelHarness {
     },
     outbound,
     clipboardWrites,
+    savedStates,
   };
 }
 
@@ -664,5 +668,237 @@ void describe("the chat panel's inline script", () => {
       false,
       "no empty transcript may travel with it"
     );
+  });
+});
+
+/** Every element under `root` (itself included) matching `predicate`. */
+function findAll(root: FakeElement, predicate: (element: FakeElement) => boolean): FakeElement[] {
+  const found: FakeElement[] = [];
+  const visit = (element: FakeElement): void => {
+    if (predicate(element)) found.push(element);
+    element.children.forEach(visit);
+  };
+  visit(root);
+  return found;
+}
+
+void describe("the chat panel's expand and collapse controls", () => {
+  const target = { kind: "task", taskName: "My Task", canonicalId: "/w/t1", stage: "impl", taskFolderPath: "/w/t1" };
+  const CONVERSATION = "/w/t1:impl";
+  const message = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    id: "m1",
+    role: "assistant",
+    text: "first line" + String.fromCharCode(10) + "second line",
+    at: "2026-10-04T10:00:00.000Z",
+    atLabel: "10:00",
+    atTitle: "10/4/2026, 10:00:00 AM",
+    ...overrides,
+  });
+  const pendingDecision = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    decisionId: "d1",
+    whatHappened: "A round failed.",
+    whyUserNeeded: "Cannot decide alone.",
+    options: [{ optionId: "o1", label: "Retry", consequence: "Runs again.", destructive: false }],
+    recommendation: { kind: "none", reasoning: "No basis." },
+    gatingLine: "Unblocks: nothing",
+    isGating: false,
+    isBlockingDecision: true,
+    atLabel: "10:20",
+    atTitle: "10/4/2026, 10:20:00 AM",
+    copyText: "Decision needed",
+    createdAt: "2026-10-04T10:20:00.000Z",
+    ...overrides,
+  });
+  const answeredDecision = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    decisionId: "d1",
+    createdAt: "2026-10-04T10:20:00.000Z",
+    stage: "impl",
+    whatHappened: "A round failed.",
+    answered: true,
+    chosenLabel: "Retry",
+    atLabel: "10:20",
+    atTitle: "10/4/2026, 10:20:00 AM",
+    copyText: "Decided",
+    ...overrides,
+  });
+  /** A state post whose timeline is exactly `items` (and whose entries are the messages in it). */
+  const paint = (items: Record<string, unknown>[], extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    type: "state",
+    target,
+    label: "My Task — Implementation",
+    entries: items.filter((i) => i.type === "message").map((i) => i.value),
+    timeline: items,
+    interactions: [],
+    decisions: [],
+    waitingForUser: false,
+    ...extra,
+  });
+  const asMessage = (value: Record<string, unknown>): Record<string, unknown> => ({ type: "message", value });
+  const rows = (panel: PanelHarness): FakeElement[] => findByClass(panel.byId("messages"), "msg-row");
+  const toggleOf = (row: FakeElement): FakeElement | undefined => findByClass(row, "msg-toggle")[0];
+  const previewOf = (row: FakeElement): string => findByClass(row, "msg-preview")[0]?.textContent ?? "";
+  const click = (element: FakeElement): void => element.listeners.get("click")![0]!({});
+  const checkedOf = (element: FakeElement): boolean => (element as unknown as { checked?: boolean }).checked === true;
+
+  void it("a pending decision stays expanded, with no toggle, even when saved state marks it collapsed", () => {
+    const panel = runPanel({ collapsed: { [CONVERSATION]: { "m:m1": true, "d:d1": true } } });
+    const pending = pendingDecision();
+    panel.post(
+      paint([asMessage(message({ decisionId: "d1" })), { type: "decision", value: pending }], { decisions: [pending] })
+    );
+    const [announcement] = rows(panel);
+    assert.ok(announcement, "the announcing message is drawn");
+    assert.equal(toggleOf(announcement), undefined, "the announcing message of a pending decision has no toggle");
+    assert.equal(announcement.classList.has("collapsed"), false);
+    const [card] = findByClass(panel.byId("messages"), "decision-card");
+    assert.ok(card);
+    assert.equal(card.classList.has("collapsed"), false);
+    assert.equal(findByClass(card, "msg-toggle").length, 0, "the pending card has no toggle");
+    assert.equal(findAll(card, (e) => e.tagName === "INPUT" && e.type === "radio").length, 1, "its radio remains");
+    assert.equal(findAll(card, (e) => e.tagName === "BUTTON" && e.textContent === "Confirm").length, 1, "and its Confirm button");
+  });
+
+  void it("an announcing message stays un-collapsible while its answer is in flight (card hidden, still pending)", () => {
+    const panel = runPanel({ collapsed: { [CONVERSATION]: { "m:m1": true } } });
+    panel.post(
+      paint([asMessage(message({ decisionId: "d1", decisionAnswered: true }))], {
+        decisions: [],
+        pendingDecisionIds: ["d1"],
+      })
+    );
+    const [announcement] = rows(panel);
+    assert.ok(announcement);
+    assert.equal(toggleOf(announcement), undefined, "no toggle while the runner still holds it pending");
+    assert.equal(announcement.classList.has("collapsed"), false);
+  });
+
+  void it("a question the user answered starts collapsed with a one-line preview ending in an ellipsis", () => {
+    const panel = runPanel();
+    panel.post(paint([asMessage(message({ role: "question", questionAnswered: true }))]));
+    const [row] = rows(panel);
+    assert.ok(row);
+    assert.equal(row.classList.has("collapsed"), true);
+    assert.equal(toggleOf(row)?.getAttribute("aria-expanded"), "false");
+    const preview = previewOf(row);
+    assert.equal(preview, "[question] first line…", "the first line only, then an ellipsis");
+    assert.equal(preview.includes(String.fromCharCode(10)), false);
+  });
+
+  void it("a question with no recorded answer, and an ordinary message, start expanded", () => {
+    const panel = runPanel();
+    panel.post(paint([asMessage(message({ id: "q1", role: "question" })), asMessage(message({ id: "a1" }))]));
+    const drawn = rows(panel);
+    assert.equal(drawn.length, 2);
+    for (const row of drawn) {
+      assert.equal(row.classList.has("collapsed"), false);
+      assert.equal(toggleOf(row)?.getAttribute("aria-expanded"), "true");
+    }
+  });
+
+  void it("a manual toggle survives a re-render, is saved with the scroll positions, and posts nothing", () => {
+    const panel = runPanel();
+    const state = paint([asMessage(message())]);
+    panel.post(state);
+    const outboundBefore = panel.outbound.length;
+    click(toggleOf(rows(panel)[0]!)!);
+    assert.equal(rows(panel)[0]!.classList.has("collapsed"), true);
+    assert.equal(panel.outbound.length, outboundBefore, "a toggle posts nothing to the extension");
+    const saved = panel.savedStates.at(-1) as {
+      scrollPositions?: unknown;
+      collapsed?: Record<string, Record<string, boolean>>;
+    };
+    assert.equal(saved.collapsed?.[CONVERSATION]?.["m:m1"], true);
+    assert.ok(saved.scrollPositions !== undefined, "scroll positions are saved in the same object");
+
+    panel.post(state);
+    assert.equal(rows(panel)[0]!.classList.has("collapsed"), true, "still collapsed after the repaint");
+    click(toggleOf(rows(panel)[0]!)!);
+    panel.post(state);
+    assert.equal(rows(panel)[0]!.classList.has("collapsed"), false, "and an expand survives too");
+  });
+
+  void it("a toggle for a message that is no longer drawn is forgotten", () => {
+    const panel = runPanel({ collapsed: { [CONVERSATION]: { "m:gone": true } } });
+    panel.post(paint([asMessage(message())]));
+    const saved = panel.savedStates.at(-1) as { collapsed?: Record<string, unknown> };
+    assert.equal(saved.collapsed?.[CONVERSATION], undefined);
+  });
+
+  void it("an open decision form keeps its draft and stays expanded across a repaint", () => {
+    const panel = runPanel();
+    const pending = pendingDecision();
+    const state = paint([asMessage(message({ decisionId: "d1" })), { type: "decision", value: pending }], {
+      decisions: [pending],
+    });
+    panel.post(state);
+    const radio = (): FakeElement =>
+      findAll(panel.byId("messages"), (e) => e.tagName === "INPUT" && e.type === "radio")[0]!;
+    (radio() as unknown as { checked: boolean }).checked = true;
+    panel.post(state);
+    assert.equal(checkedOf(radio()), true, "the draft survives");
+    assert.equal(
+      findAll(panel.byId("messages"), (e) => e.classList.has("collapsed")).length,
+      0,
+      "nothing collapses while it is open"
+    );
+  });
+
+  void it("a question being answered stays expanded until it arrives answered", () => {
+    const panel = runPanel();
+    const waiting = paint([asMessage(message({ role: "question", awaitingAnswer: true }))]);
+    panel.post(waiting);
+    const reply = (): FakeElement => findAll(panel.byId("messages"), (e) => e.tagName === "TEXTAREA")[0]!;
+    reply().value = "my half-typed answer";
+    panel.post(waiting);
+    assert.equal(reply().value, "my half-typed answer");
+    assert.equal(toggleOf(rows(panel)[0]!), undefined, "no toggle while it awaits the user");
+    assert.equal(rows(panel)[0]!.classList.has("collapsed"), false);
+
+    panel.post(paint([asMessage(message({ role: "question", awaitingAnswer: false, questionAnswered: true }))]));
+    assert.equal(rows(panel)[0]!.classList.has("collapsed"), true, "collapsed once the answer is recorded");
+  });
+
+  void it("an open-items form is never collapsible", () => {
+    const panel = runPanel({ collapsed: { [CONVERSATION]: { "m:m1": true } } });
+    panel.post(
+      paint([asMessage(message())], {
+        openPlanItemsForms: [{ formId: "f1", items: [{ itemId: "i1", itemText: "Do the thing" }] }],
+      })
+    );
+    const form = panel.byId("interaction");
+    assert.equal(findByClass(form, "msg-toggle").length, 0);
+    assert.equal(findAll(form, (e) => e.classList.has("collapsed")).length, 0);
+    assert.equal(findAll(form, (e) => e.tagName === "BUTTON" && e.textContent === "Apply").length, 1);
+  });
+
+  void it("an answered decision is drawn read-only and collapsed; expanding it survives a re-render", () => {
+    const panel = runPanel();
+    const state = paint([
+      asMessage(message({ decisionId: "d1", decisionAnswered: true })),
+      { type: "decision", value: answeredDecision() },
+    ]);
+    panel.post(state);
+    const [card] = findByClass(panel.byId("messages"), "decision-card-answered");
+    assert.ok(card);
+    assert.equal(card.classList.has("collapsed"), true);
+    assert.equal(previewOf(card), "Decided: A round failed.…");
+    assert.equal(findAll(card, (e) => e.tagName === "INPUT").length, 0, "no radios");
+    assert.equal(findAll(card, (e) => e.tagName === "BUTTON" && e.textContent === "Confirm").length, 0, "no Confirm");
+    assert.match(card.text(), /Your choice: Retry/);
+    assert.equal(rows(panel)[0]!.classList.has("collapsed"), true, "the announcing message collapses with it");
+
+    click(toggleOf(card)!);
+    assert.equal(card.classList.has("collapsed"), false);
+    panel.post(state);
+    const [again] = findByClass(panel.byId("messages"), "decision-card-answered");
+    assert.equal(again!.classList.has("collapsed"), false, "the expansion survives the repaint");
+  });
+
+  void it("a message with a decision id and no answered flag starts expanded", () => {
+    const panel = runPanel();
+    panel.post(paint([asMessage(message({ decisionId: "d9" }))]));
+    const [row] = rows(panel);
+    assert.equal(row!.classList.has("collapsed"), false);
+    assert.ok(toggleOf(row!));
   });
 });

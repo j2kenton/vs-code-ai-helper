@@ -9,7 +9,9 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import type * as vscode from "vscode";
 import {
+  answeredDecisionsForMirrorV1,
   createMirroredDecisionsMementoV1,
+  type MirroredAnsweredDecisionV1,
   decodeMirroredDecisionV1,
   liveMirroredDecisionsV1,
   readRunnerDecisionsSnapshotV1,
@@ -248,5 +250,185 @@ void describe("hostDecisionMirrorV1", () => {
     });
     assert.ok(decoded);
     assert.equal(decoded.options[0]!.resumeKind, "continue");
+  });
+});
+
+void describe("hostDecisionMirrorV1 — answered decisions (display only)", () => {
+  const answered = (overrides: Record<string, unknown> = {}): MirroredAnsweredDecisionV1 =>
+    ({
+      decisionId: "d-1",
+      taskCanonicalId: "/w/.ensemble/2026-09-17_task_3",
+      stage: "impl-low-review",
+      createdAt: "2026-09-17T16:00:00.000Z",
+      resolvedOptionId: "advance",
+      chosenLabel: "Advance to Publish",
+      whatHappened: "5 rounds without progress.",
+      ...overrides,
+    }) as MirroredAnsweredDecisionV1;
+  const resolvedRecord = (overrides: Partial<WorkflowDecisionV1> = {}): WorkflowDecisionV1 =>
+    decision({ state: "resolved", resolvedOptionId: "advance", resolvedAt: "2026-09-17T16:05:00.000Z", ...overrides });
+
+  void it("projects the chosen option's label, falls back to the option id, and drops pending and choice-less records", () => {
+    const projected = answeredDecisionsForMirrorV1(
+      [
+        resolvedRecord(),
+        resolvedRecord({ decisionId: "d-unknown-option", resolvedOptionId: "gone" }),
+        resolvedRecord({ decisionId: "d-also-pending" }),
+        resolvedRecord({ decisionId: "d-no-choice", resolvedOptionId: undefined }),
+      ],
+      new Set(["d-also-pending"])
+    );
+    assert.deepEqual(
+      projected.map((entry) => [entry.decisionId, entry.chosenLabel]),
+      [
+        ["d-1", "Advance to Publish"],
+        ["d-unknown-option", "gone"],
+      ]
+    );
+    assert.equal(projected[0]!.resolvedAt, "2026-09-17T16:05:00.000Z");
+  });
+
+  void it("round-trips through the snapshot file next to the unchanged pending list", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ensemble-decisions-answered-"));
+    try {
+      assert.equal(await writeRunnerDecisionsSnapshotV1(dir, [decision()], [answered()]), true);
+      const snapshot = await readRunnerDecisionsSnapshotV1(dir);
+      assert.deepEqual(snapshot?.decisions, [decision()]);
+      assert.deepEqual(snapshot?.answered, [answered()]);
+      assert.equal(snapshot?.undecodable, 0);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("an old runner's snapshot (no answered field) reads as no answers, with decisions unchanged", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ensemble-decisions-oldrunner-"));
+    try {
+      await fs.writeFile(
+        path.join(dir, "decisions-v1.json"),
+        JSON.stringify({ writtenAt: Date.now(), decisions: [decision()] })
+      );
+      const snapshot = await readRunnerDecisionsSnapshotV1(dir);
+      assert.deepEqual(snapshot?.answered, []);
+      assert.deepEqual(snapshot?.decisions, [decision()]);
+      assert.equal(snapshot?.undecodable, 0);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("an old viewer's view is unchanged by the extra field: same decisions and undecodable with or without it", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ensemble-decisions-oldviewer-"));
+    try {
+      const body = { writtenAt: 1_000, decisions: [decision(), { nonsense: true }] };
+      await fs.writeFile(path.join(dir, "decisions-v1.json"), JSON.stringify(body));
+      const without = await readRunnerDecisionsSnapshotV1(dir);
+      await fs.writeFile(path.join(dir, "decisions-v1.json"), JSON.stringify({ ...body, answered: [answered()] }));
+      const withAnswered = await readRunnerDecisionsSnapshotV1(dir);
+      assert.deepEqual(withAnswered?.decisions, without?.decisions);
+      assert.equal(withAnswered?.undecodable, without?.undecodable);
+      assert.equal(withAnswered?.undecodable, 1);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("drops malformed answered entries without counting them as undecodable questions", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ensemble-decisions-badanswered-"));
+    try {
+      await fs.writeFile(
+        path.join(dir, "decisions-v1.json"),
+        JSON.stringify({
+          writtenAt: Date.now(),
+          decisions: [decision()],
+          answered: [
+            answered(),
+            answered({ decisionId: "d-stage", stage: "made-up-stage" }),
+            answered({ decisionId: "d-label", chosenLabel: "" }),
+            answered({ decisionId: "d-what", whatHappened: 5 }),
+            answered({ decisionId: "d-at", resolvedAt: 7 }),
+            "not an object",
+            null,
+          ],
+        })
+      );
+      const snapshot = await readRunnerDecisionsSnapshotV1(dir, (stage) => stage === "impl-low-review");
+      assert.deepEqual(snapshot?.answered.map((entry) => entry.decisionId), ["d-1"]);
+      assert.equal(snapshot?.undecodable, 0);
+      assert.equal(await readRunnerDecisionsSnapshotV1(dir).then((s) => s?.answered.length), 2, "an unconstrained stage keeps the made-up stage only");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("answeredFor returns undefined for an id also mirrored as pending, and answers never enter the decisions key or base", async () => {
+    const base = new MapMemento();
+    const mirror = createMirroredDecisionsMementoV1(base, WORKFLOW_DECISIONS_STORAGE_KEY_V1);
+    assert.equal(mirror.setAnswered([answered({ decisionId: "d-done" }), answered({ decisionId: "d-1" })]), true);
+    assert.equal(mirror.setAnswered([answered({ decisionId: "d-done" }), answered({ decisionId: "d-1" })]), false, "unchanged");
+    assert.equal(mirror.answeredFor("d-done")?.chosenLabel, "Advance to Publish");
+    assert.equal(mirror.answeredFor("unknown"), undefined);
+
+    mirror.setDecisions([decision()]);
+    assert.equal(mirror.answeredFor("d-1"), undefined, "pending wins");
+
+    const store = new WorkflowDecisionStoreV1(mirror.memento);
+    assert.deepEqual(store.listPending().map((d) => d.decisionId), ["d-1"]);
+    assert.equal(store.get("d-done"), undefined, "an answer is not a decision record");
+    assert.deepEqual(store.listResolvedV1(), []);
+    assert.deepEqual(base.keys(), [], "nothing is written to the base memento");
+    const posted = await store.post({
+      decisionId: "local",
+      decisionKey: "exampleDecision",
+      taskCanonicalId: "/w/.ensemble/2026-09-17_task_3",
+      stage: "impl",
+      whatHappened: "Something happened.",
+      whyUserNeeded: "Only you can choose.",
+      options: [{ optionId: "go", label: "Go", consequence: "Goes.", resumeKind: "unpause", effect: { kind: "doNothing" } }],
+      recommendation: { kind: "none", reasoning: "no basis" },
+      createdAt: new Date().toISOString(),
+    });
+    assert.equal(posted.ok, true);
+    const persisted = base.values.get(WORKFLOW_DECISIONS_STORAGE_KEY_V1) as readonly WorkflowDecisionV1[];
+    assert.deepEqual(persisted.map((d) => d.decisionId), ["local"], "only this window's own record is persisted");
+  });
+
+  void it("a store change that only resolves a decision changes the runner's snapshot signature", async () => {
+    // The runner's change-listener compares this exact shape (extension.ts):
+    // resolving must be a change, or the viewer would keep the card pending.
+    const store = new WorkflowDecisionStoreV1(new MapMemento());
+    const posted = await store.post({
+      decisionId: "d-sig",
+      decisionKey: "exampleDecision",
+      taskCanonicalId: "/w/.ensemble/2026-09-17_task_3",
+      stage: "impl",
+      whatHappened: "Something happened.",
+      whyUserNeeded: "Only you can choose.",
+      options: [
+        {
+          optionId: "go",
+          label: "Go",
+          consequence: "Goes.",
+          resumeKind: "unpause",
+          effect: { kind: "doNothing" },
+        },
+      ],
+      recommendation: { kind: "none", reasoning: "no basis" },
+      createdAt: new Date().toISOString(),
+    });
+    assert.equal(posted.ok, true);
+    const signature = (): string => {
+      const pending = store.listPending();
+      const answered = answeredDecisionsForMirrorV1(
+        store.listResolvedV1(),
+        new Set(pending.map((d) => d.decisionId))
+      );
+      return JSON.stringify({ pending, answered });
+    };
+    const before = signature();
+    assert.equal((await store.resolve("d-sig", "go")).kind, "resolved");
+    const after = signature();
+    assert.notEqual(after, before);
+    assert.match(after, /"chosenLabel":"Go"/);
   });
 });

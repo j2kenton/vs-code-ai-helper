@@ -86,6 +86,8 @@ import * as effectiveReviewProgressModule from "../utils/effectiveReviewProgress
 import { taskOperations } from "../utils/taskOperations";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { formatDisplayTimestampPairV1 } from "../utils/timeFormat";
+import * as chatHistoryConstants from "../utils/chatHistoryConstants";
+import type { MirroredAnsweredDecisionV1 } from "../services/hostDecisionMirrorV1";
 
 const QUESTIONS: readonly StructuredQuestionV1[] = [
   {
@@ -4240,6 +4242,196 @@ void describe("Chat With AI — own-write render exactly-once (RC2 item 11, Step
       assert.equal(renderCalls, 1, "expected a direct fallback render when the write's own event never fired");
     } finally {
       provider.dispose();
+    }
+  });
+});
+
+void describe("Chat With AI — evidence for collapsing answered questions and decisions", () => {
+  type HistoryEntries = Parameters<typeof writeChatHistory>[1];
+  const ANCHOR_AT = "2026-10-04T10:00:00.000Z";
+  const anchorEntry = (): HistoryEntries[number] =>
+    ({ role: "assistant", text: "Decision needed", stage: "impl", at: ANCHOR_AT, decisionId: "decision-1" }) as HistoryEntries[number];
+  const mirroredAnswer = (folder: string, overrides: Record<string, unknown> = {}): MirroredAnsweredDecisionV1 =>
+    ({
+      decisionId: "decision-1",
+      taskCanonicalId: folder,
+      stage: "impl",
+      createdAt: "2026-10-04T09:59:00.000Z",
+      resolvedOptionId: "doIt",
+      chosenLabel: "Do it",
+      whatHappened: "The scheduled round finished and the summary was rejected.",
+      ...overrides,
+    }) as MirroredAnsweredDecisionV1;
+
+  interface Painted {
+    readonly timeline: ReadonlyArray<{ type: string; value: Record<string, unknown> }>;
+    readonly entries: ReadonlyArray<Record<string, unknown>>;
+    readonly decisions: ReadonlyArray<{ decisionId: string }>;
+  }
+
+  async function paintedFor(
+    entries: HistoryEntries,
+    setup: (folder: string, provider: ChatViewProvider) => Promise<void> = () => Promise.resolve()
+  ): Promise<Painted & { folder: string }> {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      await writeChatHistory(folder, entries, folder);
+      await setup(folder, provider);
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      const state = lastState(fake) as unknown as Painted;
+      return { timeline: state.timeline, entries: state.entries, decisions: state.decisions, folder };
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+    }
+  }
+  const answeredCards = (painted: Painted): Array<Record<string, unknown>> =>
+    painted.timeline.filter((item) => item.type === "decision" && item.value.answered === true).map((item) => item.value);
+  const anchorOf = (painted: Painted): Record<string, unknown> | undefined =>
+    painted.entries.find((entry) => entry.decisionId === "decision-1");
+
+  void it("marks questionAnswered only on a question with a later reply bound to it", async () => {
+    const painted = await paintedFor([
+      { role: "question", text: "First?", stage: "impl", at: "2026-10-04T10:00:00.000Z", id: "q1", pending: true },
+      { role: "question", text: "Second?", stage: "impl", at: "2026-10-04T10:01:00.000Z", id: "q2", pending: true },
+      { role: "user", text: "yes", stage: "impl", at: "2026-10-04T10:02:00.000Z", answersQuestionAt: "q1" },
+      { role: "user", text: "unrelated chat", stage: "impl", at: "2026-10-04T10:03:00.000Z" },
+    ] as unknown as HistoryEntries);
+    safeRemoveDir(painted.folder);
+    const byText = (text: string): Record<string, unknown> | undefined => painted.entries.find((e) => e.text === text);
+    assert.equal(byText("First?")?.questionAnswered, true);
+    assert.equal(byText("Second?")?.questionAnswered, undefined, "an unbound later message settles nothing");
+    assert.equal(byText("Second?")?.awaitingAnswer, true);
+    assert.equal(byText("yes")?.questionAnswered, undefined);
+    assert.equal(byText("unrelated chat")?.questionAnswered, undefined);
+  });
+
+  void it("a locally resolved decision with an anchor appears once as an answered card, and flags its anchor", async () => {
+    const painted = await paintedFor([anchorEntry()], async (folder, provider) => {
+      assert.equal((await provider.workflowDecisionStore.post(decisionInput(folder))).ok, true);
+      assert.equal((await provider.workflowDecisionStore.resolve("decision-1", "doIt")).kind, "resolved");
+    });
+    safeRemoveDir(painted.folder);
+    const cards = answeredCards(painted);
+    assert.equal(cards.length, 1, "exactly one card");
+    assert.equal(cards[0]!.chosenLabel, "Do it");
+    assert.equal(anchorOf(painted)?.decisionAnswered, true);
+    assert.deepEqual(painted.decisions, [], "an answered decision is not in the pending list");
+    const order = painted.timeline.map((item) => item.type);
+    assert.deepEqual(order, ["message", "decision"], "the card follows its announcing message");
+  });
+
+  void it("dismissed, withdrawn and superseded decisions get no card and no flag", async () => {
+    for (const settle of ["dismiss", "withdraw", "supersede"] as const) {
+      const memento = makeMemento();
+      const folder = makeFolder();
+      const provider = new ChatViewProvider(memento);
+      const fake = makeFakeWebviewView();
+      const notify = installNotificationRouterCapture();
+      const cmds = installExecuteCommandCapture();
+      try {
+        await writeChatHistory(folder, [anchorEntry()], folder);
+        assert.equal((await provider.workflowDecisionStore.post(decisionInput(folder))).ok, true);
+        if (settle === "dismiss") await provider.workflowDecisionStore.dismiss("decision-1");
+        else if (settle === "withdraw") await provider.workflowDecisionStore.withdraw("decision-1", "no longer needed");
+        else {
+          const stored = memento.get<WorkflowDecisionV1[]>("workflowDecisions", []);
+          await memento.update(
+            "workflowDecisions",
+            stored.map((d) => ({ ...d, state: "superseded" }))
+          );
+        }
+        provider.resolveWebviewView(fake.view);
+        await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+        await waitForStateMessage(fake);
+        const painted = lastState(fake) as unknown as Painted;
+        assert.equal(answeredCards(painted).length, 0, settle);
+        assert.equal(anchorOf(painted)?.decisionAnswered, undefined, settle);
+      } finally {
+        notify.restore();
+        cmds.restore();
+        provider.dispose();
+        safeRemoveDir(folder);
+      }
+    }
+  });
+
+  void it("a pending decision is listed once, and its anchor carries no answered flag", async () => {
+    const painted = await paintedFor([anchorEntry()], async (folder, provider) => {
+      assert.equal((await provider.workflowDecisionStore.post(decisionInput(folder))).ok, true);
+    });
+    safeRemoveDir(painted.folder);
+    assert.equal(painted.decisions.length, 1);
+    assert.equal(answeredCards(painted).length, 0);
+    assert.equal(painted.timeline.filter((item) => item.type === "decision").length, 1);
+    assert.equal(anchorOf(painted)?.decisionAnswered, undefined);
+  });
+
+  void it("a viewer with no local record draws the card and flag from the runner's mirrored answer", async () => {
+    const painted = await paintedFor([anchorEntry()], (folder, provider) => {
+      provider.configureMirroredAnsweredLookupV1((id) => (id === "decision-1" ? mirroredAnswer(folder) : undefined));
+      return Promise.resolve();
+    });
+    safeRemoveDir(painted.folder);
+    const cards = answeredCards(painted);
+    assert.equal(cards.length, 1);
+    assert.equal(cards[0]!.chosenLabel, "Do it");
+    assert.equal(anchorOf(painted)?.decisionAnswered, true);
+  });
+
+  void it("pending wins: an id both pending and mirrored as answered gets neither card nor flag", async () => {
+    const painted = await paintedFor([anchorEntry()], async (folder, provider) => {
+      assert.equal((await provider.workflowDecisionStore.post(decisionInput(folder))).ok, true);
+      provider.configureMirroredAnsweredLookupV1(() => mirroredAnswer(folder));
+    });
+    safeRemoveDir(painted.folder);
+    assert.equal(painted.decisions.length, 1);
+    assert.equal(answeredCards(painted).length, 0);
+    assert.equal(anchorOf(painted)?.decisionAnswered, undefined);
+  });
+
+  void it("with no local record and no mirrored answer there is no card and no flag", async () => {
+    const painted = await paintedFor([anchorEntry()], (_folder, provider) => {
+      provider.configureMirroredAnsweredLookupV1(() => undefined);
+      return Promise.resolve();
+    });
+    safeRemoveDir(painted.folder);
+    assert.equal(answeredCards(painted).length, 0);
+    assert.equal(anchorOf(painted)?.decisionAnswered, undefined);
+  });
+
+  void it("a mirrored answer for another task or stage is ignored", async () => {
+    for (const overrides of [{ taskCanonicalId: "/some/other/task" }, { stage: "plan" }]) {
+      const painted = await paintedFor([anchorEntry()], (folder, provider) => {
+        provider.configureMirroredAnsweredLookupV1(() => mirroredAnswer(folder, overrides));
+        return Promise.resolve();
+      });
+      safeRemoveDir(painted.folder);
+      assert.equal(answeredCards(painted).length, 0, JSON.stringify(overrides));
+      assert.equal(anchorOf(painted)?.decisionAnswered, undefined, JSON.stringify(overrides));
+    }
+  });
+
+  void it("rendering an answered decision leaves chat-v1.json byte-for-byte unchanged", async () => {
+    let before: Buffer | undefined;
+    const painted = await paintedFor([anchorEntry()], (folder, provider) => {
+      provider.configureMirroredAnsweredLookupV1(() => mirroredAnswer(folder));
+      before = fs.readFileSync(path.join(folder, chatHistoryConstants.CHAT_HISTORY_FILENAME));
+      return Promise.resolve();
+    });
+    try {
+      assert.equal(answeredCards(painted).length, 1, "the card was drawn");
+      const after = fs.readFileSync(path.join(painted.folder, chatHistoryConstants.CHAT_HISTORY_FILENAME));
+      assert.ok(before !== undefined && before.equals(after), "chat-v1.json is unchanged by render()");
+    } finally {
+      safeRemoveDir(painted.folder);
     }
   });
 });

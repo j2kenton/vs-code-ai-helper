@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as crypto from "crypto";
 import { isViewerHostV1 } from "../state/hostRoleV1";
 import { VIEWER_DECISION_EFFECT_COMMANDS_V1 } from "../services/viewerForwardingV1";
+import type { MirroredAnsweredDecisionV1 } from "../services/hostDecisionMirrorV1";
 import * as path from "path";
 import { normalizePath } from "../utils/taskRoot";
 import { isReviewStage, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
@@ -495,6 +496,45 @@ function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): Readon
   return awaiting;
 }
 
+/**
+ * Indices of `question` messages the user has answered through the
+ * question's own bound reply control (a later `role: "user"` entry carrying
+ * its `answersQuestionAt`). Positive evidence only: a question with no such
+ * reply is NOT in this set, so it is never collapsed on a guess. Keyed the
+ * same way `computeAwaitingQuestionIndices` keys it (`id ?? at`). Display
+ * only; nothing here is written back.
+ */
+function computeAnsweredQuestionIndices(entries: readonly ChatMessage[]): ReadonlySet<number> {
+  const answered = new Set<number>();
+  const indicesByKey = new Map<string, number[]>();
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (entry.role === "question") {
+      const key = entry.id ?? entry.at;
+      indicesByKey.set(key, [...(indicesByKey.get(key) ?? []), i]);
+    } else if (entry.role === "user" && entry.answersQuestionAt !== undefined) {
+      for (const index of indicesByKey.get(entry.answersQuestionAt) ?? []) {
+        answered.add(index);
+      }
+      indicesByKey.delete(entry.answersQuestionAt);
+    }
+  }
+  return answered;
+}
+
+/** A decision the user already answered, as the chat timeline draws it. */
+interface AnsweredDecisionDisplayV1 {
+  readonly decisionId: string;
+  readonly createdAt: string;
+  readonly stage: string;
+  readonly whatHappened: string;
+  readonly answered: true;
+  readonly chosenLabel: string;
+  readonly atLabel: string;
+  readonly atTitle: string;
+  readonly copyText: string;
+}
+
 /** Plain text a decision card puts on the clipboard: everything the card
  * shows that a person would want to paste elsewhere, one item per line. The
  * webview cannot import host code, so this is built here and posted as
@@ -554,7 +594,7 @@ export function buildInteractionCopyTextV1(
  * and sits immediately after the message that announced it. */
 function buildChatTimelineV1<
   T extends { readonly at: string; readonly decisionId?: string },
-  D extends WorkflowDecisionV1
+  D extends Pick<WorkflowDecisionV1, "decisionId" | "createdAt">
 >(entries: readonly T[], decisions: readonly D[]): Array<{ type: "message"; value: T } | { type: "decision"; value: D }> {
   const anchorAt = new Map<string, string>();
   for (const entry of entries) {
@@ -729,6 +769,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * this in a viewer (hostDecisionMirrorV1.ts); unset everywhere else.
    */
   private isRemoteDecisionV1: ((decisionId: string) => boolean) | undefined;
+  /**
+   * The runner's recorded answer for a decision id, for a viewer that never
+   * held the resolved record itself. extension.ts installs this in a viewer
+   * (hostDecisionMirrorV1.ts); unset everywhere else. Display-only.
+   */
+  private mirroredAnsweredLookupV1: ((decisionId: string) => MirroredAnsweredDecisionV1 | undefined) | undefined;
 
   /**
    * The last `taskOperations` signature this panel rendered for its current
@@ -964,6 +1010,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** See `isRemoteDecisionV1`. */
   configureRemoteDecisionPredicateV1(predicate: ((decisionId: string) => boolean) | undefined): void {
     this.isRemoteDecisionV1 = predicate;
+  }
+
+  /** See `mirroredAnsweredLookupV1`. */
+  configureMirroredAnsweredLookupV1(
+    lookup: ((decisionId: string) => MirroredAnsweredDecisionV1 | undefined) | undefined
+  ): void {
+    this.mirroredAnsweredLookupV1 = lookup;
   }
 
   setInteractionServices(services: ChatInteractionServicesV1): void {
@@ -2235,6 +2288,89 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /** `withdrawStaleDecisionsV1`, but a failure costs the check, not the panel. */
+  /**
+   * The decisions this transcript announced that the user has since
+   * ANSWERED, for the collapsed "Decided" card and the announcing message's
+   * `decisionAnswered` flag. Only positive evidence counts: a `resolved`
+   * record with a recorded choice in this window's store, else the runner's
+   * mirrored answer. Pending always wins, and dismissed, withdrawn,
+   * superseded or unknown decisions yield nothing, so the worst a failed
+   * read can do is leave a message expanded. Reads only; writes nothing.
+   */
+  private collectAnsweredDecisionsV1(
+    target: ChatTarget,
+    entries: readonly ChatMessage[]
+  ): { readonly cards: readonly AnsweredDecisionDisplayV1[]; readonly ids: ReadonlySet<string> } {
+    const cards: AnsweredDecisionDisplayV1[] = [];
+    const ids = new Set<string>();
+    if (target.kind === "global") {
+      return { cards, ids };
+    }
+    try {
+      // Raw pending, BEFORE the in-flight filter: an answer on its way to the
+      // runner is not yet an answer anyone has recorded.
+      const pendingIds = new Set(this.workflowDecisionStore.listPending(target.canonicalId).map((d) => d.decisionId));
+      const taskKey = normalizePath(target.canonicalId);
+      for (const entry of entries) {
+        const decisionId = entry.decisionId;
+        if (!decisionId || pendingIds.has(decisionId) || ids.has(decisionId)) {
+          continue;
+        }
+        let answer: { createdAt: string; stage: string; whatHappened: string; chosenLabel: string } | undefined;
+        const local = this.workflowDecisionStore.get(decisionId);
+        if (local !== undefined) {
+          if (local.state === "resolved" && local.resolvedOptionId !== undefined && local.stage === target.stage) {
+            answer = {
+              createdAt: local.createdAt,
+              stage: local.stage,
+              whatHappened: local.whatHappened,
+              chosenLabel:
+                local.options.find((option) => option.optionId === local.resolvedOptionId)?.label ??
+                local.resolvedOptionId,
+            };
+          }
+        } else {
+          const mirrored = this.mirroredAnsweredLookupV1?.(decisionId);
+          if (
+            mirrored !== undefined &&
+            mirrored.stage === target.stage &&
+            normalizePath(mirrored.taskCanonicalId) === taskKey
+          ) {
+            answer = {
+              createdAt: mirrored.createdAt,
+              stage: mirrored.stage,
+              whatHappened: mirrored.whatHappened,
+              chosenLabel: mirrored.chosenLabel,
+            };
+          }
+        }
+        if (answer === undefined) {
+          continue;
+        }
+        // Same time the pending card shows: the announcing message, else the
+        // decision's own `createdAt`.
+        const anchored = formatDisplayTimestampPairV1(entry.at);
+        const { atLabel, atTitle } = anchored.atLabel ? anchored : formatDisplayTimestampPairV1(answer.createdAt);
+        ids.add(decisionId);
+        cards.push({
+          decisionId,
+          createdAt: answer.createdAt,
+          stage: answer.stage,
+          whatHappened: answer.whatHappened,
+          answered: true,
+          chosenLabel: answer.chosenLabel,
+          atLabel,
+          atTitle,
+          copyText: ["Decided", answer.whatHappened, `Your choice: ${answer.chosenLabel}`].join("\n"),
+        });
+      }
+    } catch (error) {
+      console.error("Ensemble: could not read answered decisions; leaving those messages expanded", error);
+      return { cards: [], ids: new Set() };
+    }
+    return { cards, ids };
+  }
+
   private async withdrawStaleDecisionsSafelyV1(
     target: ChatTarget,
     decisions: readonly WorkflowDecisionV1[]
@@ -2871,6 +3007,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               .filter((d) => !this.isAnswerInFlightV1(d))
           )
         : [];
+    let rawPendingDecisionIds: string[] = [];
+    try {
+      rawPendingDecisionIds =
+        target && target.kind !== "global"
+          ? this.workflowDecisionStore.listPending(target.canonicalId).map((d) => d.decisionId)
+          : [];
+    } catch {
+      rawPendingDecisionIds = pendingDecisions.map((d) => d.decisionId);
+    }
     const targetOps = target ? taskOperations.getTaskOperations(target.canonicalId) : [];
     // A trailing pending question (no reply after it yet) drives only the
     // per-message "— awaiting your answer" label further down; it plays no
@@ -3010,10 +3155,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const outcomeIntentIds = new Set(
       entries.filter((entry) => entry.kind === "outcome" && entry.intentId !== undefined).map((entry) => entry.intentId!)
     );
+    // Display-only collapse evidence (never written): a question the user
+    // answered through its own reply control, and announcements of decisions
+    // that have since been answered. Added only when true so the payload for
+    // every other entry is unchanged.
+    const answeredQuestionIndices = computeAnsweredQuestionIndices(entries);
+    const answeredDecisions =
+      target && target.kind !== "global"
+        ? this.collectAnsweredDecisionsV1(target, entries)
+        : { cards: [] as readonly AnsweredDecisionDisplayV1[], ids: new Set<string>() as ReadonlySet<string> };
     const displayEntries = entries.map((entry, index) => {
       const date = new Date(entry.at);
       return {
         ...entry,
+        ...(answeredQuestionIndices.has(index) ? { questionAnswered: true } : {}),
+        ...(entry.decisionId !== undefined && answeredDecisions.ids.has(entry.decisionId)
+          ? { decisionAnswered: true }
+          : {}),
         text: stripAttributionHeaders(entry.text),
         atLabel: formatTimestampForDisplay(date),
         atTitle: date.toLocaleString(),
@@ -3186,10 +3344,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       target: this.target,
       label,
       entries: displayEntries,
-      timeline: buildChatTimelineV1(displayEntries, displayDecisions),
+      timeline: buildChatTimelineV1(displayEntries, [...displayDecisions, ...answeredDecisions.cards]),
       interactions: displayInteractions,
       openPlanItemsForms,
       decisions: displayDecisions,
+      // Raw pending IDs, including answers still in flight (their cards are
+      // hidden, but the announcing message must stay un-collapsible).
+      pendingDecisionIds: rawPendingDecisionIds,
       busy,
       busyLabel,
       waitingForUser,
@@ -3261,6 +3422,36 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         .msg-copy:hover {
           color: var(--vscode-foreground);
+        }
+        .msg-toggle {
+          background: none;
+          border: none;
+          cursor: pointer;
+          color: var(--vscode-descriptionForeground);
+          padding: 0 var(--ensemble-space-1);
+          font-size: 1em;
+          line-height: 1;
+        }
+        .msg-toggle:hover {
+          color: var(--vscode-foreground);
+        }
+        .msg-toggle:focus-visible {
+          outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder);
+        }
+        /* The one-line stand-in for a collapsed message: hidden until the row
+           is collapsed, which hides everything else except the meta row. */
+        .msg-preview {
+          display: none;
+          color: var(--vscode-descriptionForeground);
+          white-space: nowrap;
+          overflow: hidden;
+          text-overflow: ellipsis;
+        }
+        .collapsed > .msg-preview {
+          display: block;
+        }
+        .collapsed > :not(.msg-preview):not(.msg-meta) {
+          display: none;
         }
         #messages p {
           margin: 0;
@@ -3423,6 +3614,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-recommendation { margin: var(--ensemble-space-2) 0; font-style: italic; color: var(--ensemble-info-foreground); }
         .decision-gating { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--ensemble-info-foreground); }
         .decision-card.decision-card-gating { border-left: 3px solid var(--vscode-inputValidation-warningBorder); padding-left: var(--ensemble-space-2); }
+        .decision-card.decision-card-answered { border-left: 3px solid var(--vscode-panel-border); padding-left: var(--ensemble-space-2); }
+        .decision-choice { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--ensemble-info-foreground); }
         .decision-gating.decision-gating-active { color: var(--vscode-inputValidation-warningForeground); font-weight: bold; }
         #steering-note { display: none; margin: 0 0 var(--ensemble-space-2); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
         .interaction-actions + .msg-meta { margin-top: var(--ensemble-space-2); }
@@ -3441,10 +3634,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
+      // Messages the user expanded or collapsed BY HAND: conversation key ->
+      // { item key: true (collapsed) | false (expanded) }. Webview-only state,
+      // keyed by message id so it survives the full repaint every state post
+      // does; nothing here reaches the extension or chat-v1.json.
+      const collapsedState = (savedState.collapsed && typeof savedState.collapsed==='object') ? savedState.collapsed : {};
+      const PREVIEW_MAX_CHARS = 120;
+      // The per-paint facts makeCollapsible needs; reset by each state message.
+      let paintKey = '';
+      let drawnKeys = {};
+      let pendingIds = new Set();
       let currentKey;
       function targetKey(t){ if(!t) return ''; return t.kind==='global' ? 'global' : (t.canonicalId+':'+t.stage); }
       function isNearBottom(){ return (document.documentElement.scrollHeight-window.scrollY-window.innerHeight)<60; }
-      function persistScroll(){ if(currentKey===undefined) return; scrollPositions[currentKey]=window.scrollY; v.setState({scrollPositions:scrollPositions}); }
+      // The one place webview state is saved: scroll positions and manual
+      // collapse toggles share a single setState object, so neither write can
+      // drop the other.
+      function persistState(){ v.setState({scrollPositions:scrollPositions,collapsed:collapsedState}); }
+      function persistScroll(){ if(currentKey===undefined) return; scrollPositions[currentKey]=window.scrollY; persistState(); }
       window.addEventListener('scroll', persistScroll);
       // Renders one structured-question interaction (plan §6.1's universal
       // question flow) with typed Answer/Resume/Cancel controls. Answer
@@ -3481,6 +3688,62 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         });
         meta.appendChild(copyBtn);meta.appendChild(time);
         return meta;
+      }
+      // The first non-empty line of a message, cut to PREVIEW_MAX_CHARS and
+      // always followed by an ellipsis. String.fromCharCode(10), not a
+      // backslash escape (see the note at the top of the message handler).
+      function previewLine(text){
+        const lines=String(text==null?'':text).split(String.fromCharCode(10));
+        let first='';
+        for(const line of lines){ const t=line.trim(); if(t){first=t;break;} }
+        return first.slice(0,PREVIEW_MAX_CHARS)+'…';
+      }
+      // Gives a row an expand/collapse button in its meta row and a one-line
+      // preview that shows in place of the body while collapsed. A toggle the
+      // user made by hand (collapsedState) beats the default; the click only
+      // flips a class and saves state, so it posts nothing and repaints
+      // nothing.
+      function makeCollapsible(row,key,previewSource,startCollapsed){
+        let meta;
+        for(const child of row.children){ if(child.className==='msg-meta'){meta=child;break;} }
+        if(!meta) return row;
+        const convKey=paintKey;
+        drawnKeys[key]=true;
+        const own=collapsedState[convKey];
+        const saved=own?own[key]:undefined;
+        let isCollapsed=typeof saved==='boolean'?saved:!!startCollapsed;
+        const preview=document.createElement('div');preview.className='msg-preview';
+        preview.textContent=previewLine(previewSource);
+        row.appendChild(preview);
+        const btn=document.createElement('button');btn.type='button';btn.className='msg-toggle';
+        function paintToggle(){
+          row.classList.toggle('collapsed',isCollapsed);
+          const label=isCollapsed?'Expand message':'Collapse message';
+          btn.setAttribute('aria-expanded',isCollapsed?'false':'true');
+          btn.setAttribute('aria-label',label);btn.title=label;
+          btn.textContent=isCollapsed?'▸':'▾';
+        }
+        paintToggle();
+        btn.addEventListener('click',()=>{
+          isCollapsed=!isCollapsed;paintToggle();
+          const map=collapsedState[convKey]||(collapsedState[convKey]={});
+          map[key]=isCollapsed;persistState();
+        });
+        meta.appendChild(btn);
+        return row;
+      }
+      // Stable per-item key for the saved toggles: the message id, or role and
+      // time for a message persisted before ids existed.
+      function itemKey(x){ return 'm:'+(x.id!==undefined?x.id:(x.role+'@'+x.at)); }
+      // Something still waiting on the user is never collapsible: no toggle,
+      // always drawn expanded, whatever a saved toggle says.
+      function isAwaitingUser(x){
+        return (x.role==='question'&&!!x.awaitingAnswer)||(!!x.decisionId&&pendingIds.has(x.decisionId));
+      }
+      // Collapsed by default ONLY on positive evidence that the answer was
+      // recorded; everything else starts expanded.
+      function startsCollapsed(x){
+        return (x.role==='question'&&!!x.questionAnswered)||!!x.decisionAnswered;
       }
       function renderInteraction(interaction,append){
         if(!append) ic.replaceChildren();
@@ -3826,6 +4089,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           root.appendChild(card);
         }
       }
+      // A decision the user already answered: read-only (no options, no
+      // Confirm), drawn collapsed. Text only via textContent.
+      function renderAnsweredDecision(dcs){
+        const card=document.createElement('div'); card.className='decision-card decision-card-answered';
+        const title=document.createElement('div'); title.className='interaction-title'; title.textContent='Decided';
+        card.appendChild(title);
+        const what=document.createElement('div'); what.className='interaction-prompt'; what.textContent=dcs.whatHappened;
+        card.appendChild(what);
+        const choice=document.createElement('div'); choice.className='decision-choice'; choice.textContent='Your choice: '+dcs.chosenLabel;
+        card.appendChild(choice);
+        card.appendChild(buildMsgMeta(dcs.copyText||'',dcs.atLabel,dcs.atTitle));
+        return makeCollapsible(card,'d:'+dcs.decisionId,'Decided: '+dcs.whatHappened,true);
+      }
       window.addEventListener('message', event=>{
         const s=event.data;
         // String.fromCharCode(10) rather than a backslash escape: this whole
@@ -3921,14 +4197,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             actions.appendChild(sendBtn);replyWrap.appendChild(actions);
             row.appendChild(replyWrap);
           }
-          return row;
+          if(isAwaitingUser(x)) return row;
+          return makeCollapsible(row,itemKey(x),'['+x.role+'] '+x.text,startsCollapsed(x));
         }
+        paintKey=nextKey;drawnKeys={};
+        pendingIds=new Set((s.decisions||[]).map(d=>d.decisionId).concat(s.pendingDecisionIds||[]));
         m.replaceChildren();
         dc.replaceChildren();dc.style.display='none';
         for(const item of (s.timeline||s.entries.map(value=>({type:'message',value})))){
           if(item.type==='decision'){
             const decisionWrap=document.createElement('div');decisionWrap.className='timeline-decision';
-            renderDecisions([item.value],decisionWrap);m.appendChild(decisionWrap);
+            if(item.value.answered){ decisionWrap.appendChild(renderAnsweredDecision(item.value)); }
+            else{ renderDecisions([item.value],decisionWrap); }
+            m.appendChild(decisionWrap);
           }else if(item.value.kind==='activity'||item.value.kind==='outcome'){
             // Machine status, not conversation: stored unchanged in chat-v1.json
             // (and mirrored in the notification store), never a transcript turn.
@@ -3958,6 +4239,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         sb.disabled = sendDisabled;
         if(sendDisabled){ sr.textContent='Available when '+(s.busyLabel||'the current action')+' finishes'; sr.style.display='inline'; }
         else{ sr.textContent=''; sr.style.display='none'; }
+        // Forget hand toggles for anything this paint did not draw (a message
+        // that is gone, or one that is now waiting on the user), so the saved
+        // state cannot grow without bound. Saves only; posts nothing.
+        const ownToggles=collapsedState[nextKey];
+        if(ownToggles){
+          let pruned=false;
+          for(const k of Object.keys(ownToggles)){ if(!drawnKeys[k]){ delete ownToggles[k]; pruned=true; } }
+          if(Object.keys(ownToggles).length===0){ delete collapsedState[nextKey]; }
+          if(pruned){ persistState(); }
+        }
         currentKey=nextKey;
         requestAnimationFrame(()=>{
           if(stick){window.scrollTo(0,document.documentElement.scrollHeight);}
