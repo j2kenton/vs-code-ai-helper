@@ -33,7 +33,8 @@ WORKSPACES="${ENSEMBLE_RUNNER_WORKSPACES:-}"
 if [ -z "$WORKSPACES" ] && [ -f "$WORKSPACES_FILE" ]; then
   # One per line or colon-separated. A line whose first non-blank character is
   # '#' is a comment; a '#' INSIDE a path is part of the path
-  # (/workspace/review#2 is a legal directory name).
+  # (/workspace/review#2 is a legal directory name). A leading '!' pauses a
+  # workspace without renumbering the rest (see the start loop below).
   WORKSPACES="$(sed -e 's/^[[:space:]]*#.*$//' -e 's/[[:space:]]*$//' "$WORKSPACES_FILE" | grep -v '^$' | tr '\n' ':')"
 fi
 WORKSPACES="${WORKSPACES:-${ENSEMBLE_RUNNER_WORKSPACE:-/workspace/vs-code-ai-helper}}"
@@ -366,6 +367,18 @@ started=""
 for workspace in "$@"; do
   # An empty entry (a trailing or doubled ':') is not a workspace.
   [ -n "$workspace" ] || continue
+  # A leading '!' PAUSES a workspace: no window, but it keeps its place, and so
+  # its runner index and profile (Code-runner-N holds that box's sign-ins and
+  # state). Deleting the line instead renumbers every runner after it onto the
+  # wrong profile. Needed on the 12 GB free-tier VM, which fits two runners,
+  # not four (2026-10-14).
+  case "$workspace" in
+    '!'*)
+      echo "$(date -u +%FT%TZ) supervisor: ${workspace#!} is paused; runner $index not started" >>"$SUPERVISOR_LOG"
+      index=$((index + 1))
+      continue
+      ;;
+  esac
   # A duplicate would give one checkout two runner windows — the exact
   # collision one-runner-per-workspace exists to prevent.
   case ":$started:" in
