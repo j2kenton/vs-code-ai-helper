@@ -81,29 +81,64 @@ if ($status) {
 }
 
 $currentVersion = (Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
-Write-Host "Current published version: $currentVersion" -ForegroundColor Cyan
+Write-Host "Current version (package.json): $currentVersion" -ForegroundColor Cyan
 Write-Host ""
 
-# --- Prompt for bump type, with a reminder of what each one means ---
+# --- Version lines: the Marketplace has no "-beta" style labels, so stable and
+# pre-release builds are told apart by the minor number: EVEN minors are stable
+# (1.0.x, 1.2.x), ODD minors are pre-release (1.1.x, 1.3.x). A pre-release is
+# always numbered above the latest stable, so users who opt in keep getting it. ---
+if ($currentVersion -notmatch '^(\d+)\.(\d+)\.(\d+)$') {
+    throw "package.json version '$currentVersion' is not a plain MAJOR.MINOR.PATCH version."
+}
+$curMajor = [int]$Matches[1]; $curMinor = [int]$Matches[2]; $curPatch = [int]$Matches[3]
+$onPreReleaseLine = ($curMinor % 2) -eq 1
+
+if ($onPreReleaseLine) {
+    $nextPatch = "$curMajor.$($curMinor + 1).0"   # leave the pre-release line
+    $nextMinor = "$curMajor.$($curMinor + 1).0"
+    $nextPreRelease = "$curMajor.$curMinor.$($curPatch + 1)"
+}
+else {
+    $nextPatch = "$curMajor.$curMinor.$($curPatch + 1)"
+    $nextMinor = "$curMajor.$($curMinor + 2).0"
+    $nextPreRelease = "$curMajor.$($curMinor + 1).0"
+}
+$nextMajor = "$($curMajor + 1).0.0"
+
+# --- Prompt for release type, with a reminder of what each one means ---
 Write-Host "Which kind of release is this?" -ForegroundColor Cyan
-Write-Host "  [1] patch  -> 0.0.X  bug fixes, small internal changes, no new features, nothing breaks"
-Write-Host "  [2] minor  -> 0.X.0  new features / commands, backwards compatible"
-Write-Host "  [3] major  -> X.0.0  breaking changes (rare for an extension: e.g. dropped commands/settings)"
+Write-Host "  [1] patch       -> $nextPatch  bug fixes, small internal changes, no new features, nothing breaks"
+Write-Host "  [2] minor       -> $nextMinor  new features / commands, backwards compatible"
+Write-Host "  [3] major       -> $nextMajor  breaking changes (rare for an extension: e.g. dropped commands/settings)"
+Write-Host "  [4] pre-release -> $nextPreRelease  only for users who chose 'Switch to Pre-Release Version'"
+if ($onPreReleaseLine) {
+    Write-Host ""
+    Write-Host "  (You are on the pre-release line, so patch and minor both publish the next stable minor.)" -ForegroundColor DarkGray
+}
 Write-Host ""
 
-$choice = Read-Host "Enter 1, 2, or 3 (or type patch/minor/major)"
+$choice = Read-Host "Enter 1, 2, 3 or 4 (or type patch/minor/major/pre-release)"
 
+$preRelease = $false
 switch -Regex ($choice.Trim().ToLower()) {
-    '^(1|patch)$' { $bump = "patch" }
-    '^(2|minor)$' { $bump = "minor" }
-    '^(3|major)$' { $bump = "major" }
+    '^(1|patch)$' { $bump = "patch"; $targetVersion = $nextPatch }
+    '^(2|minor)$' { $bump = "minor"; $targetVersion = $nextMinor }
+    '^(3|major)$' { $bump = "major"; $targetVersion = $nextMajor }
+    '^(4|pre-?release)$' { $bump = "pre-release"; $targetVersion = $nextPreRelease; $preRelease = $true }
     default {
-        throw "Unrecognized choice '$choice'. Expected patch, minor, or major."
+        throw "Unrecognized choice '$choice'. Expected patch, minor, major, or pre-release."
     }
 }
 
+# Belt and braces: the minor number must match the channel.
+$targetMinor = [int]($targetVersion -split '\.')[1]
+if ($preRelease -ne (($targetMinor % 2) -eq 1)) {
+    throw "Internal error: $targetVersion does not fit the $bump channel (odd minor = pre-release, even minor = stable)."
+}
+
 Write-Host ""
-Write-Host "Selected: $bump release" -ForegroundColor Green
+Write-Host "Selected: $bump release -> $targetVersion" -ForegroundColor Green
 
 # --- Build/verify before publishing (same checks vscode:prepublish would run) ---
 Write-Host ""
@@ -125,9 +160,13 @@ if ($LASTEXITCODE -ne 0) {
     throw "Package contents check failed. Fix .vscodeignore before publishing."
 }
 
-# --- vsce publish <bump> bumps package.json, commits "<version>", tags v<version>, and publishes ---
+# --- vsce publish <version> sets package.json to that version, commits "<version>",
+# tags v<version>, and publishes. An explicit version (not patch/minor/major) keeps
+# stable releases on even minors and pre-releases on odd ones. ---
 Write-Host ""
-Write-Host "Publishing ($bump)..." -ForegroundColor Cyan
+Write-Host "Publishing $targetVersion ($bump)..." -ForegroundColor Cyan
+$publishArgs = @("exec", "vsce", "publish", $targetVersion)
+if ($preRelease) { $publishArgs += "--pre-release" }
 $previousErrorActionPreference = $ErrorActionPreference
 $hadNativeStderrPreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
 if ($hadNativeStderrPreference) {
@@ -139,7 +178,7 @@ try {
     # Capture stdout+stderr so transient Marketplace errors can be classified
     # without letting warning-only stderr lines short-circuit the script.
     $ErrorActionPreference = "Continue"
-    $publishLines = @(& pnpm run "publish:$bump" 2>&1)
+    $publishLines = @(& pnpm @publishArgs 2>&1)
     $publishExitCode = $LASTEXITCODE
 }
 finally {
@@ -185,7 +224,8 @@ if ($publishExitCode -ne 0) {
         Write-Host "" -ForegroundColor Yellow
         Write-Host "A local release commit/tag appears to exist but is not published yet." -ForegroundColor Yellow
         Write-Host "Retry publishing THIS exact version (no extra bump):" -ForegroundColor Yellow
-        Write-Host "  pnpm exec vsce publish $localVersionAfterFailure --no-git-tag-version --no-update-package-json --skip-duplicate" -ForegroundColor Yellow
+        $preReleaseFlag = if ($preRelease) { " --pre-release" } else { "" }
+        Write-Host "  pnpm exec vsce publish $localVersionAfterFailure --no-git-tag-version --no-update-package-json --skip-duplicate$preReleaseFlag" -ForegroundColor Yellow
     }
     else {
         Write-Host "" -ForegroundColor Yellow
@@ -200,6 +240,9 @@ if ($publishExitCode -ne 0) {
 $newVersion = (Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
 Write-Host ""
 Write-Host "Published $newVersion ($bump)." -ForegroundColor Green
+if ($preRelease) {
+    Write-Host "Only users who chose 'Switch to Pre-Release Version' get this build; everyone else stays on stable." -ForegroundColor Green
+}
 
 # --- Push the version-bump commit and tag that vsce created locally ---
 Write-Host ""
