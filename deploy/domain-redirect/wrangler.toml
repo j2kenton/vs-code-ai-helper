@@ -1,0 +1,19 @@
+# The domain's front door: a Cloudflare Worker that redirects the apex and www
+# to the Marketplace listing (deployed 2026-10-19). A Worker rather than a
+# Redirect Rule because `wrangler login` can write Worker routes but not zone
+# rulesets. The zone's DNS records must stay proxied (orange cloud) for the
+# routes to catch requests.
+#
+# Deploy from this folder:   wrangler login   then   wrangler deploy
+# Undo: delete the Worker (or its routes) in Cloudflare -> Workers & Pages.
+name = "ensembleworkflow-redirect"
+main = "src/index.js"
+compatibility_date = "2026-10-01"
+workers_dev = false
+
+# Only these two hosts. orchestrator.ensembleworkflow.com must NOT be added:
+# it is the control plane's public route (cloudflared tunnel).
+routes = [
+  { pattern = "ensembleworkflow.com/*", zone_name = "ensembleworkflow.com" },
+  { pattern = "www.ensembleworkflow.com/*", zone_name = "ensembleworkflow.com" },
+]
