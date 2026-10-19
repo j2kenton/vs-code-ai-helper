@@ -134,7 +134,10 @@ void describe("hand-off card Advance dispatch", () => {
     // What the command does when run is proven by executing the real handler
     // in nextStageBlockerGateV1.test.ts (completeStageAnywayV1, asserting the
     // persisted stage moves). This only checks the registration delegates to it.
-    const source = fs.readFileSync(path.join(__dirname, "..", "..", "src", "commands", "reviewActions.ts"), "utf8");
+    const source = fs.readFileSync(path.join(__dirname, "..", "..", "src", "commands", "reviewActions.ts"), "utf8").replace(
+      /\r\n/g,
+      "\n"
+    );
     const at = source.indexOf('"vs-code-ai-helper.completeStageAnywayV1",\n      (arg?');
     assert.ok(at >= 0, "completeStageAnywayV1 registration not found");
     assert.match(source.slice(at, at + 300), /completeStageAnywayV1\(context, arg\)/);

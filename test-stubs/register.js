@@ -24,6 +24,23 @@ const Module = require("node:module");
 // the test and restoring it afterwards.
 delete process.env.ENSEMBLE_HOST_ROLE;
 
+// Temp-dir fixtures must not discover the developer's enclosing git repo
+// (the repo is under the user profile on some machines, tmp under it on others).
+{
+  const os = require("node:os");
+  // RC11 hang: a stray ~/.git above the temp folder made `git status` walk the whole home folder.
+  // The ceiling must be the resolved long path (Windows 8.3 names, macOS /private).
+  const fs = require("node:fs");
+  let tmp = path.resolve(os.tmpdir());
+  try {
+    tmp = fs.realpathSync.native(tmp);
+  } catch {
+    // keep the unresolved path
+  }
+  const existing = process.env.GIT_CEILING_DIRECTORIES;
+  process.env.GIT_CEILING_DIRECTORIES = existing ? `${existing}${path.delimiter}${tmp}` : tmp;
+}
+
 const stubPath = path.join(__dirname, "vscode", "index.js");
 const originalResolveFilename = Module._resolveFilename;
 

@@ -11,3 +11,11 @@
 # windows-latest runner while the same test passed locally.
 test-fixtures/** text eol=lf
 resources/prompts/** text eol=lf
+
+# Source files are LF in the index so a Windows checkout with autocrlf cannot
+# reshape them. The three files below contain a NUL byte, so git treats them
+# as binary; keep them out of text conversion (later lines win).
+src/** text eol=lf
+src/state/effectivePauseStatusV1.ts -text
+src/state/hostIdentityV1.ts -text
+src/utils/chatHistoryStore.ts -text

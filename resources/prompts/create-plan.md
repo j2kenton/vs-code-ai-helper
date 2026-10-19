@@ -50,6 +50,10 @@ When the setting is confirmed, write each test, lint, type-check or build run th
 
 When the setting is unconfirmed, write no "Verified by Publish Checks:" item. Write an excluded owner step (`<!-- ensemble:excluded -->`) that names the expected command and tests and tells the owner, in its How to confirm, to check that this command appears under "Commands that ran" in `publish-review.md` and to run it by hand if it does not. A run the selected command does not cover (for example `build` when `verify` does not build) is an owner step too, never a "Verified by Publish Checks:" item.
 
+Items under "Behaviour to confirm" describe what a person can observe (a screen, a message, a file's contents). They never contain a claim that a test, build, lint or type-check was run or passed; those claims belong only to "Verified by Publish Checks:" items.
+
+A "Behaviour to confirm" item must be checkable by reading the code. Any part that needs a test, lint, type-check or build run goes into the excluded "Verified by Publish Checks:" item, or into an excluded owner step when Publish Checks do not cover it, never into a behaviour item.
+
 Rounds also cannot fetch web pages or documentation, and cannot run live provider CLIs (for example probing a model flag). Any step that needs such evidence is an owner step, written as "Owner evidence: <what to run or fetch> — record the result in the task description (task.md)", placed before the steps that depend on it, and never assigned to a round.
 
 Do not invent requirements that are not implied by the context. If the request is unclear, say so explicitly instead of guessing.

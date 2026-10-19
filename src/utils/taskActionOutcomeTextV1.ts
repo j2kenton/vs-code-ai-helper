@@ -112,6 +112,9 @@ function invocationTerminalReasonTextV1(code: string, detail: string | undefined
   if (code === "callerCancelled" || code === "providerCancelled") {
     return detail ? `cancelled — ${detail}` : "cancelled";
   }
+  if (code === "resumedRunAskedAgain") {
+    return "the AI asked again after your answer";
+  }
   return undefined;
 }
 

@@ -26,6 +26,7 @@ import {
   markOpenItemsCardPostedV1,
   openItemsCardPostedAtByTaskV1,
 } from "../commands/reviewActions";
+import { normalizePath } from "../utils/taskRoot";
 
 void describe("open-items card / Fast Forward stalled-warning correlation (RC2 item 13, Step 50)", () => {
   void it("suppresses (returns true, consumes) when the card was posted for this task during the run", () => {
@@ -54,7 +55,7 @@ void describe("open-items card / Fast Forward stalled-warning correlation (RC2 i
     const laterRunStartedAt = Date.now() + 1000;
     assert.equal(consumeOpenItemsCardPostedSinceV1(taskFolderPath, laterRunStartedAt), false);
     // The stale marker is left untouched (never consumed by an unrelated run).
-    assert.equal(openItemsCardPostedAtByTaskV1.has(taskFolderPath), true);
+    assert.equal(openItemsCardPostedAtByTaskV1.has(normalizePath(taskFolderPath)), true);
   });
 
   void it("does not cross-suppress a different task's stalled warning", () => {

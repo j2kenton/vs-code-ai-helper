@@ -20,7 +20,7 @@ import { describe, it } from "node:test";
 const source = fs.readFileSync(
   path.join(process.cwd(), "src", "commands", "reviewActions.ts"),
   "utf8"
-);
+).replace(/\r\n/g, "\n");
 
 void describe("reviewActions.ts Fast Forward stalled-stop notification wording", () => {
   void it("renders the count of stalled build rounds from outcome.buildRoundsWithoutProgress instead of a blanket claim", () => {

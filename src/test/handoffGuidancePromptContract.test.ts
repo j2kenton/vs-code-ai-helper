@@ -155,6 +155,24 @@ void describe("RC10 item 2: test runs are Publish Checks hand-off items", () => 
     assert.match(prompt, /a suite Publish Checks do not run is written as an owner step/);
   });
 
+  void it("both prompts keep test-run claims out of 'Behaviour to confirm' items", async () => {
+    for (const fileName of ["create-plan.md", "create-implementation.md"]) {
+      const prompt = await readPrompt(fileName);
+      assert.match(prompt, /Items under "Behaviour to confirm" describe what a person can observe/, fileName);
+      assert.match(
+        prompt,
+        /never contain a claim that a test, build, lint or type-check was run or passed/,
+        fileName
+      );
+      assert.match(prompt, /must be checkable by reading the code/, fileName);
+      assert.match(
+        prompt,
+        /Any part that needs a test, lint, type-check or build run goes into the excluded "Verified by Publish Checks:" item, or into an excluded owner step when Publish Checks do not cover it, never into a behaviour item/,
+        fileName
+      );
+    }
+  });
+
   void it("create-implementation.md never asks a round to tick a test run", async () => {
     const prompt = await readPrompt("create-implementation.md");
     assert.match(prompt, /Verified by Publish Checks/);

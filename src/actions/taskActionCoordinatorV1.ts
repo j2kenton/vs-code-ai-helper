@@ -195,7 +195,7 @@ import {
   TaskActionRegistryRowV1,
   TaskActionRegistryV1,
 } from "./taskActionRegistryV1";
-import type { StructuredAnswerV1 } from "../types/structuredQuestionV1";
+import { buildResumedAnswersBlockV1, type ResumedAnswersV1 } from "./resumedAnswersPromptV1";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "./rows/editExecutionRowV1";
 import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
 import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
@@ -1570,7 +1570,7 @@ export function createTaskActionCoordinatorV1(
     correlation: ActionCorrelationV1,
     stage: TaskStage,
     validatedInput: unknown,
-    answers: readonly StructuredAnswerV1[] | undefined,
+    resumed: ResumedAnswersV1 | undefined,
     reserved: {
       readonly providerLabel: string;
       readonly storedModelId: string;
@@ -1628,7 +1628,7 @@ export function createTaskActionCoordinatorV1(
       correlation,
       stage,
       validatedInput,
-      ...(answers !== undefined ? { answers } : {}),
+      ...(resumed !== undefined ? { answers: resumed.answers } : {}),
       ...(preflightSession !== undefined
         ? { preflight: { ledger: preflightSession.ledger, rootId: preflightSession.rootId } }
         : {}),
@@ -1649,6 +1649,9 @@ export function createTaskActionCoordinatorV1(
     const prompt =
       readSessionPreamble +
       row.buildPrompt(context) +
+      (resumed !== undefined
+        ? "\n\n" + buildResumedAnswersBlockV1(resumed.questions, resumed.answers)
+        : "") +
       "\n\n" +
       buildAiResultContractPromptV1({
         correlation,
@@ -1671,7 +1674,7 @@ export function createTaskActionCoordinatorV1(
     acquireLeasePhase: AcquireTaskLeasePhaseV1,
     metrics: ResultMetricsCaptureV1,
     /** Recorded answers from a resumed structured-question interaction (plan §6.1). */
-    answers?: readonly StructuredAnswerV1[],
+    answers?: ResumedAnswersV1,
     /**
      * Resume-only invocation-once gate (plan §3.1 / AC-RUNNER-03): checked
      * exactly once per drive, immediately before the true invocation
@@ -2831,6 +2834,15 @@ export function createTaskActionCoordinatorV1(
       }
       case "questions": {
         session.reportAttemptOutcome(attemptId, "questions");
+        if (context.answers !== undefined) {
+          return {
+            kind: "failed",
+            correlation,
+            code: "resumedRunAskedAgain",
+            retryable: true,
+            ...(context.provider ? { provider: context.provider } : {}),
+          };
+        }
         // Plan §5.5 write-through: the durable Chat interaction transaction —
         // carrying the validated input snapshot and prompt-contract identity
         // Resume needs — is persisted BEFORE the questions outcome surfaces.
@@ -3697,11 +3709,10 @@ export function createTaskActionCoordinatorV1(
         return { proceed: true };
       };
 
-      // NOTE: a resumed `sameOperation` run that returns questions AGAIN
-      // cannot persist a second transaction for the same operation
-      // (AC-CHAT-TX-01's exclusive-create); the write-through failure path
-      // maps that to the retryable `chatTransactionNotRecorded` failure and
-      // surfaces nothing unresumable.
+      // NOTE: any resumed run (either resume semantics) that returns
+      // questions AGAIN ends `resumedRunAskedAgain` before a second
+      // interaction is posted; a `sameOperation` run could not persist one
+      // anyway (AC-CHAT-TX-01's exclusive-create).
       const outcome = await runProviderRow(
         row,
         request.cancellationToken,
@@ -3711,7 +3722,7 @@ export function createTaskActionCoordinatorV1(
         record.stage,
         acquireLeasePhase,
         metrics,
-        answers,
+        { questions: record.questions ?? [], answers },
         claimInvocationOnce,
         undefined,
         undefined,

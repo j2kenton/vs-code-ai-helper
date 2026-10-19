@@ -97,6 +97,7 @@ import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelo
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import { createObservationLedgerV1 } from "../types/preflightPlanV1";
+import { buildAiResultContractPromptV1 } from "../prompts/aiResultContractV1";
 import { AttachCoordinatorIdentityErrorV1 } from "../utils/roundLedgerV1";
 import {
   createWorkflowLeaseStoreV1,
@@ -3727,6 +3728,185 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(observed[0]!.attemptId, outcome.correlation.attemptId);
     assert.ok(observed[0]!.prompt.length > 0);
     assert.ok(/^[0-9a-f]{64}$/.test(observed[0]!.promptSha256));
+  });
+
+  // RC12 item 3: Resume hands the AI the recorded questions and answers.
+  const CHOICE_QUESTIONS_TRANSPORT = (): AgentTransportV1 =>
+    envelopeTransport((correlation) =>
+      frame({
+        version: 1,
+        correlation,
+        kind: "questions",
+        questions: [
+          {
+            questionId: "q1",
+            kind: "singleChoice",
+            prompt: "Which item should be dropped?",
+            required: true,
+            options: [
+              { optionId: "keep-all", label: "Keep every item" },
+              { optionId: "drop-item-2", label: "Drop item 2" },
+            ],
+          },
+        ],
+      })
+    );
+
+  const askAndAnswerV1 = async (
+    harness: Harness,
+    answer: { questionId: string; kind: "singleChoice"; state: "answered"; selectedOptionId: string } | {
+      questionId: string;
+      kind: "text";
+      state: "answered";
+      value: string;
+    }
+  ): Promise<{
+    ref: { operationId: string; interactionId: string; taskBindingId: string; chatDocumentId: string; sourceAttemptId: string };
+    prompts: string[];
+  }> => {
+    const prompts: string[] = [];
+    const original = await harness.coordinator.executeAction({
+      ...baseRequest({ target: "plan.md" }),
+      onPromptAssembled: (info) => {
+        prompts.push(info.prompt);
+      },
+    });
+    assert.equal(original.kind, "questions");
+    if (original.kind !== "questions") {
+      assert.fail("expected a questions outcome");
+    }
+    const ref = {
+      operationId: original.correlation.operationId,
+      interactionId: original.interactionId,
+      taskBindingId: original.correlation.taskBindingId,
+      chatDocumentId: original.correlation.chatDocumentId,
+      sourceAttemptId: original.correlation.attemptId,
+    };
+    const submitted = await harness.orchestrator.submitAnswers(ref, [answer], allocateHex128IdV1());
+    assert.equal(submitted.ok, true);
+    return { ref, prompts };
+  };
+
+  const resumeRequestV1 = (
+    ref: Awaited<ReturnType<typeof askAndAnswerV1>>["ref"],
+    prompts: string[]
+  ): Parameters<Harness["coordinator"]["resumeAction"]>[0] => ({
+    interaction: ref,
+    taskBinding: TASK_BINDING,
+    taskStatus: "active",
+    taskStage: "plan",
+    resumeIdempotencyId: allocateHex128IdV1(),
+    cancellationToken: fakeToken(),
+    onPromptAssembled: (info) => {
+      prompts.push(info.prompt);
+    },
+  });
+
+  void it("RC12 item 3: a first dispatch prompt is the row prompt plus the result contract, with no answers block", async () => {
+    const seen: ActionCorrelationV1[] = [];
+    const harness = makeHarness([envelopeTransport(() => "", seen)]);
+    const prompts: string[] = [];
+    await harness.coordinator.executeAction({
+      ...baseRequest("input"),
+      onPromptAssembled: (info) => {
+        prompts.push(info.prompt);
+      },
+    });
+    assert.equal(prompts.length, 1);
+    assert.ok(seen[0]);
+    const expected =
+      "ACTION PROMPT\n\n" +
+      buildAiResultContractPromptV1({
+        correlation: seen[0],
+        permittedResultKinds: ["completed", "questions", "cancelled", "failed"],
+        completedContentType: "markdown-artifact.v1",
+        maxResponseBytes: 64 * 1024,
+      });
+    assert.equal(prompts[0], expected);
+  });
+
+  void it("RC12 item 3: a resumed prompt carries the question, the chosen option label and the do-not-ask-again sentence", async () => {
+    const completed = envelopeTransport((correlation) =>
+      frame({
+        version: 1,
+        correlation,
+        kind: "completed",
+        content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# resumed" },
+      })
+    );
+    const harness = makeHarness([CHOICE_QUESTIONS_TRANSPORT(), completed]);
+    const { ref, prompts } = await askAndAnswerV1(harness, {
+      questionId: "q1",
+      kind: "singleChoice",
+      state: "answered",
+      selectedOptionId: "drop-item-2",
+    });
+    const firstPromptCount = prompts.length;
+    assert.ok(!prompts[0]!.includes("Which item should be dropped?"));
+    const outcome = await harness.coordinator.resumeAction(resumeRequestV1(ref, prompts));
+    assert.equal(outcome.kind, "completed");
+    const resumed = prompts[firstPromptCount]!;
+    assert.ok(resumed.includes("Which item should be dropped?"));
+    assert.ok(resumed.includes("Drop item 2"));
+    assert.ok(!resumed.includes("drop-item-2"));
+    assert.ok(resumed.includes("do not ask any of these questions"));
+    assert.ok(resumed.startsWith("ACTION PROMPT\n\n## Your earlier questions"));
+  });
+
+  void it("RC12 item 3: a resumed text answer reaches the prompt verbatim", async () => {
+    const completed = envelopeTransport((correlation) =>
+      frame({
+        version: 1,
+        correlation,
+        kind: "completed",
+        content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# resumed" },
+      })
+    );
+    const harness = makeHarness([RESUME_QUESTIONS_TRANSPORT(), completed]);
+    const { ref, prompts } = await askAndAnswerV1(harness, {
+      questionId: "q1",
+      kind: "text",
+      state: "answered",
+      value: "the publish stage",
+    });
+    const before = prompts.length;
+    const outcome = await harness.coordinator.resumeAction(resumeRequestV1(ref, prompts));
+    assert.equal(outcome.kind, "completed");
+    assert.ok(prompts[before]!.includes("Question: Which stage?"));
+    assert.ok(prompts[before]!.includes("Answer: the publish stage"));
+  });
+
+  void it("RC12 item 3: a resumed sameOperation run that asks again fails in plain words and posts no new interaction", async () => {
+    const harness = makeHarness([RESUME_QUESTIONS_TRANSPORT(), RESUME_QUESTIONS_TRANSPORT()]);
+    const { ref, prompts } = await askAndAnswerV1(harness, {
+      questionId: "q1",
+      kind: "text",
+      state: "answered",
+      value: "publish",
+    });
+    const outcome = await harness.coordinator.resumeAction(resumeRequestV1(ref, prompts));
+    assert.equal(outcome.kind, "failed");
+    if (outcome.kind !== "failed") {
+      assert.fail("expected a failed outcome");
+    }
+    assert.equal(outcome.code, "resumedRunAskedAgain");
+    const text = describeTaskActionFailureV1(outcome);
+    assert.ok(text.includes("the AI asked again after your answer"));
+    assert.ok(!text.includes("chatTransactionNotRecorded"));
+  });
+
+  void it("RC12 item 3: a resumed replacementOperation run that asks again fails the same way", async () => {
+    const harness = makeHarness([RESUME_QUESTIONS_TRANSPORT(), RESUME_QUESTIONS_TRANSPORT()], {
+      resumeSemantics: "replacementOperation",
+    });
+    const { ref, prompts } = await askAndAnswerV1(harness, {
+      questionId: "q1",
+      kind: "text",
+      state: "answered",
+      value: "publish",
+    });
+    const outcome = await harness.coordinator.resumeAction(resumeRequestV1(ref, prompts));
+    assert.equal(outcome.kind === "failed" && outcome.code, "resumedRunAskedAgain");
   });
 
   void it("recovers the recorded attempt when an identical-id replay re-drives a Resume that crashed before provider invocation (AC-ID-04)", async () => {

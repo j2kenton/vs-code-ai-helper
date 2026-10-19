@@ -25,6 +25,7 @@ import type { CreateWorkflowDecisionInputV1, WorkflowDecisionOptionV1 } from "..
 // Mock dependencies before importing the module under test
 import * as stageContextModule from "../utils/stageContext";
 import * as taskProgressModule from "../types/taskProgress";
+import * as chatHistoryStoreModule from "../utils/chatHistoryStore";
 
 
 const mockComputeStageContext = (stage: TaskStage): string => `stage-${stage}`;
@@ -1758,6 +1759,74 @@ void describe("TaskTreeProvider — refresh-scoped HEAD cache", () => {
       );
     } finally {
       provider.dispose();
+      workspaceRecord.workspaceFolders = originalFolders;
+      restoreFs();
+    }
+  });
+
+  void it("marks the current stage row for an unresolved interaction and clears it once settled (RC12 item 2)", async () => {
+    const folder = vscode.Uri.file("/workspace/tasks/unresolved-question");
+    const restoreFs = installFsStubs(new Map());
+    const workspaceRecord = vscode.workspace as unknown as Record<string, unknown>;
+    const originalFolders = workspaceRecord.workspaceFolders;
+    workspaceRecord.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
+    const chatStore = chatHistoryStoreModule as Record<string, unknown>;
+    const originalRead = chatStore.readChatInteractions;
+    let interactionState = "unresolved";
+    const askedFor: Array<{ canonicalId: string; stage: unknown }> = [];
+    chatStore.readChatInteractions = (_folder: string, canonicalId: string, stage: unknown): Promise<unknown[]> => {
+      askedFor.push({ canonicalId, stage });
+      return Promise.resolve([{ state: interactionState }]);
+    };
+
+    const makeInventory = (status: string): import("../state/taskInventory").TaskInventory =>
+      ({
+        getTasks: () => [
+          {
+            taskFolderPath: folder.fsPath,
+            folderName: path.basename(folder.fsPath),
+            progress: {
+              currentStage: "plan" as TaskStage,
+              status,
+              taskFolder: path.basename(folder.fsPath),
+              createdAt: "2026-08-14T00:00:00.000Z",
+              updatedAt: "2026-08-14T00:00:00.000Z",
+            },
+            canonicalId: folder.fsPath,
+          },
+        ],
+        refresh: async (): Promise<void> => {},
+        onDidChange: (_handler: () => void): { dispose: () => void } => ({ dispose(): void {} }),
+      }) as unknown as import("../state/taskInventory").TaskInventory;
+
+    const planRow = async (status: string): Promise<StageNode | undefined> => {
+      const provider = new TaskTreeProvider(makeInventory(status));
+      try {
+        const roots = await withStubbedCommands(() => provider.getChildren());
+        const taskNode = roots.find((n): n is TaskNode => n instanceof TaskNode);
+        assert.ok(taskNode);
+        const stages = await provider.getChildren(taskNode);
+        return stages.find((n): n is StageNode => n instanceof StageNode && n.stage === "plan");
+      } finally {
+        provider.dispose();
+      }
+    };
+
+    try {
+      const pending = await planRow("active");
+      assert.ok(pending);
+      assert.strictEqual((pending.iconPath as import("vscode").ThemeIcon).id, "comment-unresolved");
+      assert.strictEqual(pending.description, "needs your decision");
+      assert.ok(pending.contextValue?.includes("decisionPending"));
+      assert.deepEqual(askedFor[0], { canonicalId: folder.fsPath, stage: "plan" });
+
+      interactionState = "resumed";
+      const settled = await planRow("active");
+      assert.ok(settled);
+      assert.notStrictEqual((settled.iconPath as import("vscode").ThemeIcon | undefined)?.id, "comment-unresolved");
+      assert.ok(!settled.contextValue?.includes("decisionPending"));
+    } finally {
+      chatStore.readChatInteractions = originalRead;
       workspaceRecord.workspaceFolders = originalFolders;
       restoreFs();
     }

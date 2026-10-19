@@ -35,6 +35,7 @@ import { StatusTreeProvider } from "../views/statusView";
 import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import { TaskProgress, TaskStage } from "../types/taskProgress";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import { normalizePath } from "../utils/taskRoot";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -246,7 +247,7 @@ void describe("generatePlanWithAI tracked-operation outcome (2026-09-22 review, 
 
       const endedRefused: TaskOperationSnapshot[] = [];
       const subRefused = taskOperations.onDidEnd((snap) => {
-        if (snap.key === refused.folderPath) { endedRefused.push(snap); }
+        if (snap.key === normalizePath(refused.folderPath)) { endedRefused.push(snap); }
       });
       try {
         const succeeded = await generatePlanWithAI(context, refusedInventory, fakeChatViewProviderV1, {
@@ -284,7 +285,7 @@ void describe("generatePlanWithAI tracked-operation outcome (2026-09-22 review, 
 
       const endedEligible: TaskOperationSnapshot[] = [];
       const subEligible = taskOperations.onDidEnd((snap) => {
-        if (snap.key === eligible.folderPath) { endedEligible.push(snap); }
+        if (snap.key === normalizePath(eligible.folderPath)) { endedEligible.push(snap); }
       });
       try {
         const succeeded = await generatePlanWithAI(context, eligibleInventory, fakeChatViewProviderV1, {
@@ -300,6 +301,75 @@ void describe("generatePlanWithAI tracked-operation outcome (2026-09-22 review, 
       } finally {
         subEligible.dispose();
       }
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      runtime.tearDown();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("RC12 item 1: a question is stamped with the stage on disk even when the inventory cache is behind", async () => {
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const runtime = setUpTaskActionRuntimeForTestV1();
+    const questionsTransportFactory = (): ReturnType<ReturnType<typeof fakeCompletedCopilotTransportFactory>> => ({
+      runnerId: "copilot-lm",
+      invoke: (request: unknown, output: { write: (chunk: string) => boolean }): Promise<{ kind: "completed" }> => {
+        const envelope = {
+          version: 1,
+          correlation: (request as { correlation: unknown }).correlation,
+          kind: "questions",
+          questions: [{ questionId: "q1", kind: "text", prompt: "Which scope?", required: true }],
+        };
+        output.write(`<<<ENSEMBLE_AI_RESULT_V1>>>\n${JSON.stringify(envelope)}\n<<<END_ENSEMBLE_AI_RESULT_V1>>>\n`);
+        return Promise.resolve({ kind: "completed" });
+      },
+    });
+    const patches: Patched[] = [
+      patch(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
+        Promise.resolve({ availability: { available: true }, providerLabel: "Stub Provider" })),
+      patch(copilotLmTransportModule, "createCopilotLmTextTransportV1", questionsTransportFactory),
+      patch(contextPackModule, "generateContextPack", () => Promise.resolve("# Context Pack (stub)\n")),
+      patch(contextPackModule, "writeContextPackContent", () => Promise.resolve(undefined)),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(promptSizeGuardModule, "checkAndConfirmPromptSize", () => Promise.resolve("ok")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(fileUtilsModule, "safeOpenTextDocument", () => Promise.resolve(undefined)),
+    ];
+    const asked: Array<{ stage: string }> = [];
+    const recordingChatViewProvider = {
+      askInteraction: (args: { stage: string }): Promise<void> => {
+        asked.push(args);
+        return Promise.resolve();
+      },
+    } as unknown as ChatViewProvider;
+
+    try {
+      const task = makeTaskFolder("stale-cache-stage", "plan");
+      const staleInventory = {
+        getTaskById: (): undefined => undefined,
+        getTaskByPath: (fsPath: string) => ({
+          taskFolderPath: fsPath,
+          workspaceFolder: vscode.Uri.file(REAL_ROOT),
+          canonicalId: fsPath,
+          progress: { status: "active", currentStage: "desc" },
+        }),
+        refresh: (): Promise<void> => Promise.resolve(),
+      } as unknown as TaskInventory;
+
+      await generatePlanWithAI(makeExtensionContext(), staleInventory, recordingChatViewProvider, {
+        taskFolderPath: task.folderPath,
+      });
+      assert.equal(asked.length, 1, "the question must be mirrored into Chat once");
+      assert.equal(asked[0]?.stage, "plan");
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       runtime.tearDown();

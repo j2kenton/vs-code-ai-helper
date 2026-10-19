@@ -10,7 +10,7 @@ import { describe, it } from "node:test";
 import { classifyFastForwardStageV1 } from "../utils/fastForwardStageDriftV1";
 import { extractParentOperationV1 } from "../commands/runPublishChecks";
 
-const read = (...parts: string[]): string => fs.readFileSync(path.join(process.cwd(), ...parts), "utf8");
+const read = (...parts: string[]): string => fs.readFileSync(path.join(process.cwd(), ...parts), "utf8").replace(/\r\n/g, "\n");
 
 void describe("classifyFastForwardStageV1", () => {
   void it("is atTarget when the task sits at the review's own stage", () => {

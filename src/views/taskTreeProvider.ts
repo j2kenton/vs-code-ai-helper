@@ -54,6 +54,7 @@ import {
   listOutstandingManualVerificationItemsV1,
   listUncheckedChecklistItemTextsV1,
 } from "../utils/implementationChecklist";
+import { onDidChangeChatHistoryV1, readChatInteractions } from "../utils/chatHistoryStore";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { renderHandoffFieldLineV1, renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
@@ -217,9 +218,28 @@ export function sortPendingDecisionsByRecencyV1(
 export function countPendingDecisionsForStageRowV1(
   decisions: readonly WorkflowDecisionV1[],
   stage: TaskStage,
-  currentStage: TaskStage
+  currentStage: TaskStage,
+  /** RC12 item 2: unresolved structured questions on the task's current stage; counted like a pending decision. */
+  unresolvedInteractionsOnCurrentStage: number = 0
 ): number {
-  return stage === currentStage ? decisions.filter((decision) => decision.stage === stage).length : 0;
+  return stage === currentStage
+    ? decisions.filter((decision) => decision.stage === stage).length + unresolvedInteractionsOnCurrentStage
+    : 0;
+}
+
+/** RC12 item 2: unresolved structured questions on the current stage; 0 for finished tasks or an unreadable chat. */
+export async function countUnresolvedInteractionsV1(
+  taskStatus: string,
+  read: () => Promise<readonly { readonly state: string }[]>
+): Promise<number> {
+  if (taskStatus === "completed" || taskStatus === "archived") {
+    return 0;
+  }
+  try {
+    return (await read()).filter((interaction) => interaction.state === "unresolved").length;
+  } catch {
+    return 0;
+  }
 }
 
 /**
@@ -1433,6 +1453,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
    */
   private readonly workflowDecisionStore?: WorkflowDecisionStoreV1;
   private readonly workflowDecisionSub?: vscode.Disposable;
+  private readonly chatHistorySub: vscode.Disposable;
 
   /**
    * Reads the scheduling-intent ledger for the "what happens next" tooltip
@@ -1512,6 +1533,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // taskOperations is a module singleton that outlives this provider, so the
     // subscription must be released on dispose or it will fire into a dead emitter.
     this.operationsSub = taskOperations.onDidChange(() => this.scheduleTreeRefreshV1());
+    this.chatHistorySub = onDidChangeChatHistoryV1(() => this.scheduleTreeRefreshV1());
 
     if (state) {
       this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
@@ -1527,6 +1549,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
 
   dispose(): void {
     this.operationsSub.dispose();
+    this.chatHistorySub.dispose();
     this.workflowDecisionSub?.dispose();
     this.schedulingIntentSub?.dispose();
     if (this.treeRefreshTimerV1) {
@@ -2000,6 +2023,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // two surfaces can never disagree about which stage is being asked.
     const pendingDecisions = this.workflowDecisionStore?.listPending(taskIdentityKey(task)) ?? [];
 
+    // RC12 item 2: an unanswered structured question marks its stage row the
+    // same way a pending decision does. Same scope Chat reads (this task,
+    // current stage); skipped for finished tasks, as decisions are.
+    const unresolvedInteractions = await countUnresolvedInteractionsV1(task.progress.status ?? "", () =>
+      readChatInteractions(task.folderUri.fsPath, taskIdentityKey(task), task.progress.currentStage)
+    );
+
     for (const stage of STAGE_ORDER) {
       const status = getStageStatus(stage, task.progress.currentStage, task.progress.completedStages);
 
@@ -2140,7 +2170,12 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           redoAvailable,
           missingPrerequisite,
           implementationProgress,
-          countPendingDecisionsForStageRowV1(pendingDecisions, stage, task.progress.currentStage),
+          countPendingDecisionsForStageRowV1(
+            pendingDecisions,
+            stage,
+            task.progress.currentStage,
+            unresolvedInteractions
+          ),
           offerRunImplementationOnThisStageRow
         )
       );

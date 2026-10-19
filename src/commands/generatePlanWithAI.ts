@@ -779,7 +779,10 @@ export async function handleGeneratePlanOutcomeV1(
     NotificationRouter.showInformation("Plan generation cancelled.");
   } else {
     NotificationRouter.showError(
-      `Plan generation failed: ${describeTaskActionFailureV1(outcome)}. Use the manual planning workflow instead.`
+      `Plan generation failed: ${describeTaskActionFailureV1(outcome)}. ` +
+        (outcome.kind === "failed" && outcome.code === "resumedRunAskedAgain"
+          ? "Run Generate Plan again, or write plan.md yourself."
+          : "Use the manual planning workflow instead.")
     );
   }
 
@@ -812,6 +815,15 @@ export async function handleGeneratePlanOutcomeV1(
 
   return { succeeded, triggerAutoReview, runLogUri };
   });
+}
+
+/** The stage on disk now; the inventory cache may not have caught up with a stage change made just before dispatch. */
+export async function readCurrentStageForDispatchV1(
+  taskFolderUri: vscode.Uri,
+  cachedStage: TaskStage
+): Promise<TaskStage> {
+  const fresh = await readTaskProgressStrictV1(taskFolderUri);
+  return fresh.ok ? fresh.decoded.progress.currentStage : cachedStage;
 }
 
 async function generatePlanWithAIForResolvedTask(
@@ -1019,11 +1031,12 @@ async function generatePlanWithAIForResolvedTask(
         const linked = linkCancellationTokens(token, op.token);
         let outcome: TaskActionOutcomeV1;
         try {
+          const dispatchStage = await readCurrentStageForDispatchV1(taskFolderUri, ownedTask.progress.currentStage);
           outcome = await coordinator.executeAction({
             actionKey: GENERATE_PLAN_ACTION_KEY_V1,
             taskBinding: { taskBindingId, chatDocumentId },
             taskStatus: ownedTask.progress.status ?? "active",
-            taskStage: ownedTask.progress.currentStage,
+            taskStage: dispatchStage,
             rawInput: validatedInput,
             cancellationToken: linked.token,
           });
@@ -1128,11 +1141,12 @@ export async function resumeGeneratePlanInteractionV1(
     async (op) => {
       const linked = linkCancellationTokens(cancellationToken, op.token);
       try {
+        const dispatchStage = await readCurrentStageForDispatchV1(taskFolderUri, ownedTask.progress.currentStage);
         return await coordinator.resumeAction({
           interaction: interactionRef,
           taskBinding: { taskBindingId: ref.taskBindingId, chatDocumentId: ref.chatDocumentId },
           taskStatus: ownedTask.progress.status ?? "active",
-          taskStage: ownedTask.progress.currentStage,
+          taskStage: dispatchStage,
           resumeIdempotencyId,
           cancellationToken: linked.token,
           onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),

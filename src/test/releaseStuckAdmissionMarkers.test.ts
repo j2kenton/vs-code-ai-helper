@@ -250,7 +250,7 @@ void describe("releaseStuckAdmissionMarkers — finding and removing stale marke
     }
   });
 
-  void it("ignores symlinks even when their targets are old marker-like files", async () => {
+  void it("ignores symlinks even when their targets are old marker-like files", async (t) => {
     const tmpDir = await mkdtemp(path.join(tmpdir(), "ensemble-test-"));
     const admissionDir = path.join(tmpDir, ".ensemble", "2026-09-25_task_1", "admission-v1");
     const outsideDir = path.join(tmpDir, "outside");
@@ -263,7 +263,16 @@ void describe("releaseStuckAdmissionMarkers — finding and removing stale marke
       const linkPath = path.join(admissionDir, markerNameV1("link-token", 12, "muglink1"));
       fs.writeFileSync(targetPath, JSON.stringify({ test: "target" }));
       fs.utimesSync(targetPath, now / 1000, (now - 60 * 60 * 1000) / 1000);
-      fs.symlinkSync(targetPath, linkPath);
+      try {
+        fs.symlinkSync(targetPath, linkPath);
+      } catch (error) {
+        // Windows without Developer Mode / elevation cannot create symlinks.
+        if ((error as NodeJS.ErrnoException).code === "EPERM") {
+          t.skip("creating symlinks needs Developer Mode or admin rights on Windows (EPERM)");
+          return;
+        }
+        throw error;
+      }
 
       const stale = findStaleAdmissionMarkersForReleaseV1(tmpDir, now);
 
