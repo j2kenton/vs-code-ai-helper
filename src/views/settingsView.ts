@@ -922,9 +922,10 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             font-size: var(--ensemble-small-font-size);
             line-height: 1.6;
           }
-          /* The three selection action buttons share one reduced text size,
-             with their leading icon laid out left of the label. */
-          #save-btn, #discard-btn, #save-providers-btn, #discard-providers-btn {
+          /* The selection action buttons and the provider sign-in / connect
+             buttons share one reduced text size, with any leading icon laid
+             out left of the label. */
+          #save-btn, #discard-btn, #save-providers-btn, #discard-providers-btn, button.provider-signin {
             display: inline-flex;
             align-items: center;
             gap: var(--ensemble-space-1);

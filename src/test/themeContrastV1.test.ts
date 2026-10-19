@@ -196,3 +196,21 @@ void describe("tooltipInfoTextV1", () => {
     );
   });
 });
+
+void describe("settings webview — provider sign-in button sizing", () => {
+  void it("shares the Save/Discard button rule and its reduced font size", () => {
+    const html = settingsHtml();
+    const match = /([^{}]*#save-btn[^{}]*)\{([^}]*)\}/.exec(html);
+    assert.ok(match, "expected the shared selection-button CSS rule");
+    assert.ok(match[1]!.includes("button.provider-signin"), "selector list includes button.provider-signin");
+    assert.match(match[2]!, /font-size:\s*var\(--ensemble-small-font-size\)/);
+  });
+
+  void it("does not override the sign-in font size in light or high-contrast themes", () => {
+    const html = settingsHtml();
+    const themed = /body\.vscode-(?:light|high-contrast)[^{}]*provider-signin[^{}]*\{([^}]*)\}/g;
+    for (const m of html.matchAll(themed)) {
+      assert.doesNotMatch(m[1]!, /font-size/);
+    }
+  });
+});
