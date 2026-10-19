@@ -773,13 +773,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           /* Some dark themes give secondary buttons the same background as the
              page, so mix in some of the theme text colour to get a grey that
-             always stands out. */
+             always stands out. Also covers the neutral action buttons
+             (Discard Unsaved Changes, + Add backup model). */
           body.vscode-dark button.provider-signin,
-          body.vscode-dark button.provider-usage {
+          body.vscode-dark button.provider-usage,
+          body.vscode-dark #discard-btn,
+          body.vscode-dark #discard-providers-btn,
+          body.vscode-dark button.add-backup {
             background-color: color-mix(in srgb, var(--vscode-foreground) 15%, var(--vscode-editor-background));
           }
           body.vscode-dark button.provider-signin:hover,
-          body.vscode-dark button.provider-usage:hover {
+          body.vscode-dark button.provider-usage:hover,
+          body.vscode-dark #discard-btn:hover,
+          body.vscode-dark #discard-providers-btn:hover,
+          body.vscode-dark button.add-backup:hover {
             background-color: color-mix(in srgb, var(--vscode-foreground) 25%, var(--vscode-editor-background));
           }
           .stage-row {

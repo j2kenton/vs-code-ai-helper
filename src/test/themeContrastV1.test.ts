@@ -143,9 +143,30 @@ void describe("settings webview — dark provider button background", () => {
     assert.notEqual(hover.trim(), rest.trim());
   });
 
+  void it("gives Discard and Add-backup buttons the same dark grey as the provider buttons", () => {
+    const html = settingsHtml();
+    const ref = ruleBody(html, "body.vscode-dark button.provider-signin");
+    const refHover = ruleBody(html, "body.vscode-dark button.provider-signin:hover");
+    for (const sel of [
+      "body.vscode-dark #discard-btn",
+      "body.vscode-dark #discard-providers-btn",
+      "body.vscode-dark button.add-backup",
+    ]) {
+      const rest = ruleBody(html, sel);
+      assert.match(rest, /background-color:\s*color-mix\(/, sel);
+      assert.match(rest, /--vscode-foreground/, sel);
+      assert.match(rest, /--vscode-editor-background/, sel);
+      assert.equal(rest.trim(), ref.trim(), sel);
+      const hover = ruleBody(html, `${sel}:hover`);
+      assert.equal(hover.trim(), refHover.trim(), `${sel}:hover`);
+      assert.notEqual(hover.trim(), rest.trim(), `${sel}:hover`);
+    }
+  });
+
   void it("adds no light or high-contrast rules for provider buttons", () => {
     const html = settingsHtml();
     assert.doesNotMatch(html, /body\.vscode-(?:light|high-contrast)[^{}]*provider-(?:signin|usage)/);
+    assert.doesNotMatch(html, /body\.vscode-(?:light|high-contrast)[^{}]*(?:#discard-btn|#discard-providers-btn|add-backup)/);
   });
 });
 
