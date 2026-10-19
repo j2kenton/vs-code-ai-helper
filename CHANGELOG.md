@@ -2,6 +2,23 @@
 
 All notable changes to Ensemble (formerly VS Code AI Helper) are documented here.
 
+## [1.0.0] — 2026-10-19 — First stable release
+
+Ensemble 1.0 is the first stable release of the supervised AI workflow for VS Code: task → plan → implementation → review → publish, with you approving every stage change. It works with GitHub Copilot and nine CLI integrations, through the AI subscriptions you already have. This release finishes twelve release-candidate rounds; the changes since 0.117 are below, and the sections after it describe earlier work.
+
+### Fixed
+
+- **Answering an AI question now works.** When an AI action asks you a question in Chat With AI and you answer and press Resume, your answer (and the question it answers) now reaches the AI. Before, the AI received its original prompt unchanged, asked the same question again, and the round failed. This applies to every action that can ask a question, not only Generate Plan. If the AI still asks again after your answer, the failure now says so in plain words.
+- **A question from Generate Plan appears in the stage you are looking at.** After **Complete & Move On** from Task Description, a question raised while generating the plan is now filed under the Plan stage, not Task Description, so it shows in the Plan chat.
+- **An unanswered question now shows on the stage row.** While a question waits for you, the stage's chat button and row icon switch to the "waiting for you" state, the same as for a pending decision, and return to normal once you answer.
+- **No "Request a Publish review" card while that review is already starting.** When Publish Checks run as part of an action that goes on to the Publish review (Fast Forward, "Run Publish Checks, Then Review", or the follow-up after a successful "Fix Linting & Code Errors"), a passing run no longer posts a card asking you to request the review. A stand-alone Publish Checks run still offers it.
+- **Plans no longer write test runs as items no round can tick.** A "Behaviour to confirm" item now covers only what can be checked by reading the code; anything that needs a test, lint, type-check or build run goes into the excluded "Verified by Publish Checks" item. Plan checklists can therefore reach 100%.
+- **Settings view buttons line up in dark themes.** The provider sign-in / connect buttons use the same text size as Discard and Save, and the Discard and Add-backup buttons get the same dark-theme background as the other provider buttons.
+
+### Developer notes
+
+- Source files now check out with LF line endings on every platform (`.gitattributes`), and the unit suite no longer hangs when a git repository sits above the temp folder or fails on Windows-only path, line-ending and symlink differences.
+
 ## [Unreleased] — Copilot `auto` everywhere, a watchdog for hung providers, and fewer stuck-task loops
 
 ### Added
