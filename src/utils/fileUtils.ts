@@ -114,6 +114,41 @@ export async function readNonEmptyText(
 }
 
 /**
+ * Read a text file's content from disk only, ignoring any open editor buffer.
+ *
+ * Use this only where the buffer is known to be behind the disk — e.g. a file
+ * a coordinator has just promoted with a temp file + `fs.promises.rename`
+ * (`services/workflowFileStoreV1.ts`), which bypasses the editor entirely, so
+ * an already-open document still holds the pre-promotion content until VS
+ * Code reloads it. Everywhere else prefer {@link readTextIfExists}, which
+ * includes unsaved editor edits.
+ */
+export async function readTextFromDiskIfExists(
+  fileUri: vscode.Uri
+): Promise<string | undefined> {
+  try {
+    const content = await vscode.workspace.fs.readFile(fileUri);
+    return new TextDecoder().decode(content);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read a text file's trimmed content from disk only, or undefined if it
+ * doesn't exist or is empty/whitespace-only. Disk-only twin of
+ * {@link readNonEmptyText}; see {@link readTextFromDiskIfExists} for when that
+ * is the right source.
+ */
+export async function readNonEmptyTextFromDisk(
+  fileUri: vscode.Uri
+): Promise<string | undefined> {
+  const content = await readTextFromDiskIfExists(fileUri);
+  const trimmed = content?.trim();
+  return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+/**
  * Stat a file, or undefined if it doesn't exist.
  */
 export async function statIfExists(
