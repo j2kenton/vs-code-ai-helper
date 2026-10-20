@@ -155,14 +155,6 @@ function Invoke-PromotePreRelease {
     Write-Host "  - sets main's package.json to $ToVersion and commits only that file"
     Write-Host "  - tags v$ToVersion on the same commit as $FromTag, and pushes main and the tag"
     Write-Host "    (your uncommitted changes are left as they are and are not pushed)"
-    Write-Host ""
-    $mode = Read-Host "Type 'publish' to do it, 'dry' to build the package only (no publish, tag, commit or push), anything else to cancel"
-    $mode = $mode.Trim().ToLower()
-    if ($mode -ne "publish" -and $mode -ne "dry") {
-        Write-Host "Cancelled." -ForegroundColor Yellow
-        return
-    }
-    $dryRun = $mode -eq "dry"
 
     # A fresh, uniquely named folder per run, so cleanup can only ever delete
     # what this run created.
@@ -181,21 +173,10 @@ function Invoke-PromotePreRelease {
             if ($LASTEXITCODE -ne 0) { throw "pnpm install failed in the $FromTag worktree. Nothing was published." }
 
             # vsce runs vscode:prepublish (type-check, lint, production build,
-            # workflow-safety, package-contents check) before packaging or
-            # publishing. --no-update-package-json/--no-git-tag-version keep the
-            # worktree untouched: the version is set only in the VSIX.
-            if ($dryRun) {
-                $vsix = Join-Path ([System.IO.Path]::GetTempPath()) "ensemble-$ToVersion-dry-run.vsix"
-                Write-Host ""
-                Write-Host "Dry run: packaging $FromTag as $ToVersion..." -ForegroundColor Cyan
-                & pnpm exec vsce package $ToVersion --no-update-package-json --no-git-tag-version -o $vsix
-                if ($LASTEXITCODE -ne 0) { throw "vsce package failed." }
-                Write-Host ""
-                Write-Host "Dry run OK. Package: $vsix" -ForegroundColor Green
-                Write-Host "Nothing was published, tagged, committed or pushed." -ForegroundColor Green
-                return
-            }
-
+            # workflow-safety, package-contents check) before publishing, so a
+            # failing build publishes nothing. --no-update-package-json and
+            # --no-git-tag-version keep the worktree untouched: the version is
+            # set only in the published package.
             Write-Host ""
             Write-Host "Publishing $FromTag as stable $ToVersion..." -ForegroundColor Cyan
             & pnpm exec vsce publish $ToVersion --no-update-package-json --no-git-tag-version
