@@ -81,6 +81,11 @@ function Invoke-PromotePreRelease {
         [Parameter(Mandatory = $true)][string]$ExtensionId
     )
 
+    # Uncommitted work elsewhere is fine (it is neither built nor committed),
+    # but the version commit below must contain only the version change.
+    if (& git status --porcelain -- package.json) {
+        throw "package.json has uncommitted changes. Commit or stash them first; option 5 commits only the new version number."
+    }
     if (& git tag --list "v$ToVersion") {
         throw "Tag v$ToVersion already exists; $ToVersion has been released before."
     }
@@ -98,7 +103,8 @@ function Invoke-PromotePreRelease {
     Write-Host "  - builds the code at $FromTag in a temporary worktree (nothing unpublished on main is included)"
     Write-Host "  - publishes it as stable $ToVersion"
     Write-Host "  - tags v$ToVersion on the same commit as $FromTag"
-    Write-Host "  - sets main's package.json to $ToVersion, commits, and pushes main and the tag"
+    Write-Host "  - sets main's package.json to $ToVersion, commits only that file, and pushes main and the tag"
+    Write-Host "    (your uncommitted changes are left as they are and are not pushed)"
     Write-Host ""
     $mode = Read-Host "Type 'publish' to do it, 'dry' to build the package only (no publish, tag, commit or push), anything else to cancel"
     $mode = $mode.Trim().ToLower()
@@ -166,8 +172,9 @@ function Invoke-PromotePreRelease {
     $packageText = [System.IO.File]::ReadAllText($packagePath)
     $updated = [regex]::new('"version"\s*:\s*"[^"]*"').Replace($packageText, "`"version`": `"$ToVersion`"", 1)
     [System.IO.File]::WriteAllText($packagePath, $updated, (New-Object System.Text.UTF8Encoding($false)))
-    & git add package.json
-    & git commit -m "$ToVersion (stable, promoted from $FromTag)"
+    # --only commits package.json alone; anything else you have staged stays
+    # staged and uncommitted.
+    & git commit --only -m "$ToVersion (stable, promoted from $FromTag)" -- package.json
     if ($LASTEXITCODE -ne 0) { throw "Published and tagged, but committing package.json failed. Set it to $ToVersion by hand." }
 
     Write-Host ""
@@ -200,14 +207,6 @@ foreach ($name in @("package", "publish:patch", "publish:minor", "publish:major"
     if ($allowedRunners -notcontains $runner -or -not $safe) {
         throw "Unsafe package script '$name': $command"
     }
-}
-
-# --- Guard: working tree must be clean, otherwise vsce will bump/commit/tag on top of unrelated changes ---
-$status = & git status --porcelain
-if ($status) {
-    Write-Host "Working tree has uncommitted changes:" -ForegroundColor Yellow
-    Write-Host $status
-    throw "Commit or stash your changes before releasing."
 }
 
 $currentVersion = (Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
@@ -269,6 +268,16 @@ if ($choice.Trim().ToLower() -match '^(5|promote)$') {
     }
     Invoke-PromotePreRelease -FromTag $newestTag -ToVersion $promoteTo -RepoRoot $repoRoot -ExtensionId "$($package.publisher).$($package.name)"
     return
+}
+
+# --- Guard (options 1-4): working tree must be clean, otherwise vsce will
+# bump/commit/tag on top of unrelated changes and build them into the release.
+# Option 5 above builds from a tag in its own worktree, so it skips this. ---
+$status = & git status --porcelain
+if ($status) {
+    Write-Host "Working tree has uncommitted changes:" -ForegroundColor Yellow
+    Write-Host $status
+    throw "Commit or stash your changes before releasing."
 }
 
 $preRelease = $false
