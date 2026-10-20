@@ -92,7 +92,7 @@ curl -fsSL https://opencode.ai/v2/install | bash
 curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
 ```
 
-OpenCode appears as two separate provider rows in Ensemble: **OpenCode Zen** for `opencode/...` models and **OpenCode Go** for `opencode-go/...` models. They use the same `opencode` CLI (OpenCode 2 is required) and can use the same OpenCode key, but enabling or connecting one does not grant access to the other. A Zen/Go backup is only used when you explicitly select it as a backup model. devpass-code is a fork of OpenCode with its own single "LLM Gateway DevPass" account, so it appears as one provider row.
+OpenCode appears as two separate provider rows in Ensemble: **OpenCode Zen** for `opencode/...` models and **OpenCode Go** for `opencode-go/...` models. They use the same `opencode` CLI and can use the same OpenCode key, but enabling or connecting one does not grant access to the other. A Zen/Go backup is only used when you explicitly select it as a backup model. Ensemble needs OpenCode 2; with OpenCode 1 still installed, an OpenCode round stops and tells you how to switch. devpass-code is a fork of OpenCode with its own single "LLM Gateway DevPass" account, so it appears as one provider row.
 
 Enable the CLI providers you want under **Ensemble: Configure AI Models**. AI actions consume real quota or money, and implementation runs modify workspace files.
 

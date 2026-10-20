@@ -293,6 +293,37 @@ void describe("toFriendlyError — structured-stream providers", () => {
     assert.doesNotMatch(friendly.message, /sessionID|metadata|API_KEY/);
   });
 
+  void it("names an installed OpenCode 1 instead of dumping its usage text", () => {
+    // What opencode-ai 1.18.13 prints (stderr, exit 1) when given OpenCode 2's
+    // `--standalone` flag, trimmed (verified live, 2026-10-20).
+    const v1UsageStderr = [
+      "opencode run [message..]",
+      "",
+      "run opencode with a message",
+      "",
+      "Positionals:",
+      "  message  message to send                                                     [array] [default: []]",
+      "",
+      "Options:",
+      "  -h, --help         show help                                                             [boolean]",
+    ].join("\n");
+    const opencode = getCliProvider("opencode-cli")!;
+    const friendly = toFriendlyError(opencode, "opencode/deepseek-v4.1-flash-free", 1, v1UsageStderr, "");
+
+    assert.match(friendly.message, /OpenCode 1 is installed, but Ensemble needs OpenCode 2/);
+    assert.match(friendly.message, /npm install -g @opencode\/cli/);
+    assert.doesNotMatch(friendly.message, /Positionals|show help/);
+    assert.equal(friendly.authFailure, false);
+
+    // The marker only counts on stderr: stdout can echo file contents.
+    const echoed = toFriendlyError(opencode, "opencode/x", 1, "", v1UsageStderr);
+    assert.doesNotMatch(echoed.message, /OpenCode 1 is installed/);
+
+    // devpass-code is itself an OpenCode 1 fork, so it never gets this message.
+    const devpass = getCliProvider("devpass-cli")!;
+    assert.equal(devpass.unsupportedVersionSignature, undefined);
+  });
+
   void it("reads OpenCode 2's flat error event: auth verdict, message and status, body kept out", () => {
     // Shape verified live against opencode 2.0.32 (2026-10-20) with an
     // expired Zen key: no `name`/`data`, just type, message, status and a

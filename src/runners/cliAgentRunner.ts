@@ -3172,9 +3172,16 @@ function toFriendlyError(
   // standing in as the sole explanation.
   const hadNoDiagnosticContent =
     diagnosticTextOverride === undefined && !realDiagnosticContent && !benignNoiseHint;
+  // stderr only: it is the CLI's own channel, while stdout can echo file
+  // contents that happen to contain the marker.
+  const unsupportedVersion =
+    def.unsupportedVersionSignature !== undefined && rawStderr.includes(def.unsupportedVersionSignature.marker)
+      ? def.unsupportedVersionSignature.message
+      : undefined;
   const diagnosticText =
     diagnosticTextOverride ??
     `${cliDisplayLabel(def)} CLI failed: ${
+      unsupportedVersion ||
       realDiagnosticContent ||
       (benignNoiseHint
         ? `exit code ${exitCode ?? "unknown"} / no diagnostic output (${benignNoiseHint})`

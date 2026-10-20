@@ -298,6 +298,12 @@ export interface CliProviderDefinition {
    */
   structuredEventStream?: "opencode" | "cline" | "kimi" | "codex" | "claude";
   /**
+   * Text the CLI writes to stderr only when the installed major version is
+   * one Ensemble no longer supports. When a failed run's stderr contains
+   * `marker`, `message` replaces the raw output as the reason shown.
+   */
+  unsupportedVersionSignature?: { readonly marker: string; readonly message: string };
+  /**
    * Optional same-conversation recovery for a provider whose headless CLI
    * persists a failed turn and exposes a continuation flag. Unlike replaying
    * the original prompt, this deliberately preserves the provider's prior
@@ -1592,6 +1598,16 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // credentials and a real 401), and the extractor surfaces that event's
     // statusCode so the "401" marker below still matches it.
     structuredEventStream: "opencode",
+    // OpenCode 1 does not know `--standalone`: it exits 1 and prints only its
+    // yargs usage to stderr, which starts with this line (verified live
+    // against opencode-ai 1.18.13, 2026-10-20). OpenCode 2's help reads
+    // "USAGE\n  opencode run [flags]" instead.
+    unsupportedVersionSignature: {
+      marker: "opencode run [message..]",
+      message:
+        "OpenCode 1 is installed, but Ensemble needs OpenCode 2. Run `npm uninstall -g opencode-ai`, " +
+        "then `npm install -g @opencode/cli`, and try again.",
+    },
     buildArgs(mode, model): string[] {
       // OpenCode 2 (verified live against 2.0.32, 2026-10-20) sends `run` to
       // a shared background service unless told otherwise. `--standalone`
