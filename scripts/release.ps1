@@ -301,6 +301,8 @@ $newestTag = Get-NewestReleaseTag
 $promoteTo = $null
 if ($newestTag -and $newestTag -match '^v(\d+)\.(\d+)\.(\d+)$' -and ([int]$Matches[2] % 2) -eq 1) {
     $promoteTo = "$($Matches[1]).$([int]$Matches[2] + 1).0"
+    # Option 6: the pre-release that follows the promoted stable.
+    $preReleaseAfterPromote = "$($Matches[1]).$([int]$Matches[2] + 2).0"
 }
 
 # --- Prompt for release type, with a reminder of what each one means ---
@@ -315,25 +317,67 @@ if ($promoteTo) {
 else {
     Write-Host "  [5] promote     -> (unavailable: the newest release, $newestTag, is not a pre-release)" -ForegroundColor DarkGray
 }
+if ($promoteTo) {
+    Write-Host "  [6] promote + pre-release -> $promoteTo, then $preReleaseAfterPromote  option 5, then option 4 for everything on main since $newestTag"
+}
+else {
+    Write-Host "  [6] promote + pre-release -> (unavailable: needs a pre-release to promote, as option 5 does)" -ForegroundColor DarkGray
+}
 if ($onPreReleaseLine) {
     Write-Host ""
     Write-Host "  (You are on the pre-release line, so patch and minor both publish the next stable minor.)" -ForegroundColor DarkGray
 }
 Write-Host ""
 
-$choice = Read-Host "Enter 1-5 (or type patch/minor/major/pre-release/promote)"
+$choice = Read-Host "Enter 1-6 (or type patch/minor/major/pre-release/promote)"
 
-if ($choice.Trim().ToLower() -match '^(5|promote)$') {
+$promoteThenPreRelease = $choice.Trim() -eq "6"
+if ($promoteThenPreRelease -or $choice.Trim().ToLower() -match '^(5|promote)$') {
     if (-not $promoteTo) {
         throw "Nothing to promote: the newest release, $newestTag, is not a pre-release."
     }
+    if ($promoteThenPreRelease) {
+        # Check everything the option 4 half needs BEFORE the promote
+        # publishes anything: it builds from the working folder, so that must
+        # be clean, and there must be something new to pre-release.
+        $status = & git status --porcelain
+        if ($status) {
+            Write-Host "Working tree has uncommitted changes:" -ForegroundColor Yellow
+            Write-Host $status
+            throw "Option 6 also pre-releases your working folder, so commit or stash your changes first (or use option 5 alone)."
+        }
+        # The pre-release must be part of main's history, or "commits since
+        # the tag" would count unrelated work and promote a side branch.
+        & git merge-base --is-ancestor $newestTag HEAD
+        if ($LASTEXITCODE -ne 0) {
+            throw "$newestTag is not part of main's history, so option 6 cannot tell what is new. Use option 5 and option 4 separately."
+        }
+        $newCommits = [int](& git rev-list --count "$newestTag..HEAD")
+        if ($newCommits -eq 0) {
+            throw "main has no commits since $newestTag, so there is nothing new to pre-release. Use option 5 alone."
+        }
+    }
     Invoke-PromotePreRelease -FromTag $newestTag -ToVersion $promoteTo -RepoRoot $repoRoot -ExtensionId "$($package.publisher).$($package.name)"
-    return
+    if (-not $promoteThenPreRelease) {
+        return
+    }
+
+    # Second half: continue exactly as option 4, from the version the promote
+    # just committed to main's package.json.
+    $promotedVersion = (Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json).version
+    if ($promotedVersion -ne $promoteTo) {
+        throw "Promoted to $promoteTo, but package.json says $promotedVersion. Stopping before the pre-release; run option 4 once that is fixed."
+    }
+    Write-Host ""
+    Write-Host "Stable $promoteTo is out. Now pre-releasing main as $preReleaseAfterPromote..." -ForegroundColor Cyan
+    $nextPreRelease = $preReleaseAfterPromote
+    $choice = "4"
 }
 
-# --- Guard (options 1-4): working tree must be clean, otherwise vsce will
-# bump/commit/tag on top of unrelated changes and build them into the release.
-# Option 5 above builds from a tag in its own worktree, so it skips this. ---
+# --- Guard (options 1-4, and option 6's pre-release half): working tree must
+# be clean, otherwise vsce will bump/commit/tag on top of unrelated changes and
+# build them into the release. Option 5 builds from a tag in its own worktree,
+# so it skips this. ---
 $status = & git status --porcelain
 if ($status) {
     Write-Host "Working tree has uncommitted changes:" -ForegroundColor Yellow
