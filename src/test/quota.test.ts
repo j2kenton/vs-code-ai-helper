@@ -72,6 +72,15 @@ void describe("isQuotaError", () => {
     assert.strictEqual(isQuotaError("command not found"), false);
   });
 
+  void it("does not classify a provider overload reply as a quota error", () => {
+    // "at capacity" is a temporary overload, not a usage limit — parking the
+    // task on a quota prompt for it would be the wrong remedy.
+    assert.strictEqual(
+      isQuotaError("Selected model is at capacity. Please try a different model."),
+      false
+    );
+  });
+
   void it("treats an explicit structured signal as an additional (not replacement) quota verdict", () => {
     // A structured error CODE like "rate_limit" (underscored) is not a
     // substring of any QUOTA_MARKERS phrase ("rate limit" with a space,
@@ -98,6 +107,20 @@ void describe("isTransportError", () => {
     assert.strictEqual(isTransportError("read ECONNRESET"), true);
     assert.strictEqual(isTransportError("TypeError: fetch failed"), true);
     assert.strictEqual(isTransportError("Premature close"), true);
+  });
+
+  void it("recognizes a provider's overload reply as temporary, case-insensitively", () => {
+    // The exact observed Codex wording from RC7, 2026-10-03: a temporary
+    // provider-side overload, not a usage limit.
+    assert.strictEqual(
+      isTransportError("Selected model is at capacity. Please try a different model."),
+      true
+    );
+    assert.strictEqual(isTransportError("SELECTED MODEL IS AT CAPACITY."), true);
+  });
+
+  void it("does not treat quota phrasing as a transport error", () => {
+    assert.strictEqual(isTransportError("You have exceeded your current quota"), false);
   });
 
   void it("stays narrow enough not to fire on ordinary failures", () => {
@@ -165,6 +188,11 @@ void describe("classifyFailure", () => {
   void it("leaves a transport-sounding message generic — TRANSPORT_MARKERS is not checked here", () => {
     assert.strictEqual(
       classifyFailure({ errorMessage: "OpenCode CLI failed: UnknownError: Streaming response failed" })
+        .failureKind,
+      "generic"
+    );
+    assert.strictEqual(
+      classifyFailure({ errorMessage: "Selected model is at capacity. Please try a different model." })
         .failureKind,
       "generic"
     );

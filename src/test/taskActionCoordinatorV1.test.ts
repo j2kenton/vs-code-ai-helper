@@ -310,7 +310,8 @@ function makeHarness(
   },
   /** Item 2 / Step 55: lets a test wrap the durable orchestrator (e.g. to force a `settleInvocation` failure) instead of the plain file-backed one. */
   orchestratorOverride?: ActionConversationOrchestratorV1,
-  candidateCountOverride?: number
+  candidateCountOverride?: number,
+  providerCapacityRetryDelayMs = 0
 ): Harness {
   const promoted: CompletedContentV1[] = [];
   const row: ProviderTaskActionRowV1 = {
@@ -372,6 +373,7 @@ function makeHarness(
         settlementRecords.push(record);
       },
     },
+    providerCapacityRetryDelayMs,
     ...(brokerOptions !== undefined ? { brokerOptions } : {}),
     ...(readTools !== undefined ? { toolSessions: readTools.toolSessions } : {}),
   });
@@ -2013,6 +2015,62 @@ void describe("taskActionCoordinatorV1", () => {
         harness.selection.reserved,
         3,
         "advances to the untried candidate instead of retrying candidate 2 on network fault"
+      );
+    });
+  });
+
+  void describe("provider-capacity same-candidate retry", () => {
+    function providerCapacityAlways(): AgentTransportV1 & { readonly calls: () => number } {
+      let calls = 0;
+      return {
+        runnerId: "codex-cli",
+        invoke: () => {
+          calls++;
+          return Promise.resolve({
+            kind: "transportFailure" as const,
+            code: "cliExit.1",
+            detail: "Selected model is at capacity. Please try a different model.",
+            providerCapacity: true,
+          });
+        },
+        calls: () => calls,
+      };
+    }
+
+    void it("makes three total attempts for the only configured provider, then returns its failure", async () => {
+      const primary = providerCapacityAlways();
+      const harness = makeHarness([primary]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+
+      assert.equal(outcome.kind, "failed");
+      assert.equal(primary.calls(), 3);
+      assert.equal(
+        harness.selection.reserved,
+        1,
+        "the selection registry reserves the Codex candidate once; retries reserve it directly"
+      );
+      assert.equal(harness.selection.opened, 1);
+    });
+
+    void it("leaves room for every untried backup before spending another capacity retry", async () => {
+      const primary = providerCapacityAlways();
+      const backup = envelopeTransport((correlation) =>
+        frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# recovered" },
+        })
+      );
+      const harness = makeHarness([primary, backup]);
+      const outcome = await harness.coordinator.executeAction(baseRequest());
+
+      assert.equal(outcome.kind, "completed");
+      assert.equal(primary.calls(), 2);
+      assert.equal(
+        harness.selection.reserved,
+        2,
+        "the registry reserves the primary and backup once each; the primary retry is direct"
       );
     });
   });

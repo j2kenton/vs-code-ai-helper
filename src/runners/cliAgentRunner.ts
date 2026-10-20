@@ -29,7 +29,13 @@ import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
 import { ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
-import { classifyCliFailure, isAuthenticationFailure, isModelEntitlementFailure, isTransportError } from "../utils/quota";
+import {
+  classifyCliFailure,
+  isAuthenticationFailure,
+  isModelEntitlementFailure,
+  isProviderCapacityError,
+  isTransportError,
+} from "../utils/quota";
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { taskOperations } from "../utils/taskOperations";
@@ -2768,6 +2774,9 @@ export function createCliTextTransportV1(options: {
                 kind: "transportFailure",
                 code: `cliExit.${String(code)}`,
                 detail,
+                ...(def.id === "codex-cli" && isProviderCapacityError(boundedDiagnosis)
+                  ? { providerCapacity: true }
+                  : {}),
               });
             });
 

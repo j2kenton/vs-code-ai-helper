@@ -335,6 +335,64 @@ void describe("createCliTextTransportV1 structured-event capture", () => {
     );
   });
 
+  void it("marks only Codex's observed capacity response for a bounded same-model retry", async () => {
+    const correlation = makeCorrelation();
+    const stdout = `${JSON.stringify({
+      type: "error",
+      message: "Selected model is at capacity. Please try a different model.",
+    })}\n`;
+    const def: CliProviderDefinition = {
+      ...scriptedDef({ id: "claude-cli", stdout, exitCode: 1 }),
+      id: "codex-cli",
+      structuredEventStream: "codex",
+      buildArgs(): string[] {
+        // Flush the diagnostic before exiting so the transport can exercise
+        // the capacity classifier instead of observing an empty stdout pipe.
+        const script =
+          `require("node:fs").writeSync(1, ${JSON.stringify(stdout)});` +
+          "process.exitCode=1;";
+        return ["-e", script];
+      },
+    };
+    const transport = createCliTextTransportV1({ def, model: undefined, cwd: process.cwd() });
+    const { writer } = collectingWriter();
+    const exit = await transport.invoke(makeRequest(correlation), writer);
+
+    assert.equal(exit.kind, "transportFailure");
+    assert.equal(exit.kind === "transportFailure" && exit.code, "cliExit.1");
+    assert.equal(exit.kind === "transportFailure" && exit.providerCapacity, true);
+    assert.match((exit.kind === "transportFailure" && exit.detail) || "", /at capacity/);
+
+    const otherProviderDef: CliProviderDefinition = { ...def, id: "opencode-cli" };
+    const otherProviderExit = await createCliTextTransportV1({
+      def: otherProviderDef,
+      model: undefined,
+      cwd: process.cwd(),
+    }).invoke(makeRequest(makeCorrelation()), collectingWriter().writer);
+    assert.equal(otherProviderExit.kind, "transportFailure");
+    assert.equal(
+      otherProviderExit.kind === "transportFailure" && otherProviderExit.providerCapacity,
+      undefined
+    );
+
+    const usageLimitDef: CliProviderDefinition = {
+      ...def,
+      buildArgs(): string[] {
+        const quotaMessage = "You've hit your usage limit. Try again at 4:12 PM.";
+        const quotaStdout = `${JSON.stringify({ type: "error", message: quotaMessage })}\n`;
+        const script = `process.stdout.write(${JSON.stringify(quotaStdout)});process.exitCode=1;`;
+        return ["-e", script];
+      },
+    };
+    const quotaExit = await createCliTextTransportV1({
+      def: usageLimitDef,
+      model: undefined,
+      cwd: process.cwd(),
+    }).invoke(makeRequest(makeCorrelation()), collectingWriter().writer);
+    assert.equal(quotaExit.kind, "transportFailure");
+    assert.equal(quotaExit.kind === "transportFailure" && quotaExit.providerCapacity, undefined);
+  });
+
   /**
    * 2026-09-15 post-freeze findings, item 4 (acceptance criterion): the
    * failure-diagnosis tail is bounded (`MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1`,

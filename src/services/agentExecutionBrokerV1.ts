@@ -506,12 +506,14 @@ async function computeInvocationOutcomeV1(
         // complete, not partial model output, so they must not make this
         // failure terminal for fallback purposes. Every other transport
         // failure keeps the existing byte-count heuristic unchanged.
-        responseStarted: exit.networkFault === true ? false : writer.bytesWritten > 0,
+        responseStarted:
+          exit.networkFault === true || exit.providerCapacity === true ? false : writer.bytesWritten > 0,
         // Pass the transport's sanitized cause through verbatim. Dropping it
         // here would defeat the point of capturing it: the code alone is what
         // made `copilotRequestFailed` undiagnosable.
         ...(exit.detail !== undefined ? { detail: exit.detail } : {}),
         ...(exit.networkFault === true ? { networkFault: true } : {}),
+        ...(exit.providerCapacity === true ? { providerCapacity: true } : {}),
       };
   }
 }

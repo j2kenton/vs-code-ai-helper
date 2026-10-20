@@ -123,6 +123,8 @@ export type RawAgentExecutionResultV1 =
       readonly detail?: string;
       /** Carried through from `AgentTransportExitV1.networkFault` — see its doc comment. */
       readonly networkFault?: boolean;
+      /** Carried through from `AgentTransportExitV1.providerCapacity` — a parsed provider overload safe to retry. */
+      readonly providerCapacity?: boolean;
       /** Only ever set for `code === "invocationDeadlineExceeded"` — see {@link RoundProcessStateV1}. */
       readonly processState?: RoundProcessStateV1;
     }
@@ -178,6 +180,13 @@ export type AgentTransportExitV1 =
        * when bytes were already written, and discards them unsealed.
        */
       readonly networkFault?: boolean;
+      /**
+       * True when a structured provider diagnostic reported the observed
+       * temporary overload reply. Unlike a network fault, this means the
+       * provider responded; the coordinator may make a bounded same-candidate
+       * retry before advancing to a backup.
+       */
+      readonly providerCapacity?: boolean;
     };
 
 /**

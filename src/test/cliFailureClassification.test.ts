@@ -1243,6 +1243,92 @@ void describe("stream-transport failures are cascade-eligible", () => {
     assert.equal(promoted.transient, true);
   });
 
+  // RC7, 2026-10-03: Codex `gpt-6-sol@high` answered a read-only High-Level
+  // Review with "Selected model is at capacity. Please try a different model."
+  // — a temporary provider-side overload. Before "at capacity" joined
+  // TRANSPORT_MARKERS this classified generic and (with no backup enabled)
+  // paused the task after a single attempt.
+  const OVERLOAD_DIAGNOSTIC =
+    "OpenAI Codex CLI failed: Selected model is at capacity. Please try a different model.";
+
+  function overloadFriendly(): {
+    message: string;
+    authFailure: boolean;
+    diagnosticText: string;
+    retryableHint: boolean;
+  } {
+    return {
+      message: OVERLOAD_DIAGNOSTIC,
+      authFailure: false,
+      diagnosticText: OVERLOAD_DIAGNOSTIC,
+      retryableHint: false,
+    };
+  }
+
+  void it("promotes a structured provider's overload reply to temporarily-unavailable in text mode", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const promoted = applyTransportTransience(
+      classifyFailed(OVERLOAD_DIAGNOSTIC),
+      overloadFriendly(),
+      "text",
+      codex
+    );
+
+    assert.equal(promoted.failureKind, "temporarily-unavailable");
+    assert.equal(promoted.transient, true);
+  });
+
+  void it("does NOT promote the overload reply in edit mode", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+
+    const promoted = applyTransportTransience(
+      classifyFailed(OVERLOAD_DIAGNOSTIC),
+      overloadFriendly(),
+      "edit",
+      codex
+    );
+
+    assert.equal(promoted.failureKind, "generic");
+    assert.equal(promoted.transient, undefined);
+  });
+
+  void it("does NOT promote the overload reply for an opaque-text provider", () => {
+    const promoted = applyTransportTransience(
+      classifyFailed(OVERLOAD_DIAGNOSTIC),
+      overloadFriendly(),
+      "text",
+      OPAQUE_TEXT_LIKE
+    );
+
+    assert.equal(promoted.failureKind, "generic");
+    assert.equal(promoted.transient, undefined);
+  });
+
+  void it("recognizes the overload reply end-to-end from a Codex --json error event", () => {
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+    const stdout = JSON.stringify({
+      type: "error",
+      message: "Selected model is at capacity. Please try a different model.",
+    });
+
+    const friendly = toFriendlyError(codex, "codex-cli:gpt-6-sol@high", 1, "", stdout);
+    assert.match(friendly.diagnosticText, /at capacity/);
+    assert.equal(friendly.authFailure, false);
+
+    const promoted = applyTransportTransience(
+      classifyFailed(friendly.message),
+      friendly,
+      "text",
+      codex
+    );
+    assert.equal(promoted.failureKind, "temporarily-unavailable");
+    assert.equal(promoted.transient, true);
+  });
+
   void it("promotes an error the provider reported retryable even with no matching phrase, for any provider", () => {
     // retryableHint is structural (the provider's own error event), so it is
     // trusted even for an opaque-text provider that would never get a

@@ -575,12 +575,15 @@ function reportCandidateSkipped(
   }
 }
 
-/** Pause before the single same-candidate retry of a transport-flagged network fault. */
+/** Retry delays for bounded same-candidate recovery attempts. */
 const DEFAULT_NETWORK_FAULT_RETRY_DELAY_MS_V1 = 750;
+const DEFAULT_PROVIDER_CAPACITY_RETRY_DELAY_MS_V1 = 5_000;
 
 export interface TaskActionCoordinatorDepsV1 {
   /** Delay before a network-fault retry; defaults to 750 ms. Tests pass 0. */
   readonly networkFaultRetryDelayMs?: number;
+  /** Delay before a provider-capacity retry; defaults to 5 seconds. Tests pass 0. */
+  readonly providerCapacityRetryDelayMs?: number;
   readonly registry: TaskActionRegistryV1;
   readonly leaseStore: WorkflowLeaseStoreV1;
   /**
@@ -1985,11 +1988,13 @@ export function createTaskActionCoordinatorV1(
         : undefined;
     let networkFaultRetriesUsedV1 = 0;
     const MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 = 1;
+    let providerCapacityRetriesUsedV1 = 0;
+    const MAX_PROVIDER_CAPACITY_RETRIES_PER_CANDIDATE_V1 = 2;
     // Attempt ids this coordinator itself allocated as a same-candidate
     // retry — the authoritative record `enrichChainExhaustionWithAttemptOutcomesV1`
     // needs to fold a retry into its original candidate's entry without
     // guessing from a repeated model id (see that function's doc comment).
-    const networkFaultRetryAttemptIdsV1 = new Set<string>();
+    const sameCandidateRetryAttemptIdsV1 = new Set<string>();
 
     for (;;) {
       let attemptId: string;
@@ -2085,7 +2090,7 @@ export function createTaskActionCoordinatorV1(
               ? enrichChainExhaustionWithAttemptOutcomesV1(
                   next.chainExhaustion,
                   session,
-                  networkFaultRetryAttemptIdsV1
+                  sameCandidateRetryAttemptIdsV1
                 )
               : undefined;
           // 2026-09-15 post-freeze findings, item 4: when every invoked
@@ -2123,6 +2128,7 @@ export function createTaskActionCoordinatorV1(
           modelId: next.reserved.handle.modelId,
         };
         networkFaultRetriesUsedV1 = 0;
+        providerCapacityRetriesUsedV1 = 0;
         freshCandidatesReservedV1++;
       }
 
@@ -2380,15 +2386,16 @@ export function createTaskActionCoordinatorV1(
           // v1 fixes 2, item 27: a network-fault candidate gets one same-model
           // retry, so say which of the two attempts this evidence belongs to
           // ("Copilot returned an empty response on attempt 1 of 2").
-          const networkFaultAttemptSuffixV1 =
-            raw.networkFault === true && !raw.responseStarted
+          const retryAttemptSuffixV1 = raw.providerCapacity === true
+            ? ` — attempt ${providerCapacityRetriesUsedV1 + 1} of ${MAX_PROVIDER_CAPACITY_RETRIES_PER_CANDIDATE_V1 + 1}`
+            : raw.networkFault === true && !raw.responseStarted
               ? `${raw.code === "copilotEmptyResponse" ? " on" : " —"} attempt ${networkFaultRetriesUsedV1 + 1} of ${
                   MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 + 1
                 }`
               : "";
           const transportEvidence = raw.detail !== undefined
-            ? `${raw.code}: ${raw.detail}${networkFaultAttemptSuffixV1}`
-            : `${raw.code}${networkFaultAttemptSuffixV1}`;
+            ? `${raw.code}: ${raw.detail}${retryAttemptSuffixV1}`
+            : `${raw.code}${retryAttemptSuffixV1}`;
           // RC6 item 2: every failure kind lands in the per-round history with
           // its provider label, so the final message names every model tried.
           const transportDetailV1 =
@@ -2450,33 +2457,44 @@ export function createTaskActionCoordinatorV1(
               ...(context.provider ? { provider: context.provider } : {}),
             });
           }
-          // Item 14: a transport-flagged network fault (dropped connection,
-          // DNS failure, TLS handshake failure, HTTP/2 protocol error) is a
-          // property of the pipe, not the model, and is usually resolved by
-          // an immediate retry — falling straight to a backup would silently
-          // change which model authors the artifact for a reason that had
-          // nothing to do with the model. Bounded to one retry per candidate,
-          // and gated on the SAME shared invocation-cap check the ordinary
-          // fallback below is gated on, so a persistent network fault cannot
-          // quietly outspend the malformed-result budget once it is armed.
-          // The retry re-reserves the exact runner/provider/model this
-          // attempt used directly through the session (bypassing the
-          // registry's ranked cursor), so it never consumes a fallback slot.
-          if (
+          // Same-candidate recovery retries are reserved for explicit,
+          // bounded signals: network faults get one retry, while Codex's
+          // observed capacity response gets two (three attempts total). Both
+          // re-reserve the same runner/provider/model before the loop advances
+          // to another ranked candidate, subject to the shared invocation
+          // budget and candidate-first guarantee.
+          const canRetryNetworkFault =
             raw.networkFault === true &&
-            networkFaultRetriesUsedV1 < MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 &&
+            !raw.responseStarted &&
+            networkFaultRetriesUsedV1 < MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1;
+          const canRetryProviderCapacity =
+            raw.providerCapacity === true &&
+            providerCapacityRetriesUsedV1 < MAX_PROVIDER_CAPACITY_RETRIES_PER_CANDIDATE_V1;
+          const untriedCandidateCountV1 = Math.max(0, candidateCountV1 - freshCandidatesReservedV1);
+          // `malformedInvocationCountV1` tracks every provider invocation,
+          // including fresh candidates and same-candidate retries. Subtracting
+          // the separately tracked candidates/retries here would count those
+          // attempts twice and prematurely spend the shared operation budget.
+          const hasRetryBudgetV1 =
+            MAX_MALFORMED_RESULT_INVOCATIONS_V1 - malformedInvocationCountV1 - 1 >=
+            untriedCandidateCountV1;
+          if (
+            (canRetryNetworkFault || canRetryProviderCapacity) &&
             currentCandidateIdentityV1 !== undefined &&
             !(malformedBudgetArmedV1 && malformedInvocationCountV1 >= MAX_MALFORMED_RESULT_INVOCATIONS_V1) &&
             // RC6 item 2: candidate-first. A repeat of an already-tried
             // candidate never pre-empts an untried one, and always fits the
             // per-round budget (Step 2c).
-            MAX_MALFORMED_RESULT_INVOCATIONS_V1 - malformedInvocationCountV1 - 1 >=
-              Math.max(0, candidateCountV1 - freshCandidatesReservedV1)
+            hasRetryBudgetV1
           ) {
-            networkFaultRetriesUsedV1++;
-            // A dropped connection or empty reply usually clears within a
-            // moment; retrying in the same tick hits the same fault.
-            const retryDelayMs = deps.networkFaultRetryDelayMs ?? DEFAULT_NETWORK_FAULT_RETRY_DELAY_MS_V1;
+            if (canRetryProviderCapacity) {
+              providerCapacityRetriesUsedV1++;
+            } else {
+              networkFaultRetriesUsedV1++;
+            }
+            const retryDelayMs = canRetryProviderCapacity
+              ? deps.providerCapacityRetryDelayMs ?? DEFAULT_PROVIDER_CAPACITY_RETRY_DELAY_MS_V1
+              : deps.networkFaultRetryDelayMs ?? DEFAULT_NETWORK_FAULT_RETRY_DELAY_MS_V1;
             if (retryDelayMs > 0) {
               await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
             }
@@ -2490,7 +2508,7 @@ export function createTaskActionCoordinatorV1(
                 retryAllocationReport.detail
               );
             }
-            networkFaultRetryAttemptIdsV1.add(retryAttemptId);
+            sameCandidateRetryAttemptIdsV1.add(retryAttemptId);
             const retryHandle = session.reserve({
               attemptId: retryAttemptId,
               mode: row.providerMode,

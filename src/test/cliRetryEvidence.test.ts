@@ -30,7 +30,7 @@ import {
   shouldRetryReadOnlyRun,
   __testOnly,
 } from "../runners/cliAgentRunner";
-import { CliProviderDefinition } from "../runners/providers";
+import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 import { classifyCliFailure } from "../utils/quota";
 
 const { applyTransportTransience } = __testOnly;
@@ -172,6 +172,33 @@ void describe("shouldRetryReadOnlyRun", () => {
 
     assert.equal(dropped.transient, true);
     assert.equal(shouldRetryReadOnlyRun(dropped, 1, false), true);
+  });
+
+  void it("a provider overload reply is retried like a transport drop, up to the unchanged attempt cap", () => {
+    // "Selected model is at capacity. Please try a different model." is a
+    // temporary provider-side overload (Codex, RC7 2026-10-03), so it takes the
+    // same read-only retry path as a dropped stream — no new attempt count or
+    // delay of its own.
+    const codex = getCliProvider("codex-cli");
+    assert.ok(codex, "expected codex-cli provider definition");
+    const diagnostic =
+      "OpenAI Codex CLI failed: Selected model is at capacity. Please try a different model.";
+    const promoted = applyTransportTransience(
+      classifyCliFailure({ status: "failed", output: "", errorMessage: diagnostic }),
+      {
+        message: diagnostic,
+        authFailure: false,
+        diagnosticText: diagnostic,
+        retryableHint: false,
+      },
+      "text",
+      codex
+    );
+
+    assert.equal(promoted.failureKind, "temporarily-unavailable");
+    assert.equal(promoted.transient, true);
+    assert.equal(shouldRetryReadOnlyRun(promoted, 1, false), true);
+    assert.equal(shouldRetryReadOnlyRun(promoted, CLI_RETRY_MAX_ATTEMPTS, false), false);
   });
 
   void it("a mid-stream transport drop is NOT transient in text mode for a provider whose text mode isn't enforced read-only", () => {
