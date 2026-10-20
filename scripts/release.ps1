@@ -51,6 +51,136 @@ function TryParse-SemVer {
     }
 }
 
+function Get-NewestReleaseTag {
+    # Newest vMAJOR.MINOR.PATCH tag by version order (vsce tags every publish).
+    $tags = @(& git tag --list "v*" --sort=-v:refname) | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' }
+    if ($tags.Count -eq 0) { return $null }
+    return [string]$tags[0]
+}
+
+function Remove-PromoteWorktree {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    # git cannot always delete a fresh node_modules on Windows ("Directory not
+    # empty"), so fall back to rmdir, then drop git's record of the worktree.
+    & git worktree remove --force $Path
+    if (Test-Path $Path) { & cmd /c "rmdir /s /q `"$Path`"" }
+    & git worktree prune
+}
+
+function Invoke-PromotePreRelease {
+    <#
+      Option 5: publish the newest PRE-RELEASE as the next STABLE version, built
+      from that pre-release's own tag in a temporary worktree, so nothing on
+      main that was never published goes out. The Marketplace will not re-mark
+      an existing version as stable, so the same code gets the next even minor.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$FromTag,
+        [Parameter(Mandatory = $true)][string]$ToVersion,
+        [Parameter(Mandatory = $true)][string]$RepoRoot,
+        [Parameter(Mandatory = $true)][string]$ExtensionId
+    )
+
+    if (& git tag --list "v$ToVersion") {
+        throw "Tag v$ToVersion already exists; $ToVersion has been released before."
+    }
+    $published = Get-LatestPublishedVersion -ExtensionId $ExtensionId
+    $fromVersion = $FromTag.TrimStart('v')
+    if (-not $published) {
+        Write-Host "Could not read the Marketplace's latest version; continuing on the git tags alone." -ForegroundColor Yellow
+    }
+    elseif ($published -ne $fromVersion) {
+        throw "The Marketplace's latest version is $published, not $fromVersion. Promote only the newest published pre-release."
+    }
+
+    Write-Host ""
+    Write-Host "Promote pre-release $fromVersion to stable $ToVersion" -ForegroundColor Cyan
+    Write-Host "  - builds the code at $FromTag in a temporary worktree (nothing unpublished on main is included)"
+    Write-Host "  - publishes it as stable $ToVersion"
+    Write-Host "  - tags v$ToVersion on the same commit as $FromTag"
+    Write-Host "  - sets main's package.json to $ToVersion, commits, and pushes main and the tag"
+    Write-Host ""
+    $mode = Read-Host "Type 'publish' to do it, 'dry' to build the package only (no publish, tag, commit or push), anything else to cancel"
+    $mode = $mode.Trim().ToLower()
+    if ($mode -ne "publish" -and $mode -ne "dry") {
+        Write-Host "Cancelled." -ForegroundColor Yellow
+        return
+    }
+    $dryRun = $mode -eq "dry"
+
+    $worktree = Join-Path ([System.IO.Path]::GetTempPath()) "ensemble-promote-$ToVersion"
+    if (Test-Path $worktree) { Remove-PromoteWorktree -Path $worktree }
+    & git worktree prune
+    & git worktree add --detach $worktree $FromTag
+    if ($LASTEXITCODE -ne 0) { throw "git worktree add failed for $FromTag." }
+
+    try {
+        Push-Location $worktree
+        try {
+            Write-Host ""
+            Write-Host "Installing dependencies for $FromTag..." -ForegroundColor Cyan
+            & pnpm install --frozen-lockfile
+            if ($LASTEXITCODE -ne 0) { throw "pnpm install failed in the $FromTag worktree." }
+
+            # vsce runs vscode:prepublish (type-check, lint, production build,
+            # workflow-safety, package-contents check) before packaging or
+            # publishing. --no-update-package-json/--no-git-tag-version keep the
+            # worktree untouched: the version is set only in the VSIX.
+            if ($dryRun) {
+                $vsix = Join-Path ([System.IO.Path]::GetTempPath()) "ensemble-$ToVersion-dry-run.vsix"
+                Write-Host ""
+                Write-Host "Dry run: packaging $FromTag as $ToVersion..." -ForegroundColor Cyan
+                & pnpm exec vsce package $ToVersion --no-update-package-json --no-git-tag-version -o $vsix
+                if ($LASTEXITCODE -ne 0) { throw "vsce package failed." }
+                Write-Host ""
+                Write-Host "Dry run OK. Package: $vsix" -ForegroundColor Green
+                Write-Host "Nothing was published, tagged, committed or pushed." -ForegroundColor Green
+                return
+            }
+
+            Write-Host ""
+            Write-Host "Publishing $FromTag as stable $ToVersion..." -ForegroundColor Cyan
+            & pnpm exec vsce publish $ToVersion --no-update-package-json --no-git-tag-version
+            if ($LASTEXITCODE -ne 0) {
+                throw "vsce publish failed. Nothing was tagged or committed; it is safe to run option 5 again."
+            }
+        }
+        finally {
+            Pop-Location
+        }
+    }
+    finally {
+        Remove-PromoteWorktree -Path $worktree
+    }
+
+    Write-Host ""
+    Write-Host "Published $ToVersion (stable, from $FromTag)." -ForegroundColor Green
+
+    # Record it in git: an annotated tag on the promoted commit, and main's
+    # package.json moved to the stable number so the next release continues
+    # from it (pre-release -> next odd minor, patch -> $ToVersion + 1 patch).
+    & git tag -a "v$ToVersion" -m "$ToVersion (stable, promoted from $FromTag)" "$FromTag^{commit}"
+    if ($LASTEXITCODE -ne 0) { throw "Published, but creating tag v$ToVersion failed. Create it by hand on $FromTag." }
+
+    $packagePath = Join-Path $RepoRoot "package.json"
+    $packageText = [System.IO.File]::ReadAllText($packagePath)
+    $updated = [regex]::new('"version"\s*:\s*"[^"]*"').Replace($packageText, "`"version`": `"$ToVersion`"", 1)
+    [System.IO.File]::WriteAllText($packagePath, $updated, (New-Object System.Text.UTF8Encoding($false)))
+    & git add package.json
+    & git commit -m "$ToVersion (stable, promoted from $FromTag)"
+    if ($LASTEXITCODE -ne 0) { throw "Published and tagged, but committing package.json failed. Set it to $ToVersion by hand." }
+
+    Write-Host ""
+    Write-Host "Pushing main and v$ToVersion..." -ForegroundColor Cyan
+    & git push origin HEAD
+    $pushMain = $LASTEXITCODE
+    & git push origin "v$ToVersion"
+    if ($pushMain -ne 0 -or $LASTEXITCODE -ne 0) {
+        throw "Published, but the push failed. Push main and tag v$ToVersion by hand."
+    }
+    Write-Host "Done." -ForegroundColor Green
+}
+
 $repoRoot = Get-RepoRoot
 Set-Location $repoRoot
 
@@ -106,19 +236,40 @@ else {
 }
 $nextMajor = "$($curMajor + 1).0.0"
 
+# Option 5 is offered only when the newest released tag is a pre-release.
+$newestTag = Get-NewestReleaseTag
+$promoteTo = $null
+if ($newestTag -and $newestTag -match '^v(\d+)\.(\d+)\.(\d+)$' -and ([int]$Matches[2] % 2) -eq 1) {
+    $promoteTo = "$($Matches[1]).$([int]$Matches[2] + 1).0"
+}
+
 # --- Prompt for release type, with a reminder of what each one means ---
 Write-Host "Which kind of release is this?" -ForegroundColor Cyan
 Write-Host "  [1] patch       -> $nextPatch  bug fixes, small internal changes, no new features, nothing breaks"
 Write-Host "  [2] minor       -> $nextMinor  new features / commands, backwards compatible"
 Write-Host "  [3] major       -> $nextMajor  breaking changes (rare for an extension: e.g. dropped commands/settings)"
 Write-Host "  [4] pre-release -> $nextPreRelease  only for users who chose 'Switch to Pre-Release Version'"
+if ($promoteTo) {
+    Write-Host "  [5] promote     -> $promoteTo  publish pre-release $newestTag as stable, without anything unpublished on main"
+}
+else {
+    Write-Host "  [5] promote     -> (unavailable: the newest release, $newestTag, is not a pre-release)" -ForegroundColor DarkGray
+}
 if ($onPreReleaseLine) {
     Write-Host ""
     Write-Host "  (You are on the pre-release line, so patch and minor both publish the next stable minor.)" -ForegroundColor DarkGray
 }
 Write-Host ""
 
-$choice = Read-Host "Enter 1, 2, 3 or 4 (or type patch/minor/major/pre-release)"
+$choice = Read-Host "Enter 1-5 (or type patch/minor/major/pre-release/promote)"
+
+if ($choice.Trim().ToLower() -match '^(5|promote)$') {
+    if (-not $promoteTo) {
+        throw "Nothing to promote: the newest release, $newestTag, is not a pre-release."
+    }
+    Invoke-PromotePreRelease -FromTag $newestTag -ToVersion $promoteTo -RepoRoot $repoRoot -ExtensionId "$($package.publisher).$($package.name)"
+    return
+}
 
 $preRelease = $false
 switch -Regex ($choice.Trim().ToLower()) {
