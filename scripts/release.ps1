@@ -60,11 +60,39 @@ function Get-NewestReleaseTag {
 
 function Remove-PromoteWorktree {
     param([Parameter(Mandatory = $true)][string]$Path)
-    # git cannot always delete a fresh node_modules on Windows ("Directory not
-    # empty"), so fall back to rmdir, then drop git's record of the worktree.
-    & git worktree remove --force $Path
-    if (Test-Path $Path) { & cmd /c "rmdir /s /q `"$Path`"" }
+    # Only ever called on the uniquely named worktree this run created.
+    # `git worktree remove` cannot delete a fresh node_modules on Windows
+    # ("Directory not empty", "Filename too long" for deep react-native
+    # paths), so delete it with rmdir and the \\?\ long-path prefix, then
+    # drop git's record of the worktree. The name check keeps rmdir away from
+    # any other folder.
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if ((Test-Path -LiteralPath $full) -and (Split-Path $full -Leaf) -like "ensemble-promote-*") {
+        # \\?\C:\... for a drive path, \\?\UNC\server\share\... for a UNC one.
+        $longPath = if ($full.StartsWith("\\")) { "\\?\UNC\" + $full.Substring(2) } else { "\\?\" + $full }
+        # Passed through an environment variable, not the command line: cmd
+        # expands %...% only once, so a literal % in the path is never
+        # re-expanded into a different folder.
+        $env:ENSEMBLE_PROMOTE_RMDIR = $longPath
+        try {
+            & cmd /c 'rmdir /s /q "%ENSEMBLE_PROMOTE_RMDIR%"'
+        }
+        finally {
+            Remove-Item Env:\ENSEMBLE_PROMOTE_RMDIR -ErrorAction SilentlyContinue
+        }
+    }
     & git worktree prune
+    if (Test-Path $Path) {
+        Write-Host "Could not delete the temporary folder $Path; delete it by hand." -ForegroundColor Yellow
+    }
+}
+
+function Write-PromoteRecovery {
+    # What is left to do by hand after a partial failure, as exact commands.
+    param([Parameter(Mandatory = $true)][string[]]$Steps)
+    Write-Host ""
+    Write-Host "To finish by hand, run in the repository (on main):" -ForegroundColor Yellow
+    foreach ($step in $Steps) { Write-Host "  $step" -ForegroundColor Yellow }
 }
 
 function Invoke-PromotePreRelease {
@@ -81,16 +109,38 @@ function Invoke-PromotePreRelease {
         [Parameter(Mandatory = $true)][string]$ExtensionId
     )
 
+    $fromVersion = $FromTag.TrimStart('v')
+    $message = "$ToVersion (stable, promoted from $FromTag)"
+    $setVersionStep = "npm pkg set version=$ToVersion"
+    $commitStep = "git commit --only -m `"$message`" -- package.json"
+    $tagStep = "git tag -a v$ToVersion -m `"$message`" `"$FromTag^{commit}`""
+    $pushMainStep = "git push origin main"
+    $pushTagStep = "git push origin v$ToVersion"
+
+    # The version commit and the push go to main, so refuse anywhere else.
+    $branch = & git symbolic-ref --quiet --short HEAD
+    if ($branch -ne "main") {
+        $where = if ($branch) { $branch } else { "a detached HEAD" }
+        throw "Option 5 must run on main (you are on $where). Check out main and try again."
+    }
     # Uncommitted work elsewhere is fine (it is neither built nor committed),
     # but the version commit below must contain only the version change.
     if (& git status --porcelain -- package.json) {
         throw "package.json has uncommitted changes. Commit or stash them first; option 5 commits only the new version number."
     }
     if (& git tag --list "v$ToVersion") {
-        throw "Tag v$ToVersion already exists; $ToVersion has been released before."
+        throw "Tag v$ToVersion already exists locally; $ToVersion has been released before."
+    }
+    # A local clone can lack a tag that exists on GitHub, and the push at the
+    # end needs GitHub anyway, so check it there too before publishing.
+    $remoteTag = & git ls-remote --tags origin "refs/tags/v$ToVersion"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not reach origin to check for tag v$ToVersion. Nothing was published."
+    }
+    if ($remoteTag) {
+        throw "Tag v$ToVersion already exists on origin; $ToVersion has been released before. Run 'git fetch --tags'."
     }
     $published = Get-LatestPublishedVersion -ExtensionId $ExtensionId
-    $fromVersion = $FromTag.TrimStart('v')
     if (-not $published) {
         Write-Host "Could not read the Marketplace's latest version; continuing on the git tags alone." -ForegroundColor Yellow
     }
@@ -102,8 +152,8 @@ function Invoke-PromotePreRelease {
     Write-Host "Promote pre-release $fromVersion to stable $ToVersion" -ForegroundColor Cyan
     Write-Host "  - builds the code at $FromTag in a temporary worktree (nothing unpublished on main is included)"
     Write-Host "  - publishes it as stable $ToVersion"
-    Write-Host "  - tags v$ToVersion on the same commit as $FromTag"
-    Write-Host "  - sets main's package.json to $ToVersion, commits only that file, and pushes main and the tag"
+    Write-Host "  - sets main's package.json to $ToVersion and commits only that file"
+    Write-Host "  - tags v$ToVersion on the same commit as $FromTag, and pushes main and the tag"
     Write-Host "    (your uncommitted changes are left as they are and are not pushed)"
     Write-Host ""
     $mode = Read-Host "Type 'publish' to do it, 'dry' to build the package only (no publish, tag, commit or push), anything else to cancel"
@@ -114,11 +164,13 @@ function Invoke-PromotePreRelease {
     }
     $dryRun = $mode -eq "dry"
 
-    $worktree = Join-Path ([System.IO.Path]::GetTempPath()) "ensemble-promote-$ToVersion"
-    if (Test-Path $worktree) { Remove-PromoteWorktree -Path $worktree }
+    # A fresh, uniquely named folder per run, so cleanup can only ever delete
+    # what this run created.
+    $suffix = [guid]::NewGuid().ToString("N").Substring(0, 8)
+    $worktree = Join-Path ([System.IO.Path]::GetTempPath()) "ensemble-promote-$ToVersion-$suffix"
     & git worktree prune
     & git worktree add --detach $worktree $FromTag
-    if ($LASTEXITCODE -ne 0) { throw "git worktree add failed for $FromTag." }
+    if ($LASTEXITCODE -ne 0) { throw "git worktree add failed for $FromTag. Nothing was published." }
 
     try {
         Push-Location $worktree
@@ -126,7 +178,7 @@ function Invoke-PromotePreRelease {
             Write-Host ""
             Write-Host "Installing dependencies for $FromTag..." -ForegroundColor Cyan
             & pnpm install --frozen-lockfile
-            if ($LASTEXITCODE -ne 0) { throw "pnpm install failed in the $FromTag worktree." }
+            if ($LASTEXITCODE -ne 0) { throw "pnpm install failed in the $FromTag worktree. Nothing was published." }
 
             # vsce runs vscode:prepublish (type-check, lint, production build,
             # workflow-safety, package-contents check) before packaging or
@@ -148,7 +200,15 @@ function Invoke-PromotePreRelease {
             Write-Host "Publishing $FromTag as stable $ToVersion..." -ForegroundColor Cyan
             & pnpm exec vsce publish $ToVersion --no-update-package-json --no-git-tag-version
             if ($LASTEXITCODE -ne 0) {
-                throw "vsce publish failed. Nothing was tagged or committed; it is safe to run option 5 again."
+                # A dropped connection can fail here after the Marketplace has
+                # already accepted the version, so do not claim nothing happened.
+                Write-Host ""
+                Write-Host "vsce publish reported a failure. Check the Marketplace for ${ToVersion}:" -ForegroundColor Yellow
+                Write-Host "  pnpm exec vsce show $ExtensionId" -ForegroundColor Yellow
+                Write-Host "If $ToVersion is NOT listed, nothing was released: fix the error and run option 5 again." -ForegroundColor Yellow
+                Write-Host "If $ToVersion IS listed, the publish went through." -ForegroundColor Yellow
+                Write-PromoteRecovery -Steps @($setVersionStep, $commitStep, $tagStep, $pushMainStep, $pushTagStep)
+                throw "vsce publish failed."
             }
         }
         finally {
@@ -162,28 +222,45 @@ function Invoke-PromotePreRelease {
     Write-Host ""
     Write-Host "Published $ToVersion (stable, from $FromTag)." -ForegroundColor Green
 
-    # Record it in git: an annotated tag on the promoted commit, and main's
-    # package.json moved to the stable number so the next release continues
-    # from it (pre-release -> next odd minor, patch -> $ToVersion + 1 patch).
-    & git tag -a "v$ToVersion" -m "$ToVersion (stable, promoted from $FromTag)" "$FromTag^{commit}"
-    if ($LASTEXITCODE -ne 0) { throw "Published, but creating tag v$ToVersion failed. Create it by hand on $FromTag." }
-
+    # Record it in git, version commit first so a failure never leaves a tag
+    # without it: main's package.json moves to the stable number so the next
+    # release continues from it (pre-release -> next odd minor, patch ->
+    # $ToVersion + 1 patch), then an annotated tag on the promoted commit.
     $packagePath = Join-Path $RepoRoot "package.json"
     $packageText = [System.IO.File]::ReadAllText($packagePath)
     $updated = [regex]::new('"version"\s*:\s*"[^"]*"').Replace($packageText, "`"version`": `"$ToVersion`"", 1)
     [System.IO.File]::WriteAllText($packagePath, $updated, (New-Object System.Text.UTF8Encoding($false)))
     # --only commits package.json alone; anything else you have staged stays
     # staged and uncommitted.
-    & git commit --only -m "$ToVersion (stable, promoted from $FromTag)" -- package.json
-    if ($LASTEXITCODE -ne 0) { throw "Published and tagged, but committing package.json failed. Set it to $ToVersion by hand." }
+    & git commit --only -m $message -- package.json
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Published, but committing package.json failed (package.json already says $ToVersion)." -ForegroundColor Yellow
+        Write-PromoteRecovery -Steps @($commitStep, $tagStep, $pushMainStep, $pushTagStep)
+        throw "git commit failed."
+    }
+
+    & git tag -a "v$ToVersion" -m $message "$FromTag^{commit}"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Published and committed, but creating tag v$ToVersion failed." -ForegroundColor Yellow
+        Write-PromoteRecovery -Steps @($tagStep, $pushMainStep, $pushTagStep)
+        throw "git tag failed."
+    }
 
     Write-Host ""
     Write-Host "Pushing main and v$ToVersion..." -ForegroundColor Cyan
-    & git push origin HEAD
+    & git push origin main
     $pushMain = $LASTEXITCODE
     & git push origin "v$ToVersion"
-    if ($pushMain -ne 0 -or $LASTEXITCODE -ne 0) {
-        throw "Published, but the push failed. Push main and tag v$ToVersion by hand."
+    $pushTag = $LASTEXITCODE
+    if ($pushMain -ne 0 -or $pushTag -ne 0) {
+        $left = @()
+        if ($pushMain -ne 0) { $left += $pushMainStep }
+        if ($pushTag -ne 0) { $left += $pushTagStep }
+        Write-Host "Published, committed and tagged, but a push failed. Fix the cause shown above" -ForegroundColor Yellow
+        Write-Host "(network, sign-in, branch protection) first. If git said main on GitHub has" -ForegroundColor Yellow
+        Write-Host "commits you do not have, run 'git pull --rebase --autostash origin main' first." -ForegroundColor Yellow
+        Write-PromoteRecovery -Steps $left
+        throw "git push failed."
     }
     Write-Host "Done." -ForegroundColor Green
 }
@@ -195,7 +272,10 @@ Set-Location $repoRoot
 # modified package script from turning a release into arbitrary command execution.
 $package = Get-Content (Join-Path $repoRoot "package.json") -Raw | ConvertFrom-Json
 $allowedRunners = @("npm", "pnpm", "yarn", "bun", "vsce")
-foreach ($name in @("package", "publish:patch", "publish:minor", "publish:major")) {
+# Only scripts the release actually runs: `package` (options 1-4) and
+# `vscode:prepublish`, which vsce runs before packaging or publishing. Every
+# option calls vsce directly, so the publish:* scripts are not used here.
+foreach ($name in @("package", "vscode:prepublish")) {
     $command = [string]$package.scripts.$name
     if (-not $command) { throw "Missing package script '$name'." }
     $runner = ($command -split '\s+')[0]

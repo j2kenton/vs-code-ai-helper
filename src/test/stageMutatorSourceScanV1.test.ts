@@ -617,7 +617,9 @@ function diffAgainstAllowlist(
     const srcRelativeKey = path.relative(SRC_DIR, file).split(path.sep).join("/");
     // LF always, so a CRLF checkout (Windows, core.autocrlf) yields the same
     // 150-character snippets as the LF files the allowlist was written from.
-    const content = fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
+    // A lone CR is a line break to JavaScript too; normalising it keeps a
+    // write after "// ...\r" from being read as part of that comment.
+    const content = fs.readFileSync(file, "utf8").replace(/\r\n?/g, "\n");
     const sites = finder(content);
     const allowed = allowlist.get(srcRelativeKey) ?? [];
     if (allowlist.has(srcRelativeKey)) {
