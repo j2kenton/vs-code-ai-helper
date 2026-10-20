@@ -55,14 +55,64 @@ function ruleBody(html: string, selector: string): string {
   return match[1]!;
 }
 
+function srgbToLinear(channel: number): number {
+  const c = channel / 255;
+  return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+}
+
+function hexChannels(hex: string): [number, number, number] {
+  const clean = hex.replace("#", "");
+  return [
+    parseInt(clean.slice(0, 2), 16),
+    parseInt(clean.slice(2, 4), 16),
+    parseInt(clean.slice(4, 6), 16),
+  ];
+}
+
+function relativeLuminance(hex: string): number {
+  const [r, g, b] = hexChannels(hex).map(srgbToLinear);
+  return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
+}
+
+function contrastRatio(a: string, b: string): number {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  const lighter = Math.max(la, lb);
+  const darker = Math.min(la, lb);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
+/** Mixes `a` over `b`, where `a` contributes `weightPercent` percent (sRGB interpolation, as CSS color-mix does). */
+function mixColors(a: string, b: string, weightPercent: number): string {
+  const weight = weightPercent / 100;
+  const channels = hexChannels(a).map((channel, index) =>
+    Math.round(channel * weight + hexChannels(b)[index]! * (1 - weight))
+  );
+  return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
 void describe("chat webview — info/disabled text contrast tokens", () => {
   void it("defines both tokens with light/dark overrides and no high-contrast override", () => {
     const html = chatHtml();
     assert.match(html, /--ensemble-info-foreground:\s*var\(--vscode-foreground\)/);
     assert.match(html, /--ensemble-disabled-foreground:\s*var\(--vscode-descriptionForeground\)/);
+    assert.match(html, /--ensemble-primary-foreground:\s*var\(--vscode-foreground\)/);
+    assert.match(html, /--ensemble-muted-foreground:\s*var\(--vscode-descriptionForeground\)/);
     assert.match(html, /body\.vscode-light\s*\{\s*--ensemble-info-foreground:\s*#000000;\s*\}/);
     assert.match(html, /body\.vscode-dark\s*\{\s*--ensemble-info-foreground:\s*#ffffff;\s*\}/);
+    assert.match(
+      html,
+      /body\.vscode-light\s*\{\s*--ensemble-primary-foreground:\s*#000000;\s*--ensemble-muted-foreground:\s*color-mix\(in srgb, var\(--ensemble-primary-foreground\)/
+    );
+    assert.match(
+      html,
+      /body\.vscode-dark\s*\{\s*--ensemble-primary-foreground:\s*#ffffff;\s*--ensemble-muted-foreground:\s*color-mix\(in srgb, var\(--ensemble-primary-foreground\)/
+    );
     assert.doesNotMatch(html, /body\.vscode-high-contrast[^{]*\{\s*--ensemble-info-foreground/);
+    assert.doesNotMatch(
+      html,
+      /body\.vscode-high-contrast[^{]*\{[^}]*(?:--ensemble-primary-foreground|--ensemble-muted-foreground)/
+    );
   });
 
   void it("colours the informational helper blocks with the info token", () => {
@@ -80,9 +130,75 @@ void describe("chat webview — info/disabled text contrast tokens", () => {
 
   void it("keeps metadata/status text on the muted colour", () => {
     const html = chatHtml();
-    for (const selector of [".msg-meta", ".msg-copy", "#busy-indicator", "#empty-notice"]) {
-      assert.match(ruleBody(html, selector), /color:\s*var\(--vscode-descriptionForeground\)/, selector);
+    for (const selector of [".msg-meta", ".msg-copy", "#busy-indicator", "#steering-note", "#send-reason"]) {
+      assert.match(ruleBody(html, selector), /color:\s*var\(--ensemble-muted-foreground\)/, selector);
     }
+  });
+
+  void it("keeps body copy on the primary colour", () => {
+    const html = chatHtml();
+    for (const selector of ["body", "#context", "#messages p.msg-user", "#messages p.msg-agent", "#empty-notice", ".msg-copy:hover"]) {
+      assert.match(ruleBody(html, selector), /color:\s*var\(--ensemble-primary-foreground\)/, selector);
+    }
+  });
+
+  void it("brightens the input placeholder without changing typed text", () => {
+    const html = chatHtml();
+    assert.match(
+      ruleBody(html, "#form textarea::placeholder"),
+      /color:\s*var\(--ensemble-muted-foreground\)/
+    );
+    assert.match(
+      ruleBody(html, "#form textarea"),
+      /color:\s*var\(--vscode-input-foreground,\s*var\(--vscode-foreground\)\)/
+    );
+  });
+
+  void it("keeps the muted tier readable and strictly below the primary tier", () => {
+    const html = chatHtml();
+    const tier = (theme: "light" | "dark"): { primary: string; percent: number; fallback: string } => {
+      const match = new RegExp(
+        `body\\.vscode-${theme}\\s*\\{\\s*--ensemble-primary-foreground:\\s*(#[0-9a-f]{6});\\s*` +
+          `--ensemble-muted-foreground:\\s*color-mix\\(in srgb, var\\(--ensemble-primary-foreground\\)\\s*(\\d+)%,\\s*` +
+          `var\\(--vscode-editor-background,\\s*(#[0-9a-f]{6})\\)\\);\\s*\\}`
+      ).exec(html);
+      assert.ok(match, `expected the ${theme} tier colour-mix rule`);
+      const [, primary, percent, fallback] = match;
+      return { primary: primary!, percent: Number(percent), fallback: fallback! };
+    };
+
+    const dark = tier("dark");
+    assert.equal(dark.fallback, "#1f1f1f");
+    const darkMuted = mixColors(dark.primary, "#1f1f1f", dark.percent);
+    assert.equal(darkMuted, "#b3b3b3");
+    assert.ok(contrastRatio(darkMuted, "#1f1f1f") >= 4.5, "dark muted contrast");
+    assert.ok(
+      contrastRatio(dark.primary, "#1f1f1f") > contrastRatio(darkMuted, "#1f1f1f"),
+      "dark primary is brighter than muted"
+    );
+    assert.ok(
+      contrastRatio(darkMuted, "#1f1f1f") < contrastRatio("#cccccc", "#1f1f1f"),
+      "dark muted stays below the typed-text input foreground"
+    );
+    const kimbieDarkMuted = mixColors(dark.primary, "#221a0f", dark.percent);
+    assert.ok(
+      contrastRatio(kimbieDarkMuted, "#51412c") >= 4.5,
+      "Kimbie Dark placeholder contrast on its input background"
+    );
+
+    const light = tier("light");
+    assert.equal(light.fallback, "#ffffff");
+    const lightMuted = mixColors(light.primary, light.fallback, light.percent);
+    assert.equal(lightMuted, "#595959");
+    assert.ok(contrastRatio(lightMuted, light.fallback) >= 4.5, "light muted contrast");
+    assert.ok(
+      contrastRatio(light.primary, light.fallback) > contrastRatio(lightMuted, light.fallback),
+      "light primary is darker than muted"
+    );
+    assert.ok(
+      contrastRatio(lightMuted, light.fallback) < contrastRatio("#3b3b3b", light.fallback),
+      "light muted stays below the typed-text input foreground"
+    );
   });
 
   void it("renders a disabled decision option with the disabled colour, not opacity", () => {

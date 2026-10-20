@@ -3286,18 +3286,34 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
              Both flip per theme kind below. */
           --ensemble-info-foreground: var(--vscode-foreground);
           --ensemble-disabled-foreground: var(--vscode-descriptionForeground);
+          /* Primary copy - body text, the heading, the message bubbles and the
+             completed-task notice - uses the platform foreground, which is
+             also the high-contrast fallback. Muted copy - metadata, status
+             lines and the input placeholder - is mixed one step below it so
+             the hierarchy survives the brightening. The theme rules below
+             resolve both. */
+          --ensemble-primary-foreground: var(--vscode-foreground);
+          --ensemble-muted-foreground: var(--vscode-descriptionForeground);
         }
         body.vscode-light { --ensemble-info-foreground: #000000; }
         body.vscode-dark { --ensemble-info-foreground: #ffffff; }
+        body.vscode-light {
+          --ensemble-primary-foreground: #000000;
+          --ensemble-muted-foreground: color-mix(in srgb, var(--ensemble-primary-foreground) 65%, var(--vscode-editor-background, #ffffff));
+        }
+        body.vscode-dark {
+          --ensemble-primary-foreground: #ffffff;
+          --ensemble-muted-foreground: color-mix(in srgb, var(--ensemble-primary-foreground) 66%, var(--vscode-editor-background, #1f1f1f));
+        }
         body {
           font-family: var(--vscode-font-family);
-          color: var(--vscode-foreground);
+          color: var(--ensemble-primary-foreground);
           background-color: var(--vscode-editor-background);
           padding: var(--ensemble-space-2) var(--ensemble-space-3);
           margin: 0;
         }
         #context {
-          color: var(--vscode-foreground);
+          color: var(--ensemble-primary-foreground);
           font-weight: bold;
           font-size: 1.1em;
           margin: 0 0 var(--ensemble-space-3);
@@ -3310,27 +3326,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .msg-row {
           margin: 0 0 var(--ensemble-space-4);
         }
-        /* .msg-meta, .msg-copy, #busy-indicator and #empty-notice stay on the
-           muted colour on purpose: they are metadata/status, not info blocks. */
+        /* Secondary copy (metadata, status lines) uses --ensemble-muted-foreground,
+           deliberately one step below the primary tier so the hierarchy survives
+           the brightening. #empty-notice is primary copy: in the completed-task
+           state it is the panel's only content. */
         .msg-meta {
           display: flex;
           align-items: center;
           gap: var(--ensemble-space-1);
           font-size: 0.85em;
-          color: var(--vscode-descriptionForeground);
+          color: var(--ensemble-muted-foreground);
           margin-top: 2px;
         }
         .msg-copy {
           background: none;
           border: none;
           cursor: pointer;
-          color: var(--vscode-descriptionForeground);
+          color: var(--ensemble-muted-foreground);
           padding: 0 var(--ensemble-space-1);
           font-size: 1em;
           line-height: 1;
         }
         .msg-copy:hover {
-          color: var(--vscode-foreground);
+          color: var(--ensemble-primary-foreground);
         }
         #messages p {
           margin: 0;
@@ -3346,14 +3364,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
            high-contrast themes, where a "highlight" background token can end
            up lighter than the foreground text meant to sit on it). */
         #messages p.msg-user {
-          color: var(--vscode-foreground);
+          color: var(--ensemble-primary-foreground);
           background-color: var(--vscode-editor-background);
           border: var(--ensemble-border-width) solid var(--vscode-foreground);
         }
         /* Agent/assistant messages: a distinct surface instead of a border,
            so the two roles are never confused at a glance. */
         #messages p.msg-agent {
-          color: var(--vscode-editor-foreground);
+          color: var(--ensemble-primary-foreground);
           background-color: var(--vscode-sideBar-background);
           border: none;
         }
@@ -3361,13 +3379,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           display: none;
           margin: var(--ensemble-space-2) 0;
           font-style: italic;
-          color: var(--vscode-descriptionForeground);
+          color: var(--ensemble-muted-foreground);
         }
         #empty-notice {
           display: none;
           margin: var(--ensemble-space-2) 0;
           font-style: italic;
-          color: var(--vscode-descriptionForeground);
+          color: var(--ensemble-primary-foreground);
         }
         #error {
           display: none;
@@ -3398,6 +3416,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder);
           outline-offset: var(--ensemble-border-width);
         }
+        #form textarea::placeholder, .interaction-question textarea::placeholder, .question-reply textarea::placeholder { color: var(--ensemble-muted-foreground); }
         #form button {
           align-self: flex-end;
           background-color: var(--vscode-button-background);
@@ -3428,7 +3447,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
            way regardless of which of the two answer channels raised it. */
         .interaction-title { font-weight: bold; margin-bottom: var(--ensemble-space-2); color: var(--vscode-inputValidation-warningForeground); }
         .interaction-answered { border-left: 3px solid var(--vscode-panel-border); padding-left: var(--ensemble-space-2); margin-left: calc(-1 * var(--ensemble-space-2)); }
-        .interaction-answered .interaction-title { color: var(--vscode-foreground); }
+        .interaction-answered .interaction-title { color: var(--ensemble-primary-foreground); }
         .interaction-question { margin-bottom: var(--ensemble-space-3); }
         .interaction-prompt { margin-bottom: var(--ensemble-space-1); }
         .interaction-help { font-size: 0.9em; color: var(--ensemble-info-foreground); margin-bottom: var(--ensemble-space-1); }
@@ -3453,7 +3472,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         .interaction-actions button:hover { background-color: var(--vscode-button-hoverBackground); }
         .interaction-actions button.secondary {
-          background-color: transparent; color: var(--vscode-foreground);
+          background-color: transparent; color: var(--ensemble-primary-foreground);
           border: var(--ensemble-border-width) solid var(--vscode-widget-border);
         }
         /* Part 10 item 13e: a pending legacy question's own bound reply
@@ -3496,10 +3515,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-gating { margin: 0 0 var(--ensemble-space-2); font-size: 0.9em; color: var(--ensemble-info-foreground); }
         .decision-card.decision-card-gating { border-left: 3px solid var(--vscode-inputValidation-warningBorder); padding-left: var(--ensemble-space-2); }
         .decision-gating.decision-gating-active { color: var(--vscode-inputValidation-warningForeground); font-weight: bold; }
-        #steering-note { display: none; margin: 0 0 var(--ensemble-space-2); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+        #steering-note { display: none; margin: 0 0 var(--ensemble-space-2); font-size: 0.85em; color: var(--ensemble-muted-foreground); }
         .interaction-actions + .msg-meta { margin-top: var(--ensemble-space-2); }
         .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--ensemble-info-foreground); }
-        #send-reason { display: none; margin-left: var(--ensemble-space-2); font-size: 0.85em; color: var(--vscode-descriptionForeground); }
+        #send-reason { display: none; margin-left: var(--ensemble-space-2); font-size: 0.85em; color: var(--ensemble-muted-foreground); }
       </style>
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>

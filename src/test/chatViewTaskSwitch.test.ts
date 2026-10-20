@@ -110,7 +110,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     const contextRule = /#context\s*\{([^}]*)\}/.exec(html);
     assert.ok(contextRule, "expected a #context CSS rule");
     assert.match(contextRule[1]!, /font-weight:\s*bold/);
-    assert.match(contextRule[1]!, /color:\s*var\(--vscode-foreground\)/);
+    assert.match(contextRule[1]!, /color:\s*var\(--ensemble-primary-foreground\)/);
     assert.doesNotMatch(contextRule[1]!, /descriptionForeground/);
 
     // User messages: foreground-on-editor-background with a foreground-
@@ -119,7 +119,7 @@ void describe("ChatViewProvider.ask() task-switch behavior", () => {
     // extension's text is what carries the message, in every theme.
     const userRule = /#messages p\.msg-user\s*\{([^}]*)\}/.exec(html);
     assert.ok(userRule, "expected a #messages p.msg-user CSS rule");
-    assert.match(userRule[1]!, /color:\s*var\(--vscode-foreground\)/);
+    assert.match(userRule[1]!, /color:\s*var\(--ensemble-primary-foreground\)/);
     assert.match(userRule[1]!, /background-color:\s*var\(--vscode-editor-background\)/);
     assert.match(userRule[1]!, /border:\s*var\(--ensemble-border-width\)\s*solid\s*var\(--vscode-foreground\)/);
 
