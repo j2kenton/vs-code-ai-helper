@@ -32,11 +32,20 @@ const AGENTIC_SESSION_ENV_PREFIXES = ["CLAUDE_CODE_"];
  * was latent (discovery never actually spawned a Windows npm-shim CLI like
  * opencode.cmd until shell:true was added there) but would have leaked the
  * session-identity vars this function strips the moment it did.
+ *
+ * `PWD` is dropped too. It describes the extension host's own directory,
+ * never the spawn's `cwd`, and OpenCode 2 prefers it over the real working
+ * directory: with a stale `PWD`, `opencode run` read and would have edited
+ * files in the extension host's folder instead of the task's workspace
+ * (verified live, opencode 2.0.32, 2026-10-20). Without it every CLI falls
+ * back to the spawn's actual `cwd`.
  */
 export function sanitizedCliEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
-    if (AGENTIC_SESSION_ENV_EXACT.has(key)) {
+    // Upper-cased: Windows environment names are case-insensitive, so a
+    // `Pwd` would still be read as PWD.
+    if (key.toUpperCase() === "PWD" || AGENTIC_SESSION_ENV_EXACT.has(key)) {
       continue;
     }
     if (AGENTIC_SESSION_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) {

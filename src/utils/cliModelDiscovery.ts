@@ -442,6 +442,54 @@ export function parseOpencodeModelsOutput(output: string): DiscoveredCliModel[] 
   return uniqueByModel(result);
 }
 
+/**
+ * OpenCode 2's model catalog, from `opencode api --standalone model.list`
+ * (verified live against opencode 2.0.32, 2026-10-20): one JSON object whose
+ * `data` array holds every model, each with `id`, `providerID`, `name` and a
+ * `variants` ARRAY of `{ id, settings }` (OpenCode 1's `models --verbose`
+ * used a variants OBJECT keyed by name; v2 dropped `--verbose` entirely).
+ * Emits the same "<provider>/<model>" and "<provider>/<model>@<variant>"
+ * entries parseOpencodeModelsOutput does, so storage and
+ * parseOpencodeModelSelection are unchanged. Anything that is not that shape
+ * yields no models.
+ */
+export function parseOpencodeApiModelListOutput(output: string): DiscoveredCliModel[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output.trim());
+  } catch {
+    return [];
+  }
+  const data = (parsed as { data?: unknown } | null)?.data;
+  if (!Array.isArray(data)) {
+    return [];
+  }
+  const result: DiscoveredCliModel[] = [];
+  for (const entry of data) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const model = entry as { id?: unknown; providerID?: unknown; name?: unknown; variants?: unknown };
+    if (typeof model.id !== "string" || !model.id || typeof model.providerID !== "string" || !model.providerID) {
+      continue;
+    }
+    const fullId = `${model.providerID}/${model.id}`;
+    const displayName = (typeof model.name === "string" && model.name.trim()) || fullId;
+    result.push({ model: fullId, name: displayName });
+    if (!Array.isArray(model.variants)) {
+      continue;
+    }
+    for (const variant of model.variants) {
+      const variantId = (variant as { id?: unknown } | null)?.id;
+      if (typeof variantId !== "string" || !variantId) {
+        continue;
+      }
+      result.push({ model: `${fullId}@${variantId}`, name: `${displayName} (${variantId})` });
+    }
+  }
+  return uniqueByModel(result);
+}
+
 export async function discoverOpencodeModels(command: string): Promise<
   DiscoveredCliModel[]
 > {
@@ -452,11 +500,14 @@ export async function discoverOpencodeModelsWithTimeout(
   command: string,
   timeoutMs: number
 ): Promise<DiscoveredCliModel[]> {
+  // `--standalone` runs a private server for this one request and exits with
+  // it, instead of starting (and leaving running) OpenCode 2's shared
+  // background service.
   return runCliModelDiscovery(
     command,
-    ["models", "--verbose"],
+    ["api", "--standalone", "model.list"],
     timeoutMs,
-    parseOpencodeModelsOutput
+    parseOpencodeApiModelListOutput
   );
 }
 

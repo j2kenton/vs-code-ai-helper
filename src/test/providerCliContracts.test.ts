@@ -243,6 +243,7 @@ void describe("provider CLI contracts", () => {
     const textArgs = opencode.buildArgs("text", undefined);
     assert.deepStrictEqual(textArgs, [
       "run",
+      "--standalone",
       "--format",
       "json",
       "--agent",
@@ -252,6 +253,7 @@ void describe("provider CLI contracts", () => {
     const editArgs = opencode.buildArgs("edit", "openai/gpt-5");
     assert.deepStrictEqual(editArgs, [
       "run",
+      "--standalone",
       "--format",
       "json",
       "--agent",
@@ -266,8 +268,8 @@ void describe("provider CLI contracts", () => {
     // model (unlike Codex) — each model declares its own variant set
     // (verified live via `opencode models --verbose`: "deepseek-v4-flash"
     // has "high"/"max", "north-mini-code-free" has "none"/"high"), so the
-    // suffix is passed through to --variant verbatim rather than validated
-    // against an allowlist — see parseOpencodeModelSelection's doc comment.
+    // suffix is passed through verbatim (OpenCode 2: `--model id#variant`)
+    // rather than validated against an allowlist — see parseOpencodeModelSelection's doc comment.
     assert.deepStrictEqual(parseOpencodeModelSelection(undefined), {
       model: undefined,
       variant: undefined,
@@ -290,15 +292,16 @@ void describe("provider CLI contracts", () => {
     const editArgs = opencode.buildArgs("edit", "opencode/deepseek-v4-flash@high");
     assert.deepStrictEqual(editArgs, [
       "run",
+      "--standalone",
       "--format",
       "json",
       "--agent",
       "build",
       "--model",
-      "opencode/deepseek-v4-flash",
-      "--variant",
-      "high",
+      "opencode/deepseek-v4-flash#high",
     ]);
+    // OpenCode 2 removed --variant; it must never be sent.
+    assert.ok(!editArgs.includes("--variant"));
 
     // Full round trip through the provider-qualified storage prefix too —
     // parseModelSelection only splits on the FIRST ":", so the "@variant"
@@ -316,9 +319,21 @@ void describe("provider CLI contracts", () => {
       for (const variant of ladder) {
         const newArgs = opencode.buildArgs("edit", `${model}@${variant}`);
         const at = newArgs.indexOf("--model");
-        assert.deepStrictEqual(newArgs.slice(at, at + 4), ["--model", model, "--variant", variant]);
+        assert.deepStrictEqual(newArgs.slice(at), ["--model", `${model}#${variant}`]);
       }
     }
+  });
+
+  void it("devpass-code (an OpenCode 1 fork) keeps OpenCode 1's --variant flag and no --standalone", () => {
+    const devpass = getCliProvider("devpass-cli");
+    assert.ok(devpass);
+    const args = devpass.buildArgs("edit", "devpass/some-model@high");
+    assert.ok(!args.includes("--standalone"));
+    assert.ok(!args.some((arg) => arg.includes("#")));
+    const at = args.indexOf("--variant");
+    assert.ok(at > 0, "devpass must still pass --variant");
+    assert.strictEqual(args[at + 1], "high");
+    assert.strictEqual(args[args.indexOf("--model") + 1], "devpass/some-model");
   });
 
   void it("OpenCode rejects a variant outside a known model's ladder instead of letting the CLI drop it", () => {

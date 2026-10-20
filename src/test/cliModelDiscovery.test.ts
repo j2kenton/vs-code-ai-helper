@@ -2,12 +2,15 @@ import * as assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { describe, it } from "node:test";
+import { OPENCODE_MODEL_VARIANTS, parseOpencodeModelSelection } from "../runners/providers";
 import {
+  discoverDevpassModelsWithTimeout,
   discoverKiroModelsWithTimeout,
   discoverOpencodeModelsWithTimeout,
   parseAgyModelsOutput,
   parseKimiModelsOutput,
   parseKiroModelsOutput,
+  parseOpencodeApiModelListOutput,
   parseOpencodeModelsOutput,
 } from "../utils/cliModelDiscovery";
 
@@ -523,7 +526,7 @@ void describe("parseOpencodeModelsOutput", () => {
     ]);
   });
 
-  void it("discovers models via `opencode models --verbose`, spawning with shell:true on Windows", async () => {
+  void it("discovers models via `opencode api --standalone model.list`, spawning with shell:true on Windows", async () => {
     // Regression guard for the actual bug this PR fixes: opencode installs
     // as an npm .cmd shim on Windows, and spawning without a shell fails
     // with "spawn opencode ENOENT" — verified live — which
@@ -550,7 +553,12 @@ void describe("parseOpencodeModelsOutput", () => {
       process.nextTick(() => {
         fake.stdout.emit(
           "data",
-          Buffer.from(verboseBlock("opencode", "big-pickle", "Big Pickle", { high: {} }))
+          Buffer.from(
+            JSON.stringify({
+              location: { directory: "/work" },
+              data: [{ id: "big-pickle", providerID: "opencode", name: "Big Pickle", variants: [{ id: "high", settings: {} }] }],
+            })
+          )
         );
         fake.emit("close", 0);
       });
@@ -562,7 +570,7 @@ void describe("parseOpencodeModelsOutput", () => {
       const parsed = await discoverOpencodeModelsWithTimeout("opencode", 500);
 
       assert.strictEqual(observedCommand, "opencode");
-      assert.deepStrictEqual(observedArgs, ["models", "--verbose"]);
+      assert.deepStrictEqual(observedArgs, ["api", "--standalone", "model.list"]);
       assert.strictEqual(observedOptions?.shell, true);
       assert.deepStrictEqual(parsed, [
         { model: "opencode/big-pickle", name: "Big Pickle" },
@@ -572,6 +580,104 @@ void describe("parseOpencodeModelsOutput", () => {
       childProcess.spawn = originalSpawn;
       Object.defineProperty(process, "platform", { value: originalPlatform });
     }
+  });
+
+  void it("devpass-code (an OpenCode 1 fork) still discovers via `models --verbose`", async () => {
+    const originalSpawn = childProcess.spawn;
+    let observedArgs: readonly string[] | undefined;
+    childProcess.spawn = ((_command: string, args: readonly string[] = []) => {
+      observedArgs = [...args];
+      const fake = new FakeChildProcess();
+      process.nextTick(() => {
+        fake.stdout.emit("data", Buffer.from(verboseBlock("devpass", "m1", "M1", { high: {} })));
+        fake.emit("close", 0);
+      });
+      return fake as unknown as import("node:child_process").ChildProcess;
+    }) as typeof childProcess.spawn;
+
+    try {
+      const parsed = await discoverDevpassModelsWithTimeout("devpass", 500);
+      assert.deepStrictEqual(observedArgs, ["models", "--verbose"]);
+      assert.deepStrictEqual(parsed, [
+        { model: "devpass/m1", name: "M1" },
+        { model: "devpass/m1@high", name: "M1 (high)" },
+      ]);
+    } finally {
+      childProcess.spawn = originalSpawn;
+    }
+  });
+});
+
+void describe("parseOpencodeApiModelListOutput (OpenCode 2)", () => {
+  // Trimmed from a live `opencode api --standalone model.list` (opencode
+  // 2.0.32, 2026-10-20): variants are an ARRAY of { id, settings }.
+  const live = JSON.stringify({
+    location: { directory: "/work" },
+    data: [
+      {
+        id: "gpt-6-sol",
+        modelID: "gpt-6-sol",
+        providerID: "opencode",
+        name: "GPT-6 Sol",
+        variants: [
+          { id: "none", settings: { reasoningEffort: "none" } },
+          { id: "high", settings: { reasoningEffort: "high" } },
+        ],
+        status: "active",
+        enabled: true,
+      },
+      { id: "glm-5.3", providerID: "opencode-go", name: "GLM-5.3", variants: [] },
+      { id: "no-name", providerID: "opencode" },
+    ],
+  });
+
+  void it("emits each model plus one @variant entry per variant id", () => {
+    assert.deepStrictEqual(parseOpencodeApiModelListOutput(live), [
+      { model: "opencode/gpt-6-sol", name: "GPT-6 Sol" },
+      { model: "opencode/gpt-6-sol@none", name: "GPT-6 Sol (none)" },
+      { model: "opencode/gpt-6-sol@high", name: "GPT-6 Sol (high)" },
+      { model: "opencode-go/glm-5.3", name: "GLM-5.3" },
+      { model: "opencode/no-name", name: "opencode/no-name" },
+    ]);
+  });
+
+  void it("the known variant ladders match OpenCode 2's live variants, and every discovered variant parses", () => {
+    // Variant ids for the OPENCODE_MODEL_VARIANTS models as returned live by
+    // `opencode api --standalone model.list` (opencode 2.0.32, 2026-10-20).
+    const liveVariants: Record<string, string[]> = {
+      "opencode/claude-opus-5-5": ["low", "medium", "high", "xhigh", "max"],
+      "opencode/gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+      "opencode/gpt-6-luna": ["none", "low", "medium", "high", "xhigh", "max"],
+      "opencode/gpt-6-sol": ["none", "low", "medium", "high", "xhigh", "max"],
+    };
+    assert.deepStrictEqual(Object.keys(liveVariants).sort(), Object.keys(OPENCODE_MODEL_VARIANTS).sort());
+    const output = JSON.stringify({
+      data: Object.entries(liveVariants).map(([fullId, variants]) => {
+        const [providerID, id] = fullId.split("/");
+        return { id, providerID, name: fullId, variants: variants.map((variant) => ({ id: variant })) };
+      }),
+    });
+    const discovered = parseOpencodeApiModelListOutput(output);
+    for (const [fullId, variants] of Object.entries(liveVariants)) {
+      for (const variant of variants) {
+        // Discovery offers it, and selection accepts it (throws otherwise).
+        assert.ok(discovered.some((entry) => entry.model === `${fullId}@${variant}`), `${fullId}@${variant}`);
+        assert.deepStrictEqual(parseOpencodeModelSelection(`${fullId}@${variant}`), { model: fullId, variant });
+      }
+    }
+    for (const [fullId, variants] of Object.entries(liveVariants)) {
+      assert.deepStrictEqual([...OPENCODE_MODEL_VARIANTS[fullId]!], variants, fullId);
+    }
+  });
+
+  void it("returns nothing for output that is not the model.list shape", () => {
+    assert.deepStrictEqual(parseOpencodeApiModelListOutput(""), []);
+    assert.deepStrictEqual(parseOpencodeApiModelListOutput("not json"), []);
+    assert.deepStrictEqual(parseOpencodeApiModelListOutput('{"data":{}}'), []);
+    assert.deepStrictEqual(
+      parseOpencodeApiModelListOutput('{"data":[{"id":"x"},{"providerID":"p"},null,{"id":"y","providerID":"p","variants":[{"id":""},{},"z"]}]}'),
+      [{ model: "p/y", name: "p/y" }]
+    );
   });
 });
 

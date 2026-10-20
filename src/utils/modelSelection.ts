@@ -900,12 +900,12 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
  * compacted to one minified JSON object per line (only the fields
  * parseOpencodeModelsOutput reads: id, providerID, name, variants —
  * cost/limit/capabilities/etc. are dropped, they're irrelevant to model
- * selection) and run through that SAME parser used for live discovery at
- * module load, rather than a hand-expanded array of {model, name} pairs.
- * This guarantees the seed and live discovery can never structurally
- * diverge — if parseOpencodeModelsOutput's variant-naming convention ever
- * changes, this seed picks up the change automatically instead of needing a
- * matching hand-edit elsewhere. Regenerate by piping a fresh `opencode
+ * selection) and run through parseOpencodeModelsOutput at module load,
+ * rather than a hand-expanded array of {model, name} pairs. That was OpenCode
+ * 1's live-discovery parser; OpenCode 2 discovery uses
+ * parseOpencodeApiModelListOutput, which emits the same
+ * "<provider>/<model>@<variant>" shape (pinned by a test in
+ * cliModelDiscovery.test.ts). Regenerate by piping a fresh `opencode
  * models --verbose` through the same id/providerID/name/variants compaction
  * when the catalog changes.
  */
@@ -1631,16 +1631,18 @@ const SEEDED_CLI_MODELS: Readonly<
   ],
   // Snapshot of `opencode models --verbose`'s full catalog (opencode 1.18.4,
   // captured 2026-07-21), including each model's own reasoning-effort
-  // variants expanded to "<provider>/<model>@<variant>" entries — see
-  // parseOpencodeModelsOutput in cliModelDiscovery.ts, which produces this
-  // exact same shape from a live CLI call. This is a MUCH larger catalog
+  // variants expanded to "<provider>/<model>@<variant>" entries — the same
+  // shape OpenCode 2 live discovery (parseOpencodeApiModelListOutput in
+  // cliModelDiscovery.ts) produces. This is a MUCH larger catalog
   // than Claude's/Codex's curated lists (466 entries vs ~2 base models)
   // because opencode proxies dozens of upstream providers rather than
   // exposing one vendor's own lineup, and it goes stale as models.dev's
   // catalog changes — unlike the small hand-curated lists above, this block
   // is meant to be regenerated wholesale, not hand-edited entry-by-entry.
-  // Regenerate by running `opencode models --verbose` through
-  // discoverOpencodeModelsWithTimeout and re-pasting its output here.
+  // Regenerate from OpenCode 2 with `opencode api --standalone model.list`,
+  // compacted to the `<provider>/<id>` + `{id,providerID,name,variants}`
+  // text blocks createSeededOpencodeModels expects (variants as an object
+  // keyed by variant id), and paste them into OPENCODE_SEEDED_CATALOG_RAW.
   "opencode-cli": createSeededOpencodeModels(),
   "devpass-cli": createSeededDevpassModels(),
   "cline-cli": createSeededClineModels(),

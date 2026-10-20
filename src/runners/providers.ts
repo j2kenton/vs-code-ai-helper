@@ -831,12 +831,14 @@ export const OPENCODE_MODEL_VARIANTS: Readonly<Record<string, readonly string[]>
  * against — each model declares its own (verified live via `opencode models
  * --verbose`: e.g. "deepseek-v4-flash" has "high"/"max", "north-mini-code-
  * free" has "none"/"high", "gpt-5" has "minimal"/"low"/"medium"/"high"), so
- * for most ids whatever follows the last "@" is passed through verbatim as
- * --variant rather than checked against an allowlist. This is safe only
- * because the only source of `@variant`-suffixed IDs is
- * parseOpencodeModelsOutput (cliModelDiscovery.ts), which derives them from
- * that same model's real variants object — an unrecognized --variant value is
- * silently ignored by the CLI rather than rejected (verified live), so a
+ * for most ids whatever follows the last "@" is passed through verbatim (as
+ * `--model provider/model#variant` since OpenCode 2; `--variant` before)
+ * rather than checked against an allowlist. This is safe only because the
+ * only source of `@variant`-suffixed IDs is model discovery
+ * (parseOpencodeApiModelListOutput / parseOpencodeModelsOutput in
+ * cliModelDiscovery.ts), which derives them from that same model's real
+ * variants — an unrecognized variant value was silently ignored by the
+ * OpenCode 1 CLI rather than rejected (verified live), so a
  * hand-typed bad variant would fail open (silently run without it) rather
  * than error, which is why this must never be reachable from free-text user
  * input.
@@ -1505,20 +1507,20 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     label: "OpenCode",
     command: "opencode",
     installHint:
-      "Install OpenCode (npm i -g opencode-ai), then run `opencode`, use `/connect`, and connect the OpenCode Zen or OpenCode Go service you intend to use.",
+      "Install OpenCode 2 (npm i -g @opencode/cli), then run `opencode`, use `/connect`, and connect the service you intend to use: OpenCode Console (for OpenCode Zen) or OpenCode Go.",
     loginHint:
       "Run `opencode` in a terminal, use `/connect`, and connect the OpenCode service for this model, then try again.",
     loginHintForModel(model): string {
       if (model?.startsWith("opencode-go/")) {
         return (
           "OpenCode Go is unavailable to the current OpenCode account. Run `opencode` in a terminal, " +
-          "use `/connect`, choose OpenCode Go, and paste the same OpenCode API key. Confirm that the Go subscription is active, then try again."
+          "use `/connect`, choose OpenCode Go, and paste a current OpenCode API key. Confirm that the Go subscription is active, then try again."
         );
       }
       if (model?.startsWith("opencode/")) {
         return (
           "OpenCode Zen is unavailable to the current OpenCode account. Run `opencode` in a terminal, " +
-          "use `/connect`, choose OpenCode Zen, and paste the OpenCode API key. Confirm that Zen billing is enabled, then try again."
+          "use `/connect`, choose OpenCode Console (OpenCode 2's name for the Zen sign-in), and paste a current OpenCode API key. Confirm that Zen billing is enabled, then try again."
         );
       }
       return this.loginHint;
@@ -1544,7 +1546,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     signInCommand: "opencode",
     signInLabel: "Sign in / Switch account",
     signInGuidance:
-      "Run `/connect` in the OpenCode terminal and select either OpenCode Zen or OpenCode Go. " +
+      "Run `/connect` in the OpenCode terminal and select OpenCode Console (for OpenCode Zen) or OpenCode Go. " +
       "They share your OpenCode account/API key, but each service needs its own billing or subscription entitlement.",
     usageUnsupportedReason:
       "OpenCode has no non-interactive, tier-specific quota or entitlement status command. " +
@@ -1591,7 +1593,11 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // statusCode so the "401" marker below still matches it.
     structuredEventStream: "opencode",
     buildArgs(mode, model): string[] {
-      const args = ["run", "--format", "json"];
+      // OpenCode 2 (verified live against 2.0.32, 2026-10-20) sends `run` to
+      // a shared background service unless told otherwise. `--standalone`
+      // gives each run its own private server in the run's working directory
+      // that exits with the run, as OpenCode 1 always behaved.
+      const args = ["run", "--standalone", "--format", "json"];
       // Verified live against opencode 1.18.4 via `opencode agent list`:
       // "plan" is a primary agent whose permission set denies `edit` on
       // every path via a wildcard deny rule, followed by a MORE SPECIFIC
@@ -1625,12 +1631,14 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // opencode's normal permission system already grants exactly what
       // each mode needs headlessly, so there is no reason to skip it.
       args.push("--agent", mode === "edit" ? "build" : "plan");
+      // OpenCode 2 removed `--variant`; the variant now rides on the model
+      // as `provider/model#variant` (`opencode run --help`, 2.0.32).
       const parsedModel = parseOpencodeModelSelection(model);
       if (parsedModel.model) {
-        args.push("--model", parsedModel.model);
-      }
-      if (parsedModel.variant) {
-        args.push("--variant", parsedModel.variant);
+        args.push(
+          "--model",
+          parsedModel.variant ? `${parsedModel.model}#${parsedModel.variant}` : parsedModel.model
+        );
       }
       return args;
     },
@@ -2336,7 +2344,7 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = reorder
     signInLabel: "Connect OpenCode Zen",
     signIn: { kind: "interactive", launch: "opencode", send: "/connect", validated: "verified" },
     signInGuidance:
-      "In the terminal, select OpenCode Zen and complete the connection with your OpenCode API key. " +
+      "In the terminal, select OpenCode Console (OpenCode 2's name for the Zen sign-in) and complete the connection with your OpenCode API key. " +
       "Zen uses the shared OpenCode account/key, but requires Zen billing. Only `opencode/...` models use this row.",
     usage: {
       kind: "unsupported",

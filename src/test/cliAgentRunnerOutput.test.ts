@@ -662,6 +662,32 @@ void describe("CLI output normalization", () => {
     }
   });
 
+  void it("drops PWD so a CLI works in the spawn's cwd, not the extension host's folder", () => {
+    // OpenCode 2 prefers PWD over the real working directory; a stale PWD
+    // sent its agent to read files in the extension host's folder (verified
+    // live, opencode 2.0.32, 2026-10-20).
+    const original = { ...process.env };
+    try {
+      process.env.PWD = "/some/other/folder";
+
+      const env = __testOnly.sanitizedCliEnv();
+
+      assert.strictEqual(env.PWD, undefined);
+      assert.strictEqual(env.PATH, original.PATH);
+
+      // Any spelling: Windows environment names are case-insensitive.
+      delete process.env.PWD;
+      process.env.Pwd = "/some/other/folder";
+      const mixed = __testOnly.sanitizedCliEnv();
+      assert.deepStrictEqual(
+        Object.keys(mixed).filter((key) => key.toUpperCase() === "PWD"),
+        []
+      );
+    } finally {
+      process.env = original;
+    }
+  });
+
   void it("preserves other providers' own env vars (e.g. CODEX_HOME) rather than stripping their whole namespace", () => {
     // Regression test: an earlier version of sanitizedCliEnv also stripped
     // every CODEX_* and GEMINI_CLI_* variable, on the mistaken assumption

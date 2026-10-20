@@ -1026,6 +1026,29 @@ function extractStructuredCliDiagnostics(
       const text = unwrapJsonString(data);
       scan.push(text);
       details.push(name ? `${name}: ${text}` : text);
+    } else if (typeof (err as { message?: unknown }).message === "string") {
+      // OpenCode 2's flat shape (verified live, 2.0.32, 2026-10-20):
+      // `{"type":"error","error":{"type":"provider.auth","message":"…",
+      // "status":401,"response":{"body":"…"}}}`. Same rules as the
+      // OpenCode 1 branch above: "HTTP <status>" for the auth markers, and
+      // the response body scanned but kept out of the user-facing detail.
+      const flat = err as { type?: unknown; message: string; status?: unknown; response?: unknown };
+      const kind = typeof flat.type === "string" ? flat.type : undefined;
+      const message = unwrapJsonString(flat.message);
+      if (kind) {
+        scan.push(kind);
+      }
+      scan.push(message);
+      const status = typeof flat.status === "number" ? flat.status : undefined;
+      if (status !== undefined) {
+        scan.push(`HTTP ${status}`);
+      }
+      const body = (flat.response as { body?: unknown } | null | undefined)?.body;
+      if (typeof body === "string") {
+        scan.push(body);
+      }
+      const text = [kind, message].filter((part): part is string => Boolean(part)).join(": ");
+      details.push(status === undefined ? text : `${text} (HTTP ${status})`);
     } else if (name) {
       details.push(name);
     }

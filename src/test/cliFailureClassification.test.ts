@@ -67,7 +67,7 @@ const OPENCODE_LIKE: CliProviderDefinition = {
   loginHintForModel(model): string {
     return model?.startsWith("opencode-go/")
       ? "OpenCode Go is unavailable to the current OpenCode account. Confirm that the Go subscription is active."
-      : "OpenCode Zen is unavailable to the current OpenCode account. Run `opencode` in a terminal, use `/connect`, choose OpenCode Zen, and paste the OpenCode API key. Confirm that Zen billing is enabled, then try again.";
+      : "OpenCode Zen is unavailable to the current OpenCode account. Run `opencode` in a terminal, use `/connect`, choose OpenCode Console (OpenCode 2's name for the Zen sign-in), and paste a current OpenCode API key. Confirm that Zen billing is enabled, then try again.";
   },
   authErrorMarkers: [
     "not logged in",
@@ -200,7 +200,7 @@ void describe("toFriendlyError — structured-stream providers", () => {
     const friendly = toFriendlyError(OPENCODE_LIKE, "opencode/deepseek-v4-flash-free", 1, "", stdout);
 
     assert.equal(friendly.authFailure, false);
-    assert.doesNotMatch(friendly.message, /paste the OpenCode API key/);
+    assert.doesNotMatch(friendly.message, /paste a current OpenCode API key/);
     assert.doesNotMatch(friendly.message, /Zen billing/);
   });
 
@@ -291,6 +291,29 @@ void describe("toFriendlyError — structured-stream providers", () => {
 
     assert.match(friendly.message, /APIError: No provider available \(HTTP 401\)/);
     assert.doesNotMatch(friendly.message, /sessionID|metadata|API_KEY/);
+  });
+
+  void it("reads OpenCode 2's flat error event: auth verdict, message and status, body kept out", () => {
+    // Shape verified live against opencode 2.0.32 (2026-10-20) with an
+    // expired Zen key: no `name`/`data`, just type, message, status and a
+    // response body.
+    const stdout = JSON.stringify({
+      type: "error",
+      timestamp: 1792477393629,
+      sessionID: "ses_test",
+      error: {
+        type: "provider.auth",
+        message:
+          "This API key has expired. Create a new API key in OpenCode Console and replace it in your client or secret store. Signing in again will not renew this key.",
+        status: 401,
+        response: { body: '{"error":{"type":"authentication_error","code":"api_key_expired"}}' },
+      },
+    });
+    const friendly = toFriendlyError(OPENCODE_LIKE, "opencode/deepseek-v4.1-flash-free", 1, "", stdout);
+
+    assert.equal(friendly.authFailure, true);
+    assert.match(friendly.message, /provider\.auth: This API key has expired\..*\(HTTP 401\)/);
+    assert.doesNotMatch(friendly.message, /authentication_error|sessionID/);
   });
 
   void it("falls back to the raw stream only when stdout is not an event stream at all", () => {
@@ -1045,7 +1068,7 @@ void describe("auth classification is structural, not textual", () => {
     );
 
     assert.equal(friendly.authFailure, true);
-    assert.match(friendly.message, /paste the OpenCode API key/);
+    assert.match(friendly.message, /paste a current OpenCode API key/);
     assert.equal(isAuthenticationFailure(friendly.message), true);
     assert.equal(isAuthenticationFailure(friendly.diagnosticText), false);
   });

@@ -65,7 +65,7 @@ Ensemble supports GitHub Copilot and nine CLI integrations. A provider is suppor
 | **Gemini CLI** | `npm install -g @google/gemini-cli` | Run `gemini` and sign in, or set `GEMINI_API_KEY` | **Gemini CLI was replaced by Antigravity CLI on 18 June 2026.** Free individual Google accounts can no longer use it; Google AI Pro/Ultra, a Gemini API key, Vertex AI and Code Assist Standard/Enterprise still work. Free users should use Antigravity CLI. See [quota and pricing](https://geminicli.com/docs/resources/quota-and-pricing/) | [Gemini CLI](https://github.com/google-gemini/gemini-cli) |
 | **Antigravity CLI** | Installer (below); installs `agy` to `~/.local/bin` | Run `agy` (browser sign-in), or set `GEMINI_API_KEY` | Free Individual plan; Google AI Pro/Ultra raise limits. Check the [pricing page](https://antigravity.google/pricing) for current limits | [Install](https://antigravity.google/docs/cli/install/) |
 | **Kiro CLI** | Installer (below) | `kiro-cli login` and a `KIRO_API_KEY` environment variable, because Ensemble runs Kiro headlessly (`chat --no-interactive`) | Kiro plans (Free, Pro, Pro+, Pro Max, Power); API keys are available only on Pro and above. See [pricing](https://kiro.dev/pricing/) | [CLI](https://kiro.dev/cli/), [headless mode](https://kiro.dev/docs/cli/headless/) |
-| **OpenCode Zen / Go** | Installer (below) or `npm install -g opencode-ai` | Run `opencode`, type `/connect`, choose Zen or Go and paste the API key from the OpenCode console | Zen: pay-as-you-go credits ([Zen](https://opencode.ai/docs/zen/)). Go: monthly subscription ([Go](https://opencode.ai/docs/go/)) | [OpenCode docs](https://opencode.ai/docs/) |
+| **OpenCode Zen / Go** | OpenCode 2: installer (below) or `npm install -g @opencode/cli` (replaces the OpenCode 1 package `opencode-ai`; uninstall that first) | Run `opencode`, type `/connect`, choose **OpenCode Console** (for Zen) or **OpenCode Go**, and paste the API key from the OpenCode Console | Zen: pay-as-you-go credits ([Zen](https://opencode.ai/docs/zen/)). Go: monthly subscription ([Go](https://opencode.ai/docs/go/)) | [OpenCode docs](https://opencode.ai/docs/) |
 | **Cline CLI** | `npm install -g cline` (Node 20+) | `cline auth`, then choose ClinePass | ClinePass subscription only (Ensemble always passes `-P cline-pass`). See [ClinePass](https://cline.bot/cline-pass) | [Installation](https://docs.cline.bot/cline-cli/installation), [authorizing](https://docs.cline.bot/getting-started/authorizing-with-cline) |
 | **Kimi Code CLI** | Official installer only (below) | `kimi login` | Kimi membership, or a Kimi Platform pay-as-you-go API key. See [membership](https://www.kimi.com/en/help/membership/membership-overview) | [Getting started](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started) |
 | **devpass-code** | `npm i -g devpass-code` | `devpass-code auth login`, then choose "LLM Gateway DevPass" | DevPass monthly subscription. See [DevPass](https://devpass.llmgateway.io/) | [GitHub](https://github.com/theopenco/devpass-code), [guide](https://docs.llmgateway.io/guides/devpass-code) |
@@ -85,14 +85,14 @@ curl -fsSL https://antigravity.google/cli/install.sh | bash
 # Kiro CLI
 curl -fsSL https://cli.kiro.dev/install | bash
 
-# OpenCode
-curl -fsSL https://opencode.ai/install | bash
+# OpenCode 2 (Windows: npm install -g @opencode/cli)
+curl -fsSL https://opencode.ai/v2/install | bash
 
 # Kimi Code CLI (Windows PowerShell: irm https://code.kimi.com/kimi-code/install.ps1 | iex)
 curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
 ```
 
-OpenCode appears as two separate provider rows in Ensemble: **OpenCode Zen** for `opencode/...` models and **OpenCode Go** for `opencode-go/...` models. They use the same `opencode` CLI and can use the same OpenCode key, but enabling or connecting one does not grant access to the other. A Zen/Go backup is only used when you explicitly select it as a backup model. devpass-code is a fork of OpenCode with its own single "LLM Gateway DevPass" account, so it appears as one provider row.
+OpenCode appears as two separate provider rows in Ensemble: **OpenCode Zen** for `opencode/...` models and **OpenCode Go** for `opencode-go/...` models. They use the same `opencode` CLI (OpenCode 2 is required) and can use the same OpenCode key, but enabling or connecting one does not grant access to the other. A Zen/Go backup is only used when you explicitly select it as a backup model. devpass-code is a fork of OpenCode with its own single "LLM Gateway DevPass" account, so it appears as one provider row.
 
 Enable the CLI providers you want under **Ensemble: Configure AI Models**. AI actions consume real quota or money, and implementation runs modify workspace files.
 
