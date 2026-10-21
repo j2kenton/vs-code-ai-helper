@@ -367,6 +367,7 @@ void describe("fast-forward fallback contract", () => {
       {
         skipImplementationSafetyCheck: false,
         preserveActiveFallback: false,
+        readReviewFromDisk: true,
         parentOperation,
         chatViewProvider: undefined,
       }
@@ -376,6 +377,7 @@ void describe("fast-forward fallback contract", () => {
       {
         skipImplementationSafetyCheck: true,
         preserveActiveFallback: true,
+        readReviewFromDisk: true,
         parentOperation,
         chatViewProvider: undefined,
       }

@@ -180,6 +180,7 @@ import {
   deletePath,
   openOrCreateDocument,
   readNonEmptyText,
+  readNonEmptyTextFromDisk,
   readTextIfExists,
   resolveCurrentPlanUri,
   safeOpenTextDocument,
@@ -1103,6 +1104,8 @@ interface RunnerFailureProbeV1 {
 }
 
 interface ApplyReviewOptions {
+  /** Read the promoted review artifact from disk for Fast Forward's automatic apply. */
+  readReviewFromDisk?: boolean;
   /** Skip repeated dirty/non-git workspace confirmations for internally chained runs. */
   skipImplementationSafetyCheck?: boolean;
   /** Preserve a stage's active fallback reservation across one internal retry loop. */
@@ -1262,9 +1265,24 @@ export function buildFastForwardApplyReviewOptions(
   return {
     skipImplementationSafetyCheck: preserveActiveFallback,
     preserveActiveFallback,
+    readReviewFromDisk: true,
     parentOperation,
     chatViewProvider,
   };
+}
+
+/**
+ * Read the review supplied to Apply Review. Fast Forward's coordinator has
+ * just promoted its review to disk without updating an already-open editor,
+ * while a standalone Apply Review should continue to honor buffer edits.
+ */
+function readApplyReviewContentV1(
+  reviewUri: vscode.Uri,
+  options: Pick<ApplyReviewOptions, "readReviewFromDisk"> = {}
+): Promise<string | undefined> {
+  return options.readReviewFromDisk
+    ? readReviewArtifactFromDiskV1(reviewUri)
+    : readNonEmptyText(reviewUri);
 }
 
 /**
@@ -1885,6 +1903,8 @@ async function readStandingImplBlockersV1(
       return undefined;
     }
     const uri = artifactUri(taskFolderUri, latest.stage);
+    // Editor-aware read is deliberate: advisory-only notice over a previous
+    // round's artifact, never a just-promoted one.
     const content = uri ? await readTextIfExists(uri) : undefined;
     if (content === undefined) {
       return undefined;
@@ -2414,6 +2434,8 @@ export function selectReviewPromptTemplate(
 async function readPreviousReviewForRereview(
   reviewUri: vscode.Uri
 ): Promise<string | undefined> {
+  // Editor-aware read is deliberate: a hand-edited artifact is a legitimate
+  // re-review input, read long after any promotion.
   const currentReview = await readNonEmptyText(reviewUri);
   if (currentReview !== undefined && !isStaleReviewArtifact(currentReview)) {
     return currentReview;
@@ -5886,6 +5908,8 @@ export async function runReviewForFolder(
   // impl -> impl-high-review -> impl -> about to review again, which is
   // exactly the unchanged-round case above).
   if (!options.skipUnchangedTreeGuard && REVIEWED_COMMIT_STAGES.has(targetStage)) {
+    // Editor-aware read is deliberate: compares the previous review's
+    // commit/tree fingerprint, not the just-promoted review.
     const existingReviewContent = await readNonEmptyText(reviewUri);
     const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
     // Exclude this stage's own review artifact (and its backup) from its own
@@ -7188,6 +7212,27 @@ export function completedReviewAttemptSinceV1(
   return { attemptId: latest.attemptId, score: latest.score, rejected: latest.rejected };
 }
 
+/**
+ * Read a review artifact from disk only, never from an open editor buffer.
+ *
+ * The coordinator promotes a freshly written review to disk with a temp file
+ * plus `fs.promises.rename` (`services/workflowFileStoreV1.ts`), which
+ * bypasses any open document. VS Code has not necessarily reloaded that
+ * document yet when Fast Forward reads it straight back, so the buffer can
+ * still hold the PREVIOUS content — for `publish-review.md` that is the
+ * Publish Checks report, which has no Readiness line, and reading it made a
+ * perfectly good review look unusable. The disk is the only source the
+ * coordinator wrote, so decision reads that follow a promotion go through
+ * here.
+ *
+ * @internal exported for testing
+ */
+export function readReviewArtifactFromDiskV1(
+  reviewUri: vscode.Uri
+): Promise<string | undefined> {
+  return readNonEmptyTextFromDisk(reviewUri);
+}
+
 export type PublishInitialRereadV1 =
   | { readonly kind: "usable" }
   | { readonly kind: "notRun" }
@@ -7332,6 +7377,8 @@ export async function describeUnusableReviewBlockV1(
  * @internal exported for testing
  */
 export async function backupReviewUnlessStale(reviewUri: vscode.Uri): Promise<void> {
+  // Editor-aware read is deliberate: write path, and the write that follows
+  // keeps the buffer and disk in sync.
   const existing = await readNonEmptyText(reviewUri);
   // The in-progress placeholder is excluded for the same reason as the stale
   // one: it can never be worth preserving as the "previous version" — if a
@@ -7366,6 +7413,8 @@ export async function markReviewArtifactStale(
   // upsertArtifactChangeStaleBannerV1's doc comment — so `_prev` continues
   // to serve View Changes' own purpose (diffing against the PRIOR write) and
   // is no longer this artifact's only surviving copy of its own content.
+  // Editor-aware read is deliberate: write path that bannerizes the artifact
+  // and writes it back.
   const existing = await readNonEmptyText(reviewUri);
   if (existing === undefined) {
     // No real review to preserve — this is the "no review has ever run" case
@@ -7455,6 +7504,8 @@ export interface InProgressReviewMarkingV1 {
 export async function beginInProgressReviewMarkingV1(
   reviewUri: vscode.Uri
 ): Promise<InProgressReviewMarkingV1> {
+  // Editor-aware read is deliberate: write path that swaps in the in-progress
+  // banner.
   const current = await readTextIfExists(reviewUri);
   if (current === undefined) {
     return { rewrote: false };
@@ -8220,7 +8271,7 @@ export async function applyReviewWithAI(
   const runApply = async (op: TaskOperationHandle): Promise<boolean> => {
     return runWithNotificationTaskContextV1(resolved.progress.displayName, resolved.folderUri.fsPath, async () => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
-    const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
+    const reviewContent = reviewUri && (await readApplyReviewContentV1(reviewUri, options));
     if (!reviewContent) {
       NotificationRouter.showWarning(
         "No review found (or it is empty). Run the review before applying it."
@@ -8983,7 +9034,9 @@ export async function fastForwardReviewWithAI(
     }
   }
 
-  let initialContent = await readNonEmptyText(reviewUri);
+  // Disk, not the editor buffer: the coordinator writes the artifact to disk
+  // only, and an open publish-review.md may still hold pre-promotion content.
+  let initialContent = await readReviewArtifactFromDiskV1(reviewUri);
   if (
     initialContent !== undefined &&
     (isUnusableAsExistingReview(initialContent) ||
@@ -9138,7 +9191,9 @@ export async function fastForwardReviewWithAI(
       ffFailedStepV1 = "Review";
     }
     ffCoordinatorOutcomeForAdmissionV1 = ffInitialReviewProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
-    initialContent = await readNonEmptyText(reviewUri);
+    // Disk, not the editor buffer: the review just dispatched is promoted on
+    // disk, and an open document may still hold the pre-promotion content.
+    initialContent = await readReviewArtifactFromDiskV1(reviewUri);
     if (
       publishBaseline !== undefined &&
       (initialContent === undefined || isUnusableAsExistingReview(initialContent))
@@ -9155,7 +9210,10 @@ export async function fastForwardReviewWithAI(
             ffInitialReviewProbe.dispatched
           )
         : undefined;
-      const reread = await readNonEmptyText(reviewUri);
+      // Disk, not the editor buffer: this is the read that classified a
+      // freshly promoted review as "no Readiness line" when the editor still
+      // held the Publish Checks report.
+      const reread = await readReviewArtifactFromDiskV1(reviewUri);
       const classified = classifyPublishInitialRereadV1(reread, completed);
       console.log(
         `[fast-forward] Publish initial review re-read: ${classified.kind}` +
@@ -9689,7 +9747,10 @@ export async function fastForwardReviewWithAI(
             if (await ffStageHasLeftV1()) {
               return null;
             }
-            const newContent = await readNonEmptyText(reviewUri);
+            // Disk, not the editor buffer: `previousContent` is seeded from the
+            // disk-based `initialContent`, so the baseline and this re-read must
+            // share the same source or a stale buffer scores as a new review.
+            const newContent = await readReviewArtifactFromDiskV1(reviewUri);
             if (!newContent || newContent === previousContent) {
               return null;
             }
@@ -10568,6 +10629,7 @@ export async function viewReview(
   if (!reviewUri) {
     return;
   }
+  // Editor-aware read is deliberate: display-only.
   const content = await readNonEmptyText(reviewUri);
   if (!content) {
     const viewReviewTaskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath);
@@ -10837,6 +10899,8 @@ async function getOutstandingPlanReviewBlockersForAdvanceV1(
     return [];
   }
   const reviewUri = vscode.Uri.joinPath(folderUri, filename);
+  // Editor-aware read is deliberate: outstanding plan-review blockers,
+  // read long after promotion at advance time.
   const content = await readTextIfExists(reviewUri);
   if (!content?.trim()) {
     return [];
@@ -15580,6 +15644,8 @@ export async function runImplementationWithAI(
     const applyReviewContinuationStage = shouldContinueAsApplyReviewV1(recoveryRecord);
     if (applyReviewContinuationStage) {
       const sourceReviewUri = artifactUri(resolved.folderUri, applyReviewContinuationStage);
+      // Editor-aware read is deliberate: the source stage's review as AI
+      // input, not a just-promoted decision read.
       const sourceReviewContent = sourceReviewUri && (await readNonEmptyText(sourceReviewUri));
       let reconstructionError: string | undefined;
       if (sourceReviewContent) {
@@ -16023,7 +16089,7 @@ export async function applyReviewEditWithAI(
   const runApply = (op: TaskOperationHandle): Promise<boolean> =>
     runWithNotificationTaskContextV1(resolved.progress.displayName, resolved.folderUri.fsPath, async () => {
     const reviewUri = artifactUri(resolved.folderUri, stage);
-    const reviewContent = reviewUri && (await readNonEmptyText(reviewUri));
+    const reviewContent = reviewUri && (await readApplyReviewContentV1(reviewUri, options));
     if (!reviewContent) {
       NotificationRouter.showWarning(
         "No review found (or it is empty). Run the review before applying it."
