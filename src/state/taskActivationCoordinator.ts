@@ -148,7 +148,7 @@ async function activateTaskLocked(
         vscode.Uri.file(task.taskFolderPath),
         // preserveFreshness: pausing the others is a side effect of focusing
         // the target, not progress on those tasks — bumping their updatedAt
-        // would reshuffle the recency-ordered task list on every activation.
+        // would make them look recently worked on to the staleness logic.
         (current) => updateTaskStatus(current, "paused", { preserveFreshness: true }),
         { skipLock: true }
       );
@@ -178,8 +178,9 @@ async function activateTaskLocked(
       : await patchTaskProgressStrictV1(
           vscode.Uri.file(taskFolderPath),
           // preserveFreshness: activating a task is selection, not progress —
-          // bumping updatedAt here hoisted whichever task was made current to
-          // the top of the recency-ordered task list, as if it were pinned.
+          // bumping updatedAt here would make selection look like progress to
+          // the watchdog and the "Last updated" tooltip. (List order does not
+          // depend on updatedAt.)
           // (The writeTarget reopen path is a real lifecycle write and keeps
           // its own coordinator-clock updatedAt.)
           (current) => updateTaskStatus(options?.mutateTarget ? options.mutateTarget(current) : current, "active", { preserveFreshness: true }),
@@ -251,7 +252,7 @@ async function rollback(previous: Array<{ taskFolderPath: string; status: string
   for (const folder of changed) {
     const old = previous.find(item => item.taskFolderPath === folder);
     // preserveFreshness: undoing this activation's own bookkeeping writes —
-    // recency must end up exactly where it started.
+    // updatedAt must end up exactly where it started.
     if (old) await patchTaskProgressStrictV1(vscode.Uri.file(folder), current => updateTaskStatus(current, old.status as TaskStatus, { preserveFreshness: true }), { skipLock: true });
   }
 }

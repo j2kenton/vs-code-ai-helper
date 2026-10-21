@@ -133,9 +133,9 @@ export function updateTaskProgressStage(
  * `preserveFreshness` keeps `updatedAt` untouched for status flips that are
  * pure focus/selection bookkeeping rather than task progress — activating a
  * task (and pausing the others as a side effect of that activation) must not
- * bump its recency, because the task list orders unpinned tasks by
- * `updatedAt` and a bump would hoist whichever task was merely selected to
- * the top as if it were pinned. Real lifecycle writes (explicit pause,
+ * bump its freshness, since `updatedAt` feeds staleness/watchdog logic and a
+ * bump would make a merely selected task look recently worked on (it does
+ * not affect task list order). Real lifecycle writes (explicit pause,
  * escalation pause, reopen) keep the default bump.
  */
 export function updateTaskStatus(
@@ -1087,7 +1087,8 @@ export function recordEscalation(
  *
  * `preserveFreshness` skips the `updatedAt` bump for callers where the clear
  * is a side effect of selecting/resuming a task rather than task progress
- * (see `updateTaskStatus` — same recency-ordering rationale).
+ * (see `updateTaskStatus` — the bump would misrepresent selection as progress;
+ * list order is by task ID and does not depend on `updatedAt`).
  */
 export function clearEscalation(
   progress: TaskProgress,

@@ -374,7 +374,7 @@ export async function resumePausedTask(
         // `updatedAt` IS bumped here, deliberately (v1 fixes item 1,
         // 2026-09-07). This call previously passed `preserveFreshness: true`
         // on the reasoning that "resuming is selection, not progress" and so
-        // must not hoist the task in the recency-ordered list. That reasoning
+        // must not count as recent activity. That reasoning
         // is defensible for focus/selection (see taskActivationCoordinator,
         // which still preserves freshness when activating one task pauses the
         // others), but for an explicit resume it hands the stalled-task
@@ -401,9 +401,8 @@ export async function resumePausedTask(
         //
         // Bumping here makes the window a full quiet period measured from the
         // resume itself, which is the event that actually means "a human is
-        // dealing with this". The cost is that an explicitly resumed task sorts
-        // to the top of the task list — the correct outcome, since the user
-        // just acted on it.
+        // dealing with this". The bump refreshes "Last updated" but does not
+        // move the task in the list, which is ordered by task ID.
         // The bump is applied HERE, unconditionally, and deliberately NOT left
         // to `clearEscalation` (2026-09-08 defect report — the first shipped
         // attempt at this fix, in 0.105.0/0.106.0, did exactly that and was

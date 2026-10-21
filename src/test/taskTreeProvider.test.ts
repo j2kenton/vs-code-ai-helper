@@ -67,14 +67,14 @@ function makeTask(currentStage: TaskStage = "impl"): {
 void describe("orderTasksForDisplay", () => {
   function taskEntry(
     name: string,
-    overrides: { pinnedAt?: string; updatedAt?: string; displayName?: string } = {}
+    overrides: { pinnedAt?: string; updatedAt?: string; displayName?: string; status?: string } = {}
   ): IncompleteTask {
     return {
       folderUri: vscode.Uri.file(`/workspace/tasks/${name}`),
       folderName: name,
       progress: {
         currentStage: "impl",
-        status: "active",
+        status: overrides.status ?? "active",
         taskFolder: name,
         createdAt: "2026-01-01T00:00:00.000Z",
         updatedAt: overrides.updatedAt ?? "2026-01-01T00:00:00.000Z",
@@ -96,28 +96,37 @@ void describe("orderTasksForDisplay", () => {
     );
   });
 
-  void it("sorts unpinned tasks by recency then task name as tiebreaker", () => {
+  void it("orders unpinned tasks by task ID, newest first, regardless of updatedAt", () => {
     const ordered = orderTasksForDisplay([
-      taskEntry("zeta", { updatedAt: "2026-05-01T00:00:00.000Z" }),
-      taskEntry("alpha", { updatedAt: "2026-05-01T00:00:00.000Z" }),
-      taskEntry("older-but-b", { updatedAt: "2026-04-01T00:00:00.000Z" }),
+      taskEntry("2026-01-01_task_1", { updatedAt: "2026-06-01T00:00:00.000Z" }),
+      taskEntry("2026-01-02_task_1", { updatedAt: "2026-01-01T00:00:00.000Z" }),
     ]);
     assert.deepEqual(
       ordered.map((t) => t.folderName),
-      ["alpha", "zeta", "older-but-b"],
-      "equal updatedAt must fall back to the display name for a deterministic order"
+      ["2026-01-02_task_1", "2026-01-01_task_1"]
     );
   });
 
-  void it("uses displayName over folderName for the tiebreaker when present", () => {
-    const ordered = orderTasksForDisplay([
-      taskEntry("2026-01-01_task_1", { displayName: "zz rename" }),
-      taskEntry("2026-01-01_task_2", { displayName: "aa rename" }),
+  void it("keeps the same order for any mix of statuses", () => {
+    const names = ["2026-01-03_task_1", "2026-01-02_task_1", "2026-01-01_task_1"];
+    const statuses = ["active", "paused", "completed"];
+    for (const rotation of [0, 1, 2]) {
+      const ordered = orderTasksForDisplay(
+        names.map((n, i) => taskEntry(n, { status: statuses[(i + rotation) % 3] }))
+      );
+      assert.deepEqual(ordered.map((t) => t.folderName), names);
+    }
+  });
+
+  void it("keeps the same order after a displayName change", () => {
+    const newer = "2026-01-02_task_1";
+    const older = "2026-01-01_task_1";
+    const before = orderTasksForDisplay([newer, older].map((n) => taskEntry(n, { displayName: "aa" })));
+    const after = orderTasksForDisplay([
+      taskEntry(newer, { displayName: "zz rename" }),
+      taskEntry(older, { displayName: "aa" }),
     ]);
-    assert.deepEqual(
-      ordered.map((t) => t.progress.displayName),
-      ["aa rename", "zz rename"]
-    );
+    assert.deepEqual(after.map((t) => t.folderName), before.map((t) => t.folderName));
   });
 });
 

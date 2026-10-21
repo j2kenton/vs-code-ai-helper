@@ -304,19 +304,19 @@ async function withStubbedCommands<T>(callback: () => Promise<T>): Promise<T> {
 
 void describe("TaskTreeProvider — autoFirstActive expands the first active task in display order", () => {
   void it("expands the first ACTIVE task even when a completed task sorts above it", async () => {
-    // The completed task is more recent, so it is ordered[0]; the active task
-    // below it must still receive the auto-expansion.
-    const completed = makeInventoryTask("/workspace/tasks/done-task", "done-task", "completed", "2026-08-09T00:00:00.000Z");
-    const active = makeInventoryTask("/workspace/tasks/live-task", "live-task", "active", "2026-08-05T00:00:00.000Z");
+    // The completed task has the newer task ID, so it is ordered[0]; the
+    // active task below it must still receive the auto-expansion.
+    const completed = makeInventoryTask("/workspace/tasks/2026-08-09_task_1", "2026-08-09_task_1", "completed", "2026-08-09T00:00:00.000Z");
+    const active = makeInventoryTask("/workspace/tasks/2026-08-05_task_1", "2026-08-05_task_1", "active", "2026-08-05T00:00:00.000Z");
 
     const provider = new TaskTreeProvider(makeInventoryWithTasks([completed, active]));
     const children = await withStubbedCommands(() => provider.getChildren());
     const taskNodes = children.filter((c): c is TaskNode => c instanceof TaskNode);
     assert.equal(taskNodes.length, 2);
-    assert.equal(taskNodes[0]?.task.folderName, "done-task", "the completed task stays first by recency");
+    assert.equal(taskNodes[0]?.task.folderName, "2026-08-09_task_1", "the completed task stays first by task ID");
 
-    const doneNode = taskNodes.find((n) => n.task.folderName === "done-task");
-    const liveNode = taskNodes.find((n) => n.task.folderName === "live-task");
+    const doneNode = taskNodes.find((n) => n.task.folderName === "2026-08-09_task_1");
+    const liveNode = taskNodes.find((n) => n.task.folderName === "2026-08-05_task_1");
     assert.equal(
       liveNode?.collapsibleState,
       vscode.TreeItemCollapsibleState.Expanded,

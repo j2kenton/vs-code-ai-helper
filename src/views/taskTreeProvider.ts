@@ -36,7 +36,7 @@ import {
 import { describeTaskFixableBlockersV1 } from "../utils/reviewRouting";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { isWaitingForHumanV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
-import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
+import { TaskInventory, TaskWithProgress, compareTasksNewestFirst } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { buildTaskContextValue, buildStageContextValue, TaskCreationContextInput } from "../utils/contextTokens";
@@ -73,24 +73,17 @@ export const TASKS_VIEW_ID = "vs-code-ai-helper.tasksView";
 
 /**
  * Task-list display order: pinned tasks first (most recently pinned first),
- * then unpinned tasks by recency (updatedAt descending) with the task
- * display name as a deterministic tiebreaker for equal timestamps.
+ * then unpinned tasks by task ID, newest first. Status, `updatedAt` and
+ * display name never affect a task's position.
  * Exported for direct unit testing.
  */
 export function orderTasksForDisplay(visible: readonly IncompleteTask[]): IncompleteTask[] {
-  const displayLabel = (t: IncompleteTask): string =>
-    t.progress.displayName ?? t.folderName;
   const pinned = visible
     .filter((t) => t.progress.pinnedAt !== undefined)
     .sort((a, b) => String(b.progress.pinnedAt).localeCompare(String(a.progress.pinnedAt)));
   const unpinned = visible
     .filter((t) => t.progress.pinnedAt === undefined)
-    .sort((a, b) => {
-      const recency =
-        new Date(b.progress.updatedAt).getTime() -
-        new Date(a.progress.updatedAt).getTime();
-      return recency !== 0 ? recency : displayLabel(a).localeCompare(displayLabel(b));
-    });
+    .sort((a, b) => compareTasksNewestFirst(a.folderName, b.folderName));
   return [...pinned, ...unpinned];
 }
 
