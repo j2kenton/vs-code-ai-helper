@@ -897,7 +897,11 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
  * the first capture — the catalog is server-side and grows over time; the
  * opencode/claude-opus-5-5 and opencode/gpt-6-* lines were added 2026-09-27
  * from an opencode 1.18.31 capture, without regenerating the rest),
- * compacted to one minified JSON object per line (only the fields
+ * 2026-10-21: added GPT-6.1 Sol and Gemini 4 Argon base IDs from the
+ * official Console / Go endpoint tables (see audit-2026-10-additions.md).
+ * Their variant ladders await a live capture; empty variants here mean
+ * provider defaults, not disabled thinking.
+ * Compacted to one minified JSON object per line (only the fields
  * parseOpencodeModelsOutput reads: id, providerID, name, variants —
  * cost/limit/capabilities/etc. are dropped, they're irrelevant to model
  * selection) and run through parseOpencodeModelsOutput at module load,
@@ -944,6 +948,8 @@ opencode/deepseek-v4-flash-free
 {"id":"deepseek-v4-flash-free","providerID":"opencode","name":"DeepSeek V4 Flash Free","variants":{"high":{},"max":{}}}
 opencode/deepseek-v4-pro
 {"id":"deepseek-v4-pro","providerID":"opencode","name":"DeepSeek V4 Pro","variants":{"high":{},"max":{}}}
+opencode/gemini-4-argon
+{"id":"gemini-4-argon","providerID":"opencode","name":"Gemini 4 Argon","variants":{}}
 opencode/gemini-3-flash
 {"id":"gemini-3-flash","providerID":"opencode","name":"Gemini 3 Flash","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
 opencode/gemini-3.1-pro
@@ -996,6 +1002,8 @@ opencode/gpt-5.6-sol
 {"id":"gpt-5.6-sol","providerID":"opencode","name":"GPT-5.6 Sol","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/gpt-5.6-terra
 {"id":"gpt-5.6-terra","providerID":"opencode","name":"GPT-5.6 Terra","variants":{"none":{},"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/gpt-6.1-sol
+{"id":"gpt-6.1-sol","providerID":"opencode","name":"GPT-6.1 Sol","variants":{}}
 opencode/gpt-6-astra
 {"id":"gpt-6-astra","providerID":"opencode","name":"GPT-6 Astra","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
 opencode/gpt-6-luna
@@ -1028,6 +1036,8 @@ opencode/qwen3.5-plus
 {"id":"qwen3.5-plus","providerID":"opencode","name":"Qwen3.5 Plus","variants":{"high":{},"max":{}}}
 opencode/qwen3.6-plus
 {"id":"qwen3.6-plus","providerID":"opencode","name":"Qwen3.6 Plus","variants":{"high":{},"max":{}}}
+opencode-go/gemini-4-argon-contributor
+{"id":"gemini-4-argon-contributor","providerID":"opencode-go","name":"Gemini 4 Argon Contributor","variants":{}}
 opencode-go/deepseek-v4-flash
 {"id":"deepseek-v4-flash","providerID":"opencode-go","name":"DeepSeek V4 Flash","variants":{"high":{},"max":{}}}
 opencode-go/deepseek-v4-pro
@@ -1598,6 +1608,10 @@ const SEEDED_CLI_MODELS: Readonly<
   // slug like `gemini-3.5-flash-medium` fails with "invalid --model"). Keep
   // these in sync with `agy models`' own output — see cliModelDiscovery.ts.
   "antigravity-cli": [
+    // Official model picker / thinking levels, checked 2026-10-21.
+    { model: "Gemini 4 Argon (Low)", name: "Gemini 4 Argon (Low)" },
+    { model: "Gemini 4 Argon (Medium)", name: "Gemini 4 Argon (Medium)" },
+    { model: "Gemini 4 Argon (High)", name: "Gemini 4 Argon (High)" },
     { model: "Gemini 3.7 Flash (Low)", name: "Gemini 3.7 Flash (Low)" },
     { model: "Gemini 3.7 Flash (Medium)", name: "Gemini 3.7 Flash (Medium)" },
     { model: "Gemini 3.7 Flash (High)", name: "Gemini 3.7 Flash (High)" },

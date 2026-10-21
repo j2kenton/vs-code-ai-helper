@@ -130,6 +130,12 @@
       "notes": "First manifest record for codex-cli. Adds gpt-6-astra, gpt-6-sol and gpt-6-luna with live-captured evidence; every other pre-existing seeded base id is recorded unverified pending a live `codex --model <id>` capture so no seeded id is left without a manifest entry.",
       "entries": [
         {
+          "id": "gpt-6.1-sol",
+          "status": "added",
+          "checkedAt": "2026-10-21",
+          "source": "Codex session available model catalog: gpt-6.1-sol, low/medium/high/xhigh/max/ultra, priority tier. Official model ID: https://developers.openai.com/api/docs/models/gpt-6.1-sol ."
+        },
+        {
           "id": "gpt-6-astra",
           "status": "added",
           "checkedAt": "2026-09-27",
@@ -202,6 +208,18 @@
       "freeLabelsAudited": false,
       "notes": "Added for the GPT-6 / Opus 5.5 task. Only the four new ids were added to the seed; the rest of the opencode/* snapshot was not regenerated. Seeded ids missing from this capture are recorded unverified rather than covered by the snapshot.",
       "entries": [
+        {
+          "id": "opencode/gpt-6.1-sol",
+          "status": "added",
+          "checkedAt": "2026-10-21",
+          "source": "https://opencode.ai/v2/docs/console/models/ lists the exact model ID and endpoint. Seed base selection only; provider-specific variants are left to live model.list discovery."
+        },
+        {
+          "id": "opencode/gemini-4-argon",
+          "status": "added",
+          "checkedAt": "2026-10-21",
+          "source": "https://opencode.ai/v2/docs/console/models/ lists the exact model ID and endpoint. Seed base selection only; provider-specific variants are left to live model.list discovery."
+        },
         {
           "id": "opencode/claude-opus-5-5",
           "status": "added",
