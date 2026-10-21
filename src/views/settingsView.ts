@@ -890,14 +890,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           /* Fallback is a boolean, so it uses the checkbox column the row
              layout has always reserved instead of making the user open a
-             dropdown to choose between two values. */
+             dropdown to choose between two values. The margin-top-only form
+             intentionally mirrors .row-enabled so the checkbox column stays
+             aligned. */
           .model-row .fallback-enabled {
-            margin: var(--ensemble-space-half) 0 0;
+            margin-top: var(--ensemble-space-1);
           }
           .model-row .fallback-label {
             flex: 1;
             margin: 0;
             padding: var(--ensemble-space-half) 0;
+            padding-left: calc(var(--ensemble-border-width) + var(--ensemble-space-1));
             font-size: var(--ensemble-small-font-size);
           }
           .model-row .strategy-spacer {
