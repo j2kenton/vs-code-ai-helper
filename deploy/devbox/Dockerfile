@@ -74,6 +74,9 @@ RUN printf '%s\n' \
 COPY entrypoint.sh /usr/local/bin/devbox-entrypoint
 COPY runner.sh /usr/local/bin/devbox-runner
 COPY install-extension.sh /usr/local/bin/devbox-install-extension
+# One command to bring every copy of Ensemble on the box to the newest
+# Marketplace version and report what each window runs.
+COPY update-ensemble.sh /usr/local/bin/devbox-update-ensemble
 # The push watcher belongs in the image, not in $HOME. runner.sh started it
 # from `$HOME/notify-watch.mjs`, a file nothing here ever installed — so a
 # rebuilt box ran no watcher at all and sent no notifications, silently, which
@@ -86,6 +89,7 @@ COPY reap-viewers.sh /usr/local/bin/devbox-reap-viewers
 # measured after the fact. Remove this once those crashes are understood.
 COPY renderer-memory-log.sh /usr/local/bin/devbox-renderer-memory-log
 RUN chmod 0755 /usr/local/bin/devbox-entrypoint /usr/local/bin/devbox-runner /usr/local/bin/devbox-install-extension \
+    /usr/local/bin/devbox-update-ensemble \
  && chmod 0644 /usr/local/lib/devbox-notify-watch.mjs \
  && chmod 0755 /usr/local/bin/devbox-reap-viewers /usr/local/bin/devbox-renderer-memory-log
 
