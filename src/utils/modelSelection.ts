@@ -950,6 +950,8 @@ opencode/deepseek-v4-pro
 {"id":"deepseek-v4-pro","providerID":"opencode","name":"DeepSeek V4 Pro","variants":{"high":{},"max":{}}}
 opencode/gemini-4-argon
 {"id":"gemini-4-argon","providerID":"opencode","name":"Gemini 4 Argon","variants":{}}
+opencode/gemini-3.8-flash
+{"id":"gemini-3.8-flash","providerID":"opencode","name":"Gemini 3.8 Flash","variants":{"low":{},"medium":{},"high":{}}}
 opencode/gemini-3-flash
 {"id":"gemini-3-flash","providerID":"opencode","name":"Gemini 3 Flash","variants":{"minimal":{},"low":{},"medium":{},"high":{}}}
 opencode/gemini-3.1-pro
@@ -1609,6 +1611,9 @@ const SEEDED_CLI_MODELS: Readonly<
   // these in sync with `agy models`' own output — see cliModelDiscovery.ts.
   "antigravity-cli": [
     // Official model picker / thinking levels, checked 2026-10-21.
+    { model: "Gemini 3.8 Flash (Low)", name: "Gemini 3.8 Flash (Low)" },
+    { model: "Gemini 3.8 Flash (Medium)", name: "Gemini 3.8 Flash (Medium)" },
+    { model: "Gemini 3.8 Flash (High)", name: "Gemini 3.8 Flash (High)" },
     { model: "Gemini 4 Argon (Low)", name: "Gemini 4 Argon (Low)" },
     { model: "Gemini 4 Argon (Medium)", name: "Gemini 4 Argon (Medium)" },
     { model: "Gemini 4 Argon (High)", name: "Gemini 4 Argon (High)" },

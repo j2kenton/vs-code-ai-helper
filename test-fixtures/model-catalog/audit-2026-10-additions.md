@@ -31,5 +31,12 @@ models from the host. Other providers' catalogs do not supply confirmed IDs
 for these additions, so their seeds remain unchanged. Existing models and
 default selections are preserved.
 
-Suggested follow-up: Gemini 3.8 Flash, listed in both the Antigravity and
-OpenCode documentation above. Verify each CLI's exact variants before adding.
+- Gemini 3.8 Flash: added to the Antigravity CLI seed as its display labels
+  at Low, Medium and High thinking; Google documents the model for the CLI
+  and those thinking levels. Its Fast option is a separate Antigravity
+  control, not a model ID suffix. The OpenCode Console seed uses
+  `opencode/gemini-3.8-flash` with Low/Medium/High variants, matching Google's
+  API capability page, which explicitly says `minimal` is unsupported.
+  Sources: https://www.antigravity.google/docs/models/ ;
+  https://opencode.ai/v2/docs/console/models/ ;
+  https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash .

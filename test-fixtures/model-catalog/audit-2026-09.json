@@ -6,43 +6,67 @@
   "providerContext": {
     "copilot": {
       "defaultAuthPath": "GitHub account VS Code is signed into (Copilot host, models come from the VS Code LM API)",
-      "supportedPathClasses": ["copilot-plan"]
+      "supportedPathClasses": [
+        "copilot-plan"
+      ]
     },
     "claude-cli": {
       "defaultAuthPath": "Claude Pro/Max subscription login (`claude`)",
-      "supportedPathClasses": ["subscription", "api-key"]
+      "supportedPathClasses": [
+        "subscription",
+        "api-key"
+      ]
     },
     "codex-cli": {
       "defaultAuthPath": "ChatGPT sign-in (`codex login`)",
-      "supportedPathClasses": ["chatgpt-signin", "api-key"]
+      "supportedPathClasses": [
+        "chatgpt-signin",
+        "api-key"
+      ]
     },
     "gemini-cli": {
       "defaultAuthPath": "Google account sign-in (`gemini`)",
-      "supportedPathClasses": ["google-account", "api-key"]
+      "supportedPathClasses": [
+        "google-account",
+        "api-key"
+      ]
     },
     "antigravity-cli": {
       "defaultAuthPath": "Google account sign-in (`agy`)",
-      "supportedPathClasses": ["google-account"]
+      "supportedPathClasses": [
+        "google-account"
+      ]
     },
     "kiro-cli": {
       "defaultAuthPath": "Kiro login plus KIRO_API_KEY for headless runs",
-      "supportedPathClasses": ["kiro-api-key"]
+      "supportedPathClasses": [
+        "kiro-api-key"
+      ]
     },
     "opencode-cli": {
       "defaultAuthPath": "OpenCode Zen key for opencode/* models, OpenCode Go subscription for opencode-go/* models",
-      "supportedPathClasses": ["zen", "go"]
+      "supportedPathClasses": [
+        "zen",
+        "go"
+      ]
     },
     "cline-cli": {
       "defaultAuthPath": "ClinePass subscription (`cline auth cline-pass`, `-P cline-pass`)",
-      "supportedPathClasses": ["cline-pass"]
+      "supportedPathClasses": [
+        "cline-pass"
+      ]
     },
     "kimi-cli": {
       "defaultAuthPath": "Moonshot AI / Kimi Code OAuth device-code sign-in (`kimi login`)",
-      "supportedPathClasses": ["kimi-code-oauth"]
+      "supportedPathClasses": [
+        "kimi-code-oauth"
+      ]
     },
     "devpass-cli": {
       "defaultAuthPath": "LLM Gateway DevPass credential (`devpass-code providers login`)",
-      "supportedPathClasses": ["devpass"]
+      "supportedPathClasses": [
+        "devpass"
+      ]
     }
   },
   "humanScopeWaivers": [],
@@ -51,7 +75,10 @@
       "provider": "claude-cli",
       "scope": "picker",
       "defaultAuthPath": "Claude Pro/Max subscription login (`claude`)",
-      "supportedPathClasses": ["subscription", "api-key"],
+      "supportedPathClasses": [
+        "subscription",
+        "api-key"
+      ],
       "evidence": {
         "authContext": "Claude Code subscription login; live `claude --model <id> -p ok --output-format json` probes run on the Ensemble dev box (aarch64 container), reading the resolved id from the response's modelUsage key; credential class and account tier for that box were not captured alongside the probe output (see the Capture log's caveat in audit-2026-09.md) and still need recording",
         "cliVersion": "claude 2.1.274",
@@ -118,7 +145,10 @@
       "provider": "codex-cli",
       "scope": "picker",
       "defaultAuthPath": "ChatGPT sign-in (`codex login`)",
-      "supportedPathClasses": ["chatgpt-signin", "api-key"],
+      "supportedPathClasses": [
+        "chatgpt-signin",
+        "api-key"
+      ],
       "evidence": {
         "authContext": "ChatGPT sign-in via `codex login`; live CLI capture on the dev box (`codex debug models`) enumerates the GPT-6 family entries directly",
         "cliVersion": "codex 0.159.0",
@@ -190,7 +220,10 @@
       "block": "opencode",
       "scope": "picker",
       "defaultAuthPath": "OpenCode Zen key for opencode/* models, OpenCode Go subscription for opencode-go/* models",
-      "supportedPathClasses": ["zen", "go"],
+      "supportedPathClasses": [
+        "zen",
+        "go"
+      ],
       "evidence": {
         "authContext": "OpenCode Zen API key (the only credential configured on the dev box); opencode-go/* is not covered by this capture",
         "cliVersion": "opencode 1.18.31",
@@ -208,6 +241,12 @@
       "freeLabelsAudited": false,
       "notes": "Added for the GPT-6 / Opus 5.5 task. Only the four new ids were added to the seed; the rest of the opencode/* snapshot was not regenerated. Seeded ids missing from this capture are recorded unverified rather than covered by the snapshot.",
       "entries": [
+        {
+          "id": "opencode/gemini-3.8-flash",
+          "status": "added",
+          "checkedAt": "2026-10-22",
+          "source": "OpenCode Console model endpoint table lists gemini-3.8-flash at https://opencode.ai/v2/docs/console/models/ . Google model documentation confirms the exact model ID and supported thinking levels low, medium, high (minimal rejected): https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash ."
+        },
         {
           "id": "opencode/gpt-6.1-sol",
           "status": "added",
@@ -281,7 +320,9 @@
       "status": "added",
       "checkedAt": "2026-09-27",
       "source": "`claude --help` (claude 2.1.274) and live runs on the dev box, 2026-09-27; see the claude-opus-5-5 entry",
-      "entryIds": ["claude-opus-5-5"]
+      "entryIds": [
+        "claude-opus-5-5"
+      ]
     },
     {
       "provider": "claude-cli",
@@ -297,7 +338,11 @@
       "status": "added",
       "checkedAt": "2026-09-29",
       "source": "`codex debug models` (codex 0.159.0) on the dev box, 2026-09-29; see the gpt-6-astra, gpt-6-sol and gpt-6-luna entries",
-      "entryIds": ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna"]
+      "entryIds": [
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna"
+      ]
     },
     {
       "provider": "codex-cli",
@@ -313,7 +358,11 @@
       "status": "added",
       "checkedAt": "2026-09-27",
       "source": "`opencode models --verbose` (opencode 1.18.31), OpenCode Zen key, 2026-09-27; see the opencode/gpt-6-* entries",
-      "entryIds": ["opencode/gpt-6-astra", "opencode/gpt-6-luna", "opencode/gpt-6-sol"]
+      "entryIds": [
+        "opencode/gpt-6-astra",
+        "opencode/gpt-6-luna",
+        "opencode/gpt-6-sol"
+      ]
     },
     {
       "provider": "opencode-cli",
@@ -322,7 +371,9 @@
       "status": "added",
       "checkedAt": "2026-09-27",
       "source": "`opencode models --verbose` (opencode 1.18.31), OpenCode Zen key, 2026-09-27; see the opencode/claude-opus-5-5 entry",
-      "entryIds": ["opencode/claude-opus-5-5"]
+      "entryIds": [
+        "opencode/claude-opus-5-5"
+      ]
     },
     {
       "provider": "opencode-cli",
