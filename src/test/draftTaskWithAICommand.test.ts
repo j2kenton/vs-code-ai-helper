@@ -30,7 +30,8 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { draftTaskWithAI } from "../commands/draftTaskWithAI";
+import { describeDraftPaymentFailureV1, draftTaskWithAI } from "../commands/draftTaskWithAI";
+import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
@@ -38,6 +39,42 @@ import {
   initNotificationRouter,
   deactivateNotificationRouter,
 } from "../utils/notificationRouter";
+
+void describe("Draft with AI payment failure wording", () => {
+  void it("names each payment model, remedy and discovered same-provider free twin", () => {
+    const outcome = {
+      kind: "unavailable",
+      code: "candidatesDeferred",
+      chainExhaustion: {
+        stage: "desc",
+        candidates: [
+          {
+            storedModelId: "opencode-cli:opencode/glm-5.3-flash@high",
+            providerLabel: "OpenCode Zen",
+            runnerId: "opencode-cli",
+            reason: "HTTP 402 payment required: Upstream request failed: Insufficient account funds",
+          },
+          {
+            storedModelId: "codex-cli:gpt-6-luna@high",
+            providerLabel: "OpenAI Codex",
+            runnerId: "codex-cli",
+            reason: "quota limit, resets 2026-10-22T03:00:00Z",
+            deferredFailureKind: "quota",
+          },
+        ],
+      },
+    } as unknown as TaskActionOutcomeV1;
+    const result = describeDraftPaymentFailureV1(outcome, [
+      "opencode-cli:opencode/glm-5.3-flash-free@high",
+    ]);
+    assert.ok(result);
+    assert.match(result, /OpenCode Zen: HTTP 402 payment required for opencode-cli:opencode\/glm-5\.3-flash@high/);
+    assert.match(result, /add credits or choose a free model/);
+    assert.match(result, /opencode-cli:opencode\/glm-5\.3-flash-free@high/);
+    assert.match(result, /OpenAI Codex codex-cli:gpt-6-luna@high: quota limit/);
+    assert.equal(describeDraftPaymentFailureV1({ kind: "failed" } as TaskActionOutcomeV1, []), undefined);
+  });
+});
 import { safeRemoveDir } from "./testFsUtils";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import type { ChatViewProvider } from "../views/chatView";
@@ -50,6 +87,7 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { resetProductionTaskActionRegistryForTestV1 } from "../actions/productionTaskActionRuntimeV1";
+import { ExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
@@ -196,7 +234,7 @@ function installFakeInventory(taskFolderPath: string): TaskInventory {
   } as unknown as TaskInventory;
 }
 
-function makeExtensionContext(): vscode.ExtensionContext {
+function makeExtensionContext(extensionPath = REAL_ROOT): vscode.ExtensionContext {
   const backing = new Map<string, unknown>([
     [
       `aiHelper.consent.v${DISCLAIMER_VERSION}`,
@@ -214,7 +252,7 @@ function makeExtensionContext(): vscode.ExtensionContext {
   };
   return {
     subscriptions: [] as vscode.Disposable[],
-    extensionUri: vscode.Uri.file(REAL_ROOT),
+    extensionUri: vscode.Uri.file(extensionPath),
     workspaceState: memento,
     globalState: memento,
   } as unknown as vscode.ExtensionContext;
@@ -255,6 +293,44 @@ function installWorkspaceFoldersStub(): { restore: () => void } {
 }
 
 void describe("draftTaskWithAI command (G18: Description-model routing regression)", () => {
+  void it("does not call a provider or change task progress when prompt rendering finds a removed extension folder", async () => {
+    const folderPath = makeTaskFolder(`draftcmd_removed_${Math.floor(Math.random() * 1e9)}`, "A real user description.");
+    const inventory = installFakeInventory(folderPath);
+    const context = makeExtensionContext(path.join(REAL_ROOT, "removed-extension-folder"));
+    const progressPath = path.join(folderPath, "task-progress.json");
+    const before = fs.readFileSync(progressPath, "utf8");
+    let providerCalls = 0;
+    initNotificationRouter({ addEntry: (): void => undefined });
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const runtime = setUpTaskActionRuntimeForTestV1();
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ modelId: "fake-desc-model:v1" })),
+      patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
+        Promise.resolve({ availability: { available: true }, providerLabel: "Stub Provider" })
+      ),
+      patch(copilotLmTransportModule, "createCopilotLmTextTransportV1", () => {
+        providerCalls += 1;
+        return { runnerId: "unused", invoke: () => Promise.resolve({ kind: "completed" }) };
+      }),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.reject(new ExtensionFolderRemovedErrorV1())),
+    ];
+    const fakeChatViewProvider = { askInteraction: (): Promise<void> => Promise.resolve() } as unknown as ChatViewProvider;
+    try {
+      const result = await draftTaskWithAI(inventory, context, fakeChatViewProvider, { canonicalId: folderPath });
+      assert.notEqual(result, true, "the failed prompt read must not be reported as a completed draft");
+      assert.equal(providerCalls, 0);
+      assert.equal(fs.readFileSync(progressPath, "utf8"), before);
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      runtime.tearDown();
+      fsBridge.restore();
+      wsStub.restore();
+      deactivateNotificationRouter();
+      safeRemoveDir(REAL_ROOT);
+    }
+  });
+
   void it("routes both the draft generation and the derived task name through the Description-stage model, and never sends the placeholder intro to the AI", async () => {
     const folderPath = makeTaskFolder(
       `draftcmd_${Math.floor(Math.random() * 1e9)}`,

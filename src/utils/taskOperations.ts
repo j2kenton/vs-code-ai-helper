@@ -109,6 +109,11 @@ export interface TaskOperationHandle {
   readonly token?: vscode.CancellationToken;
   report(detail: string | undefined): void;   // live-row sub-text, e.g. "waiting for your answer"
   /**
+   * Set terminal detail on the root operation so it survives child removal
+   * and appears in the composite's final notification entry.
+   */
+  reportRootDetail?(detail: string | undefined): void;
+  /**
    * Records the resolved model for live task-status surfaces when known.
    * Always resolves to the ROOT operation, same as setResultTargetUri and
    * reportActivity, so a model reported from a child handle still surfaces
@@ -630,6 +635,9 @@ export class TaskOperationRegistry implements vscode.Disposable {
         operation.detail = d;
         this.triggerChange(true);
       },
+      reportRootDetail: (detail: string | undefined) => {
+        this.reportRootDetail(id, detail);
+      },
       setModel: (modelId: string | undefined) => {
         this.setModel(id, modelId);
       },
@@ -678,6 +686,26 @@ export class TaskOperationRegistry implements vscode.Disposable {
         op = parent;
       }
       op.modelId = modelId;
+      this.triggerChange(true);
+      return;
+    }
+  }
+
+  /**
+   * Set terminal detail on `id`'s ROOT operation. Child `report()` values are
+   * useful while the child is running, but disappear when it is removed; a
+   * detail needed by the composite's terminal notification belongs on root.
+   */
+  reportRootDetail(id: string, detail: string | undefined): void {
+    for (const keyMap of this.operations.values()) {
+      let op = keyMap.get(id);
+      if (!op) {continue;}
+      while (op.parentId !== undefined) {
+        const parent = keyMap.get(op.parentId);
+        if (!parent) {break;}
+        op = parent;
+      }
+      op.detail = detail;
       this.triggerChange(true);
       return;
     }

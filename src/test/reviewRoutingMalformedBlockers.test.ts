@@ -15,6 +15,8 @@ import { dispatchDegenerateReviewBackupAdvanceV1, handleReviewRoutingOutcome } f
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { TaskProgress } from "../types/taskProgress";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { safeRemoveDir } from "./testFsUtils";
 
 class RecordingSurface {
@@ -490,6 +492,70 @@ void describe("handleReviewRoutingOutcome — degenerate rejection decides backu
       assert.deepStrictEqual(degenerateBackupAdvance, { kind: "exhausted" });
     } finally {
       settings.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("posts a degenerate-review card with the actual model and both retry routes", async () => {
+    const store = new Map<string, string>();
+    const decisionState = new Map<string, unknown>();
+    installMemStore(store);
+    initNotificationRouter(new RecordingSurface());
+    const context = {
+      subscriptions: [],
+      workspaceState: {
+        get: <T>(key: string, fallback?: T): T | undefined => decisionState.has(key) ? decisionState.get(key) as T : fallback,
+        update: (key: string, value: unknown): Promise<void> => {
+          if (value === undefined) decisionState.delete(key);
+          else decisionState.set(key, value);
+          return Promise.resolve();
+        },
+        keys: (): readonly string[] => [...decisionState.keys()],
+      },
+      globalState: { get: (): undefined => undefined, update: (): Promise<void> => Promise.resolve(), keys: (): readonly string[] => [] },
+      extensionUri: vscode.Uri.file(TEST_ROOT),
+    } as unknown as vscode.ExtensionContext;
+    __extensionContextV1TestOnly.set(context);
+    const settings = installModelSettingsV1({
+      "impl-high-review": { primary: "codex-cli:gpt-5.6@high", backups: [], strategy: "never-switch" },
+    });
+    const folderUri = makeTaskFolderUri("degenerate-review-card-routes");
+    seedProgress(store, folderUri, baseProgress({
+      currentStage: "impl-high-review",
+      reviewAttemptId: "attempt-card",
+      roundLedger: [{
+        roundId: "attempt-card", attemptIds: ["attempt-card"], stage: "impl-high-review", mode: "review",
+        startedAt: "2026-01-01T00:00:00.000Z", state: "open",
+      }],
+    }));
+    try {
+      await handleReviewRoutingOutcome({
+        folderUri, targetStage: "impl-high-review", reviewAttemptId: "attempt-card",
+        content: "I investigated the files and here is a summary.", score: null, threshold: 8,
+        reviewer: { providerLabel: "OpenAI Codex", storedModelId: "codex-cli:gpt-5.6@high" },
+      });
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState).listPending(folderUri.fsPath)
+        .find((item) => item.decisionKey === "degenerateReviewOutput");
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /summary, not a review/);
+      assert.match(decision.whatHappened, /gpt-5\.6@high/);
+      assert.match(decision.whatHappened, /Readiness: N\/10/);
+      assert.deepEqual(decision.options.map((option) => option.label), [
+        "Choose a different model or lower reasoning level", "Rerun on gpt-5.6@high",
+      ]);
+      const alternate = decision.options.find((option) => option.optionId === "chooseDifferentModel");
+      const retry = decision.options.find((option) => option.optionId === "retrySameModel");
+      assert.equal(retry?.effect.kind, "command");
+      if (retry?.effect.kind === "command") {
+        assert.equal(retry.effect.command, "vs-code-ai-helper.retryReviewWithBackupV1");
+      }
+      assert.equal(alternate?.effect.kind, "command");
+      if (alternate?.effect.kind === "command") {
+        assert.equal(alternate.effect.command, "vs-code-ai-helper.chooseReviewRetryV1");
+      }
+    } finally {
+      settings.restore();
+      __extensionContextV1TestOnly.reset();
       deactivateNotificationRouter();
     }
   });

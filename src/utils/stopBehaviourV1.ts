@@ -38,6 +38,7 @@ export type MidRoundFailureKindV1 =
   | "quota"
   | "temporarily-unavailable"
   | "model-entitlement"
+  | "payment-required"
   | "generic"
   | undefined;
 

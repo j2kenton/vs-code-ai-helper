@@ -16,6 +16,7 @@ import {
   type ViewerForwardResultV1,
 } from "./services/viewerForwardingV1";
 import {
+  filterDecisionsOfLiveTasksV1,
   createMirroredDecisionsMementoV1,
   HOST_DECISIONS_MIRROR_FILENAME_V1,
   liveMirroredDecisionsV1,
@@ -192,6 +193,7 @@ import { finishFinalization, recoverFinalizationTree } from "./state/finalizatio
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
 import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
+import type { WorkflowDecisionV1 } from "./types/workflowDecisionV1";
 import { IncompleteTask } from "./types/incompleteTask";
 import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateProviderAccountActionsSetting, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
 import { setExtensionContextV1 } from "./utils/extensionContextV1";
@@ -1605,23 +1607,34 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // without a store write.
     const decisionStore = new WorkflowDecisionStoreV1(context.workspaceState);
     let lastDecisionsSignature: string | undefined;
+    // Same rule as the task tree: a completed or archived task's decisions are
+    // not published, so a surface built on decisions-v1.json cannot show them.
+    const readMirroredTaskStatus = async (taskCanonicalId: string): Promise<string | undefined> => {
+      const result = await readTaskProgressStrictV1(vscode.Uri.file(taskCanonicalId));
+      return result.ok ? result.decoded.progress.status : undefined;
+    };
+    const publishablePending = (): Promise<readonly WorkflowDecisionV1[]> =>
+      filterDecisionsOfLiveTasksV1(decisionStore.listPending(), readMirroredTaskStatus);
     const writeDecisions = (): void => {
-      const pending = decisionStore.listPending();
-      const signature = JSON.stringify(pending);
-      // The signature is only remembered once the write actually LANDED, and
-      // a heartbeat rewrites it regardless, so a failed or superseded write
-      // cannot leave a viewer showing a settled question forever (review,
-      // 2026-09-17). Writes are serialized in hostMirrorWriteV1.ts.
-      void writeRunnerDecisionsSnapshotV1(relayDir, pending).then((written) => {
-        if (written) {
-          lastDecisionsSignature = signature;
-        }
+      void publishablePending().then((pending) => {
+        const signature = JSON.stringify(pending);
+        // The signature is only remembered once the write actually LANDED, and
+        // a heartbeat rewrites it regardless, so a failed or superseded write
+        // cannot leave a viewer showing a settled question forever (review,
+        // 2026-09-17). Writes are serialized in hostMirrorWriteV1.ts.
+        return writeRunnerDecisionsSnapshotV1(relayDir, pending).then((written) => {
+          if (written) {
+            lastDecisionsSignature = signature;
+          }
+        });
       });
     };
     const writeDecisionsIfChanged = (): void => {
-      if (JSON.stringify(decisionStore.listPending()) !== lastDecisionsSignature) {
-        writeDecisions();
-      }
+      void publishablePending().then((pending) => {
+        if (JSON.stringify(pending) !== lastDecisionsSignature) {
+          writeDecisions();
+        }
+      });
     };
     const decisionsListener = decisionStore.onDidChange(writeDecisionsIfChanged);
     // Unconditional on the heartbeat: it also refreshes `writtenAt`, which is

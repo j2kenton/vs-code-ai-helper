@@ -54,6 +54,41 @@ const ALL_OUTCOMES: readonly TaskActionOutcomeV1[] = [
 ] as unknown as readonly TaskActionOutcomeV1[];
 
 void describe("describeTaskActionOutcomeForLogV1", () => {
+  void it("names every deferred candidate and its recorded reason instead of only candidatesDeferred", () => {
+    const deferred: TaskActionOutcomeV1 = {
+      kind: "unavailable",
+      code: "candidatesDeferred",
+      chainExhaustion: {
+        stage: "impl-high-review",
+        candidates: [
+          {
+            storedModelId: "opencode-cli:opencode/glm-5.3-flash",
+            providerLabel: "OpenCode Zen",
+            runnerId: "opencode-cli",
+            reason: "payment limit clears at the recorded reset",
+            deferredFailureKind: "quota",
+            deferredResetAt: "2026-10-22T00:00:00.000Z",
+          },
+          {
+            storedModelId: "copilot:kimi-k3",
+            providerLabel: "GitHub Copilot",
+            runnerId: "copilot-lm",
+            reason: "backup quota unavailable until tomorrow",
+            deferredFailureKind: "quota",
+          },
+        ],
+      },
+    };
+    const log = describeTaskActionOutcomeForLogV1(deferred);
+    const failure = describeTaskActionFailureV1(deferred);
+    for (const text of [log, failure]) {
+      assert.match(text, /opencode\/glm-5\.3-flash/);
+      assert.match(text, /payment limit clears at the recorded reset/);
+      assert.match(text, /kimi-k3/);
+      assert.match(text, /backup quota unavailable until tomorrow/);
+    }
+  });
+
   void it("produces a non-empty status line for EVERY outcome kind", () => {
     for (const outcome of ALL_OUTCOMES) {
       const line = describeTaskActionOutcomeForLogV1(outcome);
@@ -489,8 +524,13 @@ void describe("handleReviewOutcomeV1 silent-failure regression", () => {
     // reason: an early return must not be able to skip it either.
     assert.match(
       source,
-      /try\s*\{\s*await routeReviewOutcomeV1\(outcome, ctx\);\s*\}\s*finally\s*\{\s*await writeReviewRunLogV1\(outcome, ctx\);\s*await terminalizeUnclosedReviewRoundV1\(outcome, ctx\);\s*\}/,
+      /try\s*\{\s*await routeReviewOutcomeV1\(outcome, ctx\);\s*\}\s*finally\s*\{\s*await finalizeReviewOutcomeV1\(outcome, ctx\);\s*\}/,
       "handleReviewOutcomeV1 must run the run log AND the round-ledger safety-net terminalizer in a finally around the routing body"
+    );
+    assert.match(
+      source,
+      /async function finalizeReviewOutcomeV1[\s\S]*?try\s*\{\s*await writeRunLog\(outcome, ctx\);\s*\}\s*finally\s*\{\s*await terminalizeUnclosedReviewRoundV1\(outcome, ctx\);\s*\}/,
+      "the finalizer must close the row even if writing the run log fails"
     );
   });
 

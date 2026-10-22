@@ -814,14 +814,19 @@ export function degenerateReviewRejectionReason(input: {
   score: number | null;
   stage: TaskStage;
   attemptId: string;
+  /** The provider-qualified identity that actually ran, when available. */
+  modelId?: string;
 }): string | null {
   if (!input.rejectDegenerateReviews || input.score !== null) {
     return null;
   }
+  const model = input.modelId
+    ? ` The model that ran was ${input.modelId}.`
+    : " The model identity was not recorded.";
   return (
-    `The ${STAGE_DISPLAY_NAMES[input.stage]} review round (attempt ${input.attemptId}) produced no ` +
-    "parseable `Readiness: N/10` line — recorded as a failed attempt, not a review. " +
-    "The round was excluded from the review score history so it cannot distort plateau detection."
+    `The ${STAGE_DISPLAY_NAMES[input.stage]} review round (attempt ${input.attemptId}) ended without a review: ` +
+    `the model replied with a summary, not a review, because it had no parseable \`Readiness: N/10\` line.` +
+    `${model} Recorded as a failed attempt, not a review; it was excluded from the review score history so it cannot distort plateau detection.`
   );
 }
 
@@ -1492,4 +1497,3 @@ export function chooseAutomaticImplementationDispatchV1(input: {
     reason: input.decision.reason,
   };
 }
-

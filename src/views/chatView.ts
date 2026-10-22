@@ -33,7 +33,9 @@ import {
 } from "../utils/chatHistoryStore";
 import { applyOpenPlanItemsFormSubmissionV1 } from "../commands/decideOpenPlanItemsV1";
 import { stripAttributionHeaders } from "../utils/fileUtils";
+import { writeRunLog } from "../utils/runLog";
 import { formatDisplayTimestampPairV1, formatTimestampForDisplay } from "../utils/timeFormat";
+import type { TaskOperationSnapshot } from "../utils/taskOperations";
 import {
   decodeStructuredAnswersArrayV1,
   DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1,
@@ -792,6 +794,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * a different `detail`/`waitingForUser`) still repaints immediately.
    */
   private lastOperationsSignatureV1: string | undefined;
+  private operationTraceWriteQueueV1: Promise<void> = Promise.resolve();
   /**
    * Coalesces renders requested by the four reactive subscriptions below
    * (RC2 item 11, Step 44): if one of these events fires while a render it
@@ -2524,6 +2527,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const { decision, option } = result;
       outcome = { ok: true, transitioned: true };
       const identity = this.identityForDecision(decision, ctx);
+      if (option.optionId === "checkAfterInstall") {
+        // Keep the owner's deferred checks in the durable task run history as
+        // well as the decision transcript. This is intentionally best-effort:
+        // a log write must not prevent the existing nextStage effect.
+        try {
+          await writeRunLog(
+            vscode.Uri.file(decision.taskCanonicalId),
+            "owner-check",
+            decision.stage,
+            `# Owner checks deferred until after install\n\n` +
+              `Decision: ${option.label}\n\n${option.consequence}\n`
+          );
+        } catch (error) {
+          console.warn("Could not record deferred owner checks in the run log:", error);
+        }
+      }
       // RC2 item 8: an option whose resumeKind is "continue" resumes the task
       // through resumePausedTask (the resumeAndXxxV1 family in
       // resumeTask.ts), which withdraws every OTHER pending card whose
@@ -2562,6 +2581,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await this.append("assistant", ackText, decision.stage, identity);
       }
       if (option.effect.kind === "command" && ctx?.skipEffect !== true) {
+        const operationTrace = identity ? this.traceDecisionOperationV1(identity, decision.stage) : undefined;
         try {
           // Some dispatched commands (e.g. goToReviewAndApplyV1) report a
           // failed multi-step sequence by resolving `false` rather than
@@ -2606,6 +2626,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               identity
             );
           }
+        } finally {
+          operationTrace?.dispose();
         }
       }
     }
@@ -2691,6 +2713,63 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         );
       }
     }
+  }
+
+  /** Mirror live operation events into the conversation that started them. */
+  private traceDecisionOperationV1(identity: ChatIdentity, fallbackStage: TaskStage): vscode.Disposable {
+    const known = new Map<string, { signature: string; snapshot: TaskOperationSnapshot; waiting: boolean }>();
+    const queueMessage = (text: string, stage: TaskStage): void => {
+      this.operationTraceWriteQueueV1 = this.operationTraceWriteQueueV1
+        .then(() => this.append("assistant", text, stage, identity))
+        .catch((error) => console.warn("Could not append operation progress to Chat:", error));
+    };
+    const signatureOf = (operation: TaskOperationSnapshot): string =>
+      `${operation.activity ?? ""}\n${operation.detail ?? ""}\n${operation.waitingForUser}`;
+    const labelFor = (operation: TaskOperationSnapshot): string => {
+      const stage = operation.stage ? STAGE_DISPLAY_NAMES[operation.stage] : STAGE_DISPLAY_NAMES[fallbackStage];
+      const detail = operation.detail ?? operation.activity;
+      return `${operation.label} — ${stage}${detail ? `: ${detail}` : ""}`;
+    };
+    for (const operation of taskOperations.getTaskOperations(identity.canonicalId)) {
+      if (operation.waitingForUser) {
+        known.set(operation.id, { signature: signatureOf(operation), snapshot: operation, waiting: true });
+      } else {
+        known.set(operation.id, { signature: signatureOf(operation), snapshot: operation, waiting: false });
+      }
+    }
+    const onChange = taskOperations.onDidChange(() => {
+      for (const operation of taskOperations.getTaskOperations(identity.canonicalId)) {
+        const prior = known.get(operation.id);
+        const signature = signatureOf(operation);
+        const stage = operation.stage ?? fallbackStage;
+        if (!prior) {
+          known.set(operation.id, { signature, snapshot: operation, waiting: false });
+          queueMessage(
+            `Started ${labelFor(operation)} at ${formatTimestampForDisplay(new Date(operation.startedAt))}.`,
+            stage
+          );
+          continue;
+        }
+        if (prior.waiting && !operation.waitingForUser) {
+          queueMessage(`Resumed ${labelFor(operation)}.`, stage);
+        }
+        if (prior.signature !== signature) {
+          queueMessage(`Progress: ${labelFor(operation)}.`, stage);
+          known.set(operation.id, { signature, snapshot: operation, waiting: operation.waitingForUser });
+        }
+      }
+    });
+    const onEnd = taskOperations.onDidEnd((operation) => {
+      if (!known.has(operation.id)) return;
+      queueMessage(`Ended ${operation.label} — ${operation.state}.`, operation.stage ?? fallbackStage);
+      known.delete(operation.id);
+    });
+    return {
+      dispose: (): void => {
+        onChange.dispose();
+        onEnd.dispose();
+      },
+    };
   }
 
   /** Chain `op` onto this task's queue so operations on one task's transcript

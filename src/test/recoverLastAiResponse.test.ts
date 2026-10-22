@@ -17,12 +17,12 @@ import { createBoundedResultStoreV1 } from "../services/boundedResultStoreV1";
 import { findMostRecentSpool } from "../commands/recoverLastAiResponse";
 import { safeRemoveDir } from "./testFsUtils";
 
-function makeCorrelation(): ActionCorrelationV1 {
+function makeCorrelation(taskBindingId = "task-binding-digest"): ActionCorrelationV1 {
   return {
     actionKey: "recoverTestAction.v1",
     operationId: allocateHex128IdV1(),
     attemptId: allocateHex128IdV1(),
-    taskBindingId: "task-binding-digest",
+    taskBindingId,
     chatDocumentId: "chat-document-id",
   };
 }
@@ -102,6 +102,26 @@ void describe("recoverLastAiResponse — findMostRecentSpool", () => {
       assert.ok(found);
       assert.equal(found.meta.operationId, newerRef.operationId);
       assert.equal(fs.readFileSync(found.binPath, "utf8"), "newer rejected");
+    } finally {
+      safeRemoveDir(rootDir);
+    }
+  });
+
+  void it("limits recovery to the requested task binding when one is supplied", async () => {
+    const rootDir = makeRootDir();
+    try {
+      const store = createBoundedResultStoreV1({ rootDir });
+      await store.writeSpool(makeCorrelation("task-a"), allocateHex128IdV1(), Buffer.from("task A"), {
+        purpose: "recovery",
+      });
+      await store.writeSpool(makeCorrelation("task-b"), allocateHex128IdV1(), Buffer.from("task B"), {
+        purpose: "recovery",
+      });
+      const found = findMostRecentSpool(rootDir, "task-a");
+      assert.ok(found);
+      assert.equal(found.meta.taskBindingId, "task-a");
+      assert.equal(fs.readFileSync(found.binPath, "utf8"), "task A");
+      assert.equal(findMostRecentSpool(rootDir, "task-not-present"), undefined);
     } finally {
       safeRemoveDir(rootDir);
     }

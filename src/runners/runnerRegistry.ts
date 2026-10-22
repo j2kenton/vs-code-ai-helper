@@ -407,7 +407,7 @@ export async function recordActiveFallbackModel(
  */
 function isQuotaParkClearingEvidence(result: {
   status: "completed" | "failed" | "cancelled";
-  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
 }): boolean {
   return (
     result.status === "completed" ||
@@ -1151,7 +1151,10 @@ export async function runImplementationForModel(options: {
   // dirty-tree withheld explanation. Only cascade-eligible kinds carry
   // provider reset wording; `parseQuotaResetV1` stays conservative.
   const resolveKnownResetAt = (): string | undefined => {
-    if (!isCascadeEligibleFailureKind(result.failureKind)) {
+    // A payment-required response can contain provider quota vocabulary and
+    // even a misleading reset phrase. Its balance does not reset on that
+    // schedule, so never derive reset advice or parking from a 402.
+    if (result.failureKind === "payment-required" || !isCascadeEligibleFailureKind(result.failureKind)) {
       return undefined;
     }
     const ctx = getExtensionContextV1();
@@ -1163,6 +1166,9 @@ export async function runImplementationForModel(options: {
         : undefined)
     );
   };
+  const resolveFailureRemedyTextV1 = (): string => result.failureKind === "payment-required"
+    ? "Add credits or choose a free model. Payment-required failures do not have a quota reset schedule."
+    : buildQuotaRemedyTextV1(resolveKnownResetAt());
   // RC4 item 1: one record per configured backup that did not rescue the
   // round, filled by the clean-tree cascade loop below.
   const backupRecords: BackupAttemptRecordV1[] = [];
@@ -1391,6 +1397,8 @@ export async function runImplementationForModel(options: {
         ? "a quota/rate limit"
         : result.failureKind === "model-entitlement"
           ? "a model-entitlement block"
+          : result.failureKind === "payment-required"
+            ? `an HTTP 402 payment requirement for ${options.modelId ?? "the configured model"} (add credits or choose a free model)`
           : result.timeoutReason === "inactivity"
             ? "the inactivity watchdog (no output for too long)"
             : result.timeoutReason === "wall-clock" || result.timedOut === true
@@ -1520,7 +1528,7 @@ export async function runImplementationForModel(options: {
     // only the direct parse of this attempt's own message benefits from the
     // widened kind check.
     const knownResetAt = resolveKnownResetAt();
-    const remedyText = buildQuotaRemedyTextV1(knownResetAt);
+    const remedyText = resolveFailureRemedyTextV1();
     // Review completion blocker (2026-09-01): `chooseStopBehaviourV1` used to
     // be consulted only in the final fallthrough further below, purely to
     // pick explanation TEXT — the actual park-record persistence and
@@ -1803,7 +1811,7 @@ export async function runImplementationForModel(options: {
                 ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
                     kind: "backupsExhausted",
                     backups: backupRecords,
-                    remedyText: buildQuotaRemedyTextV1(resolveKnownResetAt()),
+                    remedyText: resolveFailureRemedyTextV1(),
                   })
                 : undefined;
     if (explanation !== undefined) {

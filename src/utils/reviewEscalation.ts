@@ -29,7 +29,7 @@ import {
   findPlanStageNarrowingBlockerV1,
 } from "./planItemNarrowingV1";
 import { taskFixableAreAllUnbuiltWorkV1 } from "./reviewRouting";
-import { resolveBlockerPlanReferencesV1 } from "./implementationChecklist";
+import { resolveBlockerPlanReferencesV1, resolveExcludedOwnerHandoffV1 } from "./implementationChecklist";
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import * as path from "path";
@@ -573,6 +573,8 @@ export interface EscalationPlateauContextV1 {
   /** The specific open plan items (`Step N` or item text) that qualified
    * `taskFixableAllUnbuiltWork`; named in the recommendation's reason. */
   readonly unbuiltWorkReferences?: readonly string[];
+  /** Deferrable, excluded owner checks offered the post-install move-on route. */
+  readonly ownerChecksOwed?: readonly string[];
   /**
    * RC4 item 3: set when a blocker asks the owner to narrow a plan item
    * (`findNarrowingBlockerV1`). Adds the item, the round's reason and its
@@ -653,6 +655,7 @@ export function buildEscalationDecisionV1(
       allBlockersNeedOwnerDecision = false,
       taskFixableAllUnbuiltWork = false,
       unbuiltWorkReferences = [],
+      ownerChecksOwed = [],
     } = plateauContext;
     const options: WorkflowDecisionOptionV1[] = [
       ...(nextStage
@@ -699,6 +702,21 @@ export function buildEscalationDecisionV1(
             "believe otherwise despite that. Once you've updated the plan, resume the task (or choose Keep " +
             "Iterating) to continue."
       ),
+      ...(ownerChecksOwed.length > 0
+        ? [{
+            optionId: "checkAfterInstall",
+            label: "I'll check after install — move on",
+            resumeKind: "continue" as const,
+            consequence:
+              `Advances to ${nextStageName ?? "the next stage"}. These owner checks remain owed: ${ownerChecksOwed.join("; ")}. ` +
+              "After installing this build, perform each check and record its result under Owner evidence in task.md.",
+            effect: {
+              kind: "command" as const,
+              command: "vs-code-ai-helper.nextStage",
+              args: [{ taskFolderPath: target.taskFolderPath }],
+            },
+          }]
+        : []),
       // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: the
       // paused `escalate` route previously omitted the "publish over it"
       // exit entirely, even when a non-task-fixable blocker on record here
@@ -1360,6 +1378,33 @@ function classifyEnvironmentalBlockerV1(description: string): "owner-decision" |
   return "owner-decision";
 }
 
+/** Resolve the deliberately narrow post-install move-on case. */
+export function resolveDeferrableOwnerChecksV1(
+  stage: TaskStage,
+  blockers: readonly { readonly description: string; readonly resolver: string }[],
+  planOfRecord: string
+): readonly string[] | undefined {
+  if (!IMPL_REVIEW_STAGES.includes(stage) && stage !== "publish") {
+    return undefined;
+  }
+  if (blockers.length === 0) {
+    return undefined;
+  }
+  const matches = blockers.map(({ description, resolver }) => ({
+    description,
+    resolver,
+    handoff: resolveExcludedOwnerHandoffV1(description, planOfRecord),
+  }));
+  if (!matches.every(({ description, resolver, handoff }) =>
+    (resolver === "environmental" || resolver === "needs-toolchain") &&
+    classifyEnvironmentalBlockerV1(description) === "owner-evidence" &&
+    handoff !== undefined && !handoff.isPrerequisite
+  )) {
+    return undefined;
+  }
+  return matches.map(({ handoff }) => handoff!.itemText.slice(0, 320));
+}
+
 /**
  * Item 7b, review-narrowed blocker `-1`: the plateau escalation's "what
  * clears this" line used to name the union of every reason a blocker can be
@@ -1403,7 +1448,7 @@ function describeResolverClearingActionV1(
     // backtick-quoted span in the blocker is offered instead.
     const evidenceCommand = namedCommand ?? /`([^`]+)`/.exec(description)?.[1]?.trim();
     return (
-      "evidence only you can gather (named above; rounds cannot fetch pages or run live provider CLIs) — " +
+      "evidence only you can gather (the concrete check is named above; do it after installing this build when it requires the installed product, or now when it does not; rounds cannot fetch pages or run live provider CLIs) — " +
       (evidenceCommand ? `run \`${evidenceCommand}\` to gather it, then ` : "gather it, then ") +
       "record the result under an 'Owner evidence' heading in this task's task.md (the task description), " +
       `then use "Keep iterating" to have ${stageName} re-verify.`
@@ -1536,6 +1581,40 @@ async function postReviewPlateauDecisionV1(
   // not called here — see its doc comment on why fresh review content is
   // never filtered by a supersession.
   const normalized = normalizeReviewEvidenceV1(evidence.content, evidence.blockers);
+  let ownerChecksOwed: string[] = [];
+  if (IMPL_REVIEW_STAGES.includes(stage) || stage === "publish") {
+    const planText = await readTextIfExists(getCanonicalImplementationUri(folderUri));
+    const progressRead = await readTaskProgressStrictV1(folderUri, {
+      expectedTaskFolder: path.basename(target.taskFolderPath),
+    });
+    if (planText && progressRead.ok) {
+      const history = progressRead.decoded.progress.reviewScoreHistory ?? [];
+      const supersededDescriptions = new Set(
+        (progressRead.decoded.progress.blockerSupersessions ?? []).map((entry) => entry.blockerDescription.trim())
+      );
+      // Historical review rows are snapshots, not a live blocker set. Only
+      // the newest recorded round for this stage can describe blockers that
+      // remain current; unioning every older round lets a resolved task-fixable
+      // blocker veto the owner-check move-on option forever.
+      const latestStageReview = history
+        .filter((entry) => entry.stage === stage)
+        .reduce<(typeof history)[number] | undefined>(
+          (latest, entry) => !latest || entry.at > latest.at ? entry : latest,
+          undefined
+        );
+      const recordedBlockers = [
+        ...(normalized.blockers.length > 0 ? [] : latestStageReview?.blockers ?? [])
+          .filter((blocker) => !blocker.description || !supersededDescriptions.has(blocker.description.trim()))
+          .flatMap((blocker) => blocker.description
+            ? [{ description: blocker.description, resolver: blocker.resolver }]
+            : []),
+        ...normalized.blockers.map((blocker) => ({ description: blocker.description, resolver: blocker.resolver })),
+      ].filter((blocker, index, all) =>
+        all.findIndex((candidate) => candidate.description === blocker.description) === index
+      );
+      ownerChecksOwed = [...(resolveDeferrableOwnerChecksV1(stage, recordedBlockers, planText) ?? [])];
+    }
+  }
   const primaryBlocker = normalized.blockers[0];
   // v1 fixes 2, item 5: state every remaining blocker's lineage (new / narrowed
   // / unchanged) in the card's own summary — an unchanged score with a
@@ -1762,6 +1841,7 @@ async function postReviewPlateauDecisionV1(
       allBlockersNeedOwnerDecision,
       taskFixableAllUnbuiltWork,
       unbuiltWorkReferences,
+      ownerChecksOwed,
       ...(narrowing ? { narrowing } : {}),
     }),
     target

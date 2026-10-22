@@ -416,7 +416,7 @@ export async function repairMissingRoundOutcomeMessagesV1(
         taskFolderPath,
         {
           role: "assistant",
-          text: formatRoundOutcomeMessageV1(row),
+          text: formatRoundOutcomeMessageV1(row, undefined, read.decoded.progress),
           stage: row.stage,
           at: row.endedAt ?? new Date().toISOString(),
           kind: "outcome",

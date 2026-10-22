@@ -181,6 +181,8 @@ export type AiResultEnvelopeV1 =
       readonly kind: "completed";
       readonly content: CompletedContentV1;
       readonly frameRepairV1?: FrameRepairV1;
+      /** Names of unknown prose-content fields that were dropped (reported in the run log). */
+      readonly droppedFieldsV1?: readonly string[];
     }
   | {
       readonly version: 1;
@@ -885,6 +887,8 @@ export function hasLoneSurrogate(text: string): boolean {
 interface ContentDecodeOk {
   readonly ok: true;
   readonly content: CompletedContentV1;
+  /** Unknown prose-content fields that were dropped rather than failing the response. */
+  readonly droppedFields?: readonly string[];
 }
 interface ContentDecodeErr {
   readonly ok: false;
@@ -905,21 +909,25 @@ function rejectUnknownFields(
   return undefined;
 }
 
+/**
+ * Unknown fields on PROSE content (markdown, chat text) cannot change what
+ * happens — the host only reads the text — so they are dropped and reported
+ * instead of failing a whole round over them. Fields that carry authority
+ * (correlation, operations, receipts, edits, commit metadata) still reject.
+ */
+function droppedProseFields(raw: Record<string, unknown>, allowed: ReadonlySet<string>): readonly string[] {
+  return Object.keys(raw).filter((key) => !allowed.has(key));
+}
+
 function decodeMarkdownArtifact(raw: Record<string, unknown>): ContentDecodeResult {
   if (typeof raw.markdown !== "string") {
     return { ok: false, reason: "markdown-artifact.v1 is missing a string \"markdown\" field" };
   }
-  const unknownField = rejectUnknownFields(
-    raw,
-    new Set(["schemaVersion", "contentType", "markdown"]),
-    "markdown-artifact.v1"
-  );
-  if (unknownField) {
-    return { ok: false, reason: unknownField };
-  }
+  const droppedFields = droppedProseFields(raw, new Set(["schemaVersion", "contentType", "markdown"]));
   return {
     ok: true,
     content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: raw.markdown },
+    ...(droppedFields.length > 0 ? { droppedFields } : {}),
   };
 }
 
@@ -927,15 +935,12 @@ function decodeChatMessage(raw: Record<string, unknown>): ContentDecodeResult {
   if (typeof raw.text !== "string") {
     return { ok: false, reason: "chat-message.v1 is missing a string \"text\" field" };
   }
-  const unknownField = rejectUnknownFields(
-    raw,
-    new Set(["schemaVersion", "contentType", "text"]),
-    "chat-message.v1"
-  );
-  if (unknownField) {
-    return { ok: false, reason: unknownField };
-  }
-  return { ok: true, content: { contentType: "chat-message.v1", schemaVersion: 1, text: raw.text } };
+  const droppedFields = droppedProseFields(raw, new Set(["schemaVersion", "contentType", "text"]));
+  return {
+    ok: true,
+    content: { contentType: "chat-message.v1", schemaVersion: 1, text: raw.text },
+    ...(droppedFields.length > 0 ? { droppedFields } : {}),
+  };
 }
 
 function decodeCommitMetadata(raw: Record<string, unknown>): ContentDecodeResult {
@@ -1446,7 +1451,13 @@ function decodeEnvelopeV1(
           );
         }
       }
-      return { version: 1, correlation, kind: "completed", content: contentResult.content };
+      return {
+        version: 1,
+        correlation,
+        kind: "completed",
+        content: contentResult.content,
+        ...(contentResult.droppedFields ? { droppedFieldsV1: contentResult.droppedFields } : {}),
+      };
     }
     case "questions": {
       const decoded = decodeStructuredQuestionsFromProviderV1(value.questions);

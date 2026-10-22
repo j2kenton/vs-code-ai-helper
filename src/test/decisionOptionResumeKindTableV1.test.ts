@@ -141,6 +141,7 @@ const INVENTORY: readonly InventoryRow[] = [
   // keepIterating option, e.g. the implementation-side plateau case — third
   // in document order after the two plateau-card branches above.
   { file: "utils/reviewEscalation.ts", optionId: "keepIterating", occurrence: 2, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: keepIterating (generic escalation card, decisionKey reviewEscalation:plateau) dispatches resumeAndDispatchImplementation" },
+  { file: "utils/reviewEscalation.ts", optionId: "checkAfterInstall", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: checkAfterInstall advances the stage" },
 
   // src/commands/reconcilePlanChecklist.ts
   { file: "commands/reconcilePlanChecklist.ts", optionId: "applyVerifiedTicks", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: applyVerifiedTicks dispatches the stage's next action after ticking" },
@@ -163,6 +164,10 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "commands/reviewActions.ts", optionId: "notNow", occurrence: 1, resumeKind: "unpause", dispatchProof: "reviewRouting.test.ts: notNow (second card site) dispatches nothing" },
   { file: "commands/reviewActions.ts", optionId: "goToReviewAndApply", occurrence: 2, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: goToReviewAndApply (third card site) dispatches goToReviewAndApplyV1" },
   { file: "commands/reviewActions.ts", optionId: "letItRun", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: letItRun leaves the running round to finish — the process continues" },
+  { file: "commands/reviewActions.ts", optionId: "retrySameModel", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewActions review-degenerate decision test: retrySameModel reruns the review" },
+  { file: "commands/reviewActions.ts", optionId: "chooseDifferentModel", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewActions review-degenerate decision test: chooseDifferentModel opens model selection and reruns" },
+  { file: "commands/reviewActions.ts", optionId: "commitAndPush", occurrence: 0, resumeKind: "continue", dispatchProof: "publishOwnershipMatrix: clean Publish review offers Commit & Push" },
+  { file: "commands/reviewActions.ts", optionId: "notNow", occurrence: 2, resumeKind: "unpause", dispatchProof: "publishOwnershipMatrix: notNow leaves the task at Publish" },
 
   // src/commands/scheduleTaskResume.ts
   { file: "commands/scheduleTaskResume.ts", optionId: "resumeAndRerun", occurrence: 0, resumeKind: "continue", dispatchProof: "scheduleTaskResume.test.ts: resumeAndRerun dispatches the stage's current action" },
@@ -357,6 +362,7 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("utils/reviewEscalation.ts", "acknowledgeAdvance", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "handleMyself", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepIterating", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "checkAfterInstall", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "acceptNarrowing", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepItemOpen", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
 
@@ -424,6 +430,10 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   // picked, or before it is even answered. This is the same "genuinely
   // nothing to test" bar the trivial-no-dispatch bucket exists for.
   [rowKey("commands/reviewActions.ts", "letItRun", 0), { kind: "trivial-no-dispatch" }],
+  [rowKey("commands/reviewActions.ts", "retrySameModel", 0), { kind: "runtime-test", proofFiles: ["reviewRoutingMalformedBlockers.test.ts"] }],
+  [rowKey("commands/reviewActions.ts", "chooseDifferentModel", 0), { kind: "runtime-test", proofFiles: ["reviewRoutingMalformedBlockers.test.ts"] }],
+  [rowKey("commands/reviewActions.ts", "commitAndPush", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
+  [rowKey("commands/reviewActions.ts", "notNow", 2), { kind: "trivial-no-dispatch" }],
 
   [rowKey("commands/scheduleTaskResume.ts", "resumeAndRerun", 0), { kind: "runtime-test", proofFiles: ["scheduleTaskResume.test.ts"] }],
   // Corrected during verification: both handleMyself occurrences are

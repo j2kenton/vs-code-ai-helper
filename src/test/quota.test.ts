@@ -10,6 +10,7 @@ import {
   isAuthenticationFailure,
   isCascadeEligibleFailureKind,
   isModelEntitlementFailure,
+  isPaymentRequiredFailureV1,
   isQuotaError,
   isQuotaResetBeyondThresholdV1,
   isTransportError,
@@ -49,7 +50,7 @@ void describe("isQuotaError", () => {
     assert.strictEqual(isQuotaError("You have exceeded your current quota"), true);
     assert.strictEqual(isQuotaError("Rate limit exceeded, please retry later"), true);
     assert.strictEqual(isQuotaError("Your usage limit has been reached"), true);
-    assert.strictEqual(isQuotaError("Insufficient credits for this request"), true);
+    assert.strictEqual(isQuotaError("Insufficient credits for this request"), false);
     assert.strictEqual(
       isQuotaError("Claude Code CLI failed: You've hit your session limit · resets 2:30am (Asia/Jerusalem)."),
       true
@@ -79,6 +80,22 @@ void describe("isQuotaError", () => {
       isQuotaError("Selected model is at capacity. Please try a different model."),
       false
     );
+  });
+
+  void it("recognizes payment-required payloads separately from reset-bearing quota", () => {
+    const captured = JSON.stringify({
+      type: "error",
+      error: {
+        type: "provider.quota",
+        message: "Upstream request failed: Insufficient account funds",
+        status: 402,
+      },
+    });
+    assert.equal(isPaymentRequiredFailureV1(captured), true);
+    assert.equal(isPaymentRequiredFailureV1('{"status":402,"message":"payment required"}'), true);
+    assert.equal(isQuotaError(captured, true), false, "HTTP 402 takes precedence over a quota-shaped provider event");
+    assert.equal(isPaymentRequiredFailureV1("Insufficient credits for this request"), true);
+    assert.equal(isPaymentRequiredFailureV1("quota exceeded; resets in 2h"), false);
   });
 
   void it("treats an explicit structured signal as an additional (not replacement) quota verdict", () => {
@@ -141,6 +158,16 @@ void describe("classifyFailure", () => {
       classifyFailure({ errorMessage: "You have exceeded your current quota" }).failureKind,
       "quota"
     );
+  });
+
+  void it("classifies a 402 as payment-required, cascade-eligible, and never quota", () => {
+    const classified = classifyFailure({
+      errorMessage: 'OpenCode: {"type":"error","error":{"type":"provider.quota","message":"Upstream request failed: Insufficient account funds","status":402}}',
+      structuredQuotaSignal: true,
+    });
+    assert.equal(classified.failureKind, "payment-required");
+    assert.match(classified.errorMessage ?? "", /HTTP 402.*Add credits or choose a free model/);
+    assert.equal(isCascadeEligibleFailureKind(classified.failureKind), true);
   });
 
   void it("classifies server-side unavailability as temporarily-unavailable", () => {
@@ -514,6 +541,15 @@ void describe("recordQuotaObservation / formatQuotaStatus — reset time", () =>
     void recordQuotaObservation("impl", "claude-cli", "generic", "exited with code 1");
     const observation = getQuotaObservation("impl", "claude-cli");
     assert.strictEqual(observation?.resetAt, undefined);
+
+    void recordQuotaObservation(
+      "impl",
+      "opencode-cli:opencode/glm-5.3-flash",
+      "payment-required",
+      "HTTP 402: Insufficient account funds; quota resets in 2h"
+    );
+    const paymentObservation = getQuotaObservation("impl", "opencode-cli:opencode/glm-5.3-flash");
+    assert.strictEqual(paymentObservation?.resetAt, undefined, "a 402 must never inherit a nearby reset phrase");
   });
 });
 

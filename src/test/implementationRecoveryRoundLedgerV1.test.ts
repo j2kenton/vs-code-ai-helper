@@ -17,6 +17,7 @@ import {
   beginImplementationRecoveryV1,
   claimImplRecoveryDispatchV1,
 } from "../commands/implementationRecoveryV1";
+import { closeRoundRowIfDispatchThrowsV1 } from "../commands/reviewActions";
 import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import {
@@ -489,6 +490,52 @@ void describe("beginImplementationRecoveryV1 — source round terminalization (P
 });
 
 void describe("claimImplRecoveryDispatchV1 — continuation row linkage (Part 4 / item 1)", () => {
+  void it("closes the claimed continuation row as failed when its dispatch rejects", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("continuation_dispatch_failure", [
+        {
+          roundId: "continuation-source-failure",
+          attemptIds: [],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          endedAt: "2026-01-01T00:05:00.000Z",
+          state: "rejected",
+          outcome: { rejectionReason: "unusable summary", continuationOwed: true },
+        },
+      ], {
+        implRecovery: {
+          sourceAttemptId: "continuation-source-attempt-failure",
+          sourceRoundId: "continuation-source-failure",
+          reason: "unusable summary",
+          trigger: "summaryRejected",
+          mode: "unconstrained",
+          dispatch: "pending",
+          at: "2026-01-01T00:05:00.000Z",
+        },
+      });
+      const claimed = await claimImplRecoveryDispatchV1(folderUri);
+      const continuationId = claimed.record?.attemptId;
+      assert.ok(continuationId);
+
+      await assert.rejects(
+        closeRoundRowIfDispatchThrowsV1(folderUri, continuationId, () =>
+          Promise.reject(new Error("continuation provider failed"))
+        ),
+        /continuation provider failed/
+      );
+
+      const row = readProgress(folderPath).roundLedger?.find((entry) => entry.roundId === continuationId);
+      assert.equal(row?.state, "failed");
+      assert.match(row?.outcome?.rejectionReason ?? "", /continuation provider failed/);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("synthesizes a continuation row linked to the source when the task has no live row (manual rerun)", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();

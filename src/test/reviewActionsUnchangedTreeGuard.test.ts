@@ -50,6 +50,7 @@ import { safeRemoveDir } from "./testFsUtils";
 import { computePublishScopeId, renderPublishChecksFreshnessStamp } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
+import { copyPromptResources } from "./helpers/copyPromptResources";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
@@ -62,6 +63,7 @@ const runEditActionModule = require("../commands/runEditActionV1") as Record<str
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-unchanged-guard-"));
+copyPromptResources(REAL_ROOT);
 
 // A real repo with a resolvable HEAD — resolveHeadCommitSha (gitRepoInfo.ts)
 // shells out to real git, same as publishOwnershipMatrix.test.ts's identical

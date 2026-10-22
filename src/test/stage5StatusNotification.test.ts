@@ -77,7 +77,7 @@ type WindowStub = {
 
 type WorkspaceStub = {
   workspaceFolders: typeof vscode.workspace.workspaceFolders;
-  fs: Pick<typeof vscode.workspace.fs, "createDirectory" | "writeFile" | "readDirectory" | "readFile" | "rename">;
+  fs: Pick<typeof vscode.workspace.fs, "createDirectory" | "writeFile" | "readDirectory" | "readFile" | "rename" | "stat">;
   openTextDocument: typeof vscode.workspace.openTextDocument;
 };
 
@@ -142,11 +142,39 @@ function isolateTaskCreationFilesystem(writtenFiles?: Map<string, string>): { re
   stateStore.withMetaRootLock = <T>(_root: string, operation: () => Promise<T>): Promise<T> => operation();
   const originalTaskLock = stateStore.withTaskLock;
   stateStore.withTaskLock = <T>(_taskFolderPath: string, operation: () => Promise<T>): Promise<T> => operation();
+
+  // startNewTask now reads its bundled template through readExtensionResourceV1
+  // before creating anything. Provide a present extension root and template so
+  // tests that don't stub the filesystem themselves still exercise creation.
+  // Every other path goes to whatever stub the test installed before calling
+  // this, so a test's own files (an existing task's progress) stay readable.
+  const workspace = getWorkspaceStub();
+  const origReadFile = workspace.fs.readFile;
+  const origStat = workspace.fs.stat;
+  workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+    if (uri.path === "/extension/resources/prompts/task-template.md") {
+      return Promise.resolve(
+        new TextEncoder().encode(
+          "# Task\n\n## Task Description\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n## Draft with AI\n\n[Click the Draft with AI button, or press Ctrl+Shift+Alt+I]\n"
+        )
+      );
+    }
+    return Promise.resolve(origReadFile(uri));
+  };
+  workspace.fs.stat = (uri: vscode.Uri): Promise<{ type: number; size: number; ctime: number; mtime: number }> => {
+    if (uri.path === "/extension") {
+      return Promise.resolve({ type: 2, size: 0, ctime: 0, mtime: 0 });
+    }
+    return Promise.resolve(origStat(uri));
+  };
+
   return {
     restore: (): void => {
       atomicModule.writeAtomic = original;
       stateStore.withMetaRootLock = originalLock;
       stateStore.withTaskLock = originalTaskLock;
+      workspace.fs.readFile = origReadFile;
+      workspace.fs.stat = origStat;
     },
   };
 }
@@ -809,6 +837,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origExecuteCommand = commandApi.executeCommand;
       const origReadDirectory = workspace.fs.readDirectory;
       const origReadFile = workspace.fs.readFile;
+      const origStat = workspace.fs.stat;
       const writtenFiles = new Map<string, string>();
       const commands: Array<{ command: string; args: unknown[] }> = [];
       workspace.workspaceFolders = [{ uri: vscode.Uri.file("/workspace"), name: "workspace", index: 0 }];
@@ -829,6 +858,13 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       workspace.fs.readDirectory = (): Promise<Array<[string, vscode.FileType]>> =>
         Promise.resolve([["2026-01-01_task_1", vscode.FileType.Directory]]);
       workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+        if (uri.path === "/extension/resources/prompts/task-template.md") {
+          return Promise.resolve(
+            new TextEncoder().encode(
+              "# Task\n\n## Task Description\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n## Draft with AI\n\n[Click the Draft with AI button, or press Ctrl+Shift+Alt+I]\n"
+            )
+          );
+        }
         if (uri.path.includes("2026-01-01_task_1") && uri.path.endsWith("task-progress.json")) {
           return Promise.resolve(new TextEncoder().encode(JSON.stringify({
             taskFolder: "2026-01-01_task_1",
@@ -840,6 +876,13 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         }
         return Promise.reject(new Error("ENOENT"));
       };
+      // The template stub above represents a live extension installation.
+      // readExtensionResourceV1 stats the root before treating a missing
+      // resource as eligible for its inline fallback.
+      workspace.fs.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
+        uri.path === "/extension"
+          ? Promise.resolve({ type: vscode.FileType.Directory, size: 0, ctime: 0, mtime: 0 })
+          : Promise.reject(new Error(`ENOENT: ${uri.path}`));
       workspace.openTextDocument = (): Promise<vscode.TextDocument> => Promise.resolve({} as vscode.TextDocument);
       win.showTextDocument = (): Promise<vscode.TextEditor> => Promise.resolve({} as vscode.TextEditor);
       win.showErrorMessage = (): Thenable<string | undefined> => Promise.resolve(undefined);
@@ -851,7 +894,8 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const creationFilesystem = isolateTaskCreationFilesystem(writtenFiles);
 
       try {
-        await startNewTask(makeInventoryStub(), vscode.Uri.file("/extension"), makeStoreStub());
+        const created = await startNewTask(makeInventoryStub(), vscode.Uri.file("/extension"), makeStoreStub());
+        assert.ok(created !== undefined, `startNewTask should return the created folder name (got ${String(created)})`);
         await Promise.resolve();
         await Promise.resolve();
         const progressDocument = [...writtenFiles.entries()]
@@ -891,6 +935,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.fs.rename = origRename;
         workspace.fs.readDirectory = origReadDirectory;
         workspace.fs.readFile = origReadFile;
+        workspace.fs.stat = origStat;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         deactivateNotificationRouter();
@@ -993,6 +1038,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const origRename = workspace.fs.rename;
       // eslint-disable-next-line @typescript-eslint/unbound-method
       const origReadFile = (workspace.fs as typeof vscode.workspace.fs).readFile;
+      const origStat = workspace.fs.stat;
       const origOpenTextDocument = workspace.openTextDocument;
       const origShowTextDocument = win.showTextDocument;
       const origShowErrorMessage = win.showErrorMessage;
@@ -1016,11 +1062,22 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       };
       workspace.fs.rename = (): Promise<void> => Promise.resolve();
       (workspace.fs as typeof vscode.workspace.fs).readFile = (uri: vscode.Uri): Promise<Uint8Array> => {
+        if (uri.path === "/extension/resources/prompts/task-template.md") {
+          return Promise.resolve(
+            new TextEncoder().encode(
+              "# Task\n\n## Task Description\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n## Draft with AI\n\n[Click the Draft with AI button, or press Ctrl+Shift+Alt+I]\n"
+            )
+          );
+        }
         const content = writtenFiles.get(uri.path);
         return content === undefined
           ? Promise.reject(new Error(`missing ${uri.path}`))
           : Promise.resolve(new TextEncoder().encode(content));
       };
+      workspace.fs.stat = (uri: vscode.Uri): Promise<vscode.FileStat> =>
+        uri.path === "/extension"
+          ? Promise.resolve({ type: vscode.FileType.Directory, size: 0, ctime: 0, mtime: 0 })
+          : Promise.reject(new Error(`ENOENT: ${uri.path}`));
       workspace.openTextDocument = (): Promise<vscode.TextDocument> => Promise.resolve({} as vscode.TextDocument);
       win.showTextDocument = (): Promise<vscode.TextEditor> => Promise.resolve({} as vscode.TextEditor);
       win.showErrorMessage = (): Thenable<string | undefined> => Promise.resolve(undefined);
@@ -1046,6 +1103,7 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         workspace.fs.writeFile = origWriteFile;
         workspace.fs.rename = origRename;
         (workspace.fs as typeof vscode.workspace.fs).readFile = origReadFile;
+        workspace.fs.stat = origStat;
         workspace.openTextDocument = origOpenTextDocument;
         win.showTextDocument = origShowTextDocument;
         safeRemoveDir(tempRoot);

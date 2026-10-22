@@ -1970,7 +1970,29 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
 
 void describe("Publish auto-run ownership matrix — passing review, composite, reopen, and execution-time recheck", () => {
   void it("a passing manual Publish review never auto-publishes — it only nudges toward the manual Publish action", async () => {
-    const { folderPath } = makeTaskFolder(`manual-review-${Math.floor(Math.random() * 1e9)}`, "publish");
+    const { folderPath } = makeTaskFolder(`manual-review-${Math.floor(Math.random() * 1e9)}`, "publish", []);
+    // The Ready-to-publish decision needs a review with no blockers, including
+    // the mechanical ones the review's own completion checks add. Give the
+    // task's project root fast passing scripts (same pattern as
+    // reviewActionsApplyReviewEditActivityIntegration.test.ts) so those checks
+    // pass instead of failing on a missing package.json.
+    const fixturePackageJson = path.join(path.dirname(folderPath), "package.json");
+    fs.writeFileSync(
+      fixturePackageJson,
+      JSON.stringify(
+        {
+          name: "publish-owner-manual-review-fixture",
+          scripts: {
+            lint: 'node -e "process.exit(0)"',
+            "check-types": 'node -e "process.exit(0)"',
+            test: 'node -e "process.exit(0)"',
+          },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
     const fsBridge = installFsBridge();
@@ -1997,8 +2019,9 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       const nudge = provider
         .getEntries()
         .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
-      assert.ok(nudge, "expected a Notifications entry offering the manual publish action");
+      assert.ok(nudge, "expected a Notifications entry opening the Ready to publish decision");
       assert.equal(nudge?.actionCommand?.title, "Open in Chat");
+      assert.match(nudge?.message ?? "", /Ready to publish — Commit & Push is next/);
       assert.deepEqual(nudge?.actionCommand?.args, [
         { canonicalId: vscode.Uri.file(folderPath).fsPath, taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "publish" },
       ]);
@@ -2008,6 +2031,7 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       fsBridge.restore();
       provider.dispose();
       deactivateNotificationRouter();
+      fs.rmSync(fixturePackageJson, { force: true });
     }
   });
 
@@ -2260,6 +2284,10 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
         provider.getEntries().some((entry) => /No model is configured for this stage/.test(entry.message)),
         "the refusal must say why"
       );
+      const progress = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = progress.roundLedger?.find((entry) => entry.stage === "impl-low-review");
+      assert.equal(row?.state, "failed");
+      assert.match(row?.outcome?.rejectionReason ?? "", /no model is configured.*dispatch did not start/);
     } finally {
       wsStub.restore();
       fsBridge.restore();

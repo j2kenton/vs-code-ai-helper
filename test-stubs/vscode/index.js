@@ -337,9 +337,17 @@ class WorkspaceEdit {
 const workspace = {
   fs: {
     readFile: notImplemented("workspace.fs.readFile"),
-    writeFile: notImplemented("workspace.fs.writeFile"),
-    createDirectory: notImplemented("workspace.fs.createDirectory"),
-    readDirectory: notImplemented("workspace.fs.readDirectory"),
+    writeFile: async (uri, content) => {
+      fs.mkdirSync(path.dirname(uri.fsPath), { recursive: true });
+      fs.writeFileSync(uri.fsPath, Buffer.from(content));
+    },
+    createDirectory: async (uri) => {
+      fs.mkdirSync(uri.fsPath, { recursive: true });
+    },
+    readDirectory: async (uri) => fs.readdirSync(uri.fsPath, { withFileTypes: true }).map((entry) => [
+      entry.name,
+      entry.isDirectory() ? FileType.Directory : FileType.File,
+    ]),
     // Real implementation (not notImplemented): several modules use a plain
     // existence/kind check before deciding whether to migrate/create a file,
     // and that's cheap enough to back with real fs rather than require every
@@ -498,6 +506,8 @@ class TreeView {
 const quickPickResults = [];
 const inputBoxResults = [];
 const window = {
+  visibleTextEditors: [],
+  tabGroups: { all: [] },
   // Defaults to Dark; tests set `window.activeColorTheme = { kind: ... }`
   // and (optionally) fire `window._colorThemeChanges`.
   activeColorTheme: { kind: ColorThemeKind.Dark },

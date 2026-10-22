@@ -42,6 +42,7 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { resetProductionTaskActionRegistryForTestV1 } from "../actions/productionTaskActionRuntimeV1";
+import { ExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 
 void describe("validateAiNameReply / isLeadingSubstringOfDescription (pure)", () => {
   const description =
@@ -294,7 +295,7 @@ function installFakeInventory(taskFolderPath: string): TaskInventory {
   } as unknown as TaskInventory;
 }
 
-function makeExtensionContext(): vscode.ExtensionContext {
+function makeExtensionContext(extensionPath = REAL_ROOT): vscode.ExtensionContext {
   const backing = new Map<string, unknown>([
     [
       `aiHelper.consent.v${DISCLAIMER_VERSION}`,
@@ -312,7 +313,7 @@ function makeExtensionContext(): vscode.ExtensionContext {
   };
   return {
     subscriptions: [] as vscode.Disposable[],
-    extensionUri: vscode.Uri.file(REAL_ROOT),
+    extensionUri: vscode.Uri.file(extensionPath),
     workspaceState: memento,
     globalState: memento,
   } as unknown as vscode.ExtensionContext;
@@ -372,11 +373,13 @@ async function withRenameHarness(
       replies: string[],
       onCreate: () => void
     ) => (options: { model?: string }) => unknown;
+    readonly renderPrompt?: () => Promise<string>;
+    readonly extensionPath?: string;
   }
 ): Promise<void> {
   const folderPath = makeTaskFolder(`renamecmd_${Math.floor(Math.random() * 1e9)}`, taskDescription);
   const inventory = installFakeInventory(folderPath);
-  const context = makeExtensionContext();
+  const context = makeExtensionContext(options?.extensionPath);
 
   const warnings: string[] = [];
   initNotificationRouter({
@@ -404,7 +407,7 @@ async function withRenameHarness(
         () => { transportCalls += 1; }
       )
     ),
-    patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+    patch(promptTemplatesModule, "renderPromptTemplate", options?.renderPrompt ?? (() => Promise.resolve("stub prompt"))),
   ];
 
   try {
@@ -420,6 +423,24 @@ async function withRenameHarness(
 }
 
 void describe("renameTaskWithAI (command-level, real coordinator + fake transport)", () => {
+  void it("does not call a provider or change task progress when the extension folder is gone", async () => {
+    const removed = new ExtensionFolderRemovedErrorV1();
+    await withRenameHarness(
+      "Users need to export large datasets without freezing the UI.",
+      ["unused"],
+      async ({ folderPath, inventory, context, transportCallCount }) => {
+        const before = fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8");
+        await renameTaskWithAI(context, inventory, { canonicalId: folderPath });
+        assert.equal(transportCallCount(), 0);
+        assert.equal(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8"), before);
+      },
+      {
+        extensionPath: path.join(REAL_ROOT, "removed-extension-folder"),
+        renderPrompt: () => Promise.reject(removed),
+      }
+    );
+  });
+
   void it("applies a valid first reply directly — a single provider call", async () => {
     await withRenameHarness(
       "Users need to export large datasets without freezing the UI.",

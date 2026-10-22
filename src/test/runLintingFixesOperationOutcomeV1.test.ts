@@ -28,6 +28,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { taskOperations, TaskOperationSnapshot } from "../utils/taskOperations";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
+import { copyPromptResources } from "./helpers/copyPromptResources";
 import {
   deactivateNotificationRouter,
   initNotificationRouter,
@@ -45,6 +46,7 @@ const runEditActionModule = require("../commands/runEditActionV1") as Record<str
 // ("Another Ensemble session is currently updating task state").
 const REAL_ROOT = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lint-fixes-outcome-")), "workspace");
 fs.mkdirSync(REAL_ROOT, { recursive: true });
+copyPromptResources(REAL_ROOT);
 
 function makeTaskFolder(name: string): string {
   const dir = path.join(REAL_ROOT, name);

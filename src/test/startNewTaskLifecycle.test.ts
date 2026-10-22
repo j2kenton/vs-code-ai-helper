@@ -169,6 +169,32 @@ function installHarness(extraWorkspaceRoots: readonly string[] = []): Harness {
 }
 
 void describe("startNewTask — active/paused lifecycle", () => {
+  void it("does not create a task when the extension folder disappeared before loading its template", async () => {
+    const harness = installHarness();
+    const fsApi = vscode.workspace.fs as unknown as Record<string, unknown>;
+    const originalStat = fsApi.stat;
+    fsApi.stat = async (uri: vscode.Uri): Promise<unknown> => {
+      const stat = await fs.promises.stat(uri.fsPath);
+      return { type: stat.isDirectory() ? vscode.FileType.Directory : vscode.FileType.File, size: stat.size, ctime: stat.ctimeMs, mtime: stat.mtimeMs };
+    };
+    try {
+      const missingExtension = vscode.Uri.file(path.join(harness.workspaceRoot, "removed-extension"));
+      const folderName = await startNewTask(
+        harness.inventory,
+        missingExtension,
+        harness.currentTaskStore
+      );
+      assert.equal(folderName, undefined);
+      const taskFolders = fs.existsSync(harness.metaFolderPath)
+        ? fs.readdirSync(harness.metaFolderPath).filter((entry) => /_task_\d+$/.test(entry))
+        : [];
+      assert.deepEqual(taskFolders, []);
+    } finally {
+      fsApi.stat = originalStat;
+      harness.restore();
+    }
+  });
+
   void it("starts ACTIVE and becomes the current task when no task under this meta root is already active", async () => {
     const harness = installHarness();
     try {

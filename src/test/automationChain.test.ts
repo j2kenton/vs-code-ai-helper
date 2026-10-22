@@ -731,6 +731,36 @@ void test("a declined (false-resolving) automation dispatch closes its round-led
   }
 });
 
+void test("a throwing onDeclined callback still settles the opened generic row with a failure reason", async () => {
+  const fixture = makeOwnedTaskFolder("ensemble-automation-chain-declined-callback-fail-");
+  const fsBridge = installFsBridgeV1();
+  __extensionContextV1TestOnly.set({ workspaceState: new FakeMementoV1() } as unknown as vscode.ExtensionContext);
+  try {
+    const result = await scheduleAutomationChain(
+      {
+        command: "vs-code-ai-helper.runImplementationWithAI",
+        taskKey: fixture.folder,
+        chainId: "declined-callback-fail",
+        onDeclined: () => { throw new Error("decline observer failed"); },
+      },
+      undefined,
+      {
+        onDidEnd: () => ({ dispose: () => undefined }),
+        execute: () => Promise.resolve(false),
+      }
+    );
+    assert.equal(result, true, "the command ran and returned its normal declined result");
+    const raw = await waitUntilRowTerminalV1(fixture.folder);
+    const row = raw.roundLedger?.[0];
+    assert.equal(row?.state, "failed");
+    assert.equal(row?.outcome?.rejectionReason, "decline observer failed");
+  } finally {
+    __extensionContextV1TestOnly.reset();
+    fsBridge.restore();
+    safeRemoveDir(fixture.folder);
+  }
+});
+
 // 2026-08-27 review follow-up, narrowed completion blocker: "the root-
 // unsuccessful branch also records the scheduling intent as cancelled but the
 // ledger as dropped ... leaving the two durable classifications inconsistent"

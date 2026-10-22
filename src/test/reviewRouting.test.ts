@@ -752,11 +752,14 @@ void describe("degenerateReviewRejectionReason", () => {
       score: null,
       stage: "impl-high-review",
       attemptId: "attempt-42",
+      modelId: "gpt-6-luna@high",
     });
     assert.notStrictEqual(reason, null);
     assert.ok(reason!.includes("High-Level Code Review"));
     assert.ok(reason!.includes("attempt-42"));
     assert.ok(reason!.includes("excluded from the review score history"));
+    assert.match(reason!, /model replied with a summary, not a review, because it had no parseable/);
+    assert.match(reason!, /gpt-6-luna@high/);
   });
 });
 

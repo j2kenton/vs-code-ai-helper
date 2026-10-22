@@ -19,6 +19,7 @@ import {
   isClosedBeforeImplementationChecklistItemTextV1,
   isExcludedChecklistItemText,
   markClosedBeforeImplementationV1,
+  resolveExcludedOwnerHandoffV1,
 } from "../utils/implementationChecklist";
 import { readyToAdvanceStage, reconcileProgressWithChecklistV1 } from "../utils/reviewReadiness";
 
@@ -37,12 +38,38 @@ void describe("exclusion marker counting", () => {
   void it("does not count an item that merely mentions the marker", () => {
     assert.equal(isExcludedChecklistItemText(`Add the marker \`${M}\` to other items`), false);
     assert.equal(isExcludedChecklistItemText(`Document the marker ${M} in the guide`), false);
-    assert.equal(isExcludedChecklistItemText(`Write about the literal \`${M}\``), false);
+  });
+
+  void it("counts the marker wrapped in a single pair of backticks at the end of the line", () => {
+    assert.equal(isExcludedChecklistItemText(`Write about the literal \`${M}\``), true);
+    assert.equal(isExcludedChecklistItemText(`Deploy to production \`${M}\``), true);
   });
 
   void it("does not count a marker glued to text or standing alone", () => {
     assert.equal(isExcludedChecklistItemText(`the literal${M}`), false);
     assert.equal(isExcludedChecklistItemText(M), false);
+  });
+
+  void it("resolves only matching excluded five-field owner hand-offs and identifies prerequisites", () => {
+    const handoff = (title: string, prerequisite = "") =>
+      `- [ ] **${title}** — What: inspect the installed UI. Why: confirm the result. How: install and compare. If it fails: report the mismatch. Priority: LOW. ${prerequisite} ${M}`;
+    const planText = [
+      "## Owner checks",
+      handoff("Compare the installed UI"),
+      handoff("Confirm the prerequisite", "Required before Step 3."),
+      "## Part 1",
+      `- [ ] Mention this marker ${M}`,
+    ].join("\n");
+    assert.equal(
+      resolveExcludedOwnerHandoffV1("Owner evidence needed: Compare the installed UI", planText)?.isPrerequisite,
+      false
+    );
+    assert.equal(
+      resolveExcludedOwnerHandoffV1("Owner evidence needed: Confirm the prerequisite", planText)?.isPrerequisite,
+      true
+    );
+    assert.equal(resolveExcludedOwnerHandoffV1("Owner evidence needed: missing unrelated check", planText), undefined);
+    assert.equal(resolveExcludedOwnerHandoffV1("Owner evidence needed: Mention this marker", planText), undefined);
   });
 
   void it("the count keeps a mention-only item open and an appended marker settled", () => {

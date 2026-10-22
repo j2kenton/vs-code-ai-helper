@@ -18,8 +18,9 @@ import * as path from "node:path";
  *     the periodic one — can never both execute it), runs it, writes the
  *     response, and removes the request and the claim;
  *   - the viewer removes the response once read.
- * A request older than `maxAgeMs` when claimed is answered `expired`, never
- * executed: a viewer that gave up must not have its action run minutes later.
+ * An unclaimed request older than `maxAgeMs` is answered `expired`, never
+ * executed. A claimed request whose heartbeat stopped is `interrupted`,
+ * because the runner had already started it before it stopped.
  *
  * This module is VS Code-free (plain fs) so it is unit-testable; extension.ts
  * wires the runner's file watcher and the viewer's user-facing calls.
@@ -353,6 +354,18 @@ export function createHostRelayV1(options: {
         const cutoffTemps = now().getTime() - 10 * 60 * 1000;
         const cutoffClaims = now().getTime() - claimStaleMs;
         for (const name of names) {
+          if (name.startsWith(REQUEST_PREFIX) && name.endsWith(".json")) {
+            const id = name.slice(REQUEST_PREFIX.length, -".json".length);
+            if (!ID_PATTERN.test(id)) {
+              // A malformed filename cannot be turned into an executable
+              // request. Remove the bounded dead letter and any matching
+              // sidecar so it cannot remain queued forever.
+              console.warn(`[hostRelayV1] removed malformed relay request id: ${JSON.stringify(id.slice(0, 80))}`);
+              await fs.rm(path.join(dir, name), { force: true }).catch(() => undefined);
+              await fs.rm(path.join(dir, `${name}${CLAIMED_SUFFIX}`), { force: true }).catch(() => undefined);
+              continue;
+            }
+          }
           const isResponse = name.startsWith(RESPONSE_PREFIX) && name.endsWith(".json");
           const isTemp = name.endsWith(".tmp");
           // A claim whose request is gone (the viewer withdrew it at its own
@@ -398,7 +411,7 @@ export function createHostRelayV1(options: {
         await writeComplete(path.join(dir, `${RESPONSE_PREFIX}${id}.json`), {
           id,
           ok: false,
-          reason: "expired",
+          reason: "interrupted: the runner stopped while this action was running. Check the task and resume it.",
           completedAt: now().toISOString(),
         } satisfies HostRelayResponseV1);
         await fs.rm(requestPath, { force: true });

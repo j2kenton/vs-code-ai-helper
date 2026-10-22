@@ -73,7 +73,14 @@ VIEWER_TOKEN="$HOME/.serve-web-viewer.token"
 mkdir -p "$VIEWER_DIR/data/Machine" "$VIEWER_DIR/data/User"
 [ -f "$VIEWER_TOKEN" ] || node -e 'process.stdout.write(require("crypto").randomBytes(16).toString("hex"))' > "$VIEWER_TOKEN"
 chmod 600 "$VIEWER_TOKEN"
-printf '%s\n' '{' '  "ensemble.hostRole": "viewer",' '  "update.mode": "none"' '}' \
+# The viewer is for watching and chatting, not editing: keep the language
+# servers that Settings Sync brings along from starting their heavy work here.
+# Together they held about 1.8 GB on 2026-10-22, enough to push the box over
+# its memory limit and kill the runner mid-check. Machine settings override
+# the browser's own user settings and are not synced, so the laptop keeps them.
+printf '%s\n' '{' '  "ensemble.hostRole": "viewer",' '  "update.mode": "none",' \
+  '  "eslint.enable": false,' '  "python.languageServer": "None",' \
+  '  "typescript.experimental.useTsgo": false,' '  "cSpell.enabled": false' '}' \
   > "$VIEWER_DIR/data/Machine/settings.json"
 # The server keeps its OWN extensions directory, separate from ~/.vscode and
 # ~/.vscode-server: an empty one looks exactly like a dead extension host.

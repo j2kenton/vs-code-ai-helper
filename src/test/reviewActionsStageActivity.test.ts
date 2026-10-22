@@ -148,12 +148,12 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
   });
 
   void it("reports the changed-file count only at the existing post-dispatch boundary where it is known, without resetting the elapsed origin", () => {
-    const resultGuardMatch = /if \(!result\) \{\s*return false;\s*\}/.exec(source);
+    const resultGuardMatch = /if \(!result\) \{\s*await terminalizeRoundV1\([\s\S]{0,600}?return false;\s*\}/.exec(source);
     assert.ok(resultGuardMatch, "expected the executeImplementationRun result-known guard");
     const resultGuard = resultGuardMatch.index;
     const countReport = source.indexOf("options.parentOperation?.reportActivity(", resultGuard);
     assert.ok(countReport >= 0, "expected a changed-file-count reportActivity call after result is known");
-    assert.ok(countReport - resultGuard < 800, "the count report must sit at the result boundary, not deep in later logic");
+    assert.ok(countReport - resultGuard < 1600, "the count report must sit near the result boundary, after failure settlement");
 
     const guardedBlock = source.slice(resultGuard, countReport + 400);
     assert.match(
@@ -399,7 +399,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
       );
       assert.ok(contextIdx >= 0);
       const promptRenderIdx = indexOfFlexible(
-        'const prompt = await renderPromptTemplate(',
+        'prompt = await renderPromptTemplate(',
         fnStart
       );
       assert.ok(promptRenderIdx >= 0);

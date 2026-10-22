@@ -5071,6 +5071,7 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
   const fakeExtensionUri = vscode.Uri.file("/fake-extension");
 
   function seedImplHighReviewTemplate(store: Map<string, string>): void {
+    store.set(fakeExtensionUri.toString(), "extension root exists");
     const templateUri = vscode.Uri.joinPath(
       fakeExtensionUri,
       "resources",
@@ -5156,6 +5157,7 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
 
     try {
       const folderUri = makeTaskFolderUri("impl-review-missing-plan");
+      seedImplHighReviewTemplate(store);
       const workspaceRoot = makeWorkspaceFolder("/fake-workspace");
 
       // Seed plan-final.md (impl notes) — present
@@ -5239,6 +5241,7 @@ void describe("runReviewForFolder impl-review variable sourcing (production code
 
     try {
       const folderUri = makeTaskFolderUri("impl-review-missing-impl");
+      seedImplHighReviewTemplate(store);
       const workspaceRoot = makeWorkspaceFolder("/fake-workspace");
 
       // Seed plan.md (plan) — present
@@ -5729,6 +5732,7 @@ void describe("runReviewForFolder legacy-task fallback (suite 14)", () => {
   const fakeExtensionUri = vscode.Uri.file("/fake-extension");
 
   function seedImplHighReviewTemplate(store: Map<string, string>): void {
+    store.set(fakeExtensionUri.toString(), "extension root exists");
     const templateUri = vscode.Uri.joinPath(
       fakeExtensionUri,
       "resources",

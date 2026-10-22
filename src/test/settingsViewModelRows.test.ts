@@ -171,7 +171,7 @@ function runWebviewSession(script: string): WebviewSession {
 }
 
 interface InitOverrides {
-  models?: Array<{ id: string; name: string; providerLabel: string }>;
+  models?: Array<{ id: string; name: string; providerLabel: string; priceTierV1?: "Free" | "Paid" }>;
   stages?: string[];
   providers?: Array<Record<string, unknown>>;
   showProviderSignInButtons?: boolean;
@@ -474,6 +474,38 @@ void describe("AI Models view — combo labelling and type-to-select", () => {
     await input.dispatch("blur");
     await new Promise((resolve) => setTimeout(resolve, 200));
     assert.equal(hidden.value, "", "an ambiguous base must not auto-select");
+  });
+
+  void it("labels OpenCode free and paid entries in stage model choices", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(initMessage({
+      models: [
+        { id: "opencode-cli:opencode/glm-5.3-flash", name: "GLM Flash", providerLabel: "OpenCode Zen", priceTierV1: "Paid" },
+        { id: "opencode-cli:opencode/glm-5.3-flash-free", name: "GLM Flash Free", providerLabel: "OpenCode Zen", priceTierV1: "Free" },
+      ],
+      settings: { impl: { primary: "opencode-cli:opencode/glm-5.3-flash", backups: [] } },
+      enabledProviders: { "opencode-cli": true },
+    }));
+    const row = session.tbodyRows()[0]!;
+    assert.match(row.innerHTML, /GLM Flash \[Paid\]/);
+    await row.querySelector("#primary-input-impl").dispatch("focus");
+    assert.match(row.querySelector("#primary-list-impl").innerHTML, /GLM Flash Free/);
+    assert.match(row.querySelector("#primary-list-impl").innerHTML, /Free/);
+  });
+
+  void it("marks a stale configured Copilot effort and lists live alternatives from Copilot", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(initMessage({
+      models: [
+        { id: "gpt-6-luna", name: "GPT 6 Luna", providerLabel: "GitHub Copilot" },
+        { id: "claude-sonnet-5", name: "Claude Sonnet 5", providerLabel: "GitHub Copilot" },
+      ],
+      settings: { impl: { primary: "gpt-6-luna@ultra", backups: [] } },
+    }));
+    const html = session.tbodyRows()[0]!.innerHTML;
+    assert.match(html, /Unavailable model: gpt-6-luna@ultra/);
+    assert.match(html, /does not resolve in the discovered copilot catalog/i);
+    assert.match(html, /Valid alternatives: gpt-6-luna, claude-sonnet-5/);
   });
 
   void it("exact full-label selection still works", async () => {

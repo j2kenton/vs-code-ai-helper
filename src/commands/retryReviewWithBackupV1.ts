@@ -20,6 +20,7 @@ import { runReviewForFolder } from "./reviewActions";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
+import { getAvailableModels } from "../utils/modelSelection";
 
 export async function retryReviewWithBackupV1(
   extensionUri: vscode.Uri,
@@ -63,6 +64,35 @@ export async function retryReviewWithBackupV1(
   });
 }
 
+/** Let the owner choose another live model or reasoning level for this retry. */
+export async function chooseReviewRetryV1(
+  extensionUri: vscode.Uri,
+  input: { readonly taskFolderPath: string; readonly stage: TaskStage; readonly currentModelId: string }
+): Promise<void> {
+  const available = await getAvailableModels(true);
+  const choices = available
+    .filter((model) => model.id !== input.currentModelId)
+    .map((model) => ({ label: model.name, description: model.providerLabel, detail: model.id, modelId: model.id }));
+  if (choices.length === 0) {
+    NotificationRouter.showWarning(
+      `${formatNotificationTaskLabelV1(undefined, input.taskFolderPath)}: no different discovered model or reasoning level is available for this review.`
+    );
+    return;
+  }
+  const selected = await vscode.window.showQuickPick(choices, {
+    title: "Choose another model or reasoning level for this review",
+    placeHolder: "Select a discovered model and level",
+  });
+  if (!selected) {
+    return;
+  }
+  await retryReviewWithBackupV1(extensionUri, {
+    taskFolderPath: input.taskFolderPath,
+    stage: input.stage,
+    modelId: selected.modelId,
+  });
+}
+
 export function registerRetryReviewWithBackupCommandV1(
   context: vscode.ExtensionContext
 ): void {
@@ -75,6 +105,19 @@ export function registerRetryReviewWithBackupCommandV1(
               taskFolderPath: arg.taskFolderPath,
               stage: arg.stage,
               modelId: arg.modelId,
+            })
+          : Promise.resolve()
+    )
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.chooseReviewRetryV1",
+      (arg?: { taskFolderPath?: string; stage?: TaskStage; currentModelId?: string }) =>
+        arg?.taskFolderPath && arg.stage && arg.currentModelId
+          ? chooseReviewRetryV1(context.extensionUri, {
+              taskFolderPath: arg.taskFolderPath,
+              stage: arg.stage,
+              currentModelId: arg.currentModelId,
             })
           : Promise.resolve()
     )

@@ -20,6 +20,12 @@ Owner evidence: when a round declined a step because it needs a web page, docume
 
 Narrowing: when a ticked checklist item was only partly done and the round's evidence says the rest does not apply, only the owner may narrow the item. File `- [completion] [environmental] Narrowing needs an owner decision: `<the checklist item text, verbatim, in backticks>` — <what was not done>` as the blocker, never `task-fixable` (a round may not narrow the plan, so sending it back to a round cannot clear it). A plan whose tick is disputed is not complete: keep the score below the ready threshold while the narrowing is undecided, otherwise the blocker will not raise the owner card.
 
+
+
+Owner hand-offs: an excluded five-element owner check (What/Why/How/Failure/Priority), or an item marked `Verified by Publish Checks`, is an intentional hand-off. If it is still pending, list it in the verdict as owed by the owner; do not file a blocker just because installation or Publish Checks has not happened yet. This exception applies only to those owner hand-offs. An exclusion that hides unfinished round work remains a completion blocker.
+
+The final response must be the review itself and begin with the required `Readiness: N/10` line; do not return a summary of the investigation instead of the review.
+
 Structure your review as:
 
 Begin your response with a readiness score on its own line in this exact format:

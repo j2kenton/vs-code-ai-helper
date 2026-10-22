@@ -1945,8 +1945,8 @@ export async function postReconcilePlanChecklistDecisionV1(
         (progress.checklistProgressUnreliableReason
           ? `Recorded reason the checklist was flagged unreliable: ${progress.checklistProgressUnreliableReason}`
           : "Recorded reason the checklist was flagged unreliable: not recorded (older record) — this task " +
-            "was latched before that reason was captured, so judge the existing ticks on their own merits " +
-            "rather than assuming they are trustworthy."),
+            "was latched before that reason was captured. Treat the existing ticks as incomplete evidence; " +
+            "the run log for the round that set the latch may contain the missing cause."),
       gating: {
         holdsTaskPaused: false,
         unblocksProgress: true,
@@ -2197,6 +2197,7 @@ export async function reconcilePlanChecklistConfirmedV1(
     return {
       ...current,
       checklistProgressUnreliable: undefined,
+      checklistProgressUnreliableReason: undefined,
       updatedAt: new Date().toISOString(),
     };
   });

@@ -1253,7 +1253,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
 
           function modelLabel(model) {
-            return model ? model.name + ' — ' + model.providerLabel : '';
+            return model ? model.name + (model.priceTierV1 ? ' [' + model.priceTierV1 + ']' : '') + ' — ' + model.providerLabel : '';
           }
 
           function findModelById(id) {
@@ -1303,7 +1303,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
 
           function modelSearchableText(model) {
-            return [splitModelName(model.name).base, model.name, model.providerLabel, model.id]
+            return [splitModelName(model.name).base, model.name, model.priceTierV1, model.providerLabel, model.id]
               .join(' ').replace(/\\[[^\\]]*\\]/g, '').toLowerCase();
           }
 
@@ -1390,6 +1390,17 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             return enabledProviders[providerId] !== true;
           }
 
+          function unresolvedModelNote(id) {
+            const providerId = providerIdOfModelId(id);
+            const alternatives = availableModels
+              .filter(model => providerIdOfModelId(model.id) === providerId)
+              .slice(0, 4)
+              .map(model => model.id);
+            return 'This model does not resolve in the discovered ' + providerId + ' catalog' +
+              (alternatives.length ? '. Valid alternatives: ' + alternatives.join(', ') : '.') +
+              ' Choose a listed model to update this setting.';
+          }
+
           // The provider-disabled note belongs to whichever model id is
           // currently selected in this row, not to the DOM slot the row
           // happens to occupy — so a removal, promotion, or replacement
@@ -1397,7 +1408,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // leaving a stale one behind. Tolerates a missing note element.
           function syncProviderDisabledNote(note, selectedId) {
             if (!note) return;
-            note.hidden = !(selectedId && !findModelById(selectedId) && isStoredModelProviderDisabled(selectedId));
+            const unresolved = !!selectedId && !findModelById(selectedId);
+            note.hidden = !unresolved;
+            if (unresolved) {
+              note.textContent = isStoredModelProviderDisabled(selectedId)
+                ? PROVIDER_DISABLED_NOTE_TEXT
+                : unresolvedModelNote(selectedId);
+            }
           }
 
           function modelComboboxHtml(kind, stage, selectedId, disabled) {
@@ -1409,11 +1426,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const selectedLabel = selectedModel
               ? modelLabel(selectedModel)
               : selectedId
-                ? (providerDisabled ? selectedId + ' (provider disabled)' : 'Unknown model: ' + selectedId)
+                ? (providerDisabled ? selectedId + ' (provider disabled)' : 'Unavailable model: ' + selectedId)
                 : '';
             const hiddenValue = selectedId || '';
             const disabledAttr = disabled ? 'disabled aria-disabled="true"' : '';
-            const noteHiddenAttr = providerDisabled ? '' : 'hidden';
+            const unresolved = !!selectedId && !selectedModel;
+            const noteHiddenAttr = unresolved ? '' : 'hidden';
+            const noteText = providerDisabled ? PROVIDER_DISABLED_NOTE_TEXT : unresolved ? unresolvedModelNote(selectedId) : PROVIDER_DISABLED_NOTE_TEXT;
             return \`
               <div class="model-combobox" data-kind="\${kind}" data-stage="\${stage}">
                 <input type="hidden" id="\${kind}-\${stage}" value="\${escapeHtml(hiddenValue)}">
@@ -1430,7 +1449,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   \${disabledAttr}
                 >
                 <div id="\${kind}-list-\${stage}" class="model-options" role="listbox" hidden></div>
-                <div id="\${kind}-note-\${stage}" class="provider-disabled-note" \${noteHiddenAttr}>\${PROVIDER_DISABLED_NOTE_TEXT}</div>
+                <div id="\${kind}-note-\${stage}" class="provider-disabled-note" \${noteHiddenAttr}>\${escapeHtml(noteText)}</div>
               </div>
             \`;
           }
@@ -1462,7 +1481,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 ? modelLabel(selectedModel)
                 : providerDisabled
                   ? selectedId + ' (provider disabled)'
-                  : 'Unknown model: ' + selectedId;
+                  : 'Unavailable model: ' + selectedId;
               syncProviderDisabledNote(box.querySelector('.provider-disabled-note'), selectedId);
             });
           }
@@ -1489,7 +1508,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                     // The model name leads and stays matchable; the
                     // qualifiers and provider become secondary text.
                     base: parts.base,
-                    detail: [parts.qualifiers, model.providerLabel].filter(Boolean).join(' — '),
+                    detail: [parts.qualifiers, model.priceTierV1, model.providerLabel].filter(Boolean).join(' — '),
                     searchable: modelSearchableText(model)
                   };
                 })

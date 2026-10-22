@@ -42,6 +42,7 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import { copyPromptResources } from "./helpers/copyPromptResources";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
@@ -54,6 +55,7 @@ const contextPackModule = require("../utils/contextPack") as Record<string, unkn
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-applyreview-activity-"));
+copyPromptResources(REAL_ROOT);
 
 const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-applyreview-activity-private-"));
 const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);

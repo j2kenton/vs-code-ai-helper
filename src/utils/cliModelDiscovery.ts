@@ -4,6 +4,8 @@ import { killProcessTree, sanitizedCliEnv } from "./cliProcessUtils";
 export interface DiscoveredCliModel {
   model: string;
   name: string;
+  /** OpenCode 2 pricing label; absent when the catalog has no usable cost. */
+  priceTierV1?: "Free" | "Paid";
 }
 
 function uniqueByModel(
@@ -469,13 +471,14 @@ export function parseOpencodeApiModelListOutput(output: string): DiscoveredCliMo
     if (!entry || typeof entry !== "object") {
       continue;
     }
-    const model = entry as { id?: unknown; providerID?: unknown; name?: unknown; variants?: unknown };
+    const model = entry as { id?: unknown; providerID?: unknown; name?: unknown; variants?: unknown; cost?: unknown };
     if (typeof model.id !== "string" || !model.id || typeof model.providerID !== "string" || !model.providerID) {
       continue;
     }
     const fullId = `${model.providerID}/${model.id}`;
     const displayName = (typeof model.name === "string" && model.name.trim()) || fullId;
-    result.push({ model: fullId, name: displayName });
+    const priceTierV1 = parseOpenCodePriceTierV1(model.cost);
+    result.push({ model: fullId, name: displayName, ...(priceTierV1 ? { priceTierV1 } : {}) });
     if (!Array.isArray(model.variants)) {
       continue;
     }
@@ -484,10 +487,34 @@ export function parseOpencodeApiModelListOutput(output: string): DiscoveredCliMo
       if (typeof variantId !== "string" || !variantId) {
         continue;
       }
-      result.push({ model: `${fullId}@${variantId}`, name: `${displayName} (${variantId})` });
+      result.push({
+        model: `${fullId}@${variantId}`,
+        name: `${displayName} (${variantId})`,
+        ...(priceTierV1 ? { priceTierV1 } : {}),
+      });
     }
   }
   return uniqueByModel(result);
+}
+
+function parseOpenCodePriceTierV1(cost: unknown): "Free" | "Paid" | undefined {
+  if (!Array.isArray(cost) || cost.length === 0) {
+    return undefined;
+  }
+  const rawPrices = cost as unknown[];
+  if (rawPrices.some((price) => !price || typeof price !== "object" ||
+      typeof (price as { input?: unknown }).input !== "number" || !Number.isFinite((price as { input: number }).input) ||
+      typeof (price as { output?: unknown }).output !== "number" || !Number.isFinite((price as { output: number }).output))) {
+    return undefined;
+  }
+  const prices = rawPrices as Array<{ input: number; output: number }>;
+  if (prices.every((price) => price.input === 0 && price.output === 0)) {
+    return "Free";
+  }
+  if (prices.some((price) => price.input > 0 || price.output > 0)) {
+    return "Paid";
+  }
+  return undefined;
 }
 
 export async function discoverOpencodeModels(command: string): Promise<
@@ -509,6 +536,86 @@ export async function discoverOpencodeModelsWithTimeout(
     timeoutMs,
     parseOpencodeApiModelListOutput
   );
+}
+
+const CODEX_EFFORT_LABELS_V1: Readonly<Record<string, string>> = {
+  low: "Low",
+  medium: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  max: "Max",
+  ultra: "Ultra",
+};
+
+function codexEffortLabelV1(effort: string): string {
+  return CODEX_EFFORT_LABELS_V1[effort] ?? effort.charAt(0).toUpperCase() + effort.slice(1);
+}
+
+/**
+ * Codex's own model list, from `codex debug models` (verified against codex
+ * 0.159.0): `{ "models": [ { "slug", "display_name", "visibility",
+ * "supported_reasoning_levels": [ { "effort", ... } ],
+ * "additional_speed_tiers": ["fast", ...], ... } ] }`. Only `visibility:
+ * "list"` entries are offered (hidden/internal models are not). Emits the same
+ * "<slug>@<effort>" and "<slug>@<effort>+fast" entries the seeded Codex
+ * catalog uses, so storage and `parseCodexModelSelection` are unchanged.
+ * A top-level array is accepted too. Anything else yields no models, which
+ * leaves the seeded fixed list in place.
+ */
+export function parseCodexDebugModelsOutput(output: string): DiscoveredCliModel[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(output.trim());
+  } catch {
+    return [];
+  }
+  const list = Array.isArray(parsed) ? parsed : (parsed as { models?: unknown } | null)?.models;
+  if (!Array.isArray(list)) {
+    return [];
+  }
+  const result: DiscoveredCliModel[] = [];
+  for (const entry of list) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    const model = entry as {
+      slug?: unknown;
+      display_name?: unknown;
+      visibility?: unknown;
+      supported_reasoning_levels?: unknown;
+      additional_speed_tiers?: unknown;
+    };
+    if (model.visibility !== "list" || typeof model.slug !== "string" || !model.slug) {
+      continue;
+    }
+    const label = (typeof model.display_name === "string" && model.display_name.trim()) || model.slug;
+    const supportsFast =
+      Array.isArray(model.additional_speed_tiers) && model.additional_speed_tiers.includes("fast");
+    const levels = Array.isArray(model.supported_reasoning_levels) ? model.supported_reasoning_levels : [];
+    for (const level of levels) {
+      const effort = (level as { effort?: unknown } | null)?.effort;
+      if (typeof effort !== "string" || !effort) {
+        continue;
+      }
+      const effortLabel = codexEffortLabelV1(effort);
+      result.push({ model: `${model.slug}@${effort}`, name: `${label} (${effortLabel})` });
+      if (supportsFast) {
+        result.push({ model: `${model.slug}@${effort}+fast`, name: `${label} (${effortLabel}, Fast)` });
+      }
+    }
+  }
+  return uniqueByModel(result);
+}
+
+export async function discoverCodexModels(command: string): Promise<DiscoveredCliModel[]> {
+  return discoverCodexModelsWithTimeout(command, 30_000);
+}
+
+export async function discoverCodexModelsWithTimeout(
+  command: string,
+  timeoutMs: number
+): Promise<DiscoveredCliModel[]> {
+  return runCliModelDiscovery(command, ["debug", "models"], timeoutMs, parseCodexDebugModelsOutput);
 }
 
 /**

@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { TASK_DESCRIPTION_FILENAME, TASK_FILENAME, TaskStage } from "../types/taskProgress";
-import { resolveFreshModelForStage } from "../utils/modelSelection";
+import { getAvailableModels, resolveFreshModelForStage } from "../utils/modelSelection";
+import { classifyFailure } from "../utils/quota";
 import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";
 import { renderPromptTemplate } from "../utils/promptTemplates";
+import { isExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import { writeRunLog } from "../utils/runLog";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
@@ -236,6 +238,32 @@ interface DraftOutcomeContextV1 {
   readonly modelLabel: string | undefined;
 }
 
+/** Payment-specific explanation for Draft's exhausted provider chain. */
+export function describeDraftPaymentFailureV1(
+  outcome: TaskActionOutcomeV1,
+  availableModelIds: readonly string[]
+): string | undefined {
+  if (outcome.kind !== "unavailable" || !outcome.chainExhaustion) return undefined;
+  const candidates = outcome.chainExhaustion.candidates;
+  const hasPaymentFailure = candidates.some(
+    (candidate) => classifyFailure({ errorMessage: candidate.reason }).failureKind === "payment-required"
+  );
+  if (!hasPaymentFailure) return undefined;
+  const descriptions = candidates.map((candidate) => {
+    const paymentRequired =
+      classifyFailure({ errorMessage: candidate.reason }).failureKind === "payment-required";
+    if (!paymentRequired) {
+      return `${candidate.providerLabel} ${candidate.storedModelId}: ${candidate.reason}`;
+    }
+    const match = candidate.storedModelId.match(/^((?:[^:]+:)?[^/]+\/)([^@]+)(@.*)?$/);
+    const twinId = match ? `${match[1]}${match[2]}-free${match[3] ?? ""}` : undefined;
+    const freeTwin = twinId && availableModelIds.includes(twinId) ? `; free option: ${twinId}` : "";
+    return `${candidate.providerLabel}: HTTP 402 payment required for ${candidate.storedModelId}; ` +
+      `add credits or choose a free model${freeTwin}`;
+  });
+  return `Draft with AI could not run: ${descriptions.join("; ")}. task.md was not changed.`;
+}
+
 interface DraftOutcomeResultV1 {
   readonly succeeded: boolean;
   readonly runLogUri?: vscode.Uri;
@@ -321,9 +349,22 @@ async function handleDraftOutcomeV1(
   } else if (outcome.kind === "cancelled") {
     NotificationRouter.showInformation("Draft with AI cancelled.");
   } else {
-    NotificationRouter.showError(
-      `Draft with AI failed: ${describeTaskActionFailureV1(outcome)}. task.md was not changed.`
-    );
+    const availableModelIds =
+      outcome.kind === "unavailable" && outcome.chainExhaustion?.candidates.some(
+        (candidate) => classifyFailure({ errorMessage: candidate.reason }).failureKind === "payment-required"
+      )
+        ? await getAvailableModels(true).then((models) => models.map((model) => model.id)).catch(() => [])
+        : [];
+    const paymentFailure = describeDraftPaymentFailureV1(outcome, availableModelIds);
+    const failure = paymentFailure ??
+      `Draft with AI failed: ${describeTaskActionFailureV1(outcome)}. task.md was not changed.`;
+    NotificationRouter.showError(failure);
+    if (paymentFailure) {
+      await ctx.chatViewProvider.append("assistant", paymentFailure, "desc", {
+        canonicalId: ctx.taskRef.canonicalId,
+        taskFolderPath: ctx.taskRef.taskFolderPath,
+      });
+    }
   }
 
   // (2m) See generatePlanWithAI.ts's identical run-log comment: ctx.prompt is
@@ -389,25 +430,18 @@ async function draftTaskWithAIForResolvedTask(
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
   const descriptionFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_DESCRIPTION_FILENAME);
 
-  // Prefer live document buffer over stale disk content. task.md's V1
-  // promotion mutates through the workflow file store (disk only — it
-  // cannot see editor buffer state), so a dirty buffer is saved now rather
-  // than silently losing its unsaved edits to a disk-only read-merge-write
-  // later in this same drive.
+  // Prefer the live document buffer over stale disk content. Its save is
+  // deferred until after the bundled prompt has loaded, so a missing extension
+  // folder cannot change task.md while refusing to start this action.
   const openDoc = vscode.workspace.textDocuments.find(
     (doc) => doc.uri.toString() === taskFileUri.toString()
   );
   let rawContent: string;
+  let dirtyTaskDocToSave: vscode.TextDocument | undefined;
   if (openDoc) {
     rawContent = openDoc.getText();
     if (openDoc.isDirty) {
-      const saved = await openDoc.save();
-      if (!saved) {
-        NotificationRouter.showError(
-          "Could not save unsaved changes to task.md before drafting. Save the file and try again."
-        );
-        return { succeeded: false };
-      }
+      dirtyTaskDocToSave = openDoc;
     }
   } else {
     try {
@@ -457,13 +491,32 @@ async function draftTaskWithAIForResolvedTask(
   const { coordinator, providerLabel, modelLabel } = resolved.value;
 
   // Build the prompt and check its size BEFORE launching or writing artifacts.
-  const prompt = await renderPromptTemplate(
-    context.extensionUri,
-    "draft-task-with-ai.md",
-    {
-      taskDescription: `${sourceDescription}\n\nNote: this may be voice-transcribed input; resolve obvious transcription errors from context rather than treating them as requirements.`,
-    }
-  );
+  let prompt: string;
+  try {
+    prompt = await renderPromptTemplate(
+      context.extensionUri,
+      "draft-task-with-ai.md",
+      {
+        taskDescription: `${sourceDescription}\n\nNote: this may be voice-transcribed input; resolve obvious transcription errors from context rather than treating them as requirements.`,
+      }
+    );
+  } catch (error) {
+    if (!isExtensionFolderRemovedErrorV1(error)) throw error;
+    NotificationRouter.showError(
+      `${notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)} — Draft with AI was not started. ${error.message}`
+    );
+    return { succeeded: false };
+  }
+
+  // Saving the dirty task document is a task-file write. Defer it until the
+  // bundled prompt and rubric have been read successfully, so an updated-away
+  // extension cannot change the task before reporting that Draft did not run.
+  if (dirtyTaskDocToSave && !(await dirtyTaskDocToSave.save())) {
+    NotificationRouter.showError(
+      "Could not save unsaved changes to task.md before drafting. Save the file and try again."
+    );
+    return { succeeded: false };
+  }
 
   // ── Prompt-size gate ─────────────────────────────────────────────────────
   const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {

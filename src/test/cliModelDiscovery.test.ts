@@ -2,8 +2,9 @@ import * as assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import { describe, it } from "node:test";
-import { OPENCODE_MODEL_VARIANTS, parseOpencodeModelSelection } from "../runners/providers";
+import { CLI_PROVIDERS, OPENCODE_MODEL_VARIANTS, parseOpencodeModelSelection } from "../runners/providers";
 import {
+  parseCodexDebugModelsOutput,
   discoverDevpassModelsWithTimeout,
   discoverKiroModelsWithTimeout,
   discoverOpencodeModelsWithTimeout,
@@ -641,6 +642,23 @@ void describe("parseOpencodeApiModelListOutput (OpenCode 2)", () => {
     ]);
   });
 
+  void it("labels paid/free twins from numeric costs, including context-tiered prices", () => {
+    const output = JSON.stringify({ data: [
+      { id: "glm-5.3-flash", providerID: "opencode", name: "GLM Flash", cost: [{ input: 0.15, output: 0.5 }] },
+      { id: "glm-5.3-flash-free", providerID: "opencode", name: "GLM Flash Free", cost: [{ input: 0, output: 0 }] },
+      { id: "deepseek-v4.1-flash", providerID: "opencode", name: "DeepSeek Flash", cost: [{ input: 0.3, output: 1.2 }, { input: 0.4, output: 1.5, tier: { type: "context", size: 100000 } }] },
+      { id: "deepseek-v4.1-flash-free", providerID: "opencode", name: "DeepSeek Flash Free", cost: [{ input: 0, output: 0 }, { input: 0, output: 0, tier: { type: "context", size: 100000 } }] },
+      { id: "unknown-cost", providerID: "opencode", name: "Unknown", cost: "0" },
+    ] });
+    assert.deepStrictEqual(parseOpencodeApiModelListOutput(output), [
+      { model: "opencode/glm-5.3-flash", name: "GLM Flash", priceTierV1: "Paid" },
+      { model: "opencode/glm-5.3-flash-free", name: "GLM Flash Free", priceTierV1: "Free" },
+      { model: "opencode/deepseek-v4.1-flash", name: "DeepSeek Flash", priceTierV1: "Paid" },
+      { model: "opencode/deepseek-v4.1-flash-free", name: "DeepSeek Flash Free", priceTierV1: "Free" },
+      { model: "opencode/unknown-cost", name: "Unknown" },
+    ]);
+  });
+
   void it("the known variant ladders match OpenCode 2's live variants, and every discovered variant parses", () => {
     // Variant ids for the OPENCODE_MODEL_VARIANTS models as returned live by
     // `opencode api --standalone model.list` (opencode 2.0.32, 2026-10-20).
@@ -777,5 +795,81 @@ void describe("parseKimiModelsOutput", () => {
     assert.deepStrictEqual(parseKimiModelsOutput("null"), []);
     assert.deepStrictEqual(parseKimiModelsOutput("[]"), []);
     assert.deepStrictEqual(parseKimiModelsOutput('{"models": "not an object"}'), []);
+  });
+});
+
+void describe("Codex `codex debug models` discovery", () => {
+  // Trimmed from codex 0.159.0's `codex debug models` shape.
+  const codex0159 = JSON.stringify({
+    models: [
+      {
+        slug: "gpt-6.1-sol",
+        display_name: "GPT-6.1-Sol",
+        visibility: "list",
+        supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }, { effort: "max" }],
+        additional_speed_tiers: ["fast"],
+      },
+      {
+        slug: "gpt-6-luna",
+        display_name: "GPT-6-Luna",
+        visibility: "list",
+        supported_reasoning_levels: [{ effort: "medium" }],
+        additional_speed_tiers: [],
+      },
+      {
+        slug: "codex-internal",
+        display_name: "Internal",
+        visibility: "hide",
+        supported_reasoning_levels: [{ effort: "high" }],
+      },
+    ],
+  });
+
+  void it("lists only visible models, their efforts, and +fast where the speed tier is offered", () => {
+    assert.deepStrictEqual(parseCodexDebugModelsOutput(codex0159), [
+      { model: "gpt-6.1-sol@low", name: "GPT-6.1-Sol (Low)" },
+      { model: "gpt-6.1-sol@low+fast", name: "GPT-6.1-Sol (Low, Fast)" },
+      { model: "gpt-6.1-sol@high", name: "GPT-6.1-Sol (High)" },
+      { model: "gpt-6.1-sol@high+fast", name: "GPT-6.1-Sol (High, Fast)" },
+      { model: "gpt-6.1-sol@max", name: "GPT-6.1-Sol (Max)" },
+      { model: "gpt-6.1-sol@max+fast", name: "GPT-6.1-Sol (Max, Fast)" },
+      { model: "gpt-6-luna@medium", name: "GPT-6-Luna (Medium)" },
+    ]);
+  });
+
+  void it("returns nothing for unparseable or unrelated output", () => {
+    assert.deepStrictEqual(parseCodexDebugModelsOutput(""), []);
+    assert.deepStrictEqual(parseCodexDebugModelsOutput("not json"), []);
+    assert.deepStrictEqual(parseCodexDebugModelsOutput('{"models":"x"}'), []);
+  });
+
+  void it("the picker holds exactly the discovered list; a nonzero exit or bad output yields nothing so the fixed list stays", async () => {
+    const codexDef = CLI_PROVIDERS.find((def) => def.id === "codex-cli");
+    assert.ok(codexDef?.discoverModels, "codex-cli must discover its models");
+    const originalSpawn = childProcess.spawn;
+    const run = async (stdout: string, exitCode: number): Promise<readonly { model: string }[]> => {
+      let observedArgs: readonly string[] | undefined;
+      childProcess.spawn = ((_command: string, args: readonly string[] = []) => {
+        observedArgs = [...args];
+        const fake = new FakeChildProcess();
+        process.nextTick(() => {
+          fake.stdout.emit("data", Buffer.from(stdout));
+          fake.emit("close", exitCode);
+        });
+        return fake as unknown as import("node:child_process").ChildProcess;
+      }) as typeof childProcess.spawn;
+      const models = await codexDef.discoverModels!("codex");
+      assert.deepStrictEqual(observedArgs, ["debug", "models"]);
+      return models;
+    };
+    try {
+      const discovered = (await run(codex0159, 0)).map((entry) => entry.model);
+      assert.ok(discovered.includes("gpt-6.1-sol@high"));
+      assert.ok(!discovered.some((id) => id.startsWith("gpt-5.5") || id.startsWith("gpt-5.4")));
+      assert.deepStrictEqual(await run("", 1), []);
+      assert.deepStrictEqual(await run("not json", 0), []);
+    } finally {
+      childProcess.spawn = originalSpawn;
+    }
   });
 });

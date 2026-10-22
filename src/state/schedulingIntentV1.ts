@@ -5,6 +5,7 @@ import { HandoffGuidanceFieldsV1 } from "../types/handoffGuidanceV1";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { openAutomationRoundLedgerRowBestEffortV1 } from "../utils/roundLedgerV1";
+import { terminalizeGenericAutomationRoundBestEffortV1 } from "../utils/automationChain";
 
 /**
  * The scheduling-intent ledger (task: "Actionable Hand-offs", PART 6).
@@ -946,6 +947,7 @@ export async function announceAutoStartBestEffortV1(input: {
     // un-enriched call site with no intent metadata has nothing to attach a
     // row's later termination to, and writes the message with no row at all
     // (the legacy-shaped case pass (c) already covers).
+    let rowOpened = false;
     if (input.intentId !== undefined) {
       await openAutomationRoundLedgerRowBestEffortV1({
         taskFolderUri: vscode.Uri.file(input.taskKey),
@@ -953,19 +955,33 @@ export async function announceAutoStartBestEffortV1(input: {
         command: input.command,
         stage: progressResult.decoded.progress.currentStage,
       });
+      rowOpened = true;
     }
-    await appendChatMessageV1(
-      input.taskKey,
-      {
-        role: "assistant",
-        text,
-        stage: progressResult.decoded.progress.currentStage,
-        at: new Date().toISOString(),
-        kind: "activity",
-        ...(input.intentId !== undefined ? { intentId: input.intentId } : {}),
-      },
-      input.taskKey
-    );
+    try {
+      await appendChatMessageV1(
+        input.taskKey,
+        {
+          role: "assistant",
+          text,
+          stage: progressResult.decoded.progress.currentStage,
+          at: new Date().toISOString(),
+          kind: "activity",
+          ...(input.intentId !== undefined ? { intentId: input.intentId } : {}),
+        },
+        input.taskKey
+      );
+    } catch (error) {
+      // The row was flipped to "open" above; if the chat append fails, close
+      // it as failed rather than leaving it for an orphan sweep.
+      if (rowOpened) {
+        terminalizeGenericAutomationRoundBestEffortV1(
+          input.taskKey,
+          input.intentId,
+          "failed",
+          error
+        );
+      }
+    }
   } catch {
     // Best-effort — never surfaces to the caller, never blocks dispatch.
   }

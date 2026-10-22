@@ -13,7 +13,7 @@ import {
   getModelDisplayName,
   describeModelSource,
 } from "../utils/modelSelection";
-import { parseOpencodeModelsOutput } from "../utils/cliModelDiscovery";
+import { parseCodexDebugModelsOutput, parseOpencodeModelsOutput } from "../utils/cliModelDiscovery";
 import {
   CODEX_MODEL_CAPABILITIES,
   OPENCODE_MODEL_VARIANTS,
@@ -178,6 +178,58 @@ void describe("CLI model refresh fallback", () => {
 });
 
 void describe("getAvailableModels", () => {
+  void it("uses a successful Codex discovery as the complete picker catalog", async () => {
+    const codex0159Fixture = JSON.stringify({
+      models: [
+        {
+          slug: "gpt-6.1-sol",
+          display_name: "GPT-6.1 Sol",
+          visibility: "list",
+          supported_reasoning_levels: [{ effort: "low" }, { effort: "high" }],
+          additional_speed_tiers: ["fast"],
+        },
+        {
+          slug: "gpt-6-luna",
+          display_name: "GPT-6 Luna",
+          visibility: "list",
+          supported_reasoning_levels: [{ effort: "medium" }],
+          additional_speed_tiers: [],
+        },
+        {
+          slug: "codex-internal",
+          display_name: "Codex Internal",
+          visibility: "hide",
+          supported_reasoning_levels: [{ effort: "high" }],
+        },
+      ],
+    });
+    __testOnly.restoreSeededCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels: () => Promise.resolve([]),
+      cliCommandExists: (command) => Promise.resolve(command === "codex"),
+      getDiscoveredCliModels: (def) => Promise.resolve(def.id === "codex-cli"
+        ? parseCodexDebugModelsOutput(codex0159Fixture)
+        : []),
+    });
+    try {
+      const models = await getAvailableModels();
+      const codexIds = models.filter((model) => model.id.startsWith("codex-cli:")).map((model) => model.id);
+      assert.deepEqual(codexIds, [
+        "codex-cli:gpt-6.1-sol@low",
+        "codex-cli:gpt-6.1-sol@low+fast",
+        "codex-cli:gpt-6.1-sol@high",
+        "codex-cli:gpt-6.1-sol@high+fast",
+        "codex-cli:gpt-6-luna@medium",
+      ]);
+      assert.ok(codexIds.includes("codex-cli:gpt-6.1-sol@high"));
+      assert.ok(!codexIds.some((id) => /gpt-5\.(5|4)(-mini)?/.test(id)));
+      assert.ok(!codexIds.some((id) => id.includes("codex-internal")));
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
   void it("surfaces the current Copilot default model matrix", async () => {
     __testOnly.restoreSeededCliModelCache();
     __testOnly.setModelSelectionTestOverrides({
@@ -1352,6 +1404,29 @@ void describe("getAvailableModels", () => {
         "the seed's own entries should NOT appear once the cache holds a different list " +
           "(getAvailableModels does not merge — production relies on resolveRefreshedCliModels for that)"
       );
+    } finally {
+      __testOnly.clearModelSelectionTestOverrides();
+      __testOnly.resetCliModelCache();
+      __testOnly.restoreSeededCliModelCache();
+    }
+  });
+
+  void it("preserves OpenCode price labels on live discovered choices", async () => {
+    __testOnly.resetCliModelCache();
+    __testOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels() { return Promise.resolve([]); },
+      cliCommandExists(command) { return Promise.resolve(command === "opencode"); },
+    });
+    __testOnly.primeCliModelCache("opencode-cli", {
+      models: [
+        { model: "opencode/glm-5.3-flash", name: "GLM Flash", priceTierV1: "Paid" },
+        { model: "opencode/glm-5.3-flash-free", name: "GLM Flash Free", priceTierV1: "Free" },
+      ],
+    });
+    try {
+      const models = await getAvailableModels();
+      assert.equal(models.find((model) => model.id.endsWith("glm-5.3-flash"))?.priceTierV1, "Paid");
+      assert.equal(models.find((model) => model.id.endsWith("glm-5.3-flash-free"))?.priceTierV1, "Free");
     } finally {
       __testOnly.clearModelSelectionTestOverrides();
       __testOnly.resetCliModelCache();

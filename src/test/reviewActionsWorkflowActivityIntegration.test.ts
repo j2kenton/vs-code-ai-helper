@@ -42,6 +42,7 @@ import {
 import { StatusTreeProvider } from "../views/statusView";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
+import { ExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import {
   configureWorkflowPrivateStorageRootV1,
   getWorkflowFileStoreV1,
@@ -266,6 +267,55 @@ function installPlanReviewPatches(contextPackPath: string): Patched[] {
 }
 
 void describe("runReviewForFolder — real in-flight activity through the production coordinator", () => {
+  void it("does not dispatch or mutate task progress when the extension folder is removed before prompt rendering", async () => {
+    const { folderPath } = makeTaskFolder(`review-removed-extension-${Math.floor(Math.random() * 1e9)}`);
+    const taskFolderUri = vscode.Uri.file(folderPath);
+    const workspaceRoot: vscode.WorkspaceFolder = { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 };
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const contextPack = path.join(folderPath, "context-pack.md");
+    let providerCalls = 0;
+    const neverExpectedTransport: AgentTransportV1 = {
+      runnerId: "must-not-run",
+      invoke: () => {
+        providerCalls += 1;
+        return Promise.resolve({ kind: "transportFailure", code: "unexpected-provider-call" });
+      },
+    };
+    const patches = [
+      ...installPlanReviewPatches(contextPack),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.reject(new ExtensionFolderRemovedErrorV1())),
+      stubV1RunnerSelection([neverExpectedTransport]),
+    ];
+    const progressPath = path.join(folderPath, "task-progress.json");
+    const before = fs.readFileSync(progressPath, "utf8");
+
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(path.join(REAL_ROOT, "removed-extension")),
+        taskFolderUri,
+        workspaceRoot,
+        "plan-high-review",
+        true
+      );
+      assert.equal(providerCalls, 0);
+      assert.equal(fs.readFileSync(progressPath, "utf8"), before);
+      assert.equal(fs.readFileSync(contextPack, "utf8"), "# Context\n", "the prompt probe must not rewrite the context pack");
+      assert.ok(
+        provider.getEntries().some((entry) => /High-Level Review \(Plan\) was not started/.test(entry.message)),
+        "the user-facing notice should say the review did not start"
+      );
+    } finally {
+      for (const item of patches.reverse()) { item.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("reports starting -> model -> running through a real (controllable, still in-flight) provider call, then clears the row on real completion", async () => {
     const { folderPath } = makeTaskFolder(`review-activity-live-${Math.floor(Math.random() * 1e9)}`);
     const taskFolderUri = vscode.Uri.file(folderPath);

@@ -25,6 +25,10 @@ import {
   resolveImplementationArtifact,
 } from "../utils/implementationArtifactResolver";
 import { StageArtifactRequirementV1 } from "../utils/stageArtifactRequirementsV1";
+import {
+  completedRoundAttributionV1,
+  readCompletedRoundFallbackReasonFromRunLogV1,
+} from "../utils/completedRoundAttributionV1";
 import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
 import {
   computeReviewFreshness,
@@ -57,6 +61,7 @@ import {
 import { onDidChangeChatHistoryV1, readChatInteractions } from "../utils/chatHistoryStore";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { isTaskStatusHiddenFromDecisionsV1 } from "../services/hostDecisionMirrorV1";
 import { renderHandoffFieldLineV1, renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
 import {
   deriveOwedContinuationRecordV1,
@@ -784,7 +789,8 @@ export class StageNode extends vscode.TreeItem {
      * `StageContextInput.offerRunImplementationForUnusableSummary` doc
      * comment.
      */
-    offerRunImplementationForUnusableSummary: boolean = false
+    offerRunImplementationForUnusableSummary: boolean = false,
+    modelAttribution?: { readonly modelId: string; readonly providerLabel?: string; readonly providerId?: string; readonly fallbackReason?: string }
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -1028,8 +1034,7 @@ export class StageNode extends vscode.TreeItem {
     // to ignore the mark everywhere else. Nothing actionable is lost: the
     // inline "Review Pending Decision" BUTTON is not gated at all, so a
     // stranded decision on a finished task is still reachable and answerable.
-    const taskStatusShowsDecisions =
-      task.progress.status !== "completed" && task.progress.status !== "archived";
+    const taskStatusShowsDecisions = !isTaskStatusHiddenFromDecisionsV1(task.progress.status);
     if (pendingDecisionCount > 0 && !isRunning && taskStatusShowsDecisions) {
       this.iconPath = new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"));
       // Same phrasing as the isWaitingForUser branch above, plus the count —
@@ -1084,6 +1089,14 @@ export class StageNode extends vscode.TreeItem {
     let tooltipStr = artifactName
       ? (artifactUri ? `Open ${artifactName}` : `${artifactName} has not been created yet`)
       : STAGE_DISPLAY_NAMES[stage];
+    if (modelAttribution) {
+      tooltipStr += `\n\nLatest recorded model: ${modelAttribution.providerLabel
+        ? `${modelAttribution.providerLabel} (${modelAttribution.modelId})`
+        : describeModelWithProviderV1(modelAttribution.modelId)}`;
+      if (modelAttribution.fallbackReason) {
+        tooltipStr += `\nBackup used; primary was skipped or failed: ${modelAttribution.fallbackReason}`;
+      }
+    }
 
     // The 2026-09-06 review's completion blocker: this tooltip previously
     // repeated the review's self-reported step-progress figure
@@ -2022,7 +2035,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     const unresolvedInteractions = await countUnresolvedInteractionsV1(task.progress.status ?? "", () =>
       readChatInteractions(task.folderUri.fsPath, taskIdentityKey(task), task.progress.currentStage)
     );
-
     for (const stage of STAGE_ORDER) {
       const status = getStageStatus(stage, task.progress.currentStage, task.progress.completedStages);
 
@@ -2150,6 +2162,23 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
             )
           : false;
 
+      const modelAttribution = status !== "done"
+        ? undefined
+        : completedRoundAttributionV1(task.progress, stage);
+      const latestTerminalRound = [...(task.progress.roundLedger ?? [])]
+        .reverse()
+        .find((entry) => entry.stage === stage && entry.state !== "open" && entry.state !== "scheduled");
+      const fallbackReason = latestTerminalRound
+        ? await readCompletedRoundFallbackReasonFromRunLogV1(
+            path.join(task.folderUri.fsPath, "runs"),
+            stage,
+            latestTerminalRound.roundId
+          )
+        : undefined;
+      const completedModelAttribution = modelAttribution
+        ? { ...modelAttribution, ...(fallbackReason ? { fallbackReason } : {}) }
+        : undefined;
+
       nodes.push(
         new StageNode(
           task,
@@ -2169,7 +2198,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
             task.progress.currentStage,
             unresolvedInteractions
           ),
-          offerRunImplementationOnThisStageRow
+          offerRunImplementationOnThisStageRow,
+          completedModelAttribution
         )
       );
     }

@@ -60,6 +60,7 @@ import {
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { TASK_PROGRESS_FILENAME, TaskProgress } from "../types/taskProgress";
+import { taskOperations } from "../utils/taskOperations";
 import {
   applyReviewerVerifiedTicksConfirmedV1,
   postApplyReviewerVerifiedTicksDecisionV1,
@@ -83,7 +84,6 @@ import {
 } from "../utils/chatHistoryStore";
 import * as chatHistoryStoreModule from "../utils/chatHistoryStore";
 import * as effectiveReviewProgressModule from "../utils/effectiveReviewProgress";
-import { taskOperations } from "../utils/taskOperations";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { formatDisplayTimestampPairV1 } from "../utils/timeFormat";
 
@@ -983,6 +983,103 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     } finally {
       notify.restore();
       cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("records deferred post-install owner checks in both the run log and Chat outcome", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      await provider.workflowDecisionStore.post(decisionInput(folder, {
+        decisionKey: "reviewPlateauEscalation",
+        recommendation: {
+          kind: "option",
+          optionId: "checkAfterInstall",
+          reasoning: "The check is intentionally deferred until the owner can install this build.",
+        },
+        options: [{
+          optionId: "checkAfterInstall",
+          label: "I'll check after install — move on",
+          consequence: "Advances to Publish. These owner checks remain owed: compare the installed UI. After installing this build, record its result under Owner evidence in task.md.",
+          resumeKind: "continue",
+          effect: { kind: "command", command: "vs-code-ai-helper.nextStage", args: [{ taskFolderPath: folder }] },
+        }],
+      }));
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "checkAfterInstall" });
+
+      const entries = await readChatHistory(folder);
+      const ack = entries.find((entry) => entry.text.includes("I'll check after install"));
+      assert.ok(ack);
+      assert.match(ack.text, /compare the installed UI/);
+      assert.ok(cmds.calls.some((call) => call.id === "vs-code-ai-helper.nextStage"));
+      const runFiles = fs.readdirSync(path.join(folder, "runs"));
+      assert.equal(runFiles.length, 1);
+      const runLog = fs.readFileSync(path.join(folder, "runs", runFiles[0]!), "utf8");
+      assert.match(runLog, /compare the installed UI/);
+      assert.match(runLog, /Owner evidence in task\.md/);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("shows a card-started operation's stage, progress, start time and end in Chat", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const commandsObj = vscode.commands as unknown as {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const originalCommand = commandsObj._executeCommandOverride;
+    commandsObj._executeCommandOverride = () => {
+      const operation = taskOperations.begin(folder, {
+        label: "Publish Checks",
+        stage: "publish",
+        taskName: "chat operation trace",
+        exclusive: false,
+      });
+      assert.ok(operation);
+      operation.reportActivity("lint, test, verify:workflow-safety");
+      return new Promise((resolve) => setTimeout(() => {
+        operation.reportActivity("test");
+        setTimeout(() => {
+          taskOperations.end(operation, "succeeded");
+          resolve(undefined);
+        }, 20);
+      }, 20));
+    };
+    try {
+      await provider.workflowDecisionStore.post(decisionInput(folder));
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
+
+      let entries = await readChatHistory(folder);
+      for (let retry = 0; retry < 10 && !entries.some((entry) => entry.text.includes("Ended Publish Checks")); retry++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        entries = await readChatHistory(folder);
+      }
+      const texts = entries.map((entry) => entry.text);
+      assert.ok(texts.some((text) => /Started Publish Checks — Publish(?::.*)? at \d{2}:\d{2}/.test(text)));
+      assert.ok(texts.some((text) => text.includes("lint, test, verify:workflow-safety")));
+      assert.ok(texts.some((text) => text.includes("Progress: Publish Checks — Publish: test")));
+      assert.ok(texts.some((text) => text.includes("Ended Publish Checks — succeeded")));
+    } finally {
+      commandsObj._executeCommandOverride = originalCommand;
+      notify.restore();
       provider.dispose();
       safeRemoveDir(folder);
     }

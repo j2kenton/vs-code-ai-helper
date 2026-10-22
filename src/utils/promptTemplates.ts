@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { readExtensionResourceV1 } from "./extensionResourcesV1";
 
 /**
  * Reserved placeholder: expands to the shared review scoring rubric fragment
@@ -17,26 +18,18 @@ export async function renderPromptTemplate(
   templateFileName: string,
   variables: Record<string, string>
 ): Promise<string> {
-  const templateUri = vscode.Uri.joinPath(
-    extensionUri,
-    "resources",
-    "prompts",
-    templateFileName
-  );
-  const content = await vscode.workspace.fs.readFile(templateUri);
+  const content = await readExtensionResourceV1(extensionUri, ["resources", "prompts", templateFileName]);
   let template = new TextDecoder().decode(content);
 
   // Expand the reserved rubric placeholder before caller variables so that
   // variable values containing the literal placeholder are never expanded,
   // and only templates that reference it pay for the extra file read.
   if (template.includes(`{{${REVIEW_SCORING_RUBRIC_KEY}}}`)) {
-    const rubricUri = vscode.Uri.joinPath(
-      extensionUri,
+    const rubricBytes = await readExtensionResourceV1(extensionUri, [
       "resources",
       "prompts",
-      REVIEW_SCORING_RUBRIC_FILE
-    );
-    const rubricBytes = await vscode.workspace.fs.readFile(rubricUri);
+      REVIEW_SCORING_RUBRIC_FILE,
+    ]);
     const rubric = new TextDecoder().decode(rubricBytes).trim();
     template = template.split(`{{${REVIEW_SCORING_RUBRIC_KEY}}}`).join(rubric);
   }

@@ -330,7 +330,7 @@ function claimChainGuard(
  * actually correct for what they track, rather than being forced to agree on
  * one that fit neither.
  */
-function terminalizeGenericAutomationRoundBestEffortV1(
+export function terminalizeGenericAutomationRoundBestEffortV1(
   taskKey: string | undefined,
   intentId: string | undefined,
   state: "completed" | "failed" | "dropped",
@@ -373,6 +373,35 @@ function terminalizeGenericAutomationRoundBestEffortV1(
     .catch(() => {
       // Best-effort — never surfaces to the dispatch caller.
     });
+}
+
+/** A declined command's observer is part of settlement: it must not be able
+ * to strand the already-open generic row by throwing before terminalization. */
+function terminalizeDeclinedAutomationBestEffortV1(
+  dispatch: AutomationDispatch,
+  intentId: string | undefined
+): void {
+  let callbackFailed = false;
+  let callbackError: unknown;
+  try {
+    dispatch.onDeclined?.();
+  } catch (error) {
+    callbackFailed = true;
+    callbackError = error;
+  }
+  const state = callbackFailed ? "failed" : "dropped";
+  const reason = callbackFailed
+    ? callbackError instanceof Error
+      ? callbackError.message
+      : String(callbackError)
+    : "the dispatched command declined to run and no round was started";
+  void recordTerminalIntentBestEffortV1(intentId, callbackFailed ? "failed" : "cancelled");
+  terminalizeGenericAutomationRoundBestEffortV1(
+    dispatch.taskKey,
+    intentId,
+    state,
+    reason
+  );
 }
 
 /**
@@ -513,17 +542,13 @@ export function scheduleAutomationChain(
           // ledger records `"dropped"`, never a clean ending it never had.
           const declined = executed === false;
           if (declined) {
-            dispatch.onDeclined?.();
+            void intentIdPromise.then((id) => terminalizeDeclinedAutomationBestEffortV1(dispatch, id));
+          } else {
+            void intentIdPromise.then((id) => {
+              void recordTerminalIntentBestEffortV1(id, "completed");
+              terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+            });
           }
-          void intentIdPromise.then((id) => {
-            void recordTerminalIntentBestEffortV1(id, declined ? "cancelled" : "completed");
-            terminalizeGenericAutomationRoundBestEffortV1(
-              dispatch.taskKey,
-              id,
-              declined ? "dropped" : "completed",
-              declined ? "the dispatched command declined to run and no round was started" : undefined
-            );
-          });
           return true;
         },
         (error) => {
@@ -601,17 +626,13 @@ export function scheduleAutomationChain(
                 // declined (`false`) resolve is not a clean ending.
                 const declined = executed === false;
                 if (declined) {
-                  dispatch.onDeclined?.();
+                  void intentIdPromise.then((id) => terminalizeDeclinedAutomationBestEffortV1(dispatch, id));
+                } else {
+                  void intentIdPromise.then((id) => {
+                    void recordTerminalIntentBestEffortV1(id, "completed");
+                    terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+                  });
                 }
-                void intentIdPromise.then((id) => {
-                  void recordTerminalIntentBestEffortV1(id, declined ? "cancelled" : "completed");
-                  terminalizeGenericAutomationRoundBestEffortV1(
-                    dispatch.taskKey,
-                    id,
-                    declined ? "dropped" : "completed",
-                    declined ? "the dispatched command declined to run and no round was started" : undefined
-                  );
-                });
               },
               (error) => {
                 release();
@@ -625,6 +646,18 @@ export function scheduleAutomationChain(
               }
             );
             resolve(true);
+          })
+          .catch((error: unknown) => {
+            // The announcement/running step (or a synchronous throw from the
+            // dispatch itself) failed before the command's own handlers were
+            // attached: release the guard slot and close the row as failed
+            // rather than leaving it `scheduled` until an orphan sweep.
+            release();
+            void intentIdPromise.then((id) => {
+              void recordTerminalIntentBestEffortV1(id, "failed");
+              terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "failed", error);
+            });
+            resolve(false);
           });
       } else {
         release();

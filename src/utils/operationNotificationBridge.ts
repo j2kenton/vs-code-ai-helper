@@ -4,6 +4,7 @@ import { NotificationRouter } from "./notificationRouter";
 import { policyForKind } from "./operationTaxonomy";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { notificationTaskDisplayNameV1 } from "./notificationTaskContextV1";
+import { describeModelWithProviderV1 } from "../runners/providers";
 
 /**
  * The centralized operation → Notifications-section terminal-entry policy
@@ -67,6 +68,7 @@ export function terminalEntryFor(
   // necessarily stopped (verification review, 2026-09-18).
   const detail = snap.state === "cancelled" && snap.forcedEndV1 !== true ? undefined : snap.detail;
   const suffix = detail ? ` (${detail})` : "";
+  const modelSuffix = snap.modelId ? ` — model: ${describeModelWithProviderV1(snap.modelId)}` : "";
   // Name the stage where the snapshot has one, unless the label already says it.
   const stageName = snap.stage !== undefined ? STAGE_DISPLAY_NAMES[snap.stage] : undefined;
   const stageText =
@@ -74,7 +76,7 @@ export function terminalEntryFor(
   return {
     // The quoted name is a render-time decision: the snapshot's semantic
     // `taskName` (including persisted snapshots) stays unquoted.
-    message: `${snap.label} — ${formatTaskNameForDisplay(notificationTaskDisplayNameV1(snap.taskName, snap.key))}${stageText}: ${stateText}${suffix}`,
+    message: `${snap.label} — ${formatTaskNameForDisplay(notificationTaskDisplayNameV1(snap.taskName, snap.key))}${stageText}: ${stateText}${modelSuffix}${suffix}`,
     level,
     sourceOperationId: snap.id,
     // Only present when set — keeps `terminalEntryFor` output free of

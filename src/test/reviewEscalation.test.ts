@@ -34,6 +34,7 @@ import {
   escalateReviewToHuman,
   initReviewEscalationChat,
   postEnvironmentalAdvanceNoticeV1,
+  resolveDeferrableOwnerChecksV1,
   __reviewEscalationChatTestOnly,
 } from "../utils/reviewEscalation";
 import { handleReviewRoutingOutcome } from "../commands/reviewActions";
@@ -50,6 +51,39 @@ import {
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ReviewBlocker } from "../utils/reviewReadiness";
 import { safeRemoveDir } from "./testFsUtils";
+
+void describe("post-install owner-check move-on eligibility", () => {
+  const ownerCheck = (title: string, required = "") =>
+    `- [ ] **${title}** — What: inspect the installed UI. Why: confirm the behavior. How: install and compare. If it fails: report the mismatch. Priority: LOW. ${required} <!-- ensemble:excluded -->`;
+  const plan = [
+    "## Owner checks",
+    ownerCheck("Compare the installed UI"),
+    ownerCheck("Confirm prerequisite", "Required before Step 3."),
+  ].join("\n");
+
+  void it("accepts only an implementation or Publish review with matching excluded owner-evidence blockers", () => {
+    const allowed = resolveDeferrableOwnerChecksV1("impl-high-review", [
+      { resolver: "environmental", description: "Owner evidence needed: Compare the installed UI" },
+    ], plan);
+    assert.ok(allowed?.[0]?.includes("Compare the installed UI"));
+    assert.equal(resolveDeferrableOwnerChecksV1("plan-high-review" as never, [
+      { resolver: "environmental", description: "Owner evidence needed: Compare the installed UI" },
+    ], plan), undefined);
+    assert.equal(resolveDeferrableOwnerChecksV1("publish", [
+      { resolver: "environmental", description: "Owner decision: Compare the installed UI" },
+    ], plan), undefined);
+    assert.equal(resolveDeferrableOwnerChecksV1("publish", [
+      { resolver: "environmental", description: "Owner evidence needed: Confirm prerequisite" },
+    ], plan), undefined);
+  });
+
+  void it("does not offer move-on for any mixed set containing unrelated round work", () => {
+    assert.equal(resolveDeferrableOwnerChecksV1("impl-low-review", [
+      { resolver: "environmental", description: "Owner evidence needed: Compare the installed UI" },
+      { resolver: "task-fixable", description: "The build still has a missing implementation fix" },
+    ], plan), undefined);
+  });
+});
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -779,6 +813,90 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       );
     } finally {
       deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("offers the post-install move-on option for an excluded owner check recorded by an older review", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-post-install-owner-check");
+    const planUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
+    fs.mkdirSync(folderUri.fsPath, { recursive: true });
+    fs.writeFileSync(planUri.fsPath,
+      "## Owner checks\n" +
+      "- [ ] **Compare the installed UI** — What: inspect the installed UI. Why: confirm the result. How: install and compare. If it fails: report the mismatch. Priority: LOW. <!-- ensemble:excluded -->\n",
+      "utf8"
+    );
+    seedProgress(store, folderUri, baseProgress({
+      status: "active",
+      currentStage: "impl-high-review",
+      reviewAttemptId: "attempt-1",
+      reviewScoreHistory: [{
+        stage: "impl-high-review", score: 6, attemptId: "older-attempt", at: "2026-01-01T00:00:00Z",
+        blockerCount: 1, taskFixableCount: 0,
+        blockers: [{ category: "review-confidence", resolver: "environmental", subject: "installed ui", description: "Owner evidence needed: Compare the installed UI" }],
+      }],
+    }));
+    try {
+      await escalateReviewToHuman(
+        folderUri, "impl-high-review", "plateau", "owner check", "attempt-1", undefined, false, undefined,
+        { content: "Readiness: 6/10\n", blockers: [], taskFixableCount: 0 }
+      );
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending(folderUri.fsPath)
+        .find((item) => item.decisionKey === "reviewPlateauEscalation");
+      const option = decision?.options.find((item) => item.optionId === "checkAfterInstall");
+      assert.ok(option, "the older recorded owner check must still offer move-on");
+      assert.equal(option.label, "I'll check after install — move on");
+      assert.match(option.consequence, /Compare the installed UI/);
+      assert.match(option.consequence, /record its result under Owner evidence in task\.md/);
+      assert.deepEqual(option.effect, {
+        kind: "command", command: "vs-code-ai-helper.nextStage", args: [{ taskFolderPath: folderUri.fsPath }],
+      });
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("does not let a resolved task-fixable blocker from an older review veto a current owner check", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-current-owner-check-after-resolved-blocker");
+    fs.mkdirSync(folderUri.fsPath, { recursive: true });
+    fs.writeFileSync(vscode.Uri.joinPath(folderUri, "plan-final.md").fsPath,
+      "## Owner checks\n" +
+      "- [ ] **Compare the installed UI** — What: inspect the installed UI. Why: confirm the result. How: install and compare. If it fails: report the mismatch. Priority: LOW. <!-- ensemble:excluded -->\n",
+      "utf8"
+    );
+    seedProgress(store, folderUri, baseProgress({
+      status: "active",
+      currentStage: "impl-high-review",
+      reviewAttemptId: "attempt-current",
+      reviewScoreHistory: [{
+        stage: "impl-high-review", score: 5, attemptId: "older-attempt", at: "2026-01-01T00:00:00Z",
+        blockerCount: 1, taskFixableCount: 1,
+        blockers: [{ category: "review-confidence", resolver: "task-fixable", subject: "old defect", description: "The parser still drops valid records" }],
+      }],
+    }));
+    try {
+      await escalateReviewToHuman(
+        folderUri, "impl-high-review", "plateau", "owner check remains", "attempt-current", undefined, false, undefined,
+        {
+          content: "Readiness: 7/10\n",
+          blockers: [{ category: "completion", resolver: "environmental", description: "Owner evidence needed: Compare the installed UI" }],
+          taskFixableCount: 0,
+        }
+      );
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending(folderUri.fsPath)
+        .find((item) => item.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision?.options.some((item) => item.optionId === "checkAfterInstall"));
+    } finally {
       __extensionContextV1TestOnly.reset();
     }
   });

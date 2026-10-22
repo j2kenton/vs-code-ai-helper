@@ -31,6 +31,15 @@ const IMPLEMENTATION_REVIEW_TEMPLATES = [
   "review-impl-low-rereview.md",
 ];
 
+const PLAN_REVIEW_TEMPLATES = [
+  "review-plan-high.md",
+  "review-plan-low.md",
+  "review-plan-high-rereview.md",
+  "review-plan-low-rereview.md",
+];
+
+const PUBLISH_REVIEW_TEMPLATES = ["review-publish.md", "review-publish-rereview.md"];
+
 void describe("review scoring rubric", () => {
   const workspace = vscode.workspace as unknown as {
     fs: { readFile: (uri: vscode.Uri) => Promise<Uint8Array> };
@@ -105,6 +114,34 @@ void describe("review scoring rubric", () => {
       assert.ok(rendered.includes("IMPLEMENTATION REVIEW"));
       assert.ok(!rendered.includes("{{approvedPlan}}"));
       assert.ok(!rendered.includes("{{implementation}}"));
+    });
+  });
+
+  void describe("review prompt behavior contracts", () => {
+    void it("sweeps the whole plan for owner facts and round-assigned checks in every plan review", () => {
+      for (const templateFile of PLAN_REVIEW_TEMPLATES) {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /Whole-plan owner\/toolchain sweep:.*inspect the entire plan in this same review/s);
+        assert.match(raw, /move those build\/test\/live-CLI steps to the Publish Checks hand-off or Owner checks/);
+      }
+      assert.match(rubricText, /Whole-plan owner\/toolchain sweep:/);
+    });
+
+    void it("keeps owner hand-offs owed without treating their pending checks as blockers", () => {
+      for (const templateFile of [...IMPLEMENTATION_REVIEW_TEMPLATES, ...PUBLISH_REVIEW_TEMPLATES]) {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /excluded five-element owner check/);
+        assert.match(raw, /list it in the verdict as owed by the owner/);
+        assert.match(raw, /An exclusion that hides unfinished round work remains a completion blocker/);
+      }
+    });
+
+    void it("requires the final response to be the review and start with Readiness in every review prompt", () => {
+      for (const templateFile of REVIEW_TEMPLATES) {
+        const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(raw, /final response must be the review itself and begin with the required `Readiness: N\/10` line/);
+        assert.match(raw, /do not return a summary of the investigation instead of the review/);
+      }
     });
   });
 

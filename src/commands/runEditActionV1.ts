@@ -55,7 +55,7 @@ import {
 } from "../actions/rows/editPreflightRowsV1";
 import { EDIT_EXECUTION_ACTION_KEY_V1 } from "../actions/rows/editExecutionRowV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
-import { TaskStage } from "../types/taskProgress";
+import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import {
   computeWorkspaceRootBindingIdV1,
   ensureWorkflowTaskFolderRootV1,
@@ -216,7 +216,9 @@ export function checkEditActionHostGateV1():
  * read (§7.6).
  */
 export async function checkEditActionProviderPathGateV1(
-  stage: TaskStage
+  stage: TaskStage,
+  /** Task label for the warning (already formatted); omitted when the task is not resolved yet. */
+  taskLabel?: string
 ): Promise<
   | { readonly ok: true }
   | {
@@ -245,7 +247,12 @@ export async function checkEditActionProviderPathGateV1(
     return {
       ok: false,
       code: "providerModeUnavailable",
-      reason: availability.availability.reason ?? `${availability.providerLabel} is unavailable.`,
+      reason: describeModelUnavailableForStageV1({
+        taskLabel,
+        stage,
+        modelId,
+        reason: availability.availability.reason ?? `${availability.providerLabel} is unavailable.`,
+      }),
     };
   }
   let usesCopilot: boolean;
@@ -262,6 +269,28 @@ export async function checkEditActionProviderPathGateV1(
     return checkEditActionHostGateV1();
   }
   return { ok: true };
+}
+
+/**
+ * A model availability problem in words that say what it concerns: the task,
+ * the stage and the configured model with its provider ("V1 README —
+ * Implementation: its configured model, claude-sonnet-5.5 (GitHub Copilot), is
+ * unavailable: No Copilot language models are available. …"). Wording only —
+ * the underlying reason is passed through unchanged.
+ *
+ * @internal exported for testing
+ */
+export function describeModelUnavailableForStageV1(input: {
+  readonly taskLabel?: string;
+  readonly stage: TaskStage;
+  readonly modelId: string | undefined;
+  readonly reason: string;
+}): string {
+  return (
+    `${input.taskLabel !== undefined ? `${input.taskLabel} — ` : ""}` +
+    `${STAGE_DISPLAY_NAMES[input.stage]}: its configured model, ${describeModelWithProviderV1(input.modelId)}, ` +
+    `is unavailable: ${input.reason}`
+  );
 }
 
 /**
@@ -890,13 +919,58 @@ export async function continueSealedEditExecutionV1(
         "review them and run a fresh preflight for the remainder.",
     };
   }
-  if (execution?.state === "stalePreflight" || execution?.state === "executing" || execution?.state === "sealed") {
+  if (execution?.state === "stalePreflight") {
     return {
       kind: "stalePreflight",
-      reason: "The workspace changed after preflight — no edits were applied. Run the action again.",
+      reason: describeStalePreflightRefusalV1(sealed.operations.map((operation) => operation.relativePath)),
+    };
+  }
+  if (execution?.state === "executing" || execution?.state === "sealed") {
+    return {
+      kind: "stalePreflight",
+      reason: describeUnfinishedExecutionV1(execution.state),
     };
   }
   return { kind: "failed", outcome: editOutcome };
+}
+
+/** How many of the plan's target paths a refusal message names. */
+const STALE_PREFLIGHT_PATH_SAMPLE_V1 = 3;
+
+/**
+ * The message for a REAL stale preflight (the broker settled the execution
+ * `stalePreflight`: the broker could not re-verify a target before applying
+ * the edit. The broker uses this state for several refusal causes, including
+ * I/O and malformed-patch failures, so the message does not claim that an
+ * external process changed the workspace. The bounded path sample is the
+ * plan's target list, not a proven change list.
+ *
+ * @internal exported for testing
+ */
+export function describeStalePreflightRefusalV1(targetPaths: readonly string[]): string {
+  const unique = [...new Set(targetPaths)];
+  const sample = unique.slice(0, STALE_PREFLIGHT_PATH_SAMPLE_V1).join(", ");
+  const more = unique.length > STALE_PREFLIGHT_PATH_SAMPLE_V1 ? `, and ${unique.length - STALE_PREFLIGHT_PATH_SAMPLE_V1} more` : "";
+  return (
+    "The edit was refused during stale-preflight validation because a target could not be re-verified; " +
+    "no edits were applied." +
+    (sample ? ` Files this plan targets: ${sample}${more}.` : "") +
+    " Run the action again."
+  );
+}
+
+/**
+ * An execution still `executing` or `sealed` never finished (for example a
+ * wall-clock stop) — nothing says the workspace changed, so this names the
+ * state instead of claiming a stale preflight.
+ *
+ * @internal exported for testing
+ */
+export function describeUnfinishedExecutionV1(state: "executing" | "sealed"): string {
+  return (
+    `The edit execution did not finish (state: ${state}), so the plan was not fully applied. ` +
+    "Check the working tree for partial changes, then run the action again."
+  );
 }
 
 // ---------------------------------------------------------------------------

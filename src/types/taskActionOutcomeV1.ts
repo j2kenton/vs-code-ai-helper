@@ -134,8 +134,12 @@ export type TaskActionOutcomeV1 =
        */
       readonly code: "completed" | "noChanges" | "roundDeferredIncomplete" | "roundIncomplete";
       readonly provider?: TaskActionOutcomeProviderV1;
+      /** Why the primary was skipped or failed when this success came from a backup. */
+      readonly fallbackReason?: string;
       /** Set when the response's frame end marker was repaired (item 5): see {@link FrameRepairV1}. */
       readonly frameRepairV1?: FrameRepairV1;
+      /** Unknown prose-content fields that were dropped, not rejected (named in the run log). */
+      readonly droppedFieldsV1?: readonly string[];
     }
   | {
       readonly kind: "questions";
@@ -621,7 +625,7 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
     case "completed": {
       const unknown = unknownOutcomeField(
         raw,
-        new Set(["kind", "correlation", "code", "provider", "frameRepairV1"]),
+        new Set(["kind", "correlation", "code", "provider", "frameRepairV1", "droppedFieldsV1", "fallbackReason"]),
         "completed outcome"
       );
       if (unknown) {
@@ -639,6 +643,10 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       ) {
         return fail(`invalid completed outcome "code": ${JSON.stringify(raw.code)}`);
       }
+      if (raw.fallbackReason !== undefined &&
+        (typeof raw.fallbackReason !== "string" || raw.fallbackReason.length === 0 || raw.fallbackReason.length > 300)) {
+        return fail("completed outcome fallbackReason must be a bounded non-empty string");
+      }
       const provider = decodeOptionalProviderV1(raw.provider);
       if (typeof provider === "string") {
         return fail(provider);
@@ -647,6 +655,13 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       if (typeof frameRepairV1 === "string") {
         return fail(frameRepairV1);
       }
+      let droppedFieldsV1: readonly string[] | undefined;
+      if (raw.droppedFieldsV1 !== undefined) {
+        if (!Array.isArray(raw.droppedFieldsV1) || !raw.droppedFieldsV1.every((name) => typeof name === "string")) {
+          return fail("\"droppedFieldsV1\" must be an array of strings");
+        }
+        droppedFieldsV1 = raw.droppedFieldsV1 as readonly string[];
+      }
       return {
         ok: true,
         outcome: {
@@ -654,7 +669,9 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
           correlation,
           code: raw.code,
           ...(provider !== undefined ? { provider } : {}),
+          ...(typeof raw.fallbackReason === "string" ? { fallbackReason: raw.fallbackReason } : {}),
           ...(frameRepairV1 !== undefined ? { frameRepairV1 } : {}),
+          ...(droppedFieldsV1 !== undefined ? { droppedFieldsV1 } : {}),
         },
       };
     }

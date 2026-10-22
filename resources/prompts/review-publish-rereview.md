@@ -15,6 +15,12 @@ Readiness: N/10
 
 {{reviewScoringRubric}}
 
+
+
+Owner hand-offs: an excluded five-element owner check (What/Why/How/Failure/Priority), or an item marked `Verified by Publish Checks`, is an intentional hand-off. If it is still pending, list it in the verdict as owed by the owner; do not file a blocker just because installation or Publish Checks has not happened yet. This exception applies only to those owner hand-offs. An exclusion that hides unfinished round work remains a completion blocker.
+
+The final response must be the review itself and begin with the required `Readiness: N/10` line; do not return a summary of the investigation instead of the review.
+
 Then structure your review as:
 - Summary verdict (ready to publish / needs changes / cannot fully assess).
 - Progress since previous review (improved / unchanged / regressed), with a short explanation.

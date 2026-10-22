@@ -33,6 +33,7 @@ import {
   isUnusableAsExistingReview,
   beginInProgressReviewMarkingV1,
   revertInProgressReviewMarkingV1,
+  restoreRejectedReviewArtifactV1,
   backupReviewUnlessStale,
 } from "../commands/reviewActions";
 import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
@@ -369,13 +370,16 @@ function installFsStub(): () => void {
   const fsRecord = vscode.workspace.fs as unknown as Record<string, unknown>;
   const originalRead = fsRecord.readFile;
   const originalWrite = fsRecord.writeFile;
+  const originalDelete = fsRecord.delete;
   fsRecord.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
     fs.promises.readFile(uri.fsPath) as Promise<Uint8Array>;
   fsRecord.writeFile = (uri: vscode.Uri, content: Uint8Array): Promise<void> =>
     fs.promises.writeFile(uri.fsPath, content).then(() => undefined);
+  fsRecord.delete = (uri: vscode.Uri): Promise<void> => fs.promises.rm(uri.fsPath, { force: true });
   return (): void => {
     fsRecord.readFile = originalRead;
     fsRecord.writeFile = originalWrite;
+    fsRecord.delete = originalDelete;
   };
 }
 
@@ -552,6 +556,51 @@ void describe("beginInProgressReviewMarkingV1 / revertInProgressReviewMarkingV1 
       const marking = await beginInProgressReviewMarkingV1(vscode.Uri.file(reviewFile));
       assert.strictEqual(marking.rewrote, false);
       assert.strictEqual(fs.readFileSync(reviewFile, "utf8"), current);
+    } finally {
+      restore();
+    }
+  });
+
+  void it("restores the accepted artifact after a rejected provider result without rotating _prev", async () => {
+    const { folderUri, folderPath } = makeTaskFolder("task_rejected_review");
+    const reviewFile = path.join(folderPath, "impl-high-review.md");
+    const previous = "Readiness: 7/10\n\n## Summary\nAccepted review.\n";
+    fs.writeFileSync(reviewFile, previous, "utf8");
+    const oldBackup = "Readiness: 6/10\n\nOlder accepted review.\n";
+    fs.writeFileSync(path.join(folderPath, "impl-high-review_prev.md"), oldBackup, "utf8");
+    seedProgress(folderPath, { reviewAttemptId: "attempt-rejected" });
+
+    const restore = installFsStub();
+    try {
+      const marking = await beginInProgressReviewMarkingV1(vscode.Uri.file(reviewFile));
+      fs.writeFileSync(reviewFile, "The file is too large; I will page through it.\n", "utf8");
+      // Simulate a provider promotion path that rotated `_prev` before the
+      // application classified this response as rejected.
+      fs.writeFileSync(path.join(folderPath, "impl-high-review_prev.md"), "Rejected response\n", "utf8");
+      await restoreRejectedReviewArtifactV1(folderUri, vscode.Uri.file(reviewFile), "attempt-rejected", marking);
+      assert.strictEqual(fs.readFileSync(reviewFile, "utf8"), previous);
+      assert.strictEqual(fs.readFileSync(path.join(folderPath, "impl-high-review_prev.md"), "utf8"), oldBackup);
+    } finally {
+      restore();
+    }
+  });
+
+  void it("removes a rejected result when no review artifact existed before the attempt", async () => {
+    const { folderUri, folderPath } = makeTaskFolder("task_rejected_review_new");
+    const reviewFile = path.join(folderPath, "impl-high-review.md");
+    seedProgress(folderPath, { reviewAttemptId: "attempt-rejected" });
+    const restore = installFsStub();
+    try {
+      const marking = await beginInProgressReviewMarkingV1(vscode.Uri.file(reviewFile));
+      fs.writeFileSync(reviewFile, "Summary without Readiness.\n", "utf8");
+      fs.writeFileSync(path.join(folderPath, "impl-high-review_prev.md"), "Rejected response\n", "utf8");
+      await restoreRejectedReviewArtifactV1(folderUri, vscode.Uri.file(reviewFile), "attempt-rejected", marking);
+      assert.strictEqual(fs.existsSync(reviewFile), false);
+      assert.strictEqual(
+        fs.existsSync(path.join(folderPath, "impl-high-review_prev.md")),
+        false,
+        "a backup created by the rejected result must not be left behind"
+      );
     } finally {
       restore();
     }

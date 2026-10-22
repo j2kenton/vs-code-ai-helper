@@ -52,7 +52,12 @@ fi
 {
   echo '{'
   echo '  "ensemble.hostRole": "viewer",'
-  echo '  "update.mode": "none"'
+  echo '  "update.mode": "none",'
+  # Viewers don't edit: keep the synced language servers idle (see runner.sh).
+  echo '  "eslint.enable": false,'
+  echo '  "python.languageServer": "None",'
+  echo '  "typescript.experimental.useTsgo": false,'
+  echo '  "cSpell.enabled": false'
   echo '}'
 } > "$DATA_DIR/data/Machine/settings.json"
 

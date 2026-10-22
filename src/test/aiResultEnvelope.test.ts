@@ -300,7 +300,7 @@ void describe("parseAiResultEnvelopeV1 — completed content", () => {
     }
   });
 
-  void it("rejects unknown fields on completed content", () => {
+  void it("drops unknown fields on prose content and names them", () => {
     const raw = frame({
       version: 1,
       correlation: correlation(),
@@ -308,11 +308,35 @@ void describe("parseAiResultEnvelopeV1 — completed content", () => {
       content: { contentType: "chat-message.v1", schemaVersion: 1, text: "hi", extra: "nope" },
     });
     const result = parseAiResultEnvelopeV1(raw);
-    assert.equal(result.kind, "malformed");
-    if (result.kind === "malformed") {
-      assert.equal(result.code, "contentSchemaMismatch");
-      assert.match(result.reason, /unknown field/);
+    assert.equal(result.kind, "completed");
+    if (result.kind === "completed") {
+      assert.deepEqual(result.content, { contentType: "chat-message.v1", schemaVersion: 1, text: "hi" });
+      assert.deepEqual(result.droppedFieldsV1, ["extra"]);
     }
+  });
+
+  void it("still rejects unknown fields on authority-bearing content (commit metadata) and the correlation", () => {
+    const commit = parseAiResultEnvelopeV1(
+      frame({
+        version: 1,
+        correlation: correlation(),
+        kind: "completed",
+        content: { contentType: "commit-metadata.v1", schemaVersion: 1, subject: "fix: x", extra: "nope" },
+      })
+    );
+    assert.equal(commit.kind, "malformed");
+    if (commit.kind === "malformed") {
+      assert.match(commit.reason, /unknown field/);
+    }
+    const withCorrelationExtra = parseAiResultEnvelopeV1(
+      frame({
+        version: 1,
+        correlation: { ...correlation(), extra: "nope" },
+        kind: "completed",
+        content: { contentType: "chat-message.v1", schemaVersion: 1, text: "hi" },
+      })
+    );
+    assert.equal(withCorrelationExtra.kind, "malformed");
   });
 
   void it("rejects an unrecognized contentType", () => {
@@ -356,7 +380,7 @@ void describe("parseAiResultEnvelopeV1 — completed content", () => {
  * to close that ambiguity (see the file for the reworded instruction).
  */
 void describe("parseAiResultEnvelopeV1 — reconstructed fixture for the 2026-08-15 Copilot draft.v1 desc failure", () => {
-  void it("names the failing check as an unknown field on markdown-artifact.v1 when a clarifying question rides alongside the draft markdown", () => {
+  void it("drops the extra clarifyingQuestion field on markdown-artifact.v1 and keeps the draft markdown", () => {
     const raw = frame({
       version: 1,
       correlation: correlation({ actionKey: "draft.v1" }),
@@ -372,10 +396,9 @@ void describe("parseAiResultEnvelopeV1 — reconstructed fixture for the 2026-08
       },
     });
     const result = parseAiResultEnvelopeV1(raw);
-    assert.equal(result.kind, "malformed");
-    if (result.kind === "malformed") {
-      assert.equal(result.code, "contentSchemaMismatch");
-      assert.match(result.reason, /markdown-artifact\.v1 has unknown field: clarifyingQuestion/);
+    assert.equal(result.kind, "completed");
+    if (result.kind === "completed") {
+      assert.deepEqual(result.droppedFieldsV1, ["clarifyingQuestion"]);
     }
   });
 

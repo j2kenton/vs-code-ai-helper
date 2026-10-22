@@ -15,6 +15,7 @@ import {
 } from "../utils/completionLint";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { renderPromptTemplate } from "../utils/promptTemplates";
+import { isExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import { generateContextPack } from "../utils/contextPack";
 import {
   ensureStageModelConfigured,
@@ -583,6 +584,17 @@ export async function runLintingFixes(
 
   const taskLabel = notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
 
+  // Read the bundled prompt before watchdog reconciliation, review staleness
+  // writes, or lint/fix work can change task state. The full prompt is rendered
+  // later with the current diagnostics and context pack.
+  try {
+    await renderPromptTemplate(extensionUri, "final-fixes-code.md", { lint: "", contextPack: "" });
+  } catch (error) {
+    if (!isExtensionFolderRemovedErrorV1(error)) throw error;
+    NotificationRouter.showError(`${taskLabel} — Linting fixes were not started. ${error.message}`);
+    return;
+  }
+
   // Admission is now guaranteed live for this exact target — reverse a
   // watchdog-provenance pause (never a user pause) before any further setup,
   // exactly like `runReviewWithAI`/`fastForwardReviewWithAI`. This command
@@ -1140,6 +1152,17 @@ export async function runLintingFixes(
               );
             }
           } catch (error) {
+            if (isExtensionFolderRemovedErrorV1(error)) {
+              // Do not run more checks or persist another lint verdict after
+              // the extension-owned prompt read proved this window is stale.
+              fixSucceededV1 = false;
+              finalChecksV1 = undefined;
+              op.settleAs("failed", "linting fixes were not started because the extension folder was removed");
+              NotificationRouter.showError(
+                `${taskLabel} — Linting fixes were not started. ${error.message}`
+              );
+              return;
+            }
             // An error ends the fix without a verdict: nothing is owed and no
             // note is written; the stale banner stays.
             fixSucceededV1 = false;

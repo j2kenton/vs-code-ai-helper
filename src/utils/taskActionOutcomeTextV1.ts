@@ -34,6 +34,7 @@ import {
   TaskActionOutcomeV1,
 } from "../types/taskActionOutcomeV1";
 import { attributionModelLabel } from "./fileUtils";
+import { describeChainCandidatesV1 } from "./chainExhaustionMessageV1";
 
 /**
  * Render the same provider/model identity artifact attribution headers use,
@@ -48,6 +49,11 @@ function providerLogSuffix(provider: TaskActionOutcomeProviderV1 | undefined): s
   }
   const model = attributionModelLabel(provider.storedModelId);
   return ` [${provider.providerLabel}${model ? ` (${model})` : ""}]`;
+}
+
+function unavailableCandidateReasonsV1(outcome: Extract<TaskActionOutcomeV1, { kind: "unavailable" }>): string {
+  const candidates = outcome.chainExhaustion?.candidates ?? [];
+  return candidates.length > 0 ? describeChainCandidatesV1(candidates) : "";
 }
 
 /**
@@ -166,9 +172,16 @@ export function describeTaskActionOutcomeForLogV1(
       // Item 5: a repaired lookalike end marker is a tolerance, and must be
       // visible in the round's own run file, not only in the extension host
       // console (setRepairedFrameEndObserverV1's sink).
-      return outcome.frameRepairV1
+      const repairedLine = outcome.frameRepairV1
         ? `${statusLine}\nFrame: end marker repaired (one substituted character at index ${outcome.frameRepairV1.index})`
         : statusLine;
+      // Unknown prose fields are dropped, not rejected — but never silently.
+      return outcome.droppedFieldsV1 && outcome.droppedFieldsV1.length > 0
+        ? `${repairedLine}\nWarning: ignored unknown field(s) on the result content: ${outcome.droppedFieldsV1
+            .slice(0, 10)
+            .map((name) => JSON.stringify(name.slice(0, 60)))
+            .join(", ")}`
+        : repairedLine;
     }
     case "questions":
       return (
@@ -217,9 +230,9 @@ export function describeTaskActionOutcomeForLogV1(
     }
     case "unavailable":
       return outcome.code === "candidatesDeferred"
-        ? `Status: unavailable (${outcome.code}) — every remaining candidate is currently ` +
-          "quota/entitlement-limited, not tried-and-failed; the task is being parked with the " +
-          "earliest known reset time rather than treated as exhausted."
+        ? `Status: unavailable (${outcome.code}) — each deferred candidate: ` +
+          `${unavailableCandidateReasonsV1(outcome) || "candidate details are unavailable in this record"}. ` +
+          "The task is parked with the earliest known reset time rather than treated as exhausted."
         : `Status: unavailable (${outcome.code})`;
     case "recoveryRequired":
       return `Status: recovery required (${outcome.code})`;
@@ -264,7 +277,9 @@ export function describeTaskActionFailureV1(outcome: TaskActionOutcomeV1): strin
       return `the model's response was malformed (${allReasons})${providerLogSuffix(outcome.provider)}`;
     }
     case "unavailable":
-      return outcome.code;
+      return outcome.code === "candidatesDeferred"
+        ? `every remaining candidate is deferred: ${unavailableCandidateReasonsV1(outcome) || "candidate details are unavailable in this record"}`
+        : outcome.code;
     case "recoveryRequired":
       return outcome.code;
     case "duplicateRejected":

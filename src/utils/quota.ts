@@ -19,12 +19,19 @@ export interface PendingResumeOperation {
 }
 
 const KEY = "pendingQuotaResume";
-// Deliberately excludes a bare "exceeded" marker: real quota phrasing
+// Payment-required detection runs before these quota markers, so "insufficient credits"
+// cannot be parked as a resettable quota. Deliberately excludes a bare "exceeded" marker: real quota phrasing
 // already matches via "quota"/"rate limit"/"usage limit"/"session limit" (e.g. "exceeded
 // your current quota" matches on "quota" alone), while "exceeded" alone
 // would false-positive on unrelated errors like "context length exceeded"
 // or an argv-size cap message.
 const QUOTA_MARKERS = ["quota", "rate limit", "ratelimit", "credits", "credit limit", "usage limit", "session limit"];
+/** Payment exhaustion is not a quota reset: a balance will not replenish on its own. */
+export function isPaymentRequiredFailureV1(message: string | undefined): boolean {
+  const value = message ?? "";
+  return /(?:\bstatus["']?\s*[:=]\s*["']?402\b|\bhttp\s*402\b)/i.test(value) ||
+    /\binsufficient\b.{0,48}\b(?:funds?|credits?)\b/i.test(value);
+}
 const TEMPORARY_MARKERS = ["temporarily unavailable", "service unavailable", "too many requests", "try again later"];
 // Transient provider-side failures that are worth retrying. Most entries are
 // transport-level drops: the request/stream died in transit rather than the
@@ -153,6 +160,9 @@ export function isQuotaError(
   message: string | undefined,
   structuredSignal?: boolean
 ): boolean {
+  if (isPaymentRequiredFailureV1(message)) {
+    return false;
+  }
   if (structuredSignal === true) {
     return true;
   }
@@ -395,6 +405,49 @@ function parseTryAgainAtReset(message: string, now: Date): string | undefined {
   return candidate.toISOString();
 }
 
+const MONTH_INDEX_V1: Record<string, number> = {
+  january: 0, february: 1, march: 2, april: 3, may: 4, june: 5, july: 6,
+  august: 7, september: 8, october: 9, november: 10, december: 11,
+};
+
+/**
+ * "...resets September 1, 2026 at 3:00 AM" — an absolute calendar date, the
+ * shape Copilot's ChatQuotaExceeded message uses. No zone is named, so the
+ * wall-clock time is read in this process's own zone, the same convention as
+ * {@link parseTryAgainAtReset}. A date already in the past is not a reset.
+ */
+function parseAbsoluteDateReset(message: string, now: Date): string | undefined {
+  const match =
+    /\bresets?\s+(?:on\s+)?([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})(?:\s+at\s+(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?)?/i.exec(
+      message
+    );
+  if (!match) {
+    return undefined;
+  }
+  const month = MONTH_INDEX_V1[match[1]!.toLowerCase()];
+  if (month === undefined) {
+    return undefined;
+  }
+  let hour = match[4] === undefined ? 0 : Number(match[4]);
+  const minute = match[5] === undefined ? 0 : Number(match[5]);
+  if (match[6]) {
+    if (hour < 1 || hour > 12) {
+      return undefined;
+    }
+    hour = (hour % 12) + (/p/i.test(match[6]) ? 12 : 0);
+  } else if (hour > 23) {
+    return undefined;
+  }
+  if (minute > 59) {
+    return undefined;
+  }
+  const candidate = new Date(Number(match[3]), month, Number(match[2]), hour, minute, 0, 0);
+  if (Number.isNaN(candidate.getTime()) || candidate.getTime() <= now.getTime()) {
+    return undefined;
+  }
+  return candidate.toISOString();
+}
+
 /**
  * Parses a provider-reported quota/rate-limit reset time out of a failure
  * message. Returns an ISO timestamp for when the limit is expected to lift,
@@ -410,6 +463,7 @@ export function parseQuotaResetV1(message: string | undefined, now: Date): strin
   return (
     parseClockTimeReset(value, now) ??
     parseRelativeDurationReset(value, now) ??
+    parseAbsoluteDateReset(value, now) ??
     parseTryAgainAtReset(value, now)
   );
 }
@@ -490,9 +544,10 @@ export function buildQuotaRemedyTextV1(
   );
 }
 
-export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string; structuredQuotaSignal?: boolean }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" } {
+export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string; structuredQuotaSignal?: boolean }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic" } {
   const message = (result.errorMessage ?? "").toLowerCase();
-  // Quota first: a rate-limited request whose stream also dropped is a quota
+  // Payment-required first, then quota: an HTTP 402 with provider.quota-shaped
+  // metadata is a balance issue, while a rate-limited request whose stream also dropped is a quota
   // event, and reporting it as a transport blip would retry straight back into
   // the same limit.
   //
@@ -533,7 +588,9 @@ export function classifyFailure<T extends { errorMessage?: string; authDiagnosti
   // backup cascade (runnerRegistry.ts) exactly when a different model id is
   // the correct remedy.
   const isEntitlement = isModelEntitlementFailure(result.authDiagnosticText ?? result.errorMessage);
-  const failureKind = isQuotaError(result.errorMessage, result.structuredQuotaSignal)
+  const failureKind = isPaymentRequiredFailureV1(result.errorMessage)
+    ? "payment-required" as const
+    : isQuotaError(result.errorMessage, result.structuredQuotaSignal)
     ? "quota" as const
     : isEntitlement
       ? "model-entitlement" as const
@@ -543,10 +600,20 @@ export function classifyFailure<T extends { errorMessage?: string; authDiagnosti
         )
         ? "temporarily-unavailable" as const
         : "generic" as const;
-  return { ...result, failureKind };
+  return {
+    ...result,
+    ...(failureKind === "payment-required"
+      ? {
+          errorMessage:
+            `HTTP 402 payment required: ${(result.errorMessage ?? "insufficient provider funds or credits").slice(0, 240)}. ` +
+            "Add credits or choose a free model.",
+        }
+      : {}),
+    failureKind,
+  };
 }
 
-export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string; authDiagnosticText?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" } {
+export function classifyCliFailure<T extends { status: "completed" | "failed" | "cancelled"; errorMessage?: string; authDiagnosticText?: string }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic" } {
   return classifyFailure(result);
 }
 
@@ -559,10 +626,11 @@ export function classifyCliFailure<T extends { status: "completed" | "failed" | 
  * switching models fixes a credentials problem or an unexplained failure.
  */
 export function isCascadeEligibleFailureKind(
-  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" | undefined
+  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic" | undefined
 ): boolean {
   return (
     failureKind === "quota" ||
+    failureKind === "payment-required" ||
     failureKind === "temporarily-unavailable" ||
     failureKind === "model-entitlement"
   );
@@ -841,7 +909,7 @@ async function updateQuotaLedger(
   providerId: string,
   accountKey: string | undefined,
   modelId: string,
-  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" | undefined,
+  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic" | undefined,
   resetAt: string | undefined,
   observedAt: string
 ): Promise<void> {
@@ -890,7 +958,7 @@ async function updateQuotaLedger(
 export function recordQuotaObservation(
   stage: TaskStage,
   modelId: string | undefined,
-  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" | undefined,
+  failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic" | undefined,
   errorMessage?: string,
   context?: vscode.ExtensionContext,
   resetAtOverride?: string,

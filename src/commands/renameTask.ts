@@ -16,6 +16,7 @@ import { formatNotificationTaskLabelV1, notificationTaskDisplayNameV1 } from "..
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { ensureAiConsent } from "../utils/aiConsent";
 import { renderPromptTemplate } from "../utils/promptTemplates";
+import { isExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import { readChatDocumentIdentityV1 } from "../utils/chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
@@ -331,6 +332,13 @@ async function requestAiNameV1(
   }
 
   try {
+    // Load the extension-owned prompt before creating task folders or run
+    // artifacts. If another window removed this install, the action remains
+    // not started and the task is untouched.
+    const prompt = await renderPromptTemplate(context.extensionUri, "rename-task.md", {
+      taskDescription,
+      strictnessNote,
+    });
     const rootId = ensureWorkflowTaskFolderRootV1(taskFolderUri.fsPath);
     const taskBindingId = getVerifiedTaskBindingIdV1(rootId);
     if (!taskBindingId) {
@@ -348,11 +356,6 @@ async function requestAiNameV1(
       task.canonicalId ?? taskFolderUri.fsPath
     );
     const chatDocumentId = chatIdentity?.documentId ?? allocateHex128IdV1();
-
-    const prompt = await renderPromptTemplate(context.extensionUri, "rename-task.md", {
-      taskDescription,
-      strictnessNote,
-    });
 
     const coordinator = createProductionTaskActionCoordinatorV1({
       workspaceCwd: workspaceFolder.uri.fsPath,
@@ -395,6 +398,9 @@ async function requestAiNameV1(
       ? { kind: "ok", name, coordinatorOutcome: outcome }
       : { kind: "failed", detail: "the reply was empty", coordinatorOutcome: outcome };
   } catch (error) {
+    if (isExtensionFolderRemovedErrorV1(error)) {
+      return { kind: "failed", detail: `Rename Task with AI was not started. ${error.message}` };
+    }
     console.error("renameTaskWithAI: provider/coordinator call threw", error);
     return {
       kind: "failed",

@@ -873,57 +873,59 @@ export async function claimImplRecoveryDispatchV1(
   let record: ImplRecoveryV1 | undefined;
   let priorImplReviewFiles: readonly string[] = [];
   let priorPendingFiles: readonly string[] = [];
-  await patchTaskProgressStrictV1(folderUri, (current) => {
-    priorImplReviewFiles = [...(current.implReviewFiles ?? [])];
-    priorPendingFiles = [...(current.pendingImplReviewFiles ?? [])];
-    if (!current.implRecovery || current.implRecovery.dispatch !== "pending") {
-      record = current.implRecovery;
-      return current;
-    }
-    const claimed: ImplRecoveryV1 = {
-      ...current.implRecovery,
-      dispatch: "dispatched",
-      attemptId: freshToken("impl-continuation"),
-    };
-    record = claimed;
-    let next: TaskProgress = {
-      ...current,
-      implRecovery: claimed,
-      updatedAt: new Date().toISOString(),
-    };
-    // Part 4 / item 1 ("source/continuation linkage"): give the continuation
-    // round its own `roundLedger` row, linked back to the source round
-    // `beginImplementationRecoveryV1` already terminalized. Reuses the task's
-    // existing live row when one exists — an auto-dispatched continuation's
-    // own `openAutomationRoundLedgerRowBestEffortV1` row, opened moments ago
-    // by the SAME dispatch this claim runs inside of — rather than opening a
-    // second row for the identical round (the exact duplicate-row shape
-    // `claimReviewAttempt`'s own pending-intent reuse exists to avoid). A
-    // manual rerun opens no such row, so one is synthesized here under the
-    // fresh continuation `attemptId`.
-    if (claimed.sourceRoundId) {
-      const continuationOf = claimed.sourceRoundId;
-      const continuationAttemptId = claimed.attemptId as string;
-      // Resolve the SPECIFIC row this dispatch already opened, when this is
-      // an auto-dispatched continuation — `scheduleAutomationChain` staged
-      // its `intentId` for exactly this purpose moments ago
-      // (`setPendingAutomationRoundIntentV1`), and `announceAutoStartBestEffortV1`
-      // opened a row keyed by that same id. PEEK, not consume: the real
-      // consumer of this entry is `executeImplementationRun`'s own
-      // `claimImplementationRoundLedgerV1` call, which runs moments after
-      // this claim for the SAME dispatch — consuming it here would starve
-      // that later call, which would then open a SECOND row for the
-      // identical round instead of reusing this one (2026-08-27 review
-      // follow-up, blocker "recovery linkage selects the first task-wide
-      // live row rather than resolving the actual source identity"). Falls
-      // back to "whichever row is currently live for this task" only when no
-      // continuation was auto-dispatched (a manual rerun opens no such row)
-      // or the peeked id resolves to nothing live (stale/expired peek) —
-      // same stale-rebinding guard `claimReviewAttempt` and
-      // `claimImplementationRoundLedgerV1` both apply to this same map. That
-      // fallback picks the MOST RECENTLY OPENED live row, not the first one
-      // in the array (review follow-up, 2026-08-28: `roundLedger` is
-      // insertion-ordered oldest-first — `upsertRoundLedgerEntryV1` always
+  let openedContinuationRoundId: string | undefined;
+  try {
+    await patchTaskProgressStrictV1(folderUri, (current) => {
+      priorImplReviewFiles = [...(current.implReviewFiles ?? [])];
+      priorPendingFiles = [...(current.pendingImplReviewFiles ?? [])];
+      if (!current.implRecovery || current.implRecovery.dispatch !== "pending") {
+        record = current.implRecovery;
+        return current;
+      }
+      const claimed: ImplRecoveryV1 = {
+        ...current.implRecovery,
+        dispatch: "dispatched",
+        attemptId: freshToken("impl-continuation"),
+      };
+      record = claimed;
+      let next: TaskProgress = {
+        ...current,
+        implRecovery: claimed,
+        updatedAt: new Date().toISOString(),
+      };
+      // Part 4 / item 1 ("source/continuation linkage"): give the continuation
+      // round its own `roundLedger` row, linked back to the source round
+      // `beginImplementationRecoveryV1` already terminalized. Reuses the task's
+      // existing live row when one exists — an auto-dispatched continuation's
+      // own `openAutomationRoundLedgerRowBestEffortV1` row, opened moments ago
+      // by the SAME dispatch this claim runs inside of — rather than opening a
+      // second row for the identical round (the exact duplicate-row shape
+      // `claimReviewAttempt`'s own pending-intent reuse exists to avoid). A
+      // manual rerun opens no such row, so one is synthesized here under the
+      // fresh continuation `attemptId`.
+      if (claimed.sourceRoundId) {
+        const continuationOf = claimed.sourceRoundId;
+        const continuationAttemptId = claimed.attemptId as string;
+        // Resolve the SPECIFIC row this dispatch already opened, when this is
+        // an auto-dispatched continuation — `scheduleAutomationChain` staged
+        // its `intentId` for exactly this purpose moments ago
+        // (`setPendingAutomationRoundIntentV1`), and `announceAutoStartBestEffortV1`
+        // opened a row keyed by that same id. PEEK, not consume: the real
+        // consumer of this entry is `executeImplementationRun`'s own
+        // `claimImplementationRoundLedgerV1` call, which runs moments after
+        // this claim for the SAME dispatch — consuming it here would starve
+        // that later call, which would then open a SECOND row for the
+        // identical round instead of reusing this one (2026-08-27 review
+        // follow-up, blocker "recovery linkage selects the first task-wide
+        // live row rather than resolving the actual source identity"). Falls
+        // back to "whichever row is currently live for this task" only when no
+        // continuation was auto-dispatched (a manual rerun opens no such row)
+        // or the peeked id resolves to nothing live (stale/expired peek) —
+        // same stale-rebinding guard `claimReviewAttempt` and
+        // `claimImplementationRoundLedgerV1` both apply to this same map. That
+        // fallback picks the MOST RECENTLY OPENED live row, not the first one
+        // in the array (review follow-up, 2026-08-28: `roundLedger` is
+        // insertion-ordered oldest-first — `upsertRoundLedgerEntryV1` always
       // appends — so a plain `.find()` would prefer a leftover row the
       // reconciliation sweep has not yet closed over the fresh row THIS
       // dispatch actually opened, mis-linking the continuation to a stale,
@@ -974,10 +976,28 @@ export async function claimImplRecoveryDispatchV1(
             startedAt: new Date().toISOString(),
             state: "open",
           };
-      next = upsertRoundLedgerEntryV1(next, continuationRow);
+        openedContinuationRoundId = continuationRow.roundId;
+        next = upsertRoundLedgerEntryV1(next, continuationRow);
+      }
+      return next;
+    });
+  } catch (error) {
+    // The continuation row was opened/upserted above; if the patch failed
+    // after that, close it as failed rather than leaving it open until an
+    // orphan sweep.
+    if (openedContinuationRoundId) {
+      await terminalizeRoundV1(
+        openedContinuationRoundId,
+        "failed",
+        {
+          rejectionReason:
+            (error instanceof Error ? error.message : String(error)).slice(0, 300),
+        },
+        { taskFolderUri: folderUri }
+      ).catch(() => undefined);
     }
-    return next;
-  });
+    throw error;
+  }
   // PART 6.5: claiming flips `dispatch` from "pending" to "dispatched",
   // which flips `willRetry` — the ledger must re-sync here or it would show
   // "will retry" after the system has already stopped retrying. The

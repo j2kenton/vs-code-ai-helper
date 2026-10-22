@@ -39,6 +39,7 @@ export const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set([
   "vs-code-ai-helper.runPublishChecks",
   "vs-code-ai-helper.runLintingFixes",
   "vs-code-ai-helper.renameTaskWithAI",
+  "vs-code-ai-helper.recoverLastAiResponse",
   // A chat send (its stage and message travel as the command argument);
   // chatWithStage forwards only a send, opening the panel stays local.
   "vs-code-ai-helper.chatWithStage",

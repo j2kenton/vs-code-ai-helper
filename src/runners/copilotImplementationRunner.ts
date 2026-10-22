@@ -635,7 +635,7 @@ export interface ImplementationRunResult {
   summaryIsSynthetic?: boolean;
   errorMessage?: string;
   /** Stable provider-neutral failure classification; set on failed results only. */
-  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
   /**
    * The provider's own authentication verdict, when the runner can produce
    * one, captured before any login hint was appended to errorMessage. CLI

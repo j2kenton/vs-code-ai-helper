@@ -43,6 +43,7 @@
 
 import {
   discoverAgyModels,
+  discoverCodexModels,
   discoverDevpassModels,
   discoverKimiModels,
   discoverKiroModels,
@@ -575,6 +576,23 @@ const CLAUDE_REASONING_EFFORT_TO_MAX_THINKING_TOKENS = new Map<
 // listed in `claude --help`, and the CLI ignores an unknown `--effort` value
 // with a warning instead of rejecting it, so the level is validated here.
 const CLAUDE_EFFORT_FLAG_MODELS = new Set<string>(["claude-sonnet-5-5"]);
+
+/**
+ * Codex's discovered list, keeping only entries `parseCodexModelSelection`
+ * accepts with their effort intact — an entry it would reject (or whose
+ * suffix it would pass to `--model` verbatim) would be an unrunnable picker
+ * choice. Empty on any discovery failure, which keeps the seeded fixed list.
+ */
+async function discoverCodexModelsForPickerV1(command: string): Promise<DiscoveredCliModel[]> {
+  const discovered = await discoverCodexModels(command);
+  return discovered.filter((entry) => {
+    try {
+      return parseCodexModelSelection(entry.model).reasoningEffort !== undefined;
+    } catch {
+      return false;
+    }
+  });
+}
 
 export interface ParsedCodexModelSelection {
   model: string | undefined;
@@ -1205,6 +1223,10 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // semantics here, and any unsupported custom ID can still be set
     // directly via "codex-cli:<model>" in settings.
     models: [{ model: undefined, name: "Codex (CLI default)" }],
+    // The picker reads the installed Codex's own list (`codex debug models`);
+    // the fixed CODEX_MODEL_CAPABILITIES catalog stays as the fallback when
+    // discovery fails (modelSelection.ts keeps the seeded list on an empty result).
+    discoverModels: discoverCodexModelsForPickerV1,
     // Codex's final answer is read from its `--json` event stream, NOT from
     // `--output-last-message`. This flag is what gates V1 eligibility
     // (cliProviderSupportsV1StdoutCapture → openV1RunnerSelection), and

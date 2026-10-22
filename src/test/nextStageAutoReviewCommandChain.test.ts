@@ -48,6 +48,7 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import { copyPromptResources } from "./helpers/copyPromptResources";
 import { scheduleAutomationChain, resetAutomationChainGuards, type AutomationDispatch } from "../utils/automationChain";
 import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
 import {
@@ -79,6 +80,7 @@ const automationChainModule = require("../utils/automationChain") as Record<stri
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-cmd-chain-"));
+copyPromptResources(REAL_ROOT);
 let autoImplementationFolderCounter = 0;
 
 // runReviewForFolder runs through the real production coordinator

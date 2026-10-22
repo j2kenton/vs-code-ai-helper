@@ -2,8 +2,11 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as path from "path";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { SPOOL_BIN_NAME_V1, SPOOL_META_NAME_V1 } from "../services/boundedResultStoreV1";
 import {
+  ensureWorkflowTaskFolderRootV1,
+  getVerifiedTaskBindingIdV1,
   getProviderResultSpoolStoreRootDirV1,
   getProviderResultSpoolStoreV1,
 } from "../services/workflowRuntimeServicesV1";
@@ -15,6 +18,7 @@ import {
  * API (see `findMostRecentSpool`'s own doc comment for why).
  */
 interface RecoveredSpoolMetaV1 {
+  readonly taskBindingId?: string;
   readonly actionKey?: string;
   readonly operationId?: string;
   readonly attemptId?: string;
@@ -60,7 +64,7 @@ interface RecoveredSpoolV1 {
  * recoverable response.
  */
 /** @internal exported for testing */
-export function findMostRecentSpool(rootDir: string): RecoveredSpoolV1 | undefined {
+export function findMostRecentSpool(rootDir: string, taskBindingId?: string): RecoveredSpoolV1 | undefined {
   let best: RecoveredSpoolV1 | undefined;
   const nowIso = new Date().toISOString();
 
@@ -89,6 +93,9 @@ export function findMostRecentSpool(rootDir: string): RecoveredSpoolV1 | undefin
       if (typeof meta.createdAt !== "string" || meta.purpose !== "recovery") {
         continue;
       }
+      if (taskBindingId !== undefined && meta.taskBindingId !== taskBindingId) {
+        continue;
+      }
       if (typeof meta.expiresAt === "string" && meta.expiresAt < nowIso) {
         continue;
       }
@@ -111,26 +118,41 @@ export function findMostRecentSpool(rootDir: string): RecoveredSpoolV1 | undefin
  * (plan §2.2), so it is shown to the user directly rather than written into
  * anything tracked or persisted beyond the store's own expiring copy.
  *
- * Task-independent by design: a rejected result's task/stage context is
- * already sanitized out of the outcome it fed into (§2.2/§3.7), so this
- * command does not attempt to resolve or require a current task — it simply
- * shows whatever the extension most recently preserved, host-wide. The
+ * A viewer supplies its current task, and the runner filters the private
+ * store by that task's existing binding id. A bare command-palette invocation
+ * on the runner remains host-wide because it has no task context. The
  * preserved copy is durable on disk under the extension's private storage
  * and outlives any single VS Code session (until its own 24h expiry).
  */
-export async function recoverLastAiResponse(): Promise<void> {
+export async function recoverLastAiResponse(arg?: { readonly taskFolderPath?: string }): Promise<void> {
   const rootDir = getProviderResultSpoolStoreRootDirV1();
+  let taskBindingId: string | undefined;
+  if (arg?.taskFolderPath) {
+    try {
+      const rootId = ensureWorkflowTaskFolderRootV1(arg.taskFolderPath);
+      taskBindingId = getVerifiedTaskBindingIdV1(rootId);
+    } catch {
+      taskBindingId = undefined;
+    }
+  }
   if (rootDir === undefined) {
     NotificationRouter.showInformation(
-      "No AI response is available to recover yet (nothing has been preserved)."
+      "This window's private provider-results store is unavailable, so it could not be searched. Rejected responses are retained for 24 hours; no claim is made about copies in other stores."
     );
     return;
   }
 
-  const found = findMostRecentSpool(rootDir);
+  if (arg?.taskFolderPath && taskBindingId === undefined) {
+    NotificationRouter.showInformation(
+      `Could not verify the current task, so this window's private provider-results store at ${rootDir} was not searched. Rejected responses are retained for 24 hours.`
+    );
+    return;
+  }
+
+  const found = findMostRecentSpool(rootDir, taskBindingId);
   if (!found) {
     NotificationRouter.showInformation(
-      "No AI response is available to recover — nothing has been preserved, or the preserved copy has already expired (rejected responses are kept for 24 hours)."
+      `Searched this window's private provider-results store${taskBindingId ? " for the current task" : ""} at ${rootDir}; rejected responses are retained for 24 hours. No copy was found in that search.`
     );
     return;
   }
@@ -199,7 +221,9 @@ export async function recoverLastAiResponse(): Promise<void> {
 export function registerRecoverLastAiResponseCommand(context: vscode.ExtensionContext): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.recoverLastAiResponse",
-    () => recoverLastAiResponse()
+    forwardInViewerV1("vs-code-ai-helper.recoverLastAiResponse", (arg?: { readonly taskFolderPath?: string }) =>
+      recoverLastAiResponse(arg)
+    )
   );
   context.subscriptions.push(disposable);
 }

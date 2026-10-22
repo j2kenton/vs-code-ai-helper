@@ -46,6 +46,7 @@ import {
 } from "../services/workflowRuntimeServicesV1";
 import { resetProductionTaskActionRegistryForTestV1 } from "../actions/productionTaskActionRuntimeV1";
 import type { ChatViewProvider } from "../views/chatView";
+import { ExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 
 const fakeChatViewProviderV1 = {
   askInteraction: (): Promise<void> => {
@@ -201,6 +202,65 @@ function makeExtensionContext(): vscode.ExtensionContext {
 }
 
 void describe("generatePlanWithAI tracked-operation outcome (2026-09-22 review, review-pass 18 blocker)", () => {
+  void it("does not call a provider or change task progress when the extension folder disappeared before prompt rendering", async () => {
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const runtime = setUpTaskActionRuntimeForTestV1();
+    let providerCalls = 0;
+    const patches: Patched[] = [
+      patch(settingsModule, "getAutoReviewAfterPlanMode", () => "off"),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(runnerRegistryModule, "checkRunnerAvailabilityForModel", () =>
+        Promise.resolve({ availability: { available: true }, providerLabel: "Stub Provider" })),
+      patch(copilotLmTransportModule, "createCopilotLmTextTransportV1", () => ({
+        runnerId: "must-not-run",
+        invoke: () => {
+          providerCalls += 1;
+          return Promise.reject(new Error("provider should not run before prompt rendering succeeds"));
+        },
+      })),
+      patch(contextPackModule, "generateContextPack", () => Promise.resolve("# Context Pack (stub)\n")),
+      patch(contextPackModule, "writeContextPackContent", () => Promise.resolve(undefined)),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.reject(new ExtensionFolderRemovedErrorV1())),
+      patch(promptSizeGuardModule, "checkAndConfirmPromptSize", () => Promise.resolve("ok")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(fileUtilsModule, "safeOpenTextDocument", () => Promise.resolve(undefined)),
+    ];
+    const task = makeTaskFolder("removed-extension-before-plan-prompt", "plan");
+    const inventory = {
+      getTaskById: (): undefined => undefined,
+      getTaskByPath: (fsPath: string) => ({
+        taskFolderPath: fsPath,
+        workspaceFolder: vscode.Uri.file(REAL_ROOT),
+        canonicalId: fsPath,
+        progress: task.progress,
+      }),
+      refresh: (): Promise<void> => Promise.resolve(),
+    } as unknown as TaskInventory;
+    const before = fs.readFileSync(path.join(task.folderPath, "task-progress.json"), "utf8");
+
+    try {
+      const result = await generatePlanWithAI(makeExtensionContext(), inventory, fakeChatViewProviderV1, {
+        taskFolderPath: task.folderPath,
+      });
+      assert.equal(result, undefined);
+      assert.equal(providerCalls, 0);
+      assert.equal(fs.readFileSync(path.join(task.folderPath, "task-progress.json"), "utf8"), before);
+      assert.equal(fs.existsSync(path.join(task.folderPath, "plan.md")), true);
+      assert.equal(fs.existsSync(path.join(task.folderPath, "runs")), false);
+    } finally {
+      for (const item of patches.reverse()) { item.restore(); }
+      runtime.tearDown();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("ends the operation refused (never succeeded) when the stage-entry is refused, and succeeded when it moves the stage", async () => {
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);

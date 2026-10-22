@@ -12,6 +12,7 @@ import {
   writeContextPackContent,
 } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
+import { isExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import { writeRunLog } from "../utils/runLog";
 import {
   describeTaskActionFailureV1,
@@ -932,14 +933,23 @@ async function generatePlanWithAIForResolvedTask(
     priorPlanFinalContent ? listCheckedChecklistItemTextsV1(priorPlanFinalContent) : []
   );
 
-  const prompt = await renderPromptTemplate(
-    context.extensionUri,
-    "create-plan.md",
-    {
-      contextPack: contextPackContent,
-      planRevisionProposal,
-    }
-  );
+  let prompt: string;
+  try {
+    prompt = await renderPromptTemplate(
+      context.extensionUri,
+      "create-plan.md",
+      {
+        contextPack: contextPackContent,
+        planRevisionProposal,
+      }
+    );
+  } catch (error) {
+    if (!isExtensionFolderRemovedErrorV1(error)) throw error;
+    NotificationRouter.showError(
+      `${notificationTaskDisplayNameV1(revisionProgress.ok ? revisionProgress.decoded.progress.displayName : undefined, taskFolderUri.fsPath)} — Plan generation was not started. ${error.message}`
+    );
+    return { succeeded: false, triggerAutoReview: false };
+  }
 
   // ── Prompt-size gate (BEFORE any artifact is written) ────────────────────
   const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {

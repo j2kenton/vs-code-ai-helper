@@ -263,6 +263,55 @@ function installGenerateImplementationPatches(): Patched[] {
 }
 
 void describe("generateImplementationWithAI — real in-flight activity through the production dispatcher", () => {
+  void it("does not dispatch or change task progress when the extension folder disappeared before prompt rendering", async () => {
+    const { folderPath } = makeTaskFolder(`genimpl-removed-extension-${Math.floor(Math.random() * 1e9)}`);
+    const progressPath = path.join(folderPath, "task-progress.json");
+    const progressBefore = fs.readFileSync(progressPath, "utf8");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    let modelCalls = 0;
+    const transport: AgentTransportV1 = {
+      runnerId: "removed-extension-transport",
+      invoke: () => {
+        modelCalls += 1;
+        return Promise.resolve({ kind: "completed" as const });
+      },
+    };
+    const patches = [
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(contextPackModule, "generateContextPack", () => Promise.resolve("# Context\n")),
+      patch(runnerRegistryModule, "checkImplementationAvailabilityForModel", () =>
+        Promise.resolve({
+          availability: { available: true },
+          providerLabel: "Claude Code",
+          provider: "claude-cli",
+          modelId: "claude-cli:sonnet@high",
+          nativeModelId: "sonnet",
+        })),
+      stubV1RunnerSelection([transport]),
+    ];
+
+    try {
+      const result = await generateImplementationWithAI(
+        vscode.Uri.file(path.join(REAL_ROOT, "removed-extension-folder")),
+        makeExtensionContext(),
+        { taskFolderPath: folderPath }
+      );
+      assert.equal(result, false, "a removed extension folder must be reported as not started");
+      assert.equal(modelCalls, 0);
+      assert.equal(fs.readFileSync(progressPath, "utf8"), progressBefore);
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("reports starting -> reading context -> model -> running live through the real coordinator dispatch, then clears the row on completion", async () => {
     const { folderPath } = makeTaskFolder(`genimpl-activity-live-${Math.floor(Math.random() * 1e9)}`);
 

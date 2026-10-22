@@ -11,6 +11,7 @@ import type * as vscode from "vscode";
 import {
   createMirroredDecisionsMementoV1,
   decodeMirroredDecisionV1,
+  filterDecisionsOfLiveTasksV1,
   liveMirroredDecisionsV1,
   readRunnerDecisionsSnapshotV1,
   writeRunnerDecisionsSnapshotV1,
@@ -248,5 +249,26 @@ void describe("hostDecisionMirrorV1", () => {
     });
     assert.ok(decoded);
     assert.equal(decoded.options[0]!.resumeKind, "continue");
+  });
+});
+
+void describe("filterDecisionsOfLiveTasksV1", () => {
+  void it("drops decisions against completed or archived tasks and keeps unreadable ones", async () => {
+    const statuses: Record<string, string | undefined> = {
+      "/w/done": "completed",
+      "/w/arch": "archived",
+      "/w/live": "active",
+      "/w/unknown": undefined,
+    };
+    const input = Object.keys(statuses).map((taskCanonicalId, index) =>
+      decision({ decisionId: `d-${index}`, taskCanonicalId })
+    );
+    const kept = await filterDecisionsOfLiveTasksV1(input, (id) => Promise.resolve(statuses[id]));
+    assert.deepEqual(
+      kept.map((d) => d.taskCanonicalId),
+      ["/w/live", "/w/unknown"]
+    );
+    const failing = await filterDecisionsOfLiveTasksV1(input, () => Promise.reject(new Error("io")));
+    assert.equal(failing.length, input.length, "a failed status read fails open");
   });
 });

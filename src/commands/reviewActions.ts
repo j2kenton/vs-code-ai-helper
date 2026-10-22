@@ -6,6 +6,7 @@ import * as crypto from "crypto";
 import { allowsDirtyWorktreeChanges } from "../config/settings";
 import { getConfiguredTaskRoot, normalizePath, resolveTaskRootCandidates, TaskRootCandidate } from "../utils/taskRoot";
 import { repairLegacyOwnership } from "../utils/metaResourcesMigration";
+import { isExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import {
   formatNotificationTaskLabelV1,
@@ -206,7 +207,7 @@ import {
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
 import { buildOpenPlanItemsNeedDecisionCardInputV1 } from "./decideOpenPlanItemsV1";
-import { generateContextPack, writeContextPack, writeImplReviewContextPack } from "../utils/contextPack";
+import { generateContextPack, writeContextPack, writeContextPackContent, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import {
@@ -230,6 +231,7 @@ import {
 } from "./runEditActionV1";
 import {
   describeStageSubstitutesV1,
+  getAvailableModels,
   ResolvedStageModel,
   resolveConfiguredReviewStages,
   resolveEffectiveStageChainV1,
@@ -3161,6 +3163,8 @@ export async function handleReviewRoutingOutcome(options: {
    * entry so cross-reviewer comparisons can be detected. Absent when the
    * caller has no provider attribution to offer. */
   reviewer?: { providerLabel: string; storedModelId: string };
+  /** Primary skip/failure detail from this invocation, used on the Chat outcome only. */
+  fallbackReason?: string;
   /** wf10 item 7c / Part 6 step 16: the assembled prompt's length, reported
    * in a degenerate-review rejection's run log alongside the reply's output
    * length. Absent when the caller never assembled a fresh prompt. */
@@ -3216,6 +3220,7 @@ export async function handleReviewRoutingOutcome(options: {
     score,
     threshold,
     reviewer,
+    fallbackReason,
     promptLength,
     providerId,
     coordinatorOperationId,
@@ -3353,14 +3358,15 @@ export async function handleReviewRoutingOutcome(options: {
     // rounds later. Record it as a failed attempt — with its reason
     // durably persisted in task-progress.json's reviewRejections trail,
     // plus a run log and a notification — instead.
+    const degenerateModelId = reviewer?.storedModelId;
     const rejectionReason = degenerateReviewRejectionReason({
       rejectDegenerateReviews: resilience.rejectDegenerateReviews,
       score,
       stage: targetStage,
       attemptId: reviewAttemptId,
+      ...(degenerateModelId ? { modelId: attributionModelLabel(degenerateModelId) ?? degenerateModelId } : {}),
     });
     if (rejectionReason !== null) {
-      const degenerateModelId = reviewer?.storedModelId;
       // Bugfix (2026-08-27 review, "the compatibility classification and
       // ledger terminalization remain separate non-atomic writes"): the
       // `reviewRejections` trail entry, the `roundOutcomes` compatibility
@@ -3491,9 +3497,62 @@ export async function handleReviewRoutingOutcome(options: {
         episodeTriedModelIds,
       });
       const degenerateBackupTaskLabel = formatNotificationTaskLabelV1(progressBefore.displayName, folderUri.fsPath);
+      if (degenerateBackupAdvance.kind !== "advance" && degenerateModelId) {
+        const retryTarget = {
+          canonicalId: normalizePath(folderUri.fsPath),
+          taskFolderPath: folderUri.fsPath,
+          stage: targetStage,
+          taskName: progressBefore.displayName,
+        };
+        try {
+          await postWorkflowDecisionV1({
+            decisionKey: "degenerateReviewOutput",
+            taskCanonicalId: retryTarget.canonicalId,
+            stage: targetStage,
+            whatHappened: `${rejectionReason} Choose whether to rerun this review on the same model or select another discovered model or reasoning level.`,
+            whyUserNeeded: "The review output has no Readiness score, so the system cannot treat it as a review or choose the best retry route for you.",
+            options: [
+              {
+                optionId: "retrySameModel",
+                label: `Rerun on ${attributionModelLabel(degenerateModelId) ?? degenerateModelId}`,
+                consequence: "Runs this review again with the same model and reasoning level.",
+                resumeKind: "continue",
+                effect: {
+                  kind: "command",
+                  command: "vs-code-ai-helper.retryReviewWithBackupV1",
+                  args: [{ taskFolderPath: folderUri.fsPath, stage: targetStage, modelId: degenerateModelId }],
+                },
+              },
+              {
+                optionId: "chooseDifferentModel",
+                label: "Choose a different model or lower reasoning level",
+                consequence: "Shows the discovered model catalog, then reruns this review with your selection.",
+                resumeKind: "continue",
+                effect: {
+                  kind: "command",
+                  command: "vs-code-ai-helper.chooseReviewRetryV1",
+                  args: [{ taskFolderPath: folderUri.fsPath, stage: targetStage, currentModelId: degenerateModelId }],
+                },
+              },
+            ],
+            recommendation: {
+              kind: "option",
+              optionId: "chooseDifferentModel",
+              reasoning: "This model returned a summary without a Readiness line; trying another model or a lower level may produce a parseable review.",
+            },
+            gating: {
+              holdsTaskPaused: false,
+              unblocksProgress: false,
+              detail: "This retry choice does not itself change the task stage.",
+            },
+          }, retryTarget);
+        } catch (error) {
+          console.warn("Could not post the degenerate-review retry decision:", error);
+        }
+      }
       if (degenerateBackupAdvance.kind === "stop") {
         NotificationRouter.showWarning(
-          `${degenerateBackupTaskLabel} — ${rejectionReason} A configured backup (${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}) was not tried because this stage is set to Never switch.`
+          `${degenerateBackupTaskLabel} — ${rejectionReason} A configured backup (${attributionModelLabel(degenerateBackupAdvance.nextModelId) ?? degenerateBackupAdvance.nextModelId}) was not tried because this stage is set to Never switch. Choose a retry in Chat.`
         );
       } else if (degenerateBackupAdvance.kind === "exhausted") {
         // wf10 review fix (Part 5 step 15): with every configured backup
@@ -3504,7 +3563,7 @@ export async function handleReviewRoutingOutcome(options: {
         // not a fallback-chain switch, so it remains available regardless of
         // the Never switch setting.
         NotificationRouter.showWarning(
-          `${degenerateBackupTaskLabel} — ${rejectionReason} Every configured backup for this stage has also failed to produce a parseable review this episode.`,
+          `${degenerateBackupTaskLabel} — ${rejectionReason} Every configured backup for this stage has also failed to produce a parseable review this episode. Choose a retry in Chat.`,
           undefined,
           undefined,
           undefined,
@@ -3751,6 +3810,7 @@ export async function handleReviewRoutingOutcome(options: {
       },
       {
         taskFolderUri: folderUri,
+        ...(fallbackReason ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${fallbackReason}` } : {}),
         ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
         ...(coordinatorAttemptId ? { attemptId: coordinatorAttemptId } : {}),
         ...(coordinatorExtraAttemptIds?.length ? { extraAttemptIds: coordinatorExtraAttemptIds } : {}),
@@ -4094,7 +4154,22 @@ export async function handleReviewOutcomeV1(
   try {
     await routeReviewOutcomeV1(outcome, ctx);
   } finally {
-    await writeReviewRunLogV1(outcome, ctx);
+    await finalizeReviewOutcomeV1(outcome, ctx);
+  }
+}
+
+/** @internal Exported so the row-close guarantee can be tested independently. */
+export async function finalizeReviewOutcomeV1(
+  outcome: TaskActionOutcomeV1,
+  ctx: ReviewOutcomeContextV1,
+  writeRunLog: (outcome: TaskActionOutcomeV1, ctx: ReviewOutcomeContextV1) => Promise<void> =
+    writeReviewRunLogV1
+): Promise<void> {
+  // These are independent finalizers. Keep row settlement in its own
+  // finally so a run-log writer that rejects cannot strand the open row.
+  try {
+    await writeRunLog(outcome, ctx);
+  } finally {
     await terminalizeUnclosedReviewRoundV1(outcome, ctx);
   }
 }
@@ -4116,6 +4191,101 @@ export async function handleReviewOutcomeV1(
  * `writeReviewRunLogV1` beside it — a failure here must never mask the
  * review's own already-surfaced outcome.
  */
+/**
+ * Runs an implementation-round dispatch and, if it THROWS, closes the round's
+ * already-claimed ledger row as failed (with the error as its reason) before
+ * rethrowing. `terminalizeRoundV1` is idempotent, so a row the dispatch itself
+ * already closed is untouched. Kept as a helper (not an inline `try`) so the
+ * dispatch `try` stays the first one in `executeImplementationRun`.
+ *
+ * @internal exported for testing
+ */
+export async function closeRoundRowIfDispatchThrowsV1<T>(
+  folderUri: vscode.Uri,
+  roundId: string,
+  dispatch: () => Promise<T>
+): Promise<T> {
+  try {
+    return await dispatch();
+  } catch (error) {
+    await closeImplementationRoundFailureV1(
+      folderUri,
+      roundId,
+      error instanceof Error ? error.message : String(error)
+    );
+    throw error;
+  }
+}
+
+/** @internal shared by the implementation dispatch and post-dispatch boundary. */
+export async function closeImplementationRoundFailureV1(
+  folderUri: vscode.Uri,
+  roundId: string,
+  reason: string
+): Promise<void> {
+  try {
+    await terminalizeRoundV1(
+      roundId,
+      "failed",
+      { rejectionReason: reason.slice(0, 300) },
+      { taskFolderUri: folderUri }
+    );
+  } catch {
+    // Preserve the original dispatch/post-dispatch error.
+  }
+}
+
+/** @internal Shared terminal write for a failed implementation/edit result. */
+export async function terminalizeFailedImplementationRoundV1(
+  folderUri: vscode.Uri,
+  roundId: string,
+  result: {
+    readonly errorMessage?: string;
+    readonly filesChanged: readonly string[];
+    readonly filesChangedUnknown?: boolean;
+  },
+  extraAttemptIds: readonly string[] = []
+): Promise<void> {
+  await terminalizeRoundV1(
+    roundId,
+    "failed",
+    {
+      rejectionReason: result.errorMessage ?? "unknown error",
+      ...(result.filesChangedUnknown
+        ? { filesChangedUnknown: true }
+        : { filesChanged: [...result.filesChanged] }),
+    },
+    {
+      taskFolderUri: folderUri,
+      ...(extraAttemptIds.length ? { extraAttemptIds: [...extraAttemptIds] } : {}),
+    }
+  );
+}
+
+/**
+ * Closes the row `claimReviewAttempt` opened when the dispatch threw before
+ * any outcome existed to hand to `handleReviewOutcomeV1`. Best-effort and
+ * idempotent (`terminalizeRoundV1`), so it can never mask the thrown error.
+ *
+ * @internal exported for testing
+ */
+export async function closeUnsettledReviewRowV1(
+  folderUri: vscode.Uri,
+  reviewAttemptId: string,
+  thrownReason: string | undefined
+): Promise<void> {
+  try {
+    await terminalizeRoundV1(
+      reviewAttemptId,
+      "failed",
+      { rejectionReason: (thrownReason ?? "the review dispatch ended before an outcome was recorded").slice(0, 300) },
+      { taskFolderUri: folderUri }
+    );
+  } catch {
+    // Best-effort: the original error (if any) is already propagating.
+  }
+}
+
 /** @internal exported for testing (item 2 / Step 55: the rejectionReason a
  * "failed" close now carries) */
 export async function terminalizeUnclosedReviewRoundV1(
@@ -4332,6 +4502,9 @@ export async function writeReviewRunLogV1(
               "\n";
           }
         }
+        if (outcome.fallbackReason) {
+          blockerSection += `\nBackup used; primary was skipped or failed: ${outcome.fallbackReason.slice(0, 300)}\n`;
+        }
       } catch {
         // Best-effort enrichment only — the bare outcome line above already
         // makes this run log a usable record without it.
@@ -4357,7 +4530,7 @@ export async function writeReviewRunLogV1(
       `# Review Run\n\n${describeTaskActionOutcomeForLogV1(
         outcome,
         STAGE_ARTIFACT_FILENAMES[ctx.targetStage]
-      )}\n${blockerSection}${exhaustionSection}${identityAttachmentSection}`
+      )}\nReview round: ${ctx.reviewAttemptId}\n${blockerSection}${exhaustionSection}${identityAttachmentSection}`
     );
     taskOperations.setResultTargetUriForTask(ctx.folderUri.fsPath, logUri);
   } catch {
@@ -4755,6 +4928,7 @@ async function routeReviewOutcomeV1(
           score,
           threshold: autoAdvanceThreshold,
           reviewer: outcome.provider,
+          ...(outcome.fallbackReason ? { fallbackReason: outcome.fallbackReason } : {}),
           promptLength,
           providerId,
           coordinatorOperationId: outcome.correlation.operationId,
@@ -4816,17 +4990,77 @@ async function routeReviewOutcomeV1(
             stage: targetStage,
           };
           if (meetsThreshold) {
-            NotificationRouter.showWarning(
-              `Review score ${score}/10 reached the auto-advance threshold. Publish manually when you're ready.`,
-              undefined,
-              undefined,
-              undefined,
-              {
-                command: "vs-code-ai-helper.openWorkflowDecision",
-                title: "Open in Chat",
-                args: [publishNudgeTarget],
+            const noBlockers = reviewNamesNoBlockersV1(folderUri, targetStage, content);
+            if (noBlockers) {
+              await postWorkflowDecisionV1({
+                decisionKey: "publishReadyToCommit",
+                taskCanonicalId: publishNudgeTarget.canonicalId,
+                stage: targetStage,
+                whatHappened: "Ready to publish — Commit & Push is next.",
+                whyUserNeeded: "The Publish review passed, and committing and pushing always requires your explicit action.",
+                options: [
+                  {
+                    optionId: "commitAndPush",
+                    label: "Commit & Push",
+                    consequence: "Starts the existing Commit & Push flow, including its confirmation and branch checks.",
+                    resumeKind: "continue",
+                    effect: {
+                      kind: "command",
+                      command: "vs-code-ai-helper.commitAndPushTask",
+                      args: [{ taskFolderPath: folderUri.fsPath }],
+                    },
+                  },
+                  {
+                    optionId: "notNow",
+                    label: "Not now",
+                    consequence: "Leaves the task ready to publish; you can use Commit & Push later.",
+                    resumeKind: "unpause",
+                    effect: { kind: "doNothing" },
+                  },
+                ],
+                recommendation: {
+                  kind: "option",
+                  optionId: "commitAndPush",
+                  reasoning: "The review is clean and has passed its threshold; Commit & Push is the next workflow action.",
+                },
+                gating: {
+                  holdsTaskPaused: false,
+                  unblocksProgress: false,
+                  detail: "The task is ready to publish; choosing later does not erase this clean review.",
+                },
+              }, publishNudgeTarget);
+              if (chatViewProvider) {
+                await chatViewProvider.append(
+                  "assistant",
+                  "Ready to publish — Commit & Push is next.",
+                  targetStage,
+                  publishNudgeTarget
+                );
               }
-            );
+              NotificationRouter.showInformation(
+                "Ready to publish — Commit & Push is next. Open the decision in Chat to continue.",
+                undefined,
+                undefined,
+                undefined,
+                {
+                  command: "vs-code-ai-helper.openWorkflowDecision",
+                  title: "Open in Chat",
+                  args: [publishNudgeTarget],
+                }
+              );
+            } else {
+              NotificationRouter.showWarning(
+                `Review score ${score}/10 reached the auto-advance threshold, but blockers remain. Resolve them before Commit & Push.`,
+                undefined,
+                undefined,
+                undefined,
+                {
+                  command: "vs-code-ai-helper.openWorkflowDecision",
+                  title: "Open in Chat",
+                  args: [publishNudgeTarget],
+                }
+              );
+            }
           } else {
             NotificationRouter.showWarning(
               `Publish review scored ${score}/10, below the auto-advance threshold for ${folderUri.fsPath}. ` +
@@ -5489,16 +5723,67 @@ export async function pauseTaskForExhaustedChainV1(
         observedAt: new Date().toISOString(),
       }
     : undefined;
+  const paymentCandidates = exhaustion.candidates.filter((candidate) =>
+    (candidate.deferredFailureKind ?? classifyFailure({ errorMessage: candidate.reason }).failureKind) === "payment-required"
+  );
+  // Include models disabled individually in AI Models: the 402 advice is
+  // about what the provider catalog offers, not only what is checked now.
+  const availableModels = paymentCandidates.length > 0 ? await getAvailableModels(true).catch(() => []) : [];
+  const paymentHint = (candidate: (typeof paymentCandidates)[number]): string => {
+    // Stored CLI IDs include the runner qualifier (`opencode-cli:`) before
+    // the catalog's provider/model ID. Preserve both it and any effort suffix
+    // so the hint resolves to the same provider and model variant.
+    const match = candidate.storedModelId.match(/^((?:[^:]+:)?[^/]+\/)([^@]+)(@.*)?$/);
+    const twinId = match ? `${match[1]}${match[2]}-free${match[3] ?? ""}` : undefined;
+    const freeTwin = twinId && availableModels.some((model) => model.id === twinId) ? `; choose ${twinId} for the free model` : "";
+    return `${candidate.providerLabel}: HTTP 402 payment required for ${candidate.storedModelId}; add credits or choose a free model${freeTwin}.`;
+  };
   // One message naming every model the chain tried and why, and where to
   // change the list (item 11) — not a pointer at the run log.
   const chainTail = describeChainExhaustionTailV1(STAGE_DISPLAY_NAMES[stage], exhaustion.candidates);
-  const reason =
-    code === "candidatesDeferred" && quotaCandidate !== undefined
-      ? `Every configured model for ${stageName} is currently blocked by a ` +
-        `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
-        `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
-        `fault (${quotaCandidate.candidate.reason}). Deferred, not exhausted: the task is parked until the known ` +
-        `reset. ${chainTail}`
+  // The highest-ranked candidate's failure is the finding; a lower-ranked
+  // backup that was already quota-blocked is context, never the headline.
+  const primaryCandidate = exhaustion.candidates[0];
+  const primaryQuotaCandidate = quotaCandidates.find(({ candidate }) => candidate === primaryCandidate);
+  const primaryFailedForOtherReason =
+    code === "candidatesExhausted" && primaryCandidate !== undefined && primaryQuotaCandidate === undefined;
+  const backupUnavailableSentence = (): string => {
+    const backups = exhaustion.candidates.slice(1).map((candidate) => {
+      const quota = quotaCandidates.find((entry) => entry.candidate === candidate);
+      return quota
+        ? `${candidate.providerLabel} (${quota.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} limit` +
+            `${quota.resetAt !== undefined ? `, resets ${quota.resetAt}` : ""})`
+        : `${candidate.providerLabel} (${candidate.reason})`;
+    });
+    return backups.length > 0
+      ? `Lower-ranked backups were already unavailable: ${backups.join("; ")}.`
+      : "";
+  };
+  const reasonBase =
+    paymentCandidates.length > 0 && primaryCandidate && paymentCandidates.includes(primaryCandidate)
+      ? `The highest-ranked model failed: ${paymentHint(primaryCandidate)} ${backupUnavailableSentence()} ${chainTail}`
+      :
+    (code === "candidatesExhausted" || code === "candidatesDeferred") && primaryCandidate !== undefined && primaryQuotaCandidate !== undefined
+      ? `${code === "candidatesDeferred" ? `Every configured model for ${stageName} is currently deferred. ` : `Every configured model for ${stageName} was tried, but `}` +
+        `the highest-ranked model, ${primaryCandidate.providerLabel}, ${code === "candidatesDeferred" ? "is currently blocked by a " : "was blocked by a "}` +
+        `${primaryQuotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
+        `${primaryCandidate.providerLabel}: ` +
+        `${primaryCandidate.reason}. ${backupUnavailableSentence()} ` +
+        `${code === "candidatesDeferred" ? "Deferred, not exhausted: the task is parked. " : ""}${chainTail}`
+      : code === "candidatesExhausted" && primaryCandidate !== undefined
+      ? `Every configured model for ${stageName} was tried and failed. The highest-ranked model, ` +
+        `${primaryCandidate.providerLabel}, failed: ${primaryCandidate.reason}. ${backupUnavailableSentence()} ` +
+        `${chainTail}`
+      : code === "candidatesDeferred" && primaryCandidate !== undefined
+      ? `Every configured model for ${stageName} is currently deferred. The highest-ranked model, ` +
+        `${primaryCandidate.providerLabel}, failed first: ${primaryCandidate.reason}. ` +
+        `${backupUnavailableSentence()} Deferred, not exhausted: the task is parked. ${chainTail}`
+      : code === "candidatesDeferred" && quotaCandidate !== undefined
+      ? `Every configured model for ${stageName} is currently deferred. The highest-ranked model's failure ` +
+        `is not available in the candidate record; the first quota-limited backup is ` +
+        `${quotaCandidate.candidate.providerLabel} (${quotaCandidate.failureKind}` +
+        `${quotaCandidate.resetAt !== undefined ? `, resets ${quotaCandidate.resetAt}` : ""}). ` +
+        `${backupUnavailableSentence()} Deferred, not exhausted: the task is parked. ${chainTail}`
       : code === "candidatesExhausted" && quotaCandidate !== undefined
         ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
           `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
@@ -5509,6 +5794,9 @@ export async function pauseTaskForExhaustedChainV1(
             `the resolved chain was exhausted (${chain}). ${chainTail}`
           : `No configured provider for ${stageName} is available — ` +
             `the resolved chain was exhausted (${chain}). ${chainTail}`;
+  const reason = paymentCandidates.length > 0 && !(primaryCandidate && paymentCandidates.includes(primaryCandidate))
+    ? `${reasonBase} Payment details: ${paymentCandidates.map(paymentHint).join(" ")}`
+    : reasonBase;
   await patchTaskProgressStrictV1(folderUri, (current) =>
     pauseTaskWithReason(current, reason, quotaParkRecord)
   );
@@ -5589,7 +5877,14 @@ export async function pauseTaskForExhaustedChainV1(
   ];
 
   const recommendation: WorkflowDecisionRecommendationV1 =
-    quotaParkRecord?.resetAt !== undefined && !resetIsFar
+    primaryFailedForOtherReason
+      ? {
+          kind: "none",
+          reasoning:
+            "The highest-ranked model failed for a reason other than a quota block, so waiting for a " +
+            "backup's reset would not fix it. Check that failure first, then retry or adjust settings.",
+        }
+      : quotaParkRecord?.resetAt !== undefined && !resetIsFar
       ? {
           kind: "option",
           optionId: "wait",
@@ -5602,7 +5897,7 @@ export async function pauseTaskForExhaustedChainV1(
             reasoning:
               quotaParkRecord.resetAt !== undefined
                 ? `The ${quotaParkRecord.failureKind} reset is far enough off that switching providers is more likely to unblock the task than waiting.`
-                : `The ${quotaParkRecord.failureKind} block has no known reset time, so switching providers is more likely to unblock the task than waiting.`,
+                : `No reset time could be read from the ${quotaParkRecord.failureKind} error, so switching providers is more likely to unblock the task than waiting.`,
           }
         : {
             kind: "none",
@@ -6022,6 +6317,19 @@ export async function runReviewForFolder(
     previousReview
   );
   if (!templateFile) {
+    return;
+  }
+  // Probe the bundled prompt (and rubric) before context-pack generation can
+  // write task artifacts. The final render below still uses the complete
+  // round-specific variables, but a removed extension root is caught before
+  // this review changes task state.
+  try {
+    await renderPromptTemplate(extensionUri, templateFile, variables);
+  } catch (error) {
+    if (!isExtensionFolderRemovedErrorV1(error)) throw error;
+    NotificationRouter.showError(
+      `${notificationTaskDisplayNameV1(runReviewForFolderProgress?.displayName, folderUri.fsPath)} — ${STAGE_DISPLAY_NAMES[targetStage]} was not started. ${error.message}`
+    );
     return;
   }
   if (previousReview !== undefined) {
@@ -6742,6 +7050,14 @@ export async function runReviewForFolder(
   // marking or its completed review.
   const inProgressMarking = await beginInProgressReviewMarkingV1(reviewUri);
   let reviewSucceeded = false;
+  let reviewRejected = false;
+  // Round-ledger settlement: `handleReviewOutcomeV1` (and the explicit "no
+  // model" close above) terminalize the row the claim opened. A THROW before
+  // either is reached (prompt render, ownership binding, preflight, an
+  // executeAction rejection) used to leave the row `open` until a later
+  // window's orphan sweep; the `finally` below now closes it as failed.
+  let roundSettled = false;
+  let thrownReason: string | undefined;
   try {
     assertLegacyAiRouteAllowedV0("review.v1");
 
@@ -6797,7 +7113,10 @@ export async function runReviewForFolder(
       await terminalizeRoundV1(
         reviewAttemptId,
         "failed",
-        taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : undefined,
+        {
+          rejectionReason: "no model is configured for this review stage; provider dispatch did not start",
+          ...(taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : {}),
+        },
         {
           taskFolderUri: folderUri,
           ...(taskMdSizeBandForOutcome
@@ -6885,6 +7204,7 @@ export async function runReviewForFolder(
       modelId,
     });
     if (chainPreflight.kind === "exhausted") {
+      roundSettled = true;
       await handleReviewOutcomeV1(
         {
           kind: "unavailable",
@@ -7018,6 +7338,17 @@ export async function runReviewForFolder(
     if (options.dispatchProbe) {
       options.dispatchProbe.coordinatorOutcome = outcome;
     }
+    if (outcome.kind === "completed" && outcome.provider) {
+      options.operation?.setModel?.(outcome.provider.storedModelId);
+      if (outcome.fallbackReason) {
+        const backupDetail = `Backup used: ${outcome.provider.storedModelId}; primary: ${outcome.fallbackReason}`;
+        options.operation?.report?.(backupDetail);
+        // Re-reviews can run as children (for example under Apply Review).
+        // Preserve the attribution on the root too, since child details vanish
+        // when that operation ends and terminal notifications render roots.
+        options.operation?.reportRootDetail?.(backupDetail);
+      }
+    }
     // "completed" is the only outcome that overwrites reviewUri with fresh
     // content (via the coordinator's own write) — every other kind
     // (questions, cancelled, failed, unavailable, ...) leaves the in-progress
@@ -7025,6 +7356,7 @@ export async function runReviewForFolder(
     // must revert it.
     reviewSucceeded = outcome.kind === "completed";
 
+    roundSettled = true;
     await handleReviewOutcomeV1(outcome, {
       extensionUri,
       folderUri,
@@ -7047,9 +7379,31 @@ export async function runReviewForFolder(
         ? { identityAttachmentDegraded: identityAttachmentDegradedForOutcome }
         : {}),
     });
+    if (outcome.kind === "completed") {
+      const settledProgress = await readTaskProgressAdvisoryV1(folderUri);
+      reviewRejected = (settledProgress?.reviewRejections ?? []).some(
+        (entry) => entry.stage === targetStage && entry.attemptId === reviewAttemptId
+      );
+    }
+  } catch (error) {
+    thrownReason = error instanceof Error ? error.message : String(error);
+    if (isExtensionFolderRemovedErrorV1(error)) {
+      NotificationRouter.showError(
+        `${notificationTaskDisplayNameV1(runReviewForFolderProgress?.displayName, folderUri.fsPath)} — ${STAGE_DISPLAY_NAMES[targetStage]} was not started. ${error.message}`
+      );
+      // The review pass reservation is required to render the prompt, so the
+      // failed reservation is settled below; no provider invocation occurs.
+      return;
+    }
+    throw error;
   } finally {
-    if (!reviewSucceeded) {
+    if (reviewRejected) {
+      await restoreRejectedReviewArtifactV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
+    } else if (!reviewSucceeded) {
       await revertInProgressReviewMarkingV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
+    }
+    if (!roundSettled) {
+      await closeUnsettledReviewRowV1(folderUri, reviewAttemptId, thrownReason);
     }
     void clearRoundLiveV1(reviewAttemptId);
   }
@@ -7469,12 +7823,20 @@ export interface InProgressReviewMarkingV1 {
   /** True when the artifact was rewritten and must be reverted on any
    * non-success exit (see the run-token-guarded revert below). */
   readonly rewrote: boolean;
+  /** Whether an artifact existed before the provider dispatch. Used to remove
+   * a newly written rejected result when there was no prior artifact. */
+  readonly priorArtifactExisted?: boolean;
   /** The exact prior bytes, captured before the rewrite — restored verbatim
    * on revert rather than reconstructed, so revert can never drift from
    * whatever was actually on disk (a real stale placeholder, a review body
    * with a stale banner, or anything else). Only meaningful when
    * `rewrote` is true. */
   readonly priorContent?: string;
+  /** The pre-round `_prev` backup is part of the accepted artifact state too.
+   * A rejected result must not leave a backup of itself in place if a write
+   * path rotated that sibling before the rejection was recorded. */
+  readonly priorBackupExisted?: boolean;
+  readonly priorBackupContent?: string;
 }
 
 /**
@@ -7504,11 +7866,22 @@ export interface InProgressReviewMarkingV1 {
 export async function beginInProgressReviewMarkingV1(
   reviewUri: vscode.Uri
 ): Promise<InProgressReviewMarkingV1> {
+  // Capture the backup before any in-progress or provider write. Normally the
+  // coordinator's content contract rejects malformed reviews before the
+  // promotion hook, but preserving this sibling also makes the rejection
+  // recovery correct if a promotion path rotates it before the outcome is
+  // classified.
+  const previousUri = previousVersionUri(reviewUri);
+  const priorBackupContent = await readTextIfExists(previousUri);
+  const priorBackup = {
+    priorBackupExisted: priorBackupContent !== undefined,
+    ...(priorBackupContent !== undefined ? { priorBackupContent } : {}),
+  };
   // Editor-aware read is deliberate: write path that swaps in the in-progress
   // banner.
   const current = await readTextIfExists(reviewUri);
   if (current === undefined) {
-    return { rewrote: false };
+    return { rewrote: false, priorArtifactExisted: false, ...priorBackup };
   }
   // Deliberately the NARROW legacy-only check, not the broadened
   // isStaleReviewArtifact — a review carrying the (content-preserving)
@@ -7538,14 +7911,16 @@ export async function beginInProgressReviewMarkingV1(
         : []),
     ].join("\n");
     await writeTextFile(reviewUri, inProgressNotice, { skipBackup: true });
-    return { rewrote: true, priorContent: current };
+    return { rewrote: true, priorContent: current, priorArtifactExisted: true, ...priorBackup };
   }
   const withInProgressBanner = markReviewInProgressBannerV1(current);
   if (withInProgressBanner === current) {
-    return { rewrote: false };
+    // Even when there was no stale marker to rewrite, preserve the prior
+    // body for restoration if the provider's review is rejected later.
+    return { rewrote: false, priorContent: current, priorArtifactExisted: true, ...priorBackup };
   }
   await writeTextFile(reviewUri, withInProgressBanner, { skipBackup: true });
-  return { rewrote: true, priorContent: current };
+  return { rewrote: true, priorContent: current, priorArtifactExisted: true, ...priorBackup };
 }
 
 /**
@@ -7577,6 +7952,44 @@ export async function revertInProgressReviewMarkingV1(
     await writeTextFile(reviewUri, marking.priorContent, { skipBackup: true });
   } catch {
     // Best-effort marker only — see doc comment above.
+  }
+}
+
+/** Restore review artifacts after a completed provider call was rejected
+ * during outcome handling. The ordinary row contract rejects missing-
+ * Readiness content before promotion; this recovery also covers any outcome
+ * path that persisted first. Restore both the current artifact and its
+ * `_prev` sibling to their pre-round state. */
+export async function restoreRejectedReviewArtifactV1(
+  folderUri: vscode.Uri,
+  reviewUri: vscode.Uri,
+  reviewAttemptId: string,
+  marking: InProgressReviewMarkingV1
+): Promise<void> {
+  try {
+    const latest = await readTaskProgressAdvisoryV1(folderUri);
+    if (latest?.reviewAttemptId !== reviewAttemptId) return;
+    if (marking.priorArtifactExisted === false) {
+      try {
+        await vscode.workspace.fs.delete(reviewUri);
+      } catch {
+        // Nothing to remove (or the best-effort cleanup itself failed).
+      }
+    } else if (marking.priorContent !== undefined) {
+      await writeTextFile(reviewUri, marking.priorContent, { skipBackup: true });
+    }
+    const backupUri = previousVersionUri(reviewUri);
+    if (marking.priorBackupExisted === false) {
+      try {
+        await vscode.workspace.fs.delete(backupUri);
+      } catch {
+        // No rotated backup to remove (or best-effort cleanup failed).
+      }
+    } else if (marking.priorBackupContent !== undefined) {
+      await writeTextFile(backupUri, marking.priorBackupContent, { skipBackup: true });
+    }
+  } catch {
+    // Best-effort preservation must not mask the recorded rejected outcome.
   }
 }
 
@@ -8307,16 +8720,25 @@ export async function applyReviewWithAI(
       return false;
     }
     variables.plan = planContent;
-    const contextPackUri = await writeContextPack(
-      resolved.folderUri,
-      workspaceRoot.uri
-    );
-    variables.contextPack = new TextDecoder().decode(
-      await vscode.workspace.fs.readFile(contextPackUri)
-    );
+    const contextPackContent = await generateContextPack(resolved.folderUri, workspaceRoot.uri);
+    variables.contextPack = contextPackContent;
     assertLegacyAiRouteAllowedV0("applyReview.v1");
 
-    const prompt = await renderPromptTemplate(extensionUri, "apply-review.md", variables);
+    let prompt: string;
+    try {
+      prompt = await renderPromptTemplate(extensionUri, "apply-review.md", variables);
+    } catch (error) {
+      if (!isExtensionFolderRemovedErrorV1(error)) {
+        throw error;
+      }
+      NotificationRouter.showError(
+        `${notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — Apply Review was not started. ${error.message}`
+      );
+      return false;
+    }
+    // Keep the existing context-pack artifact, but create it only after the
+    // extension-owned prompt read succeeded.
+    await writeContextPackContent(resolved.folderUri, contextPackContent);
 
     const rootId = ensureWorkflowTaskFolderRootV1(resolved.folderUri.fsPath);
     const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
@@ -9010,7 +9432,12 @@ export async function fastForwardReviewWithAI(
     // lands here anyway with earlyProviderPathGate still undefined — compute
     // it now instead of asserting a guarantee that stale cached input can
     // violate.
-    const providerPathGate = earlyProviderPathGate ?? (await checkEditActionProviderPathGateV1("impl"));
+    const providerPathGate =
+      earlyProviderPathGate ??
+      (await checkEditActionProviderPathGateV1(
+        "impl",
+        formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)
+      ));
     if (!providerPathGate.ok) {
       NotificationRouter.showWarning(providerPathGate.reason);
       return;
@@ -10437,14 +10864,24 @@ async function applyImplementationReviewWithAI(
   // prior `attempt >= 6` ceiling did exactly that).
   const maxShrinkAttempts = 64;
   for (let attempt = 0; ; attempt++) {
-    parts = await buildApplyReviewPromptPartsV1(
-      extensionUri,
-      folderUri,
-      contextPackContent,
-      reviewContent,
-      maxReviewChars,
-      maxImplementationChars
-    );
+    try {
+      parts = await buildApplyReviewPromptPartsV1(
+        extensionUri,
+        folderUri,
+        contextPackContent,
+        reviewContent,
+        maxReviewChars,
+        maxImplementationChars
+      );
+    } catch (error) {
+      if (!isExtensionFolderRemovedErrorV1(error)) {
+        throw error;
+      }
+      NotificationRouter.showWarning(
+        `${formatNotificationTaskLabelV1(applyReviewEditProgress?.displayName, folderUri.fsPath)} — Apply Review Edit was not started. ${error.message}`
+      );
+      return false;
+    }
     if ("error" in parts) {
       break;
     }
@@ -11740,11 +12177,23 @@ export async function generateImplementationWithAI(
         { stageToken }
       );
 
-      const prompt = await renderPromptTemplate(
-        extensionUri,
-        "create-implementation.md",
-        { contextPack: contextPackContent, plan: planFinalContent }
-      );
+      let prompt: string;
+      try {
+        prompt = await renderPromptTemplate(
+          extensionUri,
+          "create-implementation.md",
+          { contextPack: contextPackContent, plan: planFinalContent }
+        );
+      } catch (error) {
+        if (!isExtensionFolderRemovedErrorV1(error)) {
+          throw error;
+        }
+        op?.settleAs("refused", "Implementation was not started because the extension folder was removed");
+        NotificationRouter.showWarning(
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — Implementation was not started. ${error.message}`
+        );
+        return false;
+      }
 
       const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
         displayName: resolved.progress.displayName,
@@ -11788,7 +12237,7 @@ export async function generateImplementationWithAI(
     throw error;
   }
 
-  return opResult || undefined;
+  return opResult;
 }
 
 /**
@@ -12017,6 +12466,7 @@ async function executeImplementationRun(
   // showWarning/showInformation/showError call sites in this large function)
   // so notification-task-naming attribution covers all of them.
   const executeImplRunProgress = await readTaskProgressAdvisoryV1(folderUri);
+  let claimedImplRoundId: string | undefined;
   return runWithNotificationTaskContextV1(executeImplRunProgress?.displayName, folderUri.fsPath, async () => {
   const cwd = workspaceRoot.uri.fsPath;
 
@@ -12126,6 +12576,13 @@ async function executeImplementationRun(
   // `inspect-and-complete` bounds them to the quarantined plus
   // previously-reviewed scope.
   const claimedAtStart = await claimImplRecoveryDispatchV1(folderUri);
+  // The claim opens (or links) the continuation row in the same patch that
+  // marks recovery dispatched. Retain its identity immediately: escalation
+  // or other preparation can fail before claimImplementationRoundLedgerV1
+  // returns, while this row is already live.
+  if (claimedAtStart.record?.dispatch === "dispatched" && claimedAtStart.record.attemptId) {
+    claimedImplRoundId = claimedAtStart.record.attemptId;
+  }
   // A claimed `summary-only` record's no-edit guarantee is enforceable only
   // when THIS round's actually-resolved model can dispatch in text mode with
   // edit permissions genuinely withheld. The transition-time probe
@@ -12137,11 +12594,12 @@ async function executeImplementationRun(
   // unenforceable `summary-only` claim would otherwise reach the ordinary
   // edit path still carrying its no-edits mandate (review blocker,
   // 2026-08-14).
-  const escalatedRecord = await escalateClaimedSummaryOnlyIfUnavailableV1(
-    folderUri,
-    claimedAtStart.record,
-    modelId
-  );
+  const escalateClaimedRecovery = () =>
+    escalateClaimedSummaryOnlyIfUnavailableV1(folderUri, claimedAtStart.record, modelId);
+  const escalatedRecord =
+    claimedImplRoundId !== undefined
+      ? await closeRoundRowIfDispatchThrowsV1(folderUri, claimedImplRoundId, escalateClaimedRecovery)
+      : await escalateClaimedRecovery();
   const claimedRecovery: ClaimedImplRecoveryV1 = { ...claimedAtStart, record: escalatedRecord };
   // What THIS round is running as (item 17a) — a checklist-driven
   // Implementation round, a review-driven Apply Review round, or a recovery
@@ -12174,6 +12632,7 @@ async function executeImplementationRun(
       currentDispatchMode
     )
   ).roundId;
+  claimedImplRoundId = implRoundId;
   // What a NEW recovery (if this round needs one) should record as ITS
   // source — propagated from a continuation's own source so a continuation
   // of a continuation of an apply-review round still resolves to
@@ -12184,31 +12643,47 @@ async function executeImplementationRun(
   // continuation whose apply-review re-render failed and fell through to
   // run-implementation.md is correctly recorded as checklist-driven, never
   // as apply-review ancestry it did not actually run under this round.
-  const nextRecoverySource = deriveNextRecoverySourceV1(
-    options.editActionKey,
-    postRunReviewStage,
-    claimedRecovery.record?.sourceReviewStage
-  );
-  const nextRecoverySourceDispatchMode = nextRecoverySource.sourceDispatchMode;
-  const nextRecoverySourceReviewStage = nextRecoverySource.sourceReviewStage;
-  // Checklist-mutation guard snapshot (wf "make the stage chat a record of
-  // work" Part 6 / item 5: "a round never mutates the checklist"). Read
-  // BEFORE dispatch, mirroring the baseline-SHA capture's own "must run
-  // before any edit" placement, so a round that directly edits
-  // plan-final.md's item list (an edit-mode round with file-write access)
-  // can be detected against what the plan actually read at round start —
-  // see detectChecklistItemSetMutationV1's doc comment.
-  const preRoundPlan = await readPlanOfRecordV1(folderUri);
-  const preRoundChecklistText = preRoundPlan.hasChecklist ? preRoundPlan.text : undefined;
-  const wasEscalatedFromSummaryOnly =
-    claimedAtStart.record?.mode === "summary-only" && escalatedRecord?.mode !== "summary-only";
-  const dispatchPrompt = wasEscalatedFromSummaryOnly
-    ? buildImplementationContinuationPromptV1(stripImplementationContinuationNoticeV1(prompt), {
-        mode: escalatedRecord?.mode,
-        pendingFiles: claimedRecovery.priorPendingFiles,
-        reviewedFiles: claimedRecovery.priorImplReviewFiles,
-      })
-    : prompt;
+  const roundPreparation = await closeRoundRowIfDispatchThrowsV1(folderUri, implRoundId, async () => {
+    const nextRecoverySource = deriveNextRecoverySourceV1(
+      options.editActionKey,
+      postRunReviewStage,
+      claimedRecovery.record?.sourceReviewStage
+    );
+    const nextRecoverySourceDispatchMode = nextRecoverySource.sourceDispatchMode;
+    const nextRecoverySourceReviewStage = nextRecoverySource.sourceReviewStage;
+    // Checklist-mutation guard snapshot (wf "make the stage chat a record of
+    // work" Part 6 / item 5: "a round never mutates the checklist"). Read
+    // BEFORE dispatch, mirroring the baseline-SHA capture's own "must run
+    // before any edit" placement, so a round that directly edits
+    // plan-final.md's item list (an edit-mode round with file-write access)
+    // can be detected against what the plan actually read at round start —
+    // see detectChecklistItemSetMutationV1's doc comment.
+    // The row is already open. Keep every preparation step up to dispatch
+    // inside its failure settlement boundary, including the plan snapshot read.
+    const preRoundPlan = await readPlanOfRecordV1(folderUri);
+    const preRoundChecklistText = preRoundPlan.hasChecklist ? preRoundPlan.text : undefined;
+    const wasEscalatedFromSummaryOnly =
+      claimedAtStart.record?.mode === "summary-only" && escalatedRecord?.mode !== "summary-only";
+    const dispatchPrompt = wasEscalatedFromSummaryOnly
+      ? buildImplementationContinuationPromptV1(stripImplementationContinuationNoticeV1(prompt), {
+          mode: escalatedRecord?.mode,
+          pendingFiles: claimedRecovery.priorPendingFiles,
+          reviewedFiles: claimedRecovery.priorImplReviewFiles,
+        })
+      : prompt;
+    return {
+      nextRecoverySourceDispatchMode,
+      nextRecoverySourceReviewStage,
+      preRoundChecklistText,
+      dispatchPrompt,
+    };
+  });
+  const {
+    nextRecoverySourceDispatchMode,
+    nextRecoverySourceReviewStage,
+    preRoundChecklistText,
+    dispatchPrompt,
+  } = roundPreparation;
 
   let result: Awaited<ReturnType<typeof runImplementationOrSealedV1>> | undefined;
 
@@ -12223,7 +12698,7 @@ async function executeImplementationRun(
   // inline `try`/`finally` here) so this line never shadows the dispatch
   // `try` block just below, which `reviewActionsStageActivity.test.ts`
   // locates as the FIRST `try` after this function's start.
-  await withRoundLeaseV1(implRoundId, () => vscode.window.withProgress(
+  await closeRoundRowIfDispatchThrowsV1(folderUri, implRoundId, () => withRoundLeaseV1(implRoundId, () => vscode.window.withProgress(
     {
       location: vscode.ProgressLocation.Window,
       title: progressTitle,
@@ -12353,9 +12828,15 @@ async function executeImplementationRun(
         linked.dispose();
       }
     }
-  ));
+  )));
 
   if (!result) {
+    await terminalizeRoundV1(
+      implRoundId,
+      "failed",
+      { rejectionReason: "the implementation dispatch ended without producing a result" },
+      { taskFolderUri: folderUri }
+    );
     return false;
   }
 
@@ -12552,6 +13033,12 @@ async function executeImplementationRun(
   // picks summary-only for it, and the run log records the true cause
   // distinctly from a provider-reported deferred/cut-short round.
   const timedOutRound = result.status === "failed" && result.timedOut === true;
+  if (result.storedModelId) {
+    options.parentOperation?.setModel?.(result.storedModelId);
+  }
+  if (result.cascadeNoteV1) {
+    options.parentOperation?.report?.(result.cascadeNoteV1.slice(0, 300));
+  }
   let recovery: BegunImplementationRecoveryV1 | undefined;
   if (incompleteRound || summaryIssue !== undefined || timedOutRound) {
     recovery = await beginImplementationRecoveryV1(folderUri, {
@@ -12687,13 +13174,16 @@ async function executeImplementationRun(
     options.dispatchedBlockerIds
   );
 
-  const logContent = `# Implementation Run\n\nRound ID: ${promptRoundId}\n\n${modeAndBlockerHeader}Status: ${
+  // Completed stage rows identify this work by the round-ledger id. For
+  // recovery continuations it differs from the newly allocated prompt id;
+  // retain both identities so durable attribution joins to the ledger row.
+  const logContent = `# Implementation Run\n\nRound ID: ${implRoundId}\nPrompt Round ID: ${promptRoundId}\n\n${modeAndBlockerHeader}Status: ${
     incompleteRound ? `incomplete (${incompleteRound.kind})` : result.status
   }\n\n${implProviderLine}Files changed:\n${
     result.filesChanged.length > 0
       ? result.filesChanged.map((f) => `- ${f}`).join("\n")
       : "_none recorded_"
-  }\n\n${result.cascadeNoteV1 ? `${result.cascadeNoteV1}\n\n` : ""}${result.summary ?? result.errorMessage ?? ""}${
+  }\n\n${result.cascadeNoteV1 ? `Backup used; primary was skipped or failed: ${result.cascadeNoteV1.slice(0, 300)}\n\n` : ""}${result.summary ?? result.errorMessage ?? ""}${
     incompleteRound && recovery
       ? `\n\n## Incomplete round\n\nThis round was recorded incomplete: ${incompleteRound.reason}.\n\n` +
         `Recovery record: \`${recovery.sourceAttemptId}\` (${
@@ -13140,6 +13630,7 @@ async function executeImplementationRun(
           { filesChanged: [] },
           {
             taskFolderUri: folderUri,
+            ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
             ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
             roundOutcomeClassification: {
               classification: gateClassification,
@@ -13315,6 +13806,7 @@ async function executeImplementationRun(
         { filesChanged: [] },
         {
           taskFolderUri: folderUri,
+          ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
           ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
           extraPatch: (current) => {
             const withStreak = setZeroChangeImplRounds(
@@ -13322,7 +13814,13 @@ async function executeImplementationRun(
               zeroChangeRounds > 0 ? zeroChangeRounds : undefined
             );
             return checklistUnderrecordingConfirmedByReview && !current.checklistProgressUnreliable
-              ? { ...withStreak, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
+              ? {
+                  ...withStreak,
+                  checklistProgressUnreliable: true,
+                  checklistProgressUnreliableReason:
+                    "a zero-change implementation round reported plan-item completions that did not match the plan checklist",
+                  updatedAt: new Date().toISOString(),
+                }
               : withStreak;
           },
           roundOutcomeClassification: {
@@ -13739,7 +14237,12 @@ async function executeImplementationRun(
             return checklistClaimedButUnmerged &&
               remainingChecklistProgress !== undefined &&
               remainingChecklistProgress.remaining > 0
-              ? { ...cleared, checklistProgressUnreliable: true }
+              ? {
+                  ...cleared,
+                  checklistProgressUnreliable: true,
+                  checklistProgressUnreliableReason:
+                    "an implementation round claimed checklist items that could not be merged, leaving unticked work",
+                }
               : cleared;
           }
         );
@@ -13762,7 +14265,13 @@ async function executeImplementationRun(
         const latchedProgress = await patchTaskProgressStrictV1(folderUri, (current) =>
           current.checklistProgressUnreliable
             ? undefined
-            : { ...current, checklistProgressUnreliable: true, updatedAt: new Date().toISOString() }
+            : {
+                ...current,
+                checklistProgressUnreliable: true,
+                checklistProgressUnreliableReason:
+                  "an implementation round claimed checklist items that did not match any plan item, and no review has cleared the stage",
+                updatedAt: new Date().toISOString(),
+              }
         );
         const existingLog = await readTextIfExists(logUri);
         if (existingLog !== undefined) {
@@ -13819,12 +14328,14 @@ async function executeImplementationRun(
           { filesChanged: [...result.filesChanged] },
           {
             taskFolderUri: folderUri,
+            ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
             ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
             extraPatch: (current) => setZeroChangeImplRounds(current, undefined),
             roundOutcomeClassification: {
               classification: "edits-produced",
               attemptId: implRoundId,
-              ...(modelId ? { modelId } : {}),
+              ...(result.storedModelId ?? modelId ? { modelId: result.storedModelId ?? modelId } : {}),
+              ...(result.runnerId ? { providerId: result.runnerId } : {}),
               dispatchMode: currentDispatchMode,
             },
           }
@@ -13863,11 +14374,13 @@ async function executeImplementationRun(
         result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
         {
           taskFolderUri: folderUri,
+          ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
           ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
           roundOutcomeClassification: {
             classification: noEditsClassification,
             attemptId: implRoundId,
-            ...(modelId ? { modelId } : {}),
+            ...(result.storedModelId ?? modelId ? { modelId: result.storedModelId ?? modelId } : {}),
+            ...(result.runnerId ? { providerId: result.runnerId } : {}),
             dispatchMode: currentDispatchMode,
           },
         }
@@ -14178,6 +14691,8 @@ async function executeImplementationRun(
         ? {
             ...stageUpdated,
             checklistProgressUnreliable: true,
+            checklistProgressUnreliableReason:
+              "the round may have changed files but produced a synthetic or unusable summary, so checklist progress cannot be trusted",
             updatedAt: new Date().toISOString(),
           }
         : stageUpdated;
@@ -14710,20 +15225,7 @@ async function executeImplementationRun(
       // record an omitted = unknown change set) become no-ops for this row.
       // `beginImplementationRecoveryV1` is the other writer and handles the
       // timed-out / recovery-owed rounds above.
-      await terminalizeRoundV1(
-        implRoundId,
-        "failed",
-        {
-          rejectionReason: result.errorMessage ?? "unknown error",
-          ...(result.filesChangedUnknown
-            ? { filesChangedUnknown: true }
-            : { filesChanged: [...result.filesChanged] }),
-        },
-        {
-          taskFolderUri: folderUri,
-          ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
-        }
-      );
+      await terminalizeFailedImplementationRoundV1(folderUri, implRoundId, result, implExtraAttemptIds);
       NotificationRouter.showError(
         `Implementation failed: ${result.errorMessage ?? "unknown error"}`
       );
@@ -14742,7 +15244,23 @@ async function executeImplementationRun(
     }
     return false;
   }
-  }, postRunReviewStage);
+  }, postRunReviewStage).then(
+    (completed) => completed,
+    async (error: unknown) => {
+      // The dispatch wrapper above covers preparation and execution. Keep a
+      // second boundary around the whole round so a post-dispatch read or
+      // bookkeeping failure cannot strand the already-open row (for example
+      // the plan-of-record read after a provider result is available).
+      if (claimedImplRoundId !== undefined) {
+        await closeImplementationRoundFailureV1(
+          folderUri,
+          claimedImplRoundId,
+          error instanceof Error ? error.message : String(error)
+        );
+      }
+      throw error;
+    }
+  );
 }
 
 /**
@@ -15216,11 +15734,23 @@ export async function runImplementationWithAI(
         `reading context (${Math.round(Buffer.byteLength(checklistContextPack, "utf8") / 1024)} KB)`,
         { stageToken }
       );
-      const checklistPrompt = await renderPromptTemplate(
-        extensionUri,
-        "create-implementation.md",
-        { contextPack: checklistContextPack, plan: planFinalContent }
-      );
+      let checklistPrompt: string;
+      try {
+        checklistPrompt = await renderPromptTemplate(
+          extensionUri,
+          "create-implementation.md",
+          { contextPack: checklistContextPack, plan: planFinalContent }
+        );
+      } catch (error) {
+        if (!isExtensionFolderRemovedErrorV1(error)) {
+          throw error;
+        }
+        op.settleAs("refused", "Implementation was not started because the extension folder was removed");
+        NotificationRouter.showWarning(
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — Implementation was not started. ${error.message}`
+        );
+        return false;
+      }
       const checklistModel = await resolveFreshModelForStage(resolved.folderUri, "impl");
       if (!checklistModel.modelId) {
         op.settleAs("refused", "no model is configured for impl");
@@ -15241,7 +15771,7 @@ export async function runImplementationWithAI(
           `${checklistProviderLabel} unavailable: ${checklistAvailability.reason ?? "unknown reason"}`
         );
         NotificationRouter.showWarning(
-          `${checklistProviderLabel} is unavailable: ${checklistAvailability.reason ?? "unknown reason"}. Implement the plan manually instead.`
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — Implementation: its configured model ${checklistModel.modelId} via ${checklistProviderLabel} is unavailable: ${checklistAvailability.reason ?? "unknown reason"}. Implement the plan manually instead.`
         );
         return false;
       }
@@ -15649,12 +16179,24 @@ export async function runImplementationWithAI(
       const sourceReviewContent = sourceReviewUri && (await readNonEmptyText(sourceReviewUri));
       let reconstructionError: string | undefined;
       if (sourceReviewContent) {
-        const parts = await buildApplyReviewPromptPartsV1(
-          extensionUri,
-          resolved.folderUri,
-          contextPackContent,
-          sourceReviewContent
-        );
+        let parts: { prompt: string; templateVariables: Record<string, string> } | { error: string };
+        try {
+          parts = await buildApplyReviewPromptPartsV1(
+            extensionUri,
+            resolved.folderUri,
+            contextPackContent,
+            sourceReviewContent
+          );
+        } catch (error) {
+          if (!isExtensionFolderRemovedErrorV1(error)) {
+            throw error;
+          }
+          op.settleAs("refused", "Apply Review continuation was not started because the extension folder was removed");
+          NotificationRouter.showWarning(
+            `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — Apply Review continuation was not started. ${error.message}`
+          );
+          return false;
+        }
         if ("prompt" in parts) {
           sourceReviewPrompt = parts.prompt;
           sourceReviewStageForRun = applyReviewContinuationStage;
@@ -16176,7 +16718,9 @@ export async function applyReviewEditWithAI(
 
     assertLegacyAiRouteAllowedV0("applyReviewEdit.v1");
 
-    const implementSucceeded = await runTrackedOperation(
+    let implementSucceeded: boolean;
+    try {
+      implementSucceeded = (await runTrackedOperation(
       lockKey,
       {
         parent: op,
@@ -16212,7 +16756,16 @@ export async function applyReviewEditWithAI(
             dispatchProbe: applyReviewEditDispatchProbeV1,
           }
         )
-    );
+      )) === true;
+    } catch (error) {
+      if (!isExtensionFolderRemovedErrorV1(error)) {
+        throw error;
+      }
+      NotificationRouter.showWarning(
+        `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)} — Apply Review Edit was not started. ${error.message}`
+      );
+      return false;
+    }
     if (implementSucceeded) {
       // Item 2 / Step 57a (review fix): this chained re-review runs its own
       // `coordinator.executeAction` inside `runReviewForFolder` — a second

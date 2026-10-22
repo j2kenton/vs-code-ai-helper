@@ -57,6 +57,26 @@ void describe("viewerForwardingV1", () => {
     ]);
   });
 
+  void it("forwards Recover Last AI Response with the current task to the runner", async () => {
+    configureEnsembleHostRoleForTestV1("viewer");
+    const forwarded: Array<[string, string | undefined]> = [];
+    configureViewerCommandForwarderV1((commandId, taskFolderPath) => {
+      forwarded.push([commandId, taskFolderPath]);
+      return Promise.resolve({ ok: true });
+    });
+    let ranInViewer = false;
+    const wrapped = forwardInViewerV1(
+      "vs-code-ai-helper.recoverLastAiResponse",
+      (_arg?: { readonly taskFolderPath?: string }) => { ranInViewer = true; }
+    );
+    await wrapped({ taskFolderPath: "/w/.ensemble/current-task" });
+    assert.equal(ranInViewer, false);
+    assert.deepEqual(forwarded, [[
+      "vs-code-ai-helper.recoverLastAiResponse",
+      "/w/.ensemble/current-task",
+    ]]);
+  });
+
   void it("reads the task from every argument shape the workflow's commands receive", () => {
     assert.equal(taskFolderPathFromCommandArgV1({ task: { folderUri: { fsPath: "/a" } } }), "/a");
     assert.equal(taskFolderPathFromCommandArgV1({ taskFolderPath: "/b" }), "/b");
@@ -127,6 +147,7 @@ void describe("viewerForwardingV1", () => {
   void it("refuses to wrap a command the runner would not run", () => {
     assert.throws(() => forwardInViewerV1("workbench.action.terminal.sendSequence", () => undefined), /RELAYABLE_COMMAND_IDS_V1/);
     assert.ok(RELAYABLE_COMMAND_IDS_V1.has("vs-code-ai-helper.runReviewWithAI"));
+    assert.ok(RELAYABLE_COMMAND_IDS_V1.has("vs-code-ai-helper.recoverLastAiResponse"));
     assert.equal(RELAYABLE_COMMAND_IDS_V1.has("vs-code-ai-helper.commitAndPushTask"), false, "it confirms with a modal nobody can click on the runner");
   });
 });

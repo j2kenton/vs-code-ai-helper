@@ -45,6 +45,7 @@ import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture
 import { REVIEW_STAGES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { AgentTransportV1 } from "../types/agentExecutionV1";
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
+import { copyPromptResources } from "./helpers/copyPromptResources";
 import { createChatInteractionTransactionStoreV1 } from "../services/chatInteractionTransactionStoreV1";
 import {
   configureWorkflowPrivateStorageRootV1,
@@ -67,6 +68,7 @@ const contextPackModule = require("../utils/contextPack") as Record<string, unkn
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-nested-lock-"));
+copyPromptResources(REAL_ROOT);
 
 // applyReviewWithAI's re-review path runs through the real production
 // coordinator (createProductionTaskActionCoordinatorV1), which requires the

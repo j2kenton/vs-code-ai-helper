@@ -12,12 +12,17 @@ Owner evidence: when a plan step requires evidence that rounds cannot gather (a 
 
 Publish Checks hand-off: an excluded "Verified by Publish Checks:" item (confirmed setting, covered run), or an excluded owner step for an unconfirmed setting, is correct and you must never file a blocker because such an item is excluded. File a task-fixable blocker when such an item claims a run the selected command does not cover (an uncovered run), or rests on an unconfirmed setting: a `.vscode/settings.json` value without the task's single-folder evidence, or the key's absence treated as confirmation.
 
+Whole-plan owner/toolchain sweep: once you find any missing owner-only fact or any build, test, or live-CLI step assigned to a review/implementation round that cannot run it, inspect the entire plan in this same review. Report every missing owner fact and every such round-assigned check together; do not raise them one per round. Tell the next plan revision to move those build/test/live-CLI steps to the Publish Checks hand-off or Owner checks.
+
+
 Begin your response with a readiness score on its own line in this exact format:
 Readiness: N/10
 
 Where N is a score from 0-10.
 
 {{reviewScoringRubric}}
+
+The final response must be the review itself and begin with the required `Readiness: N/10` line; do not return a summary of the investigation instead of the review.
 
 Then structure your review as:
 - Summary verdict (ready to finalize / needs changes / needs restructuring — the plan is the wrong shape, not merely under-specified; sequence it into ordered parts this task implements one per round, rather than adding detail or handing parts to other tasks).

@@ -157,7 +157,7 @@ void describe("hostRelayV1", () => {
     }
   });
 
-  void it("a claim left behind by a runner that restarted is expired at once, not at the viewer's 30-minute wait", async () => {
+  void it("a claim left behind by a runner that restarted is interrupted at once, not expired", async () => {
     // The blocker (verification review, 2026-09-18): judging a claim by the
     // REQUEST's timeout meant a runner that reloaded mid-round left a claim
     // nothing would expire for 30 minutes, while the new runner sat idle
@@ -179,7 +179,7 @@ void describe("hostRelayV1", () => {
       assert.equal(await relay.drain(() => Promise.resolve("ran")), 0);
       const response = await pending;
       assert.equal(response.ok, false);
-      assert.equal(response.reason, "expired", "a definite answer the user can retry from");
+      assert.match(response.reason ?? "", /^interrupted: the runner stopped while this action was running/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
@@ -236,7 +236,7 @@ void describe("hostRelayV1", () => {
       assert.equal(await relay.drain(() => Promise.resolve("ran")), 0, "it is claimed, so it is not run here");
       const response = await pending;
       assert.equal(response.ok, false);
-      assert.equal(response.reason, "expired");
+      assert.match(response.reason ?? "", /^interrupted: the runner stopped while this action was running/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
@@ -314,6 +314,25 @@ void describe("hostRelayV1", () => {
       assert.equal(executed, false);
       assert.equal(response.ok, false);
       assert.equal(response.reason, "expired");
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  void it("removes malformed request ids as dead letters without executing them", async () => {
+    const dir = await tempDir();
+    try {
+      const relay = createHostRelayV1({ dir });
+      const malformed = path.join(dir, "req-not-a-valid-id.json");
+      await fs.writeFile(malformed, JSON.stringify({ kind: "command", command: "must-not-run" }));
+      await fs.writeFile(`${malformed}.claimed`, "stale sidecar");
+      let executed = false;
+      assert.equal(await relay.drain(() => {
+        executed = true;
+        return Promise.resolve(undefined);
+      }), 0);
+      assert.equal(executed, false);
+      assert.deepEqual(await fs.readdir(dir), []);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

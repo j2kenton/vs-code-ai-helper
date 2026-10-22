@@ -303,6 +303,25 @@ export function hasContradictoryNoChecklistChangeClaimV1(
  */
 export const EXCLUDED_CHECKLIST_ITEM_MARKER_V1 = "<!-- ensemble:excluded -->";
 
+/** The same marker wrapped in a single pair of backticks — a formatting slip that must still settle the item. */
+const BACKTICK_WRAPPED_EXCLUDED_MARKER_V1 = "`<!-- ensemble:excluded -->`";
+
+/**
+ * Length of the trailing exclusion marker on `text`, recognizing both the
+ * bare marker and the marker wrapped in a single pair of backticks. Returns
+ * `undefined` when neither form trails the line.
+ */
+function trailingExcludedMarkerLengthV1(text: string): number | undefined {
+  const trimmed = text.trimEnd();
+  if (trimmed.endsWith(BACKTICK_WRAPPED_EXCLUDED_MARKER_V1)) {
+    return BACKTICK_WRAPPED_EXCLUDED_MARKER_V1.length;
+  }
+  if (trimmed.endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1)) {
+    return EXCLUDED_CHECKLIST_ITEM_MARKER_V1.length;
+  }
+  return undefined;
+}
+
 /**
  * True when `itemText` (the checklist line's captured text) genuinely carries
  * the exclusion marker, as opposed to merely mentioning it. The marker counts
@@ -312,15 +331,52 @@ export const EXCLUDED_CHECKLIST_ITEM_MARKER_V1 = "<!-- ensemble:excluded -->";
  * that is ABOUT the marker ("Add the marker `<!-- ensemble:excluded -->`",
  * "… the literal<!-- ensemble:excluded -->") stays an ordinary open item
  * rather than silently settling as excluded and shrinking the count (RC1
- * item 7).
+ * item 7). The marker wrapped in a single pair of backticks at the end of the
+ * line is also accepted, so a formatting slip cannot reopen an excluded item.
  */
 export function isExcludedChecklistItemText(itemText: string): boolean {
-  const trimmed = itemText.trimEnd();
-  if (!trimmed.endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1)) {
+  const markerLen = trailingExcludedMarkerLengthV1(itemText);
+  if (markerLen === undefined) {
     return false;
   }
-  const before = trimmed.slice(0, trimmed.length - EXCLUDED_CHECKLIST_ITEM_MARKER_V1.length);
+  const before = itemText.trimEnd().slice(0, itemText.trimEnd().length - markerLen);
   return before.trim().length > 0 && /\s$/.test(before);
+}
+
+/**
+ * Resolve a review blocker to an excluded five-field owner hand-off from the
+ * plan's Owner checks / Publish hand-off area. Uses the same normalized item
+ * identity as checklist tick reconciliation; an incidental wording overlap
+ * cannot authorize moving on.
+ */
+export function resolveExcludedOwnerHandoffV1(
+  blockerDescription: string,
+  planOfRecord: string
+): { itemText: string; isPrerequisite: boolean } | undefined {
+  const blockerKey = normalizeChecklistItemTextV1(blockerDescription);
+  const lines = planOfRecord.split(/\r?\n/);
+  let inHandoff = false;
+  for (const line of lines) {
+    const heading = /^#{1,4}\s+(.+)$/.exec(line)?.[1]?.toLowerCase();
+    if (heading) {
+      inHandoff = /owner checks|publish checks hand-off|publish hand-off|manual hand-offs/.test(heading);
+      continue;
+    }
+    if (!inHandoff) continue;
+    const item = /^\s*[-*+]\s+\[[ xX]\]\s+(.+\S)\s*$/.exec(line)?.[1];
+    if (!item || !isExcludedChecklistItemText(item)) continue;
+    const title = /\*\*([^*]+)\*\*/.exec(item)?.[1];
+    const titleKey = title ? normalizeChecklistItemTextV1(title.replace(/[.:]$/, "")) : "";
+    const itemKey = normalizeChecklistItemTextV1(item);
+    if (!titleKey || (!blockerKey.includes(titleKey) && !itemKey.includes(blockerKey))) continue;
+    if (!/\bwhat\b/i.test(item) || !/\bwhy\b/i.test(item) || !/\bhow\b/i.test(item) ||
+        !/\bif it fails\b/i.test(item) || !/\bpriority\b/i.test(item)) continue;
+    return {
+      itemText: item,
+      isPrerequisite: /\b(?:required before|prerequisite)\b/i.test(item),
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -340,6 +396,9 @@ export const CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1 = "<!-- ensemble:closed-befo
 /** Matches the closed-before-implementation marker plus the whitespace before it. */
 const CLOSED_BEFORE_IMPLEMENTATION_STRIP_RE = /[ \t]*<!-- ensemble:closed-before-implementation -->/g;
 
+/** Matches a trailing exclusion marker, bare or wrapped in a single pair of backticks, plus surrounding whitespace. */
+const EXCLUDED_MARKER_STRIP_RE = /[ \t]*`?<!-- ensemble:excluded -->`?[ \t]*$/;
+
 /**
  * True when `itemText` is an excluded item whose trailing excluded marker is
  * immediately preceded by {@link CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1}.
@@ -349,7 +408,8 @@ export function isClosedBeforeImplementationChecklistItemTextV1(itemText: string
     return false;
   }
   const trimmed = itemText.trimEnd();
-  const before = trimmed.slice(0, trimmed.length - EXCLUDED_CHECKLIST_ITEM_MARKER_V1.length).trimEnd();
+  const markerLen = trailingExcludedMarkerLengthV1(itemText) ?? 0;
+  const before = trimmed.slice(0, trimmed.length - markerLen).trimEnd();
   if (!before.endsWith(CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1)) {
     return false;
   }
@@ -396,7 +456,9 @@ export function unescapeChecklistItemTextV1(text: string): string {
  * whitespace/case folding.
  */
 export function normalizeChecklistItemTextV1(text: string): string {
-  const unescaped = unescapeChecklistItemTextV1(text).replace(CLOSED_BEFORE_IMPLEMENTATION_STRIP_RE, "");
+  const unescaped = unescapeChecklistItemTextV1(text)
+    .replace(CLOSED_BEFORE_IMPLEMENTATION_STRIP_RE, "")
+    .replace(EXCLUDED_MARKER_STRIP_RE, "");
   return unescaped.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
@@ -960,7 +1022,7 @@ function occurrenceKeyV1(text: string, settled: boolean): string {
   // A line this flow settled carries an appended annotation (and the excluded
   // marker); strip it so the line keeps the id it had while open and is
   // reported as "already settled" rather than "no longer in the plan".
-  const withoutMarker = text.replace(/[ \t]*<!-- ensemble:excluded -->[ \t]*$/, "");
+  const withoutMarker = text.replace(/[ \t]*`?<!-- ensemble:excluded -->`?[ \t]*$/, "");
   return exactItemKeyV1(withoutMarker.replace(/\s+— (?:Checked|Excluded by you): [\s\S]*$/, ""));
 }
 
@@ -1947,7 +2009,8 @@ function rewriteClosedBeforeImplementationV1(content: string, shouldMark: (itemT
           ) {
             return whole;
           }
-          const markerAt = text.lastIndexOf(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
+          const markerLen = trailingExcludedMarkerLengthV1(text) ?? 0;
+          const markerAt = text.trimEnd().length - markerLen;
           changed = true;
           return (
             `${open}${state}${close}${text.slice(0, markerAt)}` +
@@ -2541,7 +2604,9 @@ export function appendCoversAnnotationV1(
             return whole;
           }
           appliedCount += 1;
-          const markerIndex = text.lastIndexOf(EXCLUDED_CHECKLIST_ITEM_MARKER_V1);
+          const markerLen = trailingExcludedMarkerLengthV1(text);
+          const markerIndex =
+            markerLen !== undefined ? text.trimEnd().length - markerLen : -1;
           const annotated =
             markerIndex >= 0
               ? `${text.slice(0, markerIndex).trimEnd()} — Covers: Step ${stepNumber}. ${text.slice(markerIndex)}`

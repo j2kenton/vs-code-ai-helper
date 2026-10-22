@@ -58,7 +58,7 @@ export interface AgentRunResult {
   summary?: string;
   errorMessage?: string;
   /** Stable provider-neutral failure classification. */
-  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
   modelId?: string;
   /**
    * The provider's own pre-hint authentication verdict, when the runner can

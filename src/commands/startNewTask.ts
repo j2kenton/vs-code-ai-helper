@@ -13,6 +13,11 @@ import { safeOpenTextDocument } from "../utils/fileUtils";
 import { runTrackedOperation } from "../utils/taskOperations";
 import { ensureAutomaticMetaGitIgnore } from "./toggleMetaResourcesGitIgnore";
 import { NotificationRouter } from "../utils/notificationRouter";
+import {
+  isExtensionFolderRemovedErrorV1,
+  isExtensionResourceMissingErrorV1,
+  readExtensionResourceV1,
+} from "../utils/extensionResourcesV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { ClassifiedCreatingFootprintV1 } from "../types/taskCreationRecoveryV1";
 import {
@@ -263,16 +268,18 @@ export async function findActiveTaskOnDiskV1(
  * Load the task template from the bundled template file.
  */
 export async function loadTaskTemplate(extensionUri: vscode.Uri): Promise<string> {
-  const templateUri = vscode.Uri.joinPath(
-    extensionUri,
-    "resources",
-    "prompts",
-    "task-template.md"
-  );
   try {
-    const bytes = await vscode.workspace.fs.readFile(templateUri);
+    const bytes = await readExtensionResourceV1(extensionUri, ["resources", "prompts", "task-template.md"]);
     return new TextDecoder().decode(bytes);
   } catch (error) {
+    // A removed extension folder must stop task creation, not silently
+    // create a task from the inline fallback.
+    if (isExtensionFolderRemovedErrorV1(error)) {
+      throw error;
+    }
+    if (!isExtensionResourceMissingErrorV1(error)) {
+      throw error;
+    }
     // Fallback to inline template if file read fails — must stay
     // byte-identical to resources/prompts/task-template.md (see
     // test-fixtures/creation-seeds/README.md).
@@ -335,7 +342,9 @@ export async function startNewTask(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     NotificationRouter.showError(
-      `Failed to create task folder: ${message}`
+      isExtensionFolderRemovedErrorV1(error)
+        ? `No task was created. ${message}`
+        : `Failed to create task folder: ${message}`
     );
     return undefined;
   }

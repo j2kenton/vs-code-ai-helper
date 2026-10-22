@@ -701,6 +701,8 @@ export interface AdmittedProviderActionTicketV1 {
   readonly validatedInput: unknown;
   readonly session: ProviderSelectionSessionV1;
   readonly selection: V1RunnerSelectionV1;
+  /** First ranked candidate skip discovered while admission reserves a model. */
+  readonly firstFallbackReason?: string;
   /**
    * Set exactly when `admitAction` performed the early questions-admission
    * for `initialCandidate` (row.permittedResultKinds includes "questions").
@@ -1695,6 +1697,7 @@ export function createTaskActionCoordinatorV1(
      */
     preInvocationHook?: () => Promise<void>,
     initialCandidate?: AdmittedProviderActionTicketV1["initialCandidate"],
+    firstFallbackReasonFromAdmission?: string,
     /**
      * See `TaskActionRequestV1.malformedInvocationsAlreadyUsedV1` — seeds
      * this operation's own malformed-invocation counter so the shared
@@ -1931,6 +1934,7 @@ export function createTaskActionCoordinatorV1(
     // malformed-envelope-parse branch — a history scoped to only the latter
     // would have missed exactly the attempts the report was about.
     const malformedAttemptHistoryV1: MalformedResultAttemptRecordV1[] = [...(priorAttemptHistoryV1 ?? [])];
+    let firstFallbackReasonV1: string | undefined = firstFallbackReasonFromAdmission;
     // Candidates an earlier operation of this press already failed on before
     // any response (usage limit, CLI exit, network fault): never re-reserved.
     // While an enabled candidate is still untried, EVERY candidate already
@@ -2116,6 +2120,7 @@ export function createTaskActionCoordinatorV1(
           // next ranked candidate (plan §3.4). The audit trail only existed
           // inside the session until onCandidateSkipped; see its doc comment.
           reportCandidateSkipped(deps, next, stage);
+          firstFallbackReasonV1 ??= `${next.storedModelId} could not serve the requested ${row.providerMode} mode`;
           continue;
         }
 
@@ -2137,6 +2142,12 @@ export function createTaskActionCoordinatorV1(
       // reservation unused and take the next ranked candidate.
       if (skipOnRetryStoredIdsV1.has(reserved.storedModelId)) {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        const priorFailure = (priorAttemptHistoryV1 ?? []).find(
+          (record) => record.storedModelId === reserved.storedModelId
+        );
+        if (priorFailure) {
+          firstFallbackReasonV1 ??= `${priorFailure.storedModelId} ${priorFailure.code}${priorFailure.detail ? `: ${priorFailure.detail}` : ""}`.slice(0, 300);
+        }
         continue;
       }
 
@@ -2262,6 +2273,7 @@ export function createTaskActionCoordinatorV1(
           storedModelId: reserved.storedModelId,
           skipOnRetry: true,
         });
+        firstFallbackReasonV1 ??= `${reserved.storedModelId} providerUnavailablePreInvocation: setup failed`;
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
         continue;
       }
@@ -2432,6 +2444,7 @@ export function createTaskActionCoordinatorV1(
             });
           }
           session.reportAttemptOutcome(attemptId, "transportFailurePreResponse", transportEvidence);
+          firstFallbackReasonV1 ??= `${reserved.storedModelId} ${transportEvidence}`;
           // Item 2 / Step 55: a wall-clock invocation deadline is a terminal
           // outcome for this operation, never a signal to try another
           // candidate. Step 54 bounds every deadline/cancellation trigger so
@@ -2626,6 +2639,9 @@ export function createTaskActionCoordinatorV1(
               : "malformedResult",
           reasonDetail
         );
+        if (willAdvanceV1) {
+          firstFallbackReasonV1 ??= `${reserved.storedModelId} ${parsed.code}${reasonDetail ? `: ${reasonDetail}` : ""}`;
+        }
         // The received text was correctly unsealed — only the output-format
         // contract in front of it is what failed — so it is preserved
         // (best-effort, 24h) before being discarded. See that function's own
@@ -2716,6 +2732,9 @@ export function createTaskActionCoordinatorV1(
             willAdvanceContractV1 ? "contentContractFailurePreFallback" : "contentContractFailure",
             reasonDetail
           );
+          if (willAdvanceContractV1) {
+            firstFallbackReasonV1 ??= `${reserved.storedModelId} contentContractFailed${reasonDetail ? `: ${reasonDetail}` : ""}`;
+          }
           const preservationResult = await preserveRejectedResultForRecoveryV1(
             unsealed.text,
             correlation,
@@ -2755,12 +2774,24 @@ export function createTaskActionCoordinatorV1(
         }
       }
 
+      const primaryFailure = malformedAttemptHistoryV1.find(
+        (record) => record.storedModelId !== undefined && record.storedModelId !== reserved.storedModelId
+      );
+      // The first ranked candidate is the primary. If it was skipped before
+      // invocation (for example, it could not serve the requested mode),
+      // that is the reason a later successful candidate is a backup even if
+      // an intervening candidate subsequently produced a rejected result.
+      const fallbackReason = firstFallbackReasonV1
+        ?? (primaryFailure
+          ? `${primaryFailure.storedModelId} ${primaryFailure.code}${primaryFailure.detail ? `: ${primaryFailure.detail}` : ""}`.slice(0, 300)
+          : undefined);
+
       return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256, {
         text: unsealed.text,
         reservationId: reserved.handle.reservationId,
         providerLabel: reserved.providerLabel,
         storedModelId: reserved.storedModelId,
-      });
+      }, fallbackReason);
     }
   }
 
@@ -2772,9 +2803,16 @@ export function createTaskActionCoordinatorV1(
     context: TaskActionExecutionContextV1,
     acquireLeasePhase: AcquireTaskLeasePhaseV1,
     promptSha256: string,
-    unsealedResponse: UnsealedResponseRefV1
+    unsealedResponse: UnsealedResponseRefV1,
+    fallbackReason?: string
   ): Promise<TaskActionOutcomeV1> {
     const correlation = context.correlation;
+    // Fallback detail can originate in provider transport diagnostics. Keep
+    // the public completed-outcome field within its decoder's 300-character
+    // contract even when a provider returns an unusually long message.
+    const boundedFallbackReason = fallbackReason !== undefined
+      ? boundedDiagnosticDetailV1(fallbackReason, 300)
+      : undefined;
     if (!row.permittedResultKinds.includes(envelope.kind)) {
       const preservationResult = await preserveRejectedResultForRecoveryV1(
         unsealedResponse.text,
@@ -2836,7 +2874,9 @@ export function createTaskActionCoordinatorV1(
             correlation,
             code,
             ...(context.provider ? { provider: context.provider } : {}),
+            ...(boundedFallbackReason ? { fallbackReason: boundedFallbackReason } : {}),
             ...(envelope.frameRepairV1 ? { frameRepairV1: envelope.frameRepairV1 } : {}),
+            ...(envelope.droppedFieldsV1 ? { droppedFieldsV1: envelope.droppedFieldsV1 } : {}),
           };
         } catch (error) {
           return {
@@ -3149,6 +3189,7 @@ export function createTaskActionCoordinatorV1(
     );
 
     let initialCandidate: AdmittedProviderActionTicketV1["initialCandidate"] | undefined;
+    let firstFallbackReason: string | undefined;
     for (;;) {
       const attemptId = session.allocateAttempt();
       let identityAttached = true;
@@ -3245,10 +3286,17 @@ export function createTaskActionCoordinatorV1(
       }
       if (next.kind === "candidateUnavailable") {
         reportCandidateSkipped(deps, next, request.taskStage);
+        firstFallbackReason ??= `${next.storedModelId} could not serve the requested ${row.providerMode} mode`;
         continue;
       }
       if (skipOnRetryStoredIdsV1.has(next.reserved.storedModelId)) {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+        const priorFailure = (request.priorAttemptHistoryV1 ?? []).find(
+          (record) => record.storedModelId === next.reserved.storedModelId
+        );
+        if (priorFailure) {
+          firstFallbackReason ??= `${priorFailure.storedModelId} ${priorFailure.code}${priorFailure.detail ? `: ${priorFailure.detail}` : ""}`.slice(0, 300);
+        }
         continue;
       }
       initialCandidate = { attemptId, reserved: next.reserved };
@@ -3350,6 +3398,7 @@ export function createTaskActionCoordinatorV1(
         session,
         selection,
         initialCandidate,
+        ...(firstFallbackReason !== undefined ? { firstFallbackReason } : {}),
         ...(initialCandidateAssembledPrompt !== undefined ? { initialCandidateAssembledPrompt } : {}),
         acquireLeasePhase,
         progress,
@@ -3385,6 +3434,7 @@ export function createTaskActionCoordinatorV1(
           undefined,
           ticket.preInvocationHook,
           ticket.initialCandidate,
+          ticket.firstFallbackReason,
           ticket.request.malformedInvocationsAlreadyUsedV1,
           ticket.initialCandidateAssembledPrompt,
           ticket.request.onPromptAssembled,
@@ -3742,6 +3792,7 @@ export function createTaskActionCoordinatorV1(
         metrics,
         { questions: record.questions ?? [], answers },
         claimInvocationOnce,
+        undefined,
         undefined,
         undefined,
         undefined,

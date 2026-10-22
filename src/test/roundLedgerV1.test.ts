@@ -58,17 +58,27 @@ import {
 import {
   claimReviewAttempt,
   claimReviewAttemptWithLiveLeaseV1,
+  closeRoundRowIfDispatchThrowsV1,
+  closeUnsettledReviewRowV1,
+  finalizeReviewOutcomeV1,
+  terminalizeFailedImplementationRoundV1,
   handleReviewOutcomeV1,
   handleReviewRoutingOutcome,
   ReviewOutcomeContextV1,
   terminalizeUnclosedReviewRoundV1,
   terminalStateForUnclosedReviewOutcomeV1,
 } from "../commands/reviewActions";
+import { runSealedImplementationV1 } from "../commands/runEditActionV1";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { reconcileOrphanedRoundLedgerRowsV1 } from "../utils/roundLedgerReconciliationV1";
+
+/* eslint-disable @typescript-eslint/no-var-requires */
+const runnerRegistryModule = require("../runners/runnerRegistry") as Record<string, unknown>;
+const productionRuntimeModule = require("../actions/productionTaskActionRuntimeV1") as Record<string, unknown>;
+/* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-round-ledger-"));
 cp.execFileSync("git", ["init", "-q"], { cwd: REAL_ROOT, windowsHide: true });
@@ -1418,6 +1428,23 @@ void describe("formatRoundOutcomeMessageV1", () => {
     });
     const text = formatRoundOutcomeMessageV1(entry);
     assert.match(text, /mode apply-review — runs\/attempt-1\.md_/);
+  });
+
+  void it("adds successful-backup attribution to Chat without changing the persisted outcome", () => {
+    const entry = makeBaseEntry({
+      mode: "review",
+      state: "completed",
+      endedAt: "2026-01-01T00:05:00.000Z",
+      outcome: { score: 8 },
+    });
+    const text = formatRoundOutcomeMessageV1(
+      entry,
+      undefined,
+      undefined,
+      "Backup used; primary was skipped or failed: codex-cli:gpt-6-luna@high cliExit"
+    );
+    assert.match(text, /Backup used; primary was skipped or failed: codex-cli:gpt-6-luna@high cliExit/);
+    assert.equal("fallbackReason" in (entry.outcome ?? {}), false);
   });
 
   void it("renders a rejection reason for a rejected round", () => {
@@ -3267,6 +3294,210 @@ void describe(
     );
   }
 );
+
+void describe("closeRoundRowIfDispatchThrowsV1 (post-1.0 fixes, Step 4)", () => {
+  void it("closes an open implementation row as failed, with the reason, when the dispatch throws, and rethrows", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "close_row_on_throw");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "close_row_on_throw",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+      const claimed = await claimImplementationRoundLedgerV1(folderUri, "throwing-round", "impl", "implementation");
+
+      await assert.rejects(
+        closeRoundRowIfDispatchThrowsV1(folderUri, claimed.roundId, () => Promise.reject(new Error("prompt render blew up"))),
+        /prompt render blew up/
+      );
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.[0]?.state, "failed");
+      assert.match(raw.roundLedger?.[0]?.outcome?.rejectionReason ?? "", /prompt render blew up/);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+void describe("review dispatch row settlement (post-1.0 fixes, Step 4)", () => {
+  void it("closes a claimed review row as failed with the dispatch error", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("review_dispatch_failure_settlement");
+      const progress = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = makeBaseEntry({
+        roundId: "review-dispatch-attempt",
+        intentId: undefined,
+        attemptIds: ["review-dispatch-attempt"],
+        stage: "impl-high-review",
+        mode: "review",
+        state: "open",
+      });
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify({ ...progress, roundLedger: [row] }, null, 2),
+        "utf8"
+      );
+
+      await closeUnsettledReviewRowV1(folderUri, row.roundId, "prompt rendering failed after claim");
+
+      const settled = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(settled.roundLedger?.[0]?.state, "failed");
+      assert.match(settled.roundLedger?.[0]?.outcome?.rejectionReason ?? "", /prompt rendering failed after claim/);
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("terminalizes an open review row even when run-log persistence rejects", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("review_log_failure_settlement");
+      const progress = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = makeBaseEntry({
+        roundId: "review-log-failure-attempt",
+        intentId: undefined,
+        attemptIds: ["review-log-failure-attempt"],
+        stage: "impl-high-review",
+        mode: "review",
+        state: "open",
+      });
+      fs.writeFileSync(
+        path.join(folderPath, "task-progress.json"),
+        JSON.stringify({ ...progress, roundLedger: [row] }, null, 2),
+        "utf8"
+      );
+      const outcome = { kind: "cancelled", code: "cancelled" } as unknown as TaskActionOutcomeV1;
+      const ctx: ReviewOutcomeContextV1 = {
+        extensionUri: folderUri,
+        folderUri,
+        workspaceUri: folderUri,
+        currentStage: "impl-high-review",
+        targetStage: "impl-high-review",
+        reviewUri: folderUri,
+        variables: {},
+        reviewAttemptId: row.roundId,
+      };
+
+      await assert.rejects(
+        finalizeReviewOutcomeV1(outcome, ctx, () => Promise.reject(new Error("run-log write failed"))),
+        /run-log write failed/
+      );
+
+      const settled = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(settled.roundLedger?.[0]?.state, "cancelled");
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("closes the edit row with the stale-preflight result and reason after the dispatch refuses", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("edit_stale_preflight_row_settlement");
+      const { roundId } = await claimImplementationRoundLedgerV1(
+        folderUri,
+        "stale-preflight-edit-round",
+        "impl",
+        "implementation"
+      );
+
+      await terminalizeFailedImplementationRoundV1(folderUri, roundId, {
+        errorMessage: "stalePreflight: target changed after preflight; no edits were applied",
+        filesChanged: [],
+      });
+
+      const settled = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = resolveRoundV1(settled, roundId);
+      assert.equal(row?.state, "failed");
+      assert.match(row?.outcome?.rejectionReason ?? "", /stalePreflight: target changed after preflight/);
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("runs the sealed edit adapter through a stale-preflight refusal and persists its failed round", async () => {
+    const fsBridge = installFsBridge();
+    const originalModelAvailability = runnerRegistryModule.checkImplementationAvailabilityForModel;
+    const originalCoordinatorFactory = productionRuntimeModule.createProductionTaskActionCoordinatorV1;
+    const workspace = vscode.workspace as unknown as Record<string, unknown>;
+    const originalWorkspaceFolders = workspace.workspaceFolders;
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("sealed_edit_stale_preflight_dispatch");
+      const { roundId } = await claimImplementationRoundLedgerV1(
+        folderUri,
+        "sealed-stale-preflight-dispatch",
+        "impl",
+        "implementation"
+      );
+      runnerRegistryModule.checkImplementationAvailabilityForModel = (modelId: string | undefined): Promise<unknown> => Promise.resolve({
+        availability: { available: true },
+        providerLabel: "Claude Code",
+        provider: "claude-cli",
+        modelId,
+        nativeModelId: modelId,
+      });
+      // Let the actual two-phase driver receive a completed preflight, then
+      // leave its broker without a sealed execution. That is a real
+      // stalePreflight result from continueSealedEditExecutionV1, not a
+      // fabricated terminalizer input.
+      productionRuntimeModule.createProductionTaskActionCoordinatorV1 = (): unknown => ({
+        executeAction: (): Promise<unknown> => Promise.resolve({
+          kind: "completed",
+          code: "completed",
+          correlation: {
+            taskBindingId: "test-binding",
+            chatDocumentId: "test-chat-document",
+            actionKey: "implementation.v1",
+            operationId: "missing-sealed-operation",
+            attemptId: "test-attempt",
+          },
+        }),
+      });
+      workspace.workspaceFolders = [{ uri: vscode.Uri.file(REAL_ROOT) }];
+
+      const result = await runSealedImplementationV1({
+        editActionKey: "implementation.v1",
+        modelId: "claude-cli:sonnet@high",
+        prompt: "Apply the reviewed edit.",
+        workspaceUri: vscode.Uri.file(REAL_ROOT),
+        roundId,
+        token: new vscode.CancellationTokenSource().token,
+        onProgress: () => undefined,
+      });
+      assert.equal(result.status, "failed");
+      assert.match(result.errorMessage ?? "", /No sealed plan exists/);
+      await terminalizeFailedImplementationRoundV1(folderUri, roundId, result);
+
+      const settled = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = resolveRoundV1(settled, roundId);
+      assert.equal(row?.state, "failed");
+      assert.match(row?.outcome?.rejectionReason ?? "", /No sealed plan exists/);
+    } finally {
+      runnerRegistryModule.checkImplementationAvailabilityForModel = originalModelAvailability;
+      productionRuntimeModule.createProductionTaskActionCoordinatorV1 = originalCoordinatorFactory;
+      workspace.workspaceFolders = originalWorkspaceFolders;
+      fsBridge.restore();
+    }
+  });
+});
 
 // `recordChecklistRevisionOnRoundLedgerV1`'s own coverage was removed
 // 2026-08-28 along with the function itself — see `roundLedgerV1.ts`'s

@@ -46,6 +46,40 @@ export interface RunnerDecisionsSnapshotV1 {
 }
 
 /**
+ * The one rule for "this task's decisions are no longer answerable": a
+ * completed or archived task. The task tree's decision indicator and the
+ * runner mirror below both use it, so a surface built on the mirror cannot
+ * resurrect what the tree already hides.
+ */
+export function isTaskStatusHiddenFromDecisionsV1(status: string | undefined): boolean {
+  return status === "completed" || status === "archived";
+}
+
+/**
+ * Drops pending decisions raised against a completed or archived task. A task
+ * whose status cannot be read keeps its decisions (fail open: hiding a real
+ * question is worse than showing a stale one).
+ */
+export async function filterDecisionsOfLiveTasksV1(
+  decisions: readonly WorkflowDecisionV1[],
+  readTaskStatus: (taskCanonicalId: string) => Promise<string | undefined>
+): Promise<readonly WorkflowDecisionV1[]> {
+  const statusByTask = new Map<string, Promise<string | undefined>>();
+  const kept: WorkflowDecisionV1[] = [];
+  for (const decision of decisions) {
+    let status = statusByTask.get(decision.taskCanonicalId);
+    if (status === undefined) {
+      status = readTaskStatus(decision.taskCanonicalId).catch(() => undefined);
+      statusByTask.set(decision.taskCanonicalId, status);
+    }
+    if (!isTaskStatusHiddenFromDecisionsV1(await status)) {
+      kept.push(decision);
+    }
+  }
+  return kept;
+}
+
+/**
  * Runner side: publish the pending decisions. Resolves false when the write
  * failed or was superseded, so the caller's heartbeat can retry rather than
  * caching a signature for state that never reached disk.

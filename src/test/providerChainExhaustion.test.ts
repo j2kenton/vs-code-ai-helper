@@ -43,6 +43,7 @@ import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { describeModelWithProviderV1 } from "../runners/providers";
+import { __testOnly as modelSelectionTestOnly } from "../utils/modelSelection";
 
 function fakeCompletedCorrelation(): ActionCorrelationV1 {
   return {
@@ -350,6 +351,69 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.quotaParkRecord, undefined);
   });
 
+  void it("reports a captured HTTP 402 as payment required without inventing a reset or park", async () => {
+    const paymentOnly: ProviderChainExhaustionV1 = {
+      stage: "impl-high-review",
+      candidates: [{
+        storedModelId: "opencode-cli:opencode/glm-5.3-flash",
+        providerLabel: "OpenCode Zen",
+        runnerId: "opencode-cli",
+        reason: "HTTP 402: Upstream request failed: Insufficient account funds",
+      }],
+    };
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_payment_402");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    modelSelectionTestOnly.setModelSelectionTestOverrides({
+      getAvailableCopilotModels: () => Promise.resolve([]),
+      cliCommandExists: () => Promise.resolve(true),
+      getDiscoveredCliModels: (def) => Promise.resolve(def.id === "opencode-cli"
+        ? [{ model: "opencode/glm-5.3-flash-free", name: "GLM Flash Free" }]
+        : []),
+    });
+    try {
+      await withHarness(async () => {
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", paymentOnly, "candidatesExhausted");
+      });
+      const progress = readProgress(folderPath);
+      assert.equal(progress.quotaParkRecord, undefined);
+      assert.match(progress.pausedReason ?? "", /HTTP 402 payment required/);
+      assert.match(progress.pausedReason ?? "", /opencode-cli:opencode\/glm-5.3-flash/);
+      assert.match(progress.pausedReason ?? "", /add credits or choose a free model/i);
+      assert.match(progress.pausedReason ?? "", /choose opencode-cli:opencode\/glm-5\.3-flash-free for the free model/i);
+      assert.doesNotMatch(progress.pausedReason ?? "", /reset|parked until/i);
+    } finally {
+      modelSelectionTestOnly.clearModelSelectionTestOverrides();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("keeps payment guidance separate from a backup quota reset in a mixed chain", async () => {
+    const chain: ProviderChainExhaustionV1 = {
+      stage: "impl-high-review",
+      candidates: [
+        { storedModelId: "opencode-cli:opencode/glm-5.3-flash", providerLabel: "OpenCode Zen", runnerId: "opencode-cli", reason: "HTTP 402: Insufficient account funds" },
+        { storedModelId: "copilot:kimi-k3", providerLabel: "Copilot", runnerId: "copilot", reason: "ChatQuotaExceeded: resets September 1, 2099 at 3:00 AM" },
+      ],
+    };
+    const { folderPath, folderUri } = makeTaskFolder("exhausted_mixed_payment_quota");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await withHarness(async () => {
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", chain, "candidatesExhausted");
+      });
+      const progress = readProgress(folderPath);
+      assert.equal(progress.quotaParkRecord?.providerId, "copilot", "only the quota backup supplies the park");
+      assert.equal(progress.quotaParkRecord?.modelId, "copilot:kimi-k3");
+      assert.match(progress.pausedReason ?? "", /HTTP 402 payment required/);
+      assert.match(progress.pausedReason ?? "", /add credits or choose a free model/i);
+      assert.match(progress.pausedReason ?? "", /resets 2099/);
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   void it("prefers a candidate's typed deferredFailureKind/deferredResetAt over re-classifying its reason text", async () => {
     // 2026-09-15 post-freeze findings, item 4: `enrichChainExhaustionWithAttemptOutcomesV1`
     // stamps `deferredFailureKind`/`deferredResetAt` at the point a candidate's
@@ -381,6 +445,80 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.quotaParkRecord?.failureKind, "quota");
     assert.equal(persisted.quotaParkRecord?.resetAt, "2099-01-01T00:00:00.000Z");
     assert.equal(persisted.quotaParkRecord?.modelId, "claude-cli:sonnet");
+  });
+
+  void it("leads with the highest-ranked candidate's failure and reads the backup's displayed reset", async () => {
+    const chainWithBackupQuota: ProviderChainExhaustionV1 = {
+      stage: "impl-high-review",
+      candidates: [
+        { storedModelId: "codex-cli:gpt-5.6-sol", providerLabel: "OpenAI Codex", runnerId: "codex-cli", reason: "cliExit.1: exited 1; stderr 662 byte(s)" },
+        { storedModelId: "copilot:kimi-k3", providerLabel: "Copilot", runnerId: "copilot", reason: "ChatQuotaExceeded: quota exhausted, resets September 1, 2099 at 3:00 AM" },
+      ],
+    };
+    const { folderUri } = makeTaskFolder("exhausted_primary_leads");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await withHarness(async () => {
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", chainWithBackupQuota, "candidatesExhausted");
+      });
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending(folderUri.fsPath)
+        .find((d) => d.decisionKey === "providerChainExhausted");
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /highest-ranked model, OpenAI Codex, failed: cliExit/);
+      assert.match(decision.whatHappened, /Lower-ranked backups were already unavailable: Copilot/);
+      assert.ok(decision.options.some((o) => o.optionId === "wait"), "a parsed reset must offer Wait");
+      assert.equal(decision.recommendation.kind, "none");
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("keeps a quota-blocked primary as the headline when a backup resets sooner", async () => {
+    const backupReset = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const primaryReset = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+    const chain: ProviderChainExhaustionV1 = {
+      stage: "impl-high-review",
+      candidates: [
+        {
+          storedModelId: "codex-cli:gpt-6.1-sol",
+          providerLabel: "OpenAI Codex",
+          runnerId: "codex-cli",
+          reason: `usage limit reached; resets ${primaryReset}`,
+          deferredFailureKind: "quota",
+          deferredResetAt: primaryReset,
+        },
+        {
+          storedModelId: "copilot:kimi-k3",
+          providerLabel: "Copilot",
+          runnerId: "copilot",
+          reason: `ChatQuotaExceeded: resets ${backupReset}`,
+          deferredFailureKind: "quota",
+          deferredResetAt: backupReset,
+        },
+      ],
+    };
+    const { folderUri } = makeTaskFolder("exhausted_primary_quota_leads");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await withHarness(async () => {
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", chain, "candidatesExhausted");
+      });
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending(folderUri.fsPath)
+        .find((d) => d.decisionKey === "providerChainExhausted");
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /highest-ranked model, OpenAI Codex, was blocked by a quota/);
+      assert.doesNotMatch(decision.whatHappened, /Lower-ranked backups were already unavailable: OpenAI Codex/);
+      assert.match(decision.whatHappened, /Lower-ranked backups were already unavailable: Copilot/);
+      assert.equal(decision.recommendation.kind, "option");
+      assert.equal(decision.recommendation.optionId, "wait");
+      assert.ok(decision.options.find((option) => option.optionId === "wait")?.consequence.includes(backupReset));
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
   });
 
   void it("posts a WorkflowDecisionV1 enumerating retry/adjust/stay with a 'no basis' recommendation when nothing is quota-shaped", async () => {
@@ -503,6 +641,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     // The bare 60-byte record is gone: the status line remains, but the
     // enrichment names the stage, every candidate, and every reason.
     assert.match(logs[0]!, /Status: unavailable \(providerModeUnavailable\)/);
+    assert.match(logs[0]!, /Review round: attempt-1/);
     assert.match(logs[0]!, /## Provider chain exhausted/);
     assert.match(logs[0]!, /No provider could be acquired for impl-high-review/);
     assert.match(logs[0]!, /Cline CLI .*— the CLI is not installed/);

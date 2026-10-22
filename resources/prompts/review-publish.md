@@ -4,6 +4,12 @@ Publish assesses whether the task, as approved, is actually complete and safe to
 
 The context pack below contains the implementation review files for this task — the files changed while implementing it. When the task was implemented manually (or before file tracking was introduced), the context pack falls back to the files open in the editor at review time — in that case the pack will say so explicitly. Treat the actual files as the change under review. Where the pack is truncated or omits a file, read it from the workspace instead (see "Reading the workspace yourself" in the rubric below). Only when evidence is genuinely unobtainable — you tried to read it and could not, or it exists nowhere in the workspace — and publish readiness cannot responsibly be established without it, classify that separately as a review-confidence blocker rather than guessing.
 
+
+
+Owner hand-offs: an excluded five-element owner check (What/Why/How/Failure/Priority), or an item marked `Verified by Publish Checks`, is an intentional hand-off. If it is still pending, list it in the verdict as owed by the owner; do not file a blocker just because installation or Publish Checks has not happened yet. This exception applies only to those owner hand-offs. An exclusion that hides unfinished round work remains a completion blocker.
+
+The final response must be the review itself and begin with the required `Readiness: N/10` line; do not return a summary of the investigation instead of the review.
+
 Structure your review as:
 
 Begin your response with a readiness score on its own line in this exact format:

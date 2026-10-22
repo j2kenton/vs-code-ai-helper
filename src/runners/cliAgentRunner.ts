@@ -341,7 +341,7 @@ export interface CliExecResult {
   output: string;
   errorMessage?: string;
   /** Set on failed results; absent for completed/cancelled. */
-  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic";
+  failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
   /**
    * True when the failure is a transient transport-level condition — a run
    * timeout, or a mid-stream transport drop — that is in principle retryable.
@@ -540,7 +540,7 @@ export function isCliTextModeSummaryOnlyCapableV1(def: CliProviderDefinition): b
  * one with the provider and mode context needed to gate it correctly.
  */
 function applyTransportTransience(
-  result: CliExecResult & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "generic" },
+  result: CliExecResult & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic" },
   friendly: CliFriendlyError,
   mode: CliRunMode,
   def: CliProviderDefinition

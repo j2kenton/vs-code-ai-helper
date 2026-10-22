@@ -20,6 +20,7 @@ import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
 import { resetAutomationChainGuards, scheduleAutomationChain } from "../utils/automationChain";
 import { checkAndReviewPublishV1 } from "../commands/checkAndReviewPublish";
+import { ExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import {
   classifyPublishChecksFreshnessV1,
   computePublishScopeId,
@@ -93,6 +94,8 @@ async function runFix(
      * leaves the Publish Checks stamp stale until the checks command runs.
      */
     realChain?: { parentFails: boolean; headMoved: boolean };
+    /** Simulate the shared resource reader detecting a removed extension root. */
+    extensionFolderRemoved?: boolean;
   } = {}
 ): Promise<{
   scheduled: ScheduledCall[];
@@ -101,6 +104,7 @@ async function runFix(
   taskFolderPath: string;
   parentOpId?: string;
   aiCalls: number;
+  progressBefore: string;
   chain?: { dispatchedWhileParentLive: number; commands: string[]; reviewStampCommit?: string; newHead: string };
 }> {
   const taskFolderPath = path.join(REAL_ROOT, name);
@@ -121,6 +125,7 @@ async function runFix(
     },
   };
   fs.writeFileSync(path.join(taskFolderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+  const progressBefore = fs.readFileSync(path.join(taskFolderPath, "task-progress.json"), "utf8");
   const reviewPath = path.join(taskFolderPath, "publish-review.md");
   fs.writeFileSync(reviewPath, "# Publish Review\n\nReadiness: 6/10\n\nNeeds changes.\n", "utf8");
   const packageJsonPath = path.join(REAL_ROOT, "package.json");
@@ -183,6 +188,13 @@ async function runFix(
     mod[key] = value;
   };
   const originalGetWorkspaceFolder = vscode.workspace.getWorkspaceFolder;
+  patch(
+    promptTemplatesModule,
+    "renderPromptTemplate",
+    () => options.extensionFolderRemoved
+      ? Promise.reject(new ExtensionFolderRemovedErrorV1())
+      : Promise.resolve("prompt")
+  );
   if (options.ai) {
     const ai = options.ai;
     patch(runEditActionModule, "checkEditActionAvailabilityV1", () => Promise.resolve({ ok: true }));
@@ -324,6 +336,7 @@ async function runFix(
       taskFolderPath,
       parentOpId,
       aiCalls,
+      progressBefore,
       chain: options.realChain ? chainLog : undefined,
     };
   } finally {
@@ -346,6 +359,22 @@ async function runFix(
 }
 
 void describe("runLintingFixes — RC6 item 5 execution paths", () => {
+  void it("does not run AI or modify task progress when the extension folder disappeared before linting prompt setup", async () => {
+    const result = await runFix("rc6-removed-extension", 'node -e "process.exit(0)"', {
+      extensionFolderRemoved: true,
+    });
+    assert.equal(result.aiCalls, 0);
+    assert.equal(
+      fs.readFileSync(path.join(result.taskFolderPath, "task-progress.json"), "utf8"),
+      result.progressBefore
+    );
+    assert.ok(
+      result.surface.entries.some((entry) => /Linting fixes were not started/.test(entry.message)),
+      "the user-facing notice should say linting fixes did not start"
+    );
+    assert.deepEqual(result.scheduled, []);
+  });
+
   void it("deterministic success marks the review stale and schedules the Publish review once, after the marker is gone", async () => {
     const result = await runFix("rc6-det-success", 'node -e "process.exit(0)"');    assert.equal(result.scheduled.length, 1);
     assert.equal(result.scheduled[0]?.command, "vs-code-ai-helper.checkAndReviewPublish");

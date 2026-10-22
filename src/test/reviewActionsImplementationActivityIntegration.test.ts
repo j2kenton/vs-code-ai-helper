@@ -58,6 +58,7 @@ import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 const settingsModule = require("../config/settings") as Record<string, unknown>;
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const runnerRegistryModule = require("../runners/runnerRegistry") as Record<string, unknown>;
+const productionRuntimeModule = require("../actions/productionTaskActionRuntimeV1") as Record<string, unknown>;
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
 const contextPackModule = require("../utils/contextPack") as Record<string, unknown>;
@@ -449,6 +450,82 @@ function installImplementationPatches(): Patched[] {
 }
 
 void describe("runImplementationWithAI — real in-flight activity through the production dispatcher", () => {
+  void it("terminalizes the sealed stale-preflight refusal through the real failed-dispatch branch", async () => {
+    const { folderPath } = makeImplTaskFolder(
+      `impl-activity-stale-preflight-${Math.floor(Math.random() * 1e9)}`
+    );
+
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const tabGroupsStub = installTabGroupsStub();
+    const originalWorkspaceFolders = (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders;
+    const copilotModelId = "copilot:gpt-4.1";
+    const patches = [
+      ...installImplementationPatches(),
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: copilotModelId })
+      ),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: copilotModelId })
+      ),
+      patch(modelSelectionModule, "resolveEffectiveStageChainV1", () => ({
+        originStage: "impl",
+        source: "stage",
+        primary: copilotModelId,
+        backups: [],
+      })),
+      patch(runnerRegistryModule, "checkImplementationAvailabilityForModel", () =>
+        Promise.resolve({
+          availability: { available: true },
+          providerLabel: "GitHub Copilot",
+          provider: "copilot",
+          modelId: copilotModelId,
+          nativeModelId: "gpt-4.1",
+        })
+      ),
+      patch(productionRuntimeModule, "createProductionTaskActionCoordinatorV1", () => ({
+        executeAction: () => Promise.resolve({
+          kind: "completed",
+          code: "completed",
+          correlation: {
+            taskBindingId: "test-binding",
+            chatDocumentId: "test-chat-document",
+            actionKey: "implementation.v1",
+            operationId: "missing-sealed-operation",
+            attemptId: "test-attempt",
+          },
+        }),
+      })),
+    ];
+
+    try {
+      await runImplementationWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        makeExtensionContext(),
+        { taskFolderPath: folderPath }
+      );
+
+      const progress = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as {
+        roundLedger?: Array<{ state?: string; outcome?: { rejectionReason?: string } }>;
+      };
+      const row = progress.roundLedger?.find((entry) => entry.state === "failed");
+      assert.ok(row, "the real failed-dispatch branch must close its opened implementation row");
+      assert.match(row?.outcome?.rejectionReason ?? "", /No sealed plan exists/);
+    } finally {
+      for (const p of patches.reverse()) { p.restore(); }
+      (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
+      tabGroupsStub.restore();
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("reports starting -> model -> running live, then the boundary-only changed-file count once the real dispatch result is known", async () => {
     const { folderPath } = makeImplTaskFolder(`impl-activity-live-${Math.floor(Math.random() * 1e9)}`);
 
@@ -826,9 +903,9 @@ void describe("runImplementationWithAI — real in-flight activity through the p
       );
 
       assert.deepEqual(
-        modelIdsSeen,
+        modelIdsSeen.filter((modelId, index) => modelId !== modelIdsSeen[index - 1]),
         ["claude-cli:sonnet@high", "claude-cli:opus@max", "claude-cli:sonnet@high"],
-        "the model segment must swap main -> checklist -> main across the two sub-dispatches"
+        "the model segment must swap main -> checklist -> main across the two sub-dispatches; repeated main-model attachment is one visible segment"
       );
 
       assert.deepEqual(

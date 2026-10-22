@@ -64,6 +64,17 @@ void describe("chooseStopBehaviourV1", () => {
     );
   });
 
+  void it("alerts (does not park) a payment-required failure even when reset text is present", () => {
+    assert.equal(
+      chooseStopBehaviourV1({
+        failureKind: "payment-required",
+        authFailure: false,
+        knownNearResetAt: new Date(Date.now() + 3_600_000).toISOString(),
+      }),
+      "alert"
+    );
+  });
+
   void it("alerts (does not park) an undefined failure kind", () => {
     assert.equal(
       chooseStopBehaviourV1({ failureKind: undefined, authFailure: false }),

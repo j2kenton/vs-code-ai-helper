@@ -21,6 +21,7 @@ import { runLintingFixes } from "../commands/runLintingFixes";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
+import { copyPromptResources } from "./helpers/copyPromptResources";
 import {
   deactivateNotificationRouter,
   initNotificationRouter,
@@ -43,6 +44,7 @@ const runEditActionModule = require("../commands/runEditActionV1") as Record<str
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lint-fixes-gate-"));
+copyPromptResources(REAL_ROOT);
 
 function makeTaskFolder(name: string): string {
   const dir = path.join(REAL_ROOT, name);

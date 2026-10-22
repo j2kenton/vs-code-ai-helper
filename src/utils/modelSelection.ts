@@ -613,6 +613,8 @@ export interface SelectableModel {
   name: string;
   /** Display name of where the model runs, e.g. "GitHub Copilot". */
   providerLabel: string;
+  /** OpenCode price classification from its live model.list catalog. */
+  priceTierV1?: "Free" | "Paid";
 }
 
 interface ModelSelectionTestOverrides {
@@ -1591,7 +1593,6 @@ const SEEDED_CLI_MODELS: Readonly<
   "claude-cli": [
     ...createSeededClaudeCliModels(),
   ],
-  "codex-cli": createSeededCodexModels(),
   // `model` must be the exact string `agy --model` accepts — Antigravity has
   // no separate slug/id form, its CLI takes the human display name verbatim
   // (verified live: `agy --model "Gemini 3.5 Flash (Medium)"` works, while a
@@ -1683,7 +1684,9 @@ export function getSeededCatalogForAudit(): {
 } {
   const gemini = CLI_PROVIDERS.find((def) => def.id === "gemini-cli");
   return {
-    seeded: SEEDED_CLI_MODELS,
+    // Codex's fixed capability list remains the picker fallback when live
+    // discovery is unavailable, even though it is not merged with a live list.
+    seeded: { ...SEEDED_CLI_MODELS, "codex-cli": createSeededCodexModels() },
     geminiFallbackIds: (gemini?.models ?? []).flatMap((m) => (m.model ? [m.model] : [])),
     strippedFreeMarkerIds: STRIPPED_FREE_MARKER_IDS,
   };
@@ -1855,7 +1858,7 @@ function modelProviderLabel(
  * unavailable is not an error — CLI providers still work without it,
  * and vice versa.
  */
-export async function getAvailableModels(): Promise<SelectableModel[]> {
+export async function getAvailableModels(includeModelDisabled = false): Promise<SelectableModel[]> {
   const result: SelectableModel[] = [];
   const seenIds = new Set<string>();
   const getCopilotModels =
@@ -1897,7 +1900,18 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
       continue;
     }
 
-    for (const choice of def.models) {
+    // Codex's installed CLI catalog is authoritative when discovery returns
+    // models. Keep the seeded capability table only for installations where
+    // discovery cannot produce a usable catalog (older CLI, missing command,
+    // or malformed output).
+    const discoveredChoices = await discoverCliModels(def);
+    const seededChoices =
+      discoveredChoices.length > 0 && (def.id === "codex-cli" || def.id === "opencode-cli")
+        ? []
+        : def.id === "codex-cli"
+          ? [...def.models, ...createSeededCodexModels()]
+          : def.models;
+    for (const choice of seededChoices) {
       const id = toQualifiedModelId(def.id, choice.model);
       // OpenCode CLI can also list external upstream providers such as
       // `openai/...` and `github-copilot/...`. This integration deliberately
@@ -1910,7 +1924,7 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
       ) {
         continue;
       }
-      if (!isModelProviderEnabled(id)) {
+      if (!includeModelDisabled && !isModelProviderEnabled(id)) {
         continue;
       }
       pushSelectableModel(result, seenIds, {
@@ -1920,7 +1934,6 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
       });
     }
 
-    const discoveredChoices = await discoverCliModels(def);
     for (const choice of discoveredChoices) {
       const id = toQualifiedModelId(def.id, choice.model);
       if (
@@ -1929,13 +1942,14 @@ export async function getAvailableModels(): Promise<SelectableModel[]> {
       ) {
         continue;
       }
-      if (!isModelProviderEnabled(id)) {
+      if (!includeModelDisabled && !isModelProviderEnabled(id)) {
         continue;
       }
       pushSelectableModel(result, seenIds, {
         id,
         name: choice.name,
         providerLabel: modelProviderLabel(def, choice.model),
+        ...(choice.priceTierV1 ? { priceTierV1: choice.priceTierV1 } : {}),
       });
     }
   }
@@ -1987,4 +2001,3 @@ export function describeModelSource(
       return "automatic selection";
   }
 }
-

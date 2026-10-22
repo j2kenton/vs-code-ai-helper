@@ -92,6 +92,7 @@ import {
   V1ReserveNextResultV1,
 } from "../runners/runnerRegistry";
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { decodeTaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { AgentTransportExitV1, AgentTransportV1 } from "../types/agentExecutionV1";
 import { CompletedContentV1, MalformedAiResultV1 } from "../types/aiResultEnvelope";
 import { MIGRATED_ACTION_KEYS_V0 } from "../services/legacyAiActionSafetyGateV0";
@@ -218,16 +219,24 @@ function stubSelectionOpener(
   exhaustion?: import("../types/taskActionOutcomeV1").ProviderChainExhaustionV1,
   /** false models a Copilot-shaped provider with no file access of its own. */
   providerReadsWorkspaceNatively = true,
-  candidateCountOverride?: number
+  candidateCountOverride?: number,
+  leadingUnavailable: readonly { storedModelId: string; providerLabel: string; runnerId: string }[] = []
 ): StubSelectionSource {
   let opened = 0;
   let reservedCount = 0;
   let cursor = 0;
+  let leadingUnavailableCursor = 0;
   const opener: RunnerSelectionOpenerV1 = ({ session, mode }) => {
     opened += 1;
     return {
-      candidateCount: candidateCountOverride ?? transports.length,
+      candidateCount: candidateCountOverride ?? transports.length + leadingUnavailable.length,
       reserveNext(attemptId): V1ReserveNextResultV1 {
+        const unavailable = leadingUnavailable[leadingUnavailableCursor];
+        if (unavailable) {
+          leadingUnavailableCursor += 1;
+          session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
+          return { kind: "candidateUnavailable", code: "providerModeUnavailable", ...unavailable };
+        }
         const transport = transports[cursor];
         if (!transport) {
           return cursor === 0
@@ -311,7 +320,8 @@ function makeHarness(
   /** Item 2 / Step 55: lets a test wrap the durable orchestrator (e.g. to force a `settleInvocation` failure) instead of the plain file-backed one. */
   orchestratorOverride?: ActionConversationOrchestratorV1,
   candidateCountOverride?: number,
-  providerCapacityRetryDelayMs = 0
+  providerCapacityRetryDelayMs = 0,
+  leadingUnavailable: readonly { storedModelId: string; providerLabel: string; runnerId: string }[] = []
 ): Harness {
   const promoted: CompletedContentV1[] = [];
   const row: ProviderTaskActionRowV1 = {
@@ -342,7 +352,8 @@ function makeHarness(
     transports,
     selectionExhaustion,
     readTools?.providerReadsWorkspaceNatively ?? true,
-    candidateCountOverride
+    candidateCountOverride,
+    leadingUnavailable
   );
   const followUps: TaskActionFollowUpRequestV1[] = [];
   const leaseHeldAtFollowUp: (string | undefined)[] = [];
@@ -3277,6 +3288,45 @@ void describe("taskActionCoordinatorV1", () => {
     assert.equal(skipped[0]?.taskStage, "plan");
   });
 
+  void it("keeps the highest-ranked skip as the primary reason after a later failed candidate", async () => {
+    const candidate2 = Object.assign({
+      runnerId: "runner-2",
+      invoke: () => Promise.resolve({ kind: "transportFailure" as const, code: "cliExit.1", detail: "failed" }),
+    }, {
+      storedModelId: "candidate-2",
+      providerLabel: "Candidate 2",
+      providerId: "provider-2",
+    });
+    const candidate3 = Object.assign(
+      envelopeTransport((correlation) => frame({
+        version: 1,
+        correlation,
+        kind: "completed",
+        content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+      })),
+      { storedModelId: "candidate-3", providerLabel: "Candidate 3", providerId: "provider-3" }
+    );
+    const harness = makeHarness(
+      [candidate2, candidate3],
+      {},
+      [],
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      3,
+      0,
+      [{ storedModelId: "candidate-1", providerLabel: "Candidate 1", runnerId: "runner-1" }]
+    );
+
+    const outcome = await harness.coordinator.executeAction(baseRequest());
+    assert.equal(outcome.kind, "completed");
+    if (outcome.kind === "completed") {
+      assert.match(outcome.fallbackReason ?? "", /candidate-1 could not serve the requested text mode/);
+      assert.doesNotMatch(outcome.fallbackReason ?? "", /candidate-2/);
+    }
+  });
+
   void it("never lets a throwing onCandidateSkipped observer change the outcome", async () => {
     // Reporting is advisory. A notification surface that throws (or is torn
     // down mid-operation) must not turn a working cascade into a failure.
@@ -5524,6 +5574,31 @@ void describe("taskActionCoordinatorV1 — item 2 / Step 55: cancellation termin
   });
 
   void describe("RC6 Part B: running-model visibility (item 4)", () => {
+    void it("bounds a long primary transport diagnostic before returning a completed backup outcome", async () => {
+      const primary = Object.assign(
+        preResponseFailingTransport("cliExit.1", `diagnostic ${"detail ".repeat(100)}`),
+        { storedModelId: "primary-model-id", providerLabel: "Primary Provider" }
+      );
+      const backup = Object.assign(
+        envelopeTransport((correlation) => frame({
+          version: 1,
+          correlation,
+          kind: "completed",
+          content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "ok" },
+        })),
+        { storedModelId: "backup-model-id", providerLabel: "Backup Provider" }
+      );
+
+      const outcome = await makeHarness([primary, backup]).coordinator.executeAction(baseRequest());
+
+      assert.equal(outcome.kind, "completed");
+      if (outcome.kind === "completed") {
+        assert.ok((outcome.fallbackReason?.length ?? 0) <= 300);
+        assert.match(outcome.fallbackReason ?? "", /^primary-model-id cliExit\.1:/);
+        assert.equal(decodeTaskActionOutcomeV1(JSON.parse(JSON.stringify(outcome))).ok, true);
+      }
+    });
+
     void it("observer receives the backup's id when primary fails and backup runs", async () => {
       const invokedModels: string[] = [];
       const primary = Object.assign(
@@ -5549,6 +5624,9 @@ void describe("taskActionCoordinatorV1 — item 2 / Step 55: cancellation termin
       });
 
       assert.equal(outcome.kind, "completed");
+      if (outcome.kind === "completed") {
+        assert.match(outcome.fallbackReason ?? "", /primary-model-id cliExit\.1/);
+      }
       assert.deepEqual(invokedModels, ["primary-model-id", "backup-model-id"]);
       assert.equal(invokedModels[invokedModels.length - 1], "backup-model-id");
     });
@@ -5581,6 +5659,9 @@ void describe("taskActionCoordinatorV1 — item 2 / Step 55: cancellation termin
       });
 
       assert.equal(outcome.kind, "completed");
+      if (outcome.kind === "completed") {
+        assert.match(outcome.fallbackReason ?? "", /c1 cliExit\.1/);
+      }
       assert.deepEqual(invokedModels, ["c2"]);
     });
 

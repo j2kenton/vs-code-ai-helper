@@ -21,6 +21,11 @@
  * a second copy that could drift.
  */
 import * as vscode from "vscode";
+import {
+  isExtensionFolderRemovedErrorV1,
+  isExtensionResourceMissingErrorV1,
+  readExtensionResourceV1,
+} from "../utils/extensionResourcesV1";
 
 export type CreationSeedVersionV1 = "v0" | "v1";
 
@@ -98,10 +103,18 @@ let cachedExtensionUriKey: string | undefined;
 
 async function loadSeedText(extensionUri: vscode.Uri, relativeSegments: string[]): Promise<string | undefined> {
   try {
-    const bytes = await vscode.workspace.fs.readFile(vscode.Uri.joinPath(extensionUri, ...relativeSegments));
+    const bytes = await readExtensionResourceV1(extensionUri, relativeSegments);
     return new TextDecoder().decode(bytes);
-  } catch {
-    return undefined;
+  } catch (error) {
+    // Skip a seed only when a single file is missing; a removed extension
+    // folder propagates so nothing is cached from a root that is gone.
+    if (isExtensionFolderRemovedErrorV1(error)) {
+      throw error;
+    }
+    if (isExtensionResourceMissingErrorV1(error)) {
+      return undefined;
+    }
+    throw error;
   }
 }
 

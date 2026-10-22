@@ -254,6 +254,7 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendRoundOutcome, handBackToHumanAfterCompletedRoundV1, pauseTaskWithReason, pauseTaskWithReasonForClaimV1, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
 import { appendChatMessageV1 } from "./chatHistoryStore";
 import { stepOutcomeNameV1 } from "./stepLabelsV1";
+import { completedRoundAttributionV1 } from "./completedRoundAttributionV1";
 
 /** `RoundLedgerEntryV1.state` values `terminalizeRoundV1` may set — every
  * value except the two live states. */
@@ -290,6 +291,8 @@ export interface TerminalizeRoundOutcomeClassificationV1 {
 
 export interface TerminalizeRoundOptionsV1 {
   readonly taskFolderUri: vscode.Uri;
+  /** Ephemeral, sanitized backup provenance for Chat; deliberately not persisted in task-progress.json. */
+  readonly chatAttributionNote?: string;
   /** Chat document canonical id, when the task uses a non-default one.
    * Defaults to `taskFolderUri.fsPath`, matching `appendChatMessageV1`'s own
    * default. */
@@ -464,7 +467,12 @@ export type TerminalizeRoundNoLiveRowResultV1 =
  * this in the webview; this is the durable message TEXT stored in
  * `chat-v1.json`, kept short and self-contained since it is also what a
  * plain-text reader of the transcript sees. */
-export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceStartedAt?: string): string {
+export function formatRoundOutcomeMessageV1(
+  entry: RoundLedgerEntryV1,
+  sourceStartedAt?: string,
+  progress?: Pick<TaskProgress, "reviewScoreHistory" | "roundOutcomes">,
+  chatAttributionNote?: string
+): string {
   const stageName = STAGE_DISPLAY_NAMES[entry.stage] ?? entry.stage;
   // One plain name per step across row, notification and this line
   // (v1 fixes 2, step 10): "Apply Review (High-Level Code Review)", not a bare
@@ -515,6 +523,15 @@ export function formatRoundOutcomeMessageV1(entry: RoundLedgerEntryV1, sourceSta
   // task-progress.json.  A reader needs it to distinguish checklist-driven
   // Implementation from Apply Review and a continuation after the fact.
   parts.push(`mode ${entry.mode}`);
+  const attribution = progress
+    ? completedRoundAttributionV1(progress, entry.stage, entry.attemptIds)
+    : undefined;
+  if (attribution) {
+    parts.push(
+      `model ${attribution.providerLabel ? `${attribution.providerLabel} (${attribution.modelId})` : attribution.providerId ? `${attribution.providerId} (${attribution.modelId})` : attribution.modelId}`
+    );
+  }
+  if (chatAttributionNote) parts.push(chatAttributionNote.slice(0, 300));
   if (outcome?.runLogPath) {
     parts.push(outcome.runLogPath);
   }
@@ -709,7 +726,9 @@ export async function terminalizeRoundV1(
           entry,
           entry.continuationOf
             ? patched.roundLedger?.find((candidate) => candidate.roundId === entry.continuationOf)?.startedAt
-            : undefined
+            : undefined,
+          patched,
+          options.chatAttributionNote
         ),
         stage: entry.stage,
         at: entry.endedAt ?? new Date().toISOString(),
