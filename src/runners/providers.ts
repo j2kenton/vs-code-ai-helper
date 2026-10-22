@@ -471,6 +471,16 @@ const CODEX_EFFORT_LOW_TO_XHIGH = [
 export const CODEX_MODEL_CAPABILITIES: Readonly<
   Record<string, CodexModelCapability>
 > = {
+  // Codex session model catalog, 2026-10-21: six efforts and priority tier.
+  "gpt-6.1-sol": {
+    label: "GPT-6.1-Sol",
+    efforts: [
+      ...CODEX_EFFORT_LOW_TO_XHIGH,
+      ["max", "Max"],
+      ["ultra", "Ultra"],
+    ],
+    supportsFast: true,
+  },
   "gpt-6-astra": {
     label: "GPT-6-Astra",
     efforts: [

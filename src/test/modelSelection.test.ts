@@ -729,6 +729,19 @@ void describe("getAvailableModels", () => {
         [
           codexVariant("codex-cli:default", "Codex (CLI default)"),
           ...codexVariants(
+            "gpt-6.1-sol",
+            "GPT-6.1-Sol",
+            [
+              ["low", "Low"],
+              ["medium", "Medium"],
+              ["high", "High"],
+              ["xhigh", "Extra High"],
+              ["max", "Max"],
+              ["ultra", "Ultra"],
+            ],
+            true
+          ),
+          ...codexVariants(
             "gpt-6-astra",
             "GPT-6-Astra",
             [
@@ -845,6 +858,36 @@ void describe("getAvailableModels", () => {
           {
             id: "antigravity-cli:default",
             name: "Antigravity (CLI default)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.8 Flash (Low)",
+            name: "Gemini 3.8 Flash (Low)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.8 Flash (Medium)",
+            name: "Gemini 3.8 Flash (Medium)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 3.8 Flash (High)",
+            name: "Gemini 3.8 Flash (High)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 4 Argon (Low)",
+            name: "Gemini 4 Argon (Low)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 4 Argon (Medium)",
+            name: "Gemini 4 Argon (Medium)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 4 Argon (High)",
+            name: "Gemini 4 Argon (High)",
             providerLabel: "Antigravity CLI (subscription CLI)",
           },
           {
@@ -1790,6 +1833,37 @@ void describe("GPT-6 / Opus 5.5 listed entries validate against the provider lad
 
   const ladderOf = (ids: readonly string[], prefix: string): string[] =>
     ids.filter((id) => id.startsWith(`${prefix}@`)).map((id) => id.slice(id.lastIndexOf("@") + 1));
+
+  void it("routes every GPT-6.1 Sol effort and speed to its exact Codex model", async () => {
+    const ids = await seededPickerIds("codex");
+    const prefix = "codex-cli:gpt-6.1-sol";
+    const efforts = ["low", "medium", "high", "xhigh", "max", "ultra"];
+    assert.deepStrictEqual(ladderOf(ids, prefix).sort(),
+      efforts.flatMap((effort) => [effort, `${effort}+fast`]).sort());
+    for (const effort of efforts) {
+      for (const fast of [false, true]) {
+        const selection = `gpt-6.1-sol@${effort}${fast ? "+fast" : ""}`;
+        assert.deepStrictEqual(parseCodexModelSelection(selection), {
+          model: "gpt-6.1-sol",
+          reasoningEffort: effort,
+          serviceTier: fast ? "priority" : undefined,
+        });
+      }
+    }
+    for (const invalid of ["none", "minimal", "turbo"]) {
+      assert.throws(() => parseCodexModelSelection(`gpt-6.1-sol@${invalid}`));
+    }
+  });
+
+  void it("seeds the confirmed OpenCode model IDs using provider default variants", async () => {
+    const ids = await seededPickerIds("opencode");
+    for (const model of ["opencode/gpt-6.1-sol", "opencode/gemini-4-argon",
+      "opencode-go/gemini-4-argon-contributor"]) {
+      assert.ok(ids.includes(`opencode-cli:${model}`), model);
+      assert.deepStrictEqual(parseOpencodeModelSelection(model), { model, variant: undefined });
+      assert.deepStrictEqual(ladderOf(ids, `opencode-cli:${model}`), []);
+    }
+  });
 
   void it("lists Codex gpt-6-astra with exactly its evidenced ladder, every listed id resolving to gpt-6-astra", async () => {
     const ids = await seededPickerIds("codex");
