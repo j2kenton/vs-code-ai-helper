@@ -38,14 +38,14 @@ $ViewerPort = 8082
 $Workspace  = '/workspace/vs-code-ai-helper'
 $VncUrl     = "http://localhost:$VncPort/vnc.html?autoconnect=true&resize=scale"
 
-# Fixed options for the long-lived tunnels: stay up, and fail at once if the
-# local port is already taken (an old tunnel still running) instead of
-# silently tunnelling nothing.
+# Fixed options for the long-lived tunnels. No ExitOnForwardFailure: while
+# VS Code is connected to the box it may already forward the same port on one
+# address family, and that option then made ssh quit at once, silently
+# (seen 2026-10-23).
 $TunnelOptions = @(
   '-N',
   '-o', 'ServerAliveInterval=15',
-  '-o', 'ServerAliveCountMax=3',
-  '-o', 'ExitOnForwardFailure=yes'
+  '-o', 'ServerAliveCountMax=3'
 )
 
 function Get-ViewerUrl {
@@ -61,10 +61,11 @@ function Start-Tunnel([string[]]$Forwards, [string[]]$Urls) {
   # because ssh -N blocks this window for as long as the tunnel is up.
   $null = Start-Job -ArgumentList (,$Urls) -ScriptBlock {
     param($u)
-    Start-Sleep -Seconds 3
+    Start-Sleep -Seconds 8
     foreach ($x in $u) { Start-Process $x }
   }
   & ssh @TunnelOptions @Forwards $BoxHost
+  Write-Host "Tunnel closed (ssh exit code $LASTEXITCODE)."
 }
 
 switch ($Command) {
