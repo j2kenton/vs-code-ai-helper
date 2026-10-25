@@ -6,6 +6,10 @@ import {
   isAutomationDispatchContextV1,
 } from "../state/automationDispatchContextV1";
 import { NotificationRouter } from "./notificationRouter";
+import { CurrentTaskStore } from "./currentTaskStore";
+import { offerActionInChatV1 } from "./chatActionOfferV1";
+import { askChatChoiceV1 } from "./chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "./globalChatTargetV1";
 
 /**
  * Workspace-state key for the current disclaimer version's consent record.
@@ -39,7 +43,8 @@ interface ConsentRecord {
  *   3. high-context confirm   (if prompt is large)
  */
 export async function ensureAiConsent(
-  context: vscode.ExtensionContext
+  context: vscode.ExtensionContext,
+  taskFolderPath?: string
 ): Promise<boolean> {
   const existing = context.workspaceState.get<ConsentRecord>(CONSENT_KEY);
   if (existing && existing.version === DISCLAIMER_VERSION) {
@@ -56,10 +61,20 @@ export async function ensureAiConsent(
   // Say so visibly, and name the way out (run any AI action by hand once).
   if (isAutomationDispatchContextV1()) {
     console.log(describeAutomationDefaultV1("AI consent prompt", "declined"));
-    NotificationRouter.showWarning(
+    const reason =
       "An automated round did not run: AI consent has not been given in this workspace and no one was attached " +
-        "to give it. Run any Ensemble AI action once by hand and accept the notice, then run the automation again."
-    );
+      "to give it. Run an Ensemble AI action from chat and accept the consent notice, then run the automation again.";
+    const targetTaskFolder = taskFolderPath ?? new CurrentTaskStore(context.workspaceState).get();
+    if (targetTaskFolder) {
+      await offerActionInChatV1({
+        taskFolderPath: targetTaskFolder,
+        actionLabel: "Apply Current Stage Action",
+        command: "vs-code-ai-helper.applyCurrentStageAction",
+        args: [{ taskFolderPath: targetTaskFolder }],
+        noticeText: reason,
+      });
+    }
+    NotificationRouter.showWarning(reason);
     return false;
   }
 
@@ -70,8 +85,11 @@ export async function ensureAiConsent(
   // silently declining.
   let promptAgain = true;
   while (promptAgain) {
-    const choice = await vscode.window.showWarningMessage(
-      [
+    const target = await resolveGlobalChatTargetOrDefaultV1();
+    const choice = await askChatChoiceV1({
+      decisionKey: "firstUseAiConsent",
+      target,
+      whatHappened: [
         "⚠️  Ensemble — Before you continue",
         "",
         "AI commands consume real quota/money from your AI subscription.",
@@ -84,12 +102,28 @@ export async function ensureAiConsent(
         "Use is at your own risk. Read DISCLAIMER.md before proceeding.",
         "Never use this extension unsupervised.",
       ].join("\n"),
-      { modal: true },
-      ACCEPT,
-      VIEW
-    );
+      whyUserNeeded: "First-use AI consent is required before any AI provider command runs in this workspace.",
+      options: [
+        {
+          optionId: "accept",
+          label: ACCEPT,
+          consequence: "Records your consent for this workspace and continues the AI action.",
+        },
+        {
+          optionId: "view",
+          label: VIEW,
+          consequence: "Opens DISCLAIMER.md and asks again.",
+        },
+        {
+          optionId: "decline",
+          label: "Cancel",
+          consequence: "Leaves AI consent unset and cancels the current AI action.",
+        },
+      ],
+      detail: "Answering enables or declines AI features for this workspace.",
+    });
 
-    if (choice === ACCEPT) {
+    if (choice === "accept" || choice === ACCEPT) {
       const record: ConsentRecord = {
         acceptedAt: new Date().toISOString(),
         version: DISCLAIMER_VERSION,
@@ -98,7 +132,7 @@ export async function ensureAiConsent(
       return true;
     }
 
-    if (choice === VIEW) {
+    if (choice === "view" || choice === VIEW) {
       await vscode.commands.executeCommand(
         "vs-code-ai-helper.viewDisclaimer"
       );

@@ -817,6 +817,50 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     }
   });
 
+  void it("adds a bound chat text question for an owner-evidence blocker", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    initNotificationRouter(new RecordingSurface());
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-owner-evidence-question");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-owner-evidence" }));
+    let asked: { question: string; forceOpen: boolean } | undefined;
+    initReviewEscalationChat({
+      ask: (input, forceOpen) => {
+        asked = { question: input.question, forceOpen: forceOpen ?? false };
+        return Promise.resolve();
+      },
+      askInteraction: () => Promise.resolve(undefined),
+    });
+    try {
+      await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-owner-evidence",
+        undefined,
+        false,
+        undefined,
+        {
+          content: "Readiness: 6/10\n\n<!-- progress: 4/4 -->\n",
+          blockers: [{ category: "completion", resolver: "environmental", description: "Owner evidence needed: run `tool --version`" }],
+          taskFixableCount: 0,
+        }
+      );
+      assert.ok(asked);
+      assert.equal(asked.forceOpen, true);
+      assert.match(asked.question, /Paste the output, or type what you found/);
+      assert.match(asked.question, /task\.md/);
+      assert.match(asked.question, /Blocker: Owner evidence needed: run `tool --version`/);
+    } finally {
+      __reviewEscalationChatTestOnly.reset();
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   void it("offers the post-install move-on option for an excluded owner check recorded by an older review", async () => {
     const store = new Map<string, string>();
     installMemStore(store);
@@ -2645,6 +2689,35 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
         0,
         "no decision should be posted when there is nothing non-task-fixable to name"
       );
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("adds the owner-evidence answer question beside the environmental advance decision", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("advance-notice-owner-evidence-question");
+    let asked: { question: string; forceOpen: boolean } | undefined;
+    initReviewEscalationChat({
+      ask: (input, forceOpen) => {
+        asked = { question: input.question, forceOpen: forceOpen ?? false };
+        return Promise.resolve();
+      },
+      askInteraction: () => Promise.resolve(undefined),
+    });
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1(
+        folderUri,
+        "impl-high-review",
+        [{ category: "completion", resolver: "environmental", description: "Owner evidence needed: inspect the installed UI" }],
+        { canonicalId: "c1", taskFolderPath: folderUri.fsPath, taskName: "sample task" }
+      );
+      assert.equal(posted, true);
+      assert.ok(asked, "the advance notice must also expose the owner-evidence response control");
+      assert.equal(asked.forceOpen, true);
+      assert.match(asked.question, /Paste the output, or type what you found/);
+      assert.match(asked.question, /Blocker: Owner evidence needed: inspect the installed UI/);
     } finally {
       __extensionContextV1TestOnly.reset();
     }

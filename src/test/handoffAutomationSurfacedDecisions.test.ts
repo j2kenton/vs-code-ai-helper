@@ -24,7 +24,7 @@ async function readSrc(relativePath: string): Promise<string> {
 }
 
 void describe("copilotImplementationRunner.ts's round-limit gate (Part 11 site #20)", () => {
-  void it("awaits the decision through awaitWorkflowDecisionAnswerV1 when a task is available, falling back to the raw modal otherwise", async () => {
+  void it("awaits the decision through awaitWorkflowDecisionAnswerV1, routing to global chat when no task is available", async () => {
     const source = await readSrc("src/runners/copilotImplementationRunner.ts");
     const marker = 'decisionKey: "implementationRoundLimitReached"';
     const index = source.indexOf(marker);
@@ -37,14 +37,18 @@ void describe("copilotImplementationRunner.ts's round-limit gate (Part 11 site #
     );
     assert.match(
       before,
-      /if\s*\(taskFolderUri\s*&&\s*stage\)/,
-      "the migrated path must be gated on taskFolderUri and stage both being available"
+      /taskFolderUri\s*&&\s*stage/,
+      "the migrated path must target task chat when taskFolderUri and stage are available"
     );
-    const after = source.slice(index, index + 2500);
     assert.match(
-      after,
-      /showWarningMessage\(/,
-      "expected the raw-modal fallback to remain for callers with no taskFolderUri/stage"
+      source,
+      /resolveGlobalChatTargetOrDefaultV1/,
+      "the unbound path must route to global chat"
+    );
+    assert.doesNotMatch(
+      source,
+      /vscode\.window\.showWarningMessage\(/,
+      "copilotImplementationRunner must not fall back to a raw modal"
     );
   });
 

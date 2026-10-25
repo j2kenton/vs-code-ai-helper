@@ -4,6 +4,7 @@ import { isViewerHostV1 } from "../state/hostRoleV1";
 import { VIEWER_DECISION_EFFECT_COMMANDS_V1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { normalizePath } from "../utils/taskRoot";
+import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
 import { isReviewStage, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeReviewStageScoreV1 } from "./taskTreeProvider";
@@ -35,6 +36,13 @@ import { applyOpenPlanItemsFormSubmissionV1 } from "../commands/decideOpenPlanIt
 import { stripAttributionHeaders } from "../utils/fileUtils";
 import { writeRunLog } from "../utils/runLog";
 import { formatDisplayTimestampPairV1, formatTimestampForDisplay } from "../utils/timeFormat";
+import {
+  appendOwnerEvidenceThenV1,
+  OWNER_EVIDENCE_ANSWER_MARKER_V1,
+  OwnerEvidenceSubmissionErrorV1,
+} from "../utils/ownerEvidenceV1";
+import { settleChatFreeTextQuestionV1 } from "../utils/chatFreeTextV1";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
 import {
   decodeStructuredAnswersArrayV1,
@@ -256,6 +264,12 @@ function isSendMessage(value: unknown): value is SendMessage {
 function isReadyMessage(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
   return (value as Record<string, unknown>).type === "ready";
+}
+
+function isOpenDecisionEvidenceMessageV1(value: unknown): value is { type: "openDecisionEvidence"; filePath: string } {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return candidate.type === "openDecisionEvidence" && typeof candidate.filePath === "string";
 }
 
 /**
@@ -1034,6 +1048,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         void this.render();
         return;
       }
+      if (isOpenDecisionEvidenceMessageV1(message) && this.target) {
+        const candidate = path.resolve(message.filePath);
+        const relative = path.relative(path.resolve(this.target.taskFolderPath), candidate);
+        if (relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+          try {
+            const document = await vscode.workspace.openTextDocument(vscode.Uri.file(candidate));
+            await vscode.window.showTextDocument(document, { preview: true });
+          } catch (error) {
+            console.warn("Could not open workflow decision evidence", error);
+          }
+        }
+        return;
+      }
       if (isResolveWorkflowDecisionMessage(message)) {
         await this.resolveWorkflowDecision(message.decisionId, message.optionId);
         return;
@@ -1228,13 +1255,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     const identity = this.target;
     const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
-    const confirmed = await vscode.window.showWarningMessage(
-      `${taskLabel} — Reset Chat History clears this conversation's unresolved questions, after saving a private recovery ` +
-        "snapshot. This cannot be undone from Chat With AI. Continue?",
-      { modal: true },
-      "Reset Chat History"
-    );
-    if (confirmed !== "Reset Chat History") {
+    const confirmed = await askChatChoiceV1({
+      target: identity,
+      decisionKey: "confirmResetChatHistory",
+      whatHappened:
+        `${taskLabel} — Reset Chat History clears this conversation's unresolved questions, after saving a private recovery ` +
+        "snapshot. This cannot be undone from Chat With AI.",
+      whyUserNeeded: "Resetting chat history requires explicit confirmation before clearing unresolved interactions.",
+      options: [
+        {
+          optionId: "reset",
+          label: "Reset Chat History",
+          description: "Save a private recovery snapshot and clear unresolved questions",
+        },
+        {
+          optionId: "cancel",
+          label: "Cancel",
+          description: "Keep the conversation's unresolved questions unchanged",
+        },
+      ],
+      recommendedOptionId: "reset",
+    });
+    if (confirmed !== "reset") {
       return;
     }
     const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
@@ -1478,14 +1520,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       const message: ChatMessage = {
         role: "user",
-        text: trimmed,
+        text: transcript.some((m) => m.role === "question" && (m.id ?? m.at) === questionAt && m.text.includes(OWNER_EVIDENCE_ANSWER_MARKER_V1))
+          ? text
+          : trimmed,
         stage,
         at: new Date().toISOString(),
         answersQuestionAt: questionAt,
       };
       await this.persistAppend(identity, message);
-      return { kind: "answered" as const };
+      const matchedQuestion = transcript.find(
+        (m) => m.role === "question" && (m.id ?? m.at) === questionAt
+      );
+      const sourceQuestion = matchedQuestion?.text.includes(OWNER_EVIDENCE_ANSWER_MARKER_V1)
+        ? matchedQuestion
+        : undefined;
+      const blockerMarker = "\nBlocker: ";
+      const blockerAt = sourceQuestion?.text.indexOf(blockerMarker) ?? -1;
+      return {
+        kind: "answered" as const,
+        ...(matchedQuestion ? { questionText: matchedQuestion.text } : {}),
+        ...(blockerAt >= 0 ? { ownerEvidenceBlocker: sourceQuestion!.text.slice(blockerAt + blockerMarker.length).trim() } : {}),
+      };
     });
+
+    if (outcome.kind === "answered" && outcome.questionText) {
+      settleChatFreeTextQuestionV1(outcome.questionText, trimmed);
+    }
 
     if (outcome.kind === "alreadyAnswered") {
       const taskLabel = formatNotificationTaskLabelV1(
@@ -1493,10 +1553,52 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         identity.taskFolderPath
       );
       NotificationRouter.showInformation(`${taskLabel} — This question was already answered.`);
+    } else if (outcome.ownerEvidenceBlocker !== undefined) {
+      try {
+        await appendOwnerEvidenceThenV1(
+          identity.taskFolderPath,
+          outcome.ownerEvidenceBlocker,
+          text,
+          () => this.rerunOwnerEvidenceReviewV1(identity, stage, outcome.ownerEvidenceBlocker!)
+        );
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const writeFailed = error instanceof OwnerEvidenceSubmissionErrorV1 && error.phase === "write";
+        await this.append(
+          "assistant",
+          writeFailed
+            ? `The owner evidence answer was received but could not be written to task.md (${detail}). Your answer remains in this chat; edit task.md under ## Owner evidence or retry after fixing the write problem. The review has not been restarted.`
+            : `Owner evidence was saved to task.md, but the review could not be restarted (${detail}). Use Keep iterating on the existing decision to re-run it.`,
+          stage,
+          identity
+        );
+        return;
+      }
     }
 
     if (sameIdentity(this.target, identity)) {
       await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
+    }
+  }
+
+  private async rerunOwnerEvidenceReviewV1(
+    identity: ChatIdentity,
+    stage: TaskStage,
+    blocker: string
+  ): Promise<void> {
+    const supersededDecision = this.workflowDecisionStore.listPending().find((candidate) =>
+      candidate.taskCanonicalId === identity.canonicalId &&
+      candidate.stage === stage &&
+      candidate.whatHappened.includes(blocker)
+    );
+    const started = await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndRerunReview", {
+      taskFolderPath: identity.taskFolderPath,
+    }, { skipUnchangedTreeGuardV1: true });
+    if (started !== true) {
+      throw new Error("the stage review did not start");
+    }
+    if (supersededDecision) {
+      await this.workflowDecisionStore.withdraw(supersededDecision.decisionId, "Owner evidence was submitted; the stage review is running again.");
     }
   }
 
@@ -2125,11 +2227,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * The decision's own record carries only `taskCanonicalId` + `stage`, not
    * the `taskFolderPath` a transcript append needs — so the identity used to
    * acknowledge a resolution is `this.target` when it is still the exact
-   * task/stage the decision belonged to (the only case a webview click could
-   * actually have come from). A decision resolved after the user switched
-   * chats in the interim (a narrow race) still resolves correctly in the
-   * store; it just has nowhere to append a visible acknowledgement, which is
-   * no worse than today's silence.
+   * task/stage or Global Assistant conversation the decision belonged to. A
+   * decision resolved after the user switched chats in the interim (a narrow
+   * race) still resolves correctly in the store; it just has nowhere to
+   * append a visible acknowledgement.
    */
   private identityForDecision(
     decision: WorkflowDecisionV1,
@@ -2144,7 +2245,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       return ctx.identity;
     }
     return this.target &&
-      this.target.kind !== "global" &&
       this.target.canonicalId === decision.taskCanonicalId &&
       this.target.stage === decision.stage
       ? this.target
@@ -2992,28 +3092,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     }
     if (!sameRenderTarget(target, this.target)) return;
-    // Pending `WorkflowDecisionV1` records for this exact task/stage (the
-    // global assistant never carries decisions — they are always stage-
-    // scoped). Read fresh on every render so a decision resolved from
-    // elsewhere (or superseded by a repost) disappears without a stale
+    // Pending `WorkflowDecisionV1` records for this exact task/stage, or for
+    // the Global Assistant identity when that chat is open. Read fresh on
+    // every render so a decision resolved from elsewhere (or superseded by
+    // a repost) disappears without a stale
     // control lingering in the panel.
-    // Guarded on purpose (see `render`): these predicates read the task's own
-    // files, and a read that fails must cost at most the cards.
+    // Task-scoped stale predicates read the task's own files; a read failure
+    // must cost at most those cards.
     const pendingDecisions: readonly WorkflowDecisionV1[] =
-      target && target.kind !== "global"
-        ? await this.withdrawStaleDecisionsSafelyV1(
-            target,
-            this.workflowDecisionStore
-              .listPending(target.canonicalId)
-              .filter((d) => d.stage === target.stage)
-              // An answer already on its way to the runner: the card is gone
-              // the moment it is pressed, exactly as a local click removes it,
-              // instead of coming back enabled on the next re-render and
-              // inviting a second press (review, 2026-09-17). It reappears
-              // only if the relay reports the answer did not land.
-              .filter((d) => !this.isAnswerInFlightV1(d))
-          )
-        : [];
+      target && target.kind === "global"
+        ? this.workflowDecisionStore
+            .listPending(GLOBAL_ASSISTANT_CANONICAL_ID)
+            .filter((d) => d.stage === target.stage)
+            .filter((d) => !this.isAnswerInFlightV1(d))
+        : target
+          ? await this.withdrawStaleDecisionsSafelyV1(
+              target,
+              this.workflowDecisionStore
+                .listPending(target.canonicalId)
+                .filter((d) => d.stage === target.stage)
+                // An answer already on its way to the runner: the card is gone
+                // the moment it is pressed, exactly as a local click removes it,
+                // instead of coming back enabled on the next re-render and
+                // inviting a second press (review, 2026-09-17). It reappears
+                // only if the relay reports the answer did not land.
+                .filter((d) => !this.isAnswerInFlightV1(d))
+            )
+          : [];
     const targetOps = target ? taskOperations.getTaskOperations(target.canonicalId) : [];
     // A trailing pending question (no reply after it yet) drives only the
     // per-message "— awaiting your answer" label further down; it plays no
@@ -3930,6 +4035,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             evWrap.appendChild(evTitle);
             for(const ev of dcs.evidence){
               const line=document.createElement('div'); line.textContent=ev.label+': '+ev.detail;
+              if(ev.openFilePath){ const open=document.createElement('button'); open.type='button'; open.textContent='Open run log'; open.addEventListener('click',()=>vscode.postMessage({type:'openDecisionEvidence',filePath:ev.openFilePath})); line.appendChild(open); }
               evWrap.appendChild(line);
             }
             card.appendChild(evWrap);

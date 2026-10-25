@@ -16,6 +16,8 @@ import { TaskProgress } from "../types/taskProgress";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { askChatChoiceV1 } from "./chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "./globalChatTargetV1";
 
 const CONFIG_SECTION = "vs-code-ai-helper";
 const META_RESOURCES_PATH_KEY = "metaResourcesPath";
@@ -362,13 +364,29 @@ export async function maybeOfferMetaResourcesMigration(
   }
 
   const target = path.join(workspaceRoot, DEFAULT_TASK_ROOT);
-  const choice = await vscode.window.showInformationMessage(
-    `Move Ensemble resources from "${path.relative(workspaceRoot, legacyRoot) || legacyRoot}" to "${DEFAULT_TASK_ROOT}"? ` +
+  const chatTarget = await resolveGlobalChatTargetOrDefaultV1(legacyRoot);
+  const choice = await askChatChoiceV1({
+    decisionKey: "offerMetaResourcesMigration",
+    target: chatTarget,
+    whatHappened:
+      `Move Ensemble resources from "${path.relative(workspaceRoot, legacyRoot) || legacyRoot}" to "${DEFAULT_TASK_ROOT}"? ` +
       "Task state and artifacts move with the folder.",
-    "Move",
-    "Not Now"
-  );
-  if (choice !== "Move") {
+    whyUserNeeded: "Choose whether to move legacy Ensemble task resources to .ensemble now or keep the legacy location.",
+    options: [
+      {
+        optionId: "move",
+        label: "Move",
+        consequence: `Moves task state and artifacts from ${path.relative(workspaceRoot, legacyRoot) || legacyRoot} to ${DEFAULT_TASK_ROOT}.`,
+      },
+      {
+        optionId: "notNow",
+        label: "Not Now",
+        consequence: "Keeps the legacy resource location active.",
+      },
+    ],
+    detail: "Answering moves or keeps the legacy Ensemble resource folder.",
+  });
+  if (choice !== "move" && choice !== "Move") {
     // Internal compatibility record only — no configuration UI. Re-offered
     // exclusively via the migrateMetaResources command. Declining means
     // "keep using the legacy location": the legacy root stays the active

@@ -8,6 +8,7 @@ import { resolveCurrentPlanUri, withPlanFileWriteLockV1, markOwnSaveInFlightV1, 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
 import { runTrackedOperation, resolveWorkflowRootTaskName } from "../utils/taskOperations";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import {
   readRedoSidecar,
   isRedoAvailableFromRecord,
@@ -122,14 +123,36 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
         );
         return;
       }
-      const choice = await vscode.window.showWarningMessage(
-        kind === "revert"
-          ? "Are you sure you want to revert the changes? This restores the stage's file to its previous version."
-          : "Are you sure you want to redo? This restores the content that the last revert replaced.",
-        { modal: true },
-        confirmLabel
-      );
-      if (choice !== confirmLabel) return;
+      const confirmedOptionId = await askChatChoiceV1({
+        decisionKey: kind === "revert" ? "confirmRevertStageChanges" : "confirmRedoStageChanges",
+        target: {
+          canonicalId: node.task.folderUri.fsPath,
+          taskFolderPath: node.task.folderUri.fsPath,
+          stage: node.task.progress?.currentStage ?? node.stage,
+          taskName: node.task.progress?.displayName ?? node.task.folderName,
+        },
+        whatHappened:
+          kind === "revert"
+            ? "Revert the stage's file to its previous version?"
+            : "Redo the stage's file, restoring the content the last revert replaced?",
+        whyUserNeeded: "This replaces the artifact on disk and is hard to undo without the backup.",
+        options: [
+          {
+            optionId: "confirm",
+            label: confirmLabel,
+            consequence: `Replaces ${artifactName} with its previous version.`,
+          },
+          {
+            optionId: "cancel",
+            label: "Cancel",
+            consequence: "Leaves the stage artifact unchanged.",
+          },
+        ],
+        recommendedOptionId: "cancel",
+        recommendationReasoning: "Only confirm when the change was unwanted.",
+        detail: "Answering continues this command; cancel leaves everything as it is.",
+      });
+      if (confirmedOptionId !== "confirm") return;
       // Re-check after the modal: the dirty state can change while it was open.
       const doc = openArtifactDoc();
       if (doc?.isDirty) {

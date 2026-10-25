@@ -35,6 +35,7 @@ import { notifyDesktop } from "../utils/desktopNotifier";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { awaitWorkflowDecisionAnswerV1 } from "../utils/workflowDecisionDispatchV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 import { ChatTarget } from "../views/chatView";
 import { TaskStage } from "../types/taskProgress";
 
@@ -526,56 +527,55 @@ export async function resolveRoundLimitDecisionV1(options: {
   NotificationRouter.showError(
     `${formatNotificationTaskLabelV1(undefined, folderName)} — Can't proceed without your input: implementation reached its ${maxIterations}-round limit and needs "Continue" or "Cancel."`
   );
-  let choice: "Continue" | "Cancel" | undefined;
-  if (taskFolderUri && stage) {
-    const target: ChatTarget = {
-      canonicalId: taskFolderUri.fsPath,
-      taskFolderPath: taskFolderUri.fsPath,
-      stage,
-    };
-    const chosenOptionId = await awaitWorkflowDecisionAnswerV1(
-      {
-        decisionKey: "implementationRoundLimitReached",
-        taskCanonicalId: taskFolderUri.fsPath,
+  const target: ChatTarget = taskFolderUri && stage
+    ? {
+        canonicalId: taskFolderUri.fsPath,
+        taskFolderPath: taskFolderUri.fsPath,
         stage,
-        whatHappened: `The implementation reached its ${maxIterations}-round tool-call limit without finishing.`,
-        whyUserNeeded: "The loop cannot continue without your choice — it can either keep working with a raised limit, or stop here and report what it has so far.",
-        options: [
-          {
-            optionId: "continue",
-            label: "Continue",
-            resumeKind: "continue",
-            consequence: `Raises the round limit and keeps working from where it stopped, reusing the same conversation and file changes so far.`,
-            effect: { kind: "doNothing" },
-          },
-          {
-            optionId: "cancel",
-            label: "Cancel",
-            resumeKind: "unpause",
-            consequence: "Stops here and reports the round-limit failure. Any file changes already made are kept — nothing is reverted.",
-            effect: { kind: "doNothing" },
-          },
-        ],
-        recommendation: {
-          kind: "none",
-          reasoning: "Only you know whether this implementation is close to finishing (worth continuing) or looping without progress (worth stopping to inspect).",
+      }
+    : await resolveGlobalChatTargetOrDefaultV1(workspaceUri.fsPath);
+  const chosenOptionId = await awaitWorkflowDecisionAnswerV1(
+    {
+      decisionKey: "implementationRoundLimitReached",
+      taskCanonicalId: target.canonicalId,
+      stage: target.stage,
+      whatHappened: `The implementation reached its ${maxIterations}-round tool-call limit without finishing.`,
+      whyUserNeeded: "The loop cannot continue without your choice — it can either keep working with a raised limit, or stop here and report what it has so far.",
+      options: [
+        {
+          optionId: "continue",
+          label: "Continue",
+          resumeKind: "continue",
+          consequence: `Raises the round limit and keeps working from where it stopped, reusing the same conversation and file changes so far.`,
+          effect: { kind: "doNothing" },
         },
-        gating: {
-          holdsTaskPaused: true,
-          unblocksProgress: true,
-          detail: "The round is paused on this exact choice; answering it either resumes the round with a higher limit or ends it.",
+        {
+          optionId: "cancel",
+          label: "Cancel",
+          resumeKind: "unpause",
+          consequence: "Stops here and reports the round-limit failure. Any file changes already made are kept — nothing is reverted.",
+          effect: { kind: "doNothing" },
         },
+      ],
+      recommendation: {
+        kind: "none",
+        reasoning: "Only you know whether this implementation is close to finishing (worth continuing) or looping without progress (worth stopping to inspect).",
       },
-      target,
-      token
-    );
-    choice = chosenOptionId === "continue" ? "Continue" : chosenOptionId === "cancel" ? "Cancel" : undefined;
-  } else {
-    choice = await vscode.window.showWarningMessage(
-      `The implementation reached its ${maxIterations}-round limit. Continue working?`,
-      "Continue", "Cancel"
-    );
-  }
+      gating: {
+        holdsTaskPaused: true,
+        unblocksProgress: true,
+        detail: "The round is paused on this exact choice; answering it either resumes the round with a higher limit or ends it.",
+      },
+    },
+    target,
+    token
+  );
+  const choice: "Continue" | "Cancel" | undefined =
+    chosenOptionId === "continue"
+      ? "Continue"
+      : chosenOptionId === "cancel"
+        ? "Cancel"
+        : undefined;
   onBusyDetail?.(undefined);
   onWaitingForUser?.(false);
   return choice;
@@ -636,6 +636,12 @@ export interface ImplementationRunResult {
   errorMessage?: string;
   /** Stable provider-neutral failure classification; set on failed results only. */
   failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
+  /**
+   * True when the failure is a Codex "model is at capacity" reply (a
+   * temporary overload at OpenAI) that outlived the same-model retries.
+   * Failure messages describe it as capacity, not a usage limit.
+   */
+  providerCapacity?: boolean;
   /**
    * The provider's own authentication verdict, when the runner can produce
    * one, captured before any login hint was appended to errorMessage. CLI
@@ -712,6 +718,18 @@ export interface ImplementationRunResult {
    * `publishOwnershipMatrix.test.ts` regression).
    */
   allocatedAttemptIds?: readonly string[];
+  /**
+   * Check execution feedback (Step 27 / Defect 13). Populated when check
+   * commands are executed in the sandbox or via host check runner fallback.
+   */
+  executedChecks?: readonly CheckExecutionFeedbackV1[];
+}
+
+export interface CheckExecutionFeedbackV1 {
+  readonly command: string;
+  readonly outcome: "sandbox-success" | "sandbox-denied" | "host-fallback";
+  readonly exitCode?: number | null;
+  readonly hostOutput?: string;
 }
 
 /**

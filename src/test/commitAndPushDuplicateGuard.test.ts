@@ -23,6 +23,19 @@ import {
 } from "../utils/notificationRouter";
 import { safeRemoveDir } from "./testFsUtils";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+
+class FakeMemento {
+  private readonly values = new Map<string, unknown>();
+  get<T>(key: string, defaultValue: T): T {
+    return (this.values.has(key) ? this.values.get(key) : defaultValue) as T;
+  }
+  update(key: string, value: unknown): Promise<void> {
+    this.values.set(key, value);
+    return Promise.resolve();
+  }
+}
 
 // completionLint.ts is required (not `import`ed) so its exported function
 // reference can be monkey-patched for the duration of a test: TypeScript
@@ -208,37 +221,44 @@ void describe("commitAndPushTask duplicate-invocation guard", () => {
       passed: true, summary: "", runAt: new Date().toISOString(), issueCount: 0, failedChecks: [],
     });
 
+    const memento = new FakeMemento();
+    __extensionContextV1TestOnly.set({
+      workspaceState: memento as unknown as vscode.Memento,
+    } as unknown as vscode.ExtensionContext);
+    const store = new WorkflowDecisionStoreV1(memento as unknown as vscode.Memento);
+
     let confirmModalCallCount = 0;
-    const confirmGate = deferred<string>();
     vscode.window.showWarningMessage = ((..._args: unknown[]) => {
       confirmModalCallCount += 1;
-      return confirmGate.promise;
+      return Promise.resolve(undefined);
     }) as unknown as typeof vscode.window.showWarningMessage;
 
     try {
       const firstCall = commitAndPushTask(inventory, { canonicalId });
       // Let the first call proceed through lint, git-repo resolution, and
-      // changed-file collection up to the confirmation modal. Poll rather
+      // changed-file collection up to the confirmation decision. Poll rather
       // than a fixed sleep since the several real `git` child-process calls
       // on the way there have variable latency.
       const deadline = Date.now() + 10_000;
-      while (confirmModalCallCount === 0 && Date.now() < deadline) {
+      while (store.listPending(canonicalId).length === 0 && Date.now() < deadline) {
         await new Promise((r) => setTimeout(r, 20));
       }
-      assert.equal(confirmModalCallCount, 1, "expected the first invocation to reach the confirmation modal");
+      assert.equal(store.listPending(canonicalId).length, 1, "expected the first invocation to reach the confirmation decision");
 
       const secondCall = commitAndPushTask(inventory, { canonicalId });
       await secondCall;
 
-      assert.equal(confirmModalCallCount, 1, "the confirmation modal must not be shown a second time for the duplicate invocation");
+      assert.equal(store.listPending(canonicalId).length, 1, "the confirmation decision must not be shown a second time for the duplicate invocation");
+      assert.equal(confirmModalCallCount, 0, "no confirmation modal must be shown");
       assert.ok(
         surface.entries.some((e) => /already in progress/.test(e.message)),
         `expected a busy warning; got: ${JSON.stringify(surface.entries)}`
       );
 
-      confirmGate.resolve("Cancel");
+      await store.resolve(store.listPending(canonicalId)[0]!.decisionId, "cancel");
       await firstCall;
     } finally {
+      __extensionContextV1TestOnly.reset();
       completionLintModule.runCompletionLint = originalRunCompletionLint;
       vscode.window.showWarningMessage = originalShowWarningMessage;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;

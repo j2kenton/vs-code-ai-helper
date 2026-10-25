@@ -23,6 +23,8 @@ import { REVIEW_STAGES, type TaskProgress } from "../types/taskProgress";
 import { safeRemoveDir } from "./testFsUtils";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import type { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { clearFastForwardRunActiveV1, markFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -86,13 +88,14 @@ const PLAN_FINAL = [
   "",
 ].join("\n");
 
-function reviewText(options: { blockers?: string[]; verified?: string[] }): string {
+function reviewText(options: { blockers?: string[]; verified?: string[]; verdict?: string; progress?: string }): string {
   return [
     "# Implementation Review",
     "",
     "Readiness: 9/10",
     "",
-    "<!-- progress: 29/90 -->",
+    ...(options.verdict ? [`**Verdict:** ${options.verdict}`, ""] : []),
+    `<!-- progress: ${options.progress ?? "29/90"} -->`,
     "",
     "<!-- blockers:start -->",
     ...(options.blockers ?? []),
@@ -106,6 +109,10 @@ function reviewText(options: { blockers?: string[]; verified?: string[] }): stri
 }
 
 interface Routed {
+  /** Keys of every pending workflow decision posted to the chat. */
+  decisionKeys: readonly string[];
+  /** Pending workflow decisions with the given key, as posted to the chat. */
+  latchedCards: readonly WorkflowDecisionV1[];
   entries: RecordingSurface["entries"];
   planFinal: string;
   pendingTickCards: number;
@@ -129,7 +136,7 @@ function makeMemento(): vscode.Memento {
 
 async function route(
   name: string,
-  options: { latched: boolean; review: string }
+  options: { latched: boolean; review: string; plan?: string }
 ): Promise<Routed> {
   const bridge = installDiskBridge();
   const memento = makeMemento();
@@ -163,7 +170,7 @@ async function route(
   fs.mkdirSync(folderUri.fsPath, { recursive: true });
   fs.writeFileSync(path.join(folderUri.fsPath, "task-progress.json"), JSON.stringify(progress, null, 2));
   fs.writeFileSync(reviewUri.fsPath, options.review);
-  fs.writeFileSync(planFinalUri.fsPath, PLAN_FINAL);
+  fs.writeFileSync(planFinalUri.fsPath, options.plan ?? PLAN_FINAL);
 
   const originals = ["isAutoAdvanceEnabled", "getAutoAdvanceScoreThreshold"].map(
     (key) => [key, settingsModule[key]] as const
@@ -216,6 +223,10 @@ async function route(
     }
     return {
       error,
+      decisionKeys: new WorkflowDecisionStoreV1(memento).listPending().map((d) => d.decisionKey),
+      latchedCards: new WorkflowDecisionStoreV1(memento)
+        .listPending()
+        .filter((d) => d.decisionKey === "latchedCleanReviewOpenItems"),
       entries: surface.entries,
       planFinal: fs.readFileSync(planFinalUri.fsPath, "utf8"),
       stage: (
@@ -243,18 +254,99 @@ const CLEAN = reviewText({});
 const NOTICE = "Advancing: the review is clean; the plan checklist is behind and is not used to hold the stage.";
 
 void describe("RC8 item 4: a clean review advances while the checklist is flagged unreliable", () => {
-  void it("(a) latched, zero blockers: advances with the new notice and never says it is staying", async () => {
-    const { entries, stage, error } = await route("latched-clean", { latched: true, review: CLEAN });
+  void it("(a) latched, zero blockers, plan items still open: does not advance; one chat card offers Move on and Back to Implementation", async () => {
+    const { entries, stage, error, latchedCards } = await route("latched-clean", { latched: true, review: CLEAN });
     assert.equal(error, undefined, "routing completed without throwing");
-    assert.equal(stage, "impl-low-review", "the task actually advanced to Low-Level Code Review");
+    assert.equal(stage, "impl-high-review", "the stage is not advanced by itself while plan items are open");
     const messages = entries.map((e) => e.message);
-    assert.ok(messages.some((m) => m.includes(NOTICE)), "the notice says the checklist is not used to hold the stage");
-    assert.ok(messages.some((m) => m.includes("Auto-advancing stage")));
-    assert.ok(
-      messages.findIndex((m) => m.includes(NOTICE)) < messages.findIndex((m) => m.includes("Auto-advancing stage")),
-      "the notice comes before the Auto-advancing line"
-    );
-    assert.ok(!messages.some((m) => m.includes("Staying on this stage")));
+    assert.ok(!messages.some((m) => m.includes("Auto-advancing stage")));
+    assert.ok(!messages.some((m) => m.includes(NOTICE)), "the silent 'not used to hold the stage' notice is gone");
+    assert.equal(latchedCards.length, 1, "exactly one card");
+    const card = latchedCards[0]!;
+    assert.match(card.whatHappened, /3 plan items are still open/);
+    assert.match(card.whatHappened, /Item two/);
+    assert.deepEqual(card.options.map((o) => o.label).sort(), ["Back to Implementation", "Move on"]);
+    // An open item asks for a build, so Back to Implementation is recommended.
+    assert.equal(card.recommendation.kind === "option" ? card.recommendation.optionId : undefined, "backToImplementation");
+    const moveOn = card.options.find((o) => o.optionId === "moveOn")!;
+    assert.equal(moveOn.effect.kind, "command");
+    if (moveOn.effect.kind === "command") {
+      assert.equal(moveOn.effect.command, "vs-code-ai-helper.resumeAndSetTaskStage");
+      assert.equal((moveOn.effect.args?.[0] as { stage: string }).stage, "impl-low-review");
+    }
+    const back = card.options.find((o) => o.optionId === "backToImplementation")!;
+    if (back.effect.kind === "command") {
+      assert.equal((back.effect.args?.[0] as { stage: string }).stage, "impl");
+    }
+  });
+
+  void it("(a1) a Fast Forward run reaching the card stops there; Move on is built to continue the run", async () => {
+    const folderPath = path.join(ROOT, ".ensemble", "latched-ff");
+    markFastForwardRunActiveV1(folderPath);
+    try {
+      const { latchedCards, stage } = await route("latched-ff", { latched: true, review: CLEAN });
+      assert.equal(stage, "impl-high-review", "the run waits for the owner");
+      assert.equal(latchedCards.length, 1);
+      const moveOn = latchedCards[0]!.options.find((o) => o.optionId === "moveOn")!;
+      assert.ok(moveOn.effect.kind === "command");
+      if (moveOn.effect.kind === "command") {
+        assert.equal((moveOn.effect.args?.[0] as { resumeFastForward: boolean }).resumeFastForward, true);
+      }
+    } finally {
+      clearFastForwardRunActiveV1(folderPath);
+    }
+  });
+
+  void it("(a2) latched, clean, every open item is a verification item: Move on is recommended", async () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] 1. Item one",
+      "- [ ] 2. Verify the fix by running the unit tests on the dev box",
+      "",
+    ].join("\n");
+    const { latchedCards, stage } = await route("latched-verification", { latched: true, review: CLEAN, plan });
+    assert.equal(stage, "impl-high-review");
+    assert.equal(latchedCards.length, 1);
+    const recommendation = latchedCards[0]!.recommendation;
+    assert.equal(recommendation.kind === "option" ? recommendation.optionId : undefined, "moveOn");
+  });
+
+  void it("(a3) latched, clean, no open items after the ticks: advances as today, with no card", async () => {
+    const plan = ["<!-- ensemble:implementation-checklist -->", "", "- [x] 1. Item one", "- [x] 2. Item two", ""].join("\n");
+    const { entries, stage, latchedCards } = await route("latched-nothing-open", { latched: true, review: CLEAN, plan });
+    assert.equal(stage, "impl-low-review", "the task advanced to Low-Level Code Review");
+    assert.equal(latchedCards.length, 0, "no card when nothing is open");
+    assert.ok(entries.some((e) => e.message.includes("Auto-advancing stage")));
+  });
+
+  void it("(a4) latched, review ticks every open item as verified complete: advances, no card", async () => {
+    const review = reviewText({ verified: ["2. Item two", "3. Item three", "4. Item four"] });
+    const { stage, latchedCards } = await route("latched-ticked-all", { latched: true, review });
+    assert.equal(latchedCards.length, 0);
+    assert.equal(stage, "impl-low-review");
+  });
+
+  void it("(f) item 10: a clean-scoring review whose verdict says steps remain to be built, with no completion blocker, is held with a chat card", async () => {
+    const plan = ["<!-- ensemble:implementation-checklist -->", "", "- [x] 1. Item one", "- [x] 2. Item two", ""].join("\n");
+    const review = reviewText({
+      verdict: "On track — 41 of 94 checklist items are settled. Next, finish Step 6's caller handling and tests.",
+      progress: "2/2",
+    });
+    const { stage, entries, decisionKeys } = await route("unbuilt-contradiction", { latched: false, review, plan });
+    assert.equal(stage, "impl-high-review", "the stage is held");
+    assert.ok(!entries.some((e) => e.message.includes("Auto-advancing stage")));
+    assert.ok(decisionKeys.includes("reviewNamesUnbuiltSteps"), "the card says why the stage was held");
+  });
+
+  void it("(f2) item 10: built-but-unticked wording is not a contradiction; the stage advances", async () => {
+    const plan = ["<!-- ensemble:implementation-checklist -->", "", "- [x] 1. Item one", "- [x] 2. Item two", ""].join("\n");
+    const review = reviewText({
+      verdict: "Ready — Steps 3 and 4 are built but not ticked and are listed under Verified Complete.",
+      progress: "2/2",
+    });
+    const { stage, entries, decisionKeys } = await route("built-not-ticked", { latched: false, review, plan });
+    assert.equal(stage, "impl-low-review", JSON.stringify({ entries, decisionKeys }));
   });
 
   void it("(b) not latched, same input: an open checklist still holds the stage", async () => {

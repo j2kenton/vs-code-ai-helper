@@ -14,6 +14,8 @@ import {
 } from "../utils/artifactPicker";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
+import { resolveGlobalChatTargetV1 } from "../utils/globalChatTargetV1";
 
 interface ViewTaskArg {
   task?: IncompleteTask;
@@ -65,11 +67,27 @@ export async function viewTask(arg?: ViewTaskArg): Promise<void> {
     return;
   }
 
-  const selected = await vscode.window.showQuickPick(items, {
-    title: "View Task",
-    placeHolder: "Select a task to view",
+  const target = await resolveGlobalChatTargetV1();
+  if (!target) {
+    NotificationRouter.showError(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+  const chosen = await askChatChoiceV1({
+    decisionKey: "viewTaskArtifact",
+    target,
+    whatHappened: "Choose which task's task.md to open.",
+    whyUserNeeded: "More than one task exists in this workspace.",
+    options: items.map((item, index) => ({
+      optionId: `task-${index}`,
+      label: item.label,
+      description: item.description,
+    })),
+    detail: "Answering opens the chosen task.md.",
   });
-
+  const selectedIndex = chosen === undefined ? -1 : items.findIndex((_item, index) => `task-${index}` === chosen);
+  const selected = selectedIndex >= 0 ? items[selectedIndex] : undefined;
   if (!selected) {
     return;
   }
@@ -150,11 +168,27 @@ export async function viewPlan(arg?: ViewPlanArg): Promise<void> {
     return;
   }
 
-  const selected = await vscode.window.showQuickPick(items, {
-    title: "View Plan",
-    placeHolder: "Select a task to view its plan",
+  const target = await resolveGlobalChatTargetV1();
+  if (!target) {
+    NotificationRouter.showError(
+      "No workspace folder open. Please open a folder first."
+    );
+    return;
+  }
+  const chosen = await askChatChoiceV1({
+    decisionKey: "viewPlanArtifact",
+    target,
+    whatHappened: "Choose which task's plan.md to open.",
+    whyUserNeeded: "More than one task with a plan exists in this workspace.",
+    options: items.map((item, index) => ({
+      optionId: `task-${index}`,
+      label: item.label,
+      description: item.description,
+    })),
+    detail: "Answering opens the chosen task's plan.md.",
   });
-
+  const selectedIndex = chosen === undefined ? -1 : items.findIndex((_item, index) => `task-${index}` === chosen);
+  const selected = selectedIndex >= 0 ? items[selectedIndex] : undefined;
   if (!selected) {
     return;
   }

@@ -28,6 +28,8 @@ import {
 import { planStageAction } from "../utils/chatStageActionEnvelope";
 import { getGlobalAssistantOperation } from "../utils/globalAssistantActions";
 import { ChatViewProvider } from "../views/chatView";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import { makeOwnedTaskFolder, readTaskProgressForTest } from "./taskFolderFixture";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
@@ -500,6 +502,23 @@ void test("dispatchProposedStageActionV1 executes a confirmed action and appends
     const inventory = makeSingleTaskInventory(task);
     const currentTaskStore = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
 
+    const memento = makeMemento();
+    const contextStub = { workspaceState: memento } as unknown as vscode.ExtensionContext;
+    __extensionContextV1TestOnly.set(contextStub);
+    const decisionStore = new WorkflowDecisionStoreV1(memento);
+    decisionStore.onDidChange(() => {
+      setImmediate(() => {
+        void (async (): Promise<void> => {
+          const pending = decisionStore.listPending();
+          for (const d of pending) {
+            if (d.decisionKey === "confirmGlobalAssistantAction") {
+              await decisionStore.resolve(d.decisionId, "runAction");
+            }
+          }
+        })();
+      });
+    });
+
     win.showWarningMessage = (): Promise<string | undefined> => Promise.resolve("Run Action");
     // completeTask's operation delegates to vs-code-ai-helper.markTaskDone;
     // this stub mutates the same task object the inventory returns so the
@@ -511,9 +530,9 @@ void test("dispatchProposedStageActionV1 executes a confirmed action and appends
       return Promise.resolve(undefined);
     };
 
-    const provider = new ChatViewProvider(makeMemento());
+    const provider = new ChatViewProvider(memento);
     await dispatchProposedStageActionV1(
-      makeContextStub(),
+      contextStub,
       inventory,
       currentTaskStore,
       provider,
@@ -527,6 +546,7 @@ void test("dispatchProposedStageActionV1 executes a confirmed action and appends
     assert.equal(history.length, 1);
     assert.match(history[0]!.text, /Completed "The Task"/);
   } finally {
+    __extensionContextV1TestOnly.reset();
     win.showWarningMessage = originalWarning;
     commandsObj._executeCommandOverride = originalExecOverride;
     bridge.restore();
@@ -1142,8 +1162,25 @@ void test("dispatchProposedBlockerSupersessionEditV1 applies the write only on c
   const win = vscode.window as unknown as Record<string, unknown>;
   const originalWarning = win.showWarningMessage;
   try {
+    const memento = makeMemento();
+    const contextStub = { workspaceState: memento } as unknown as vscode.ExtensionContext;
+    __extensionContextV1TestOnly.set(contextStub);
+    const decisionStore = new WorkflowDecisionStoreV1(memento);
+    decisionStore.onDidChange(() => {
+      setImmediate(() => {
+        void (async (): Promise<void> => {
+          const pending = decisionStore.listPending();
+          for (const d of pending) {
+            if (d.decisionKey === "confirmBlockerSupersessionEdit") {
+              await decisionStore.resolve(d.decisionId, "apply");
+            }
+          }
+        })();
+      });
+    });
+
     win.showWarningMessage = (): Promise<string | undefined> => Promise.resolve("Apply Update");
-    const provider = new ChatViewProvider(makeMemento());
+    const provider = new ChatViewProvider(memento);
 
     await dispatchProposedBlockerSupersessionEditV1(provider, folder, folder, "plan-high-review", {
       relPath: "plan.md",
@@ -1170,6 +1207,7 @@ void test("dispatchProposedBlockerSupersessionEditV1 applies the write only on c
     );
     assert.equal(progress?.blockerSupersessions?.[0]?.planRelPath, "plan.md");
   } finally {
+    __extensionContextV1TestOnly.reset();
     win.showWarningMessage = originalWarning;
     bridge.restore();
     safeRemoveDir(folder);

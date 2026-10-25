@@ -76,6 +76,7 @@ import {
   TaskProgress,
 } from "../types/taskProgress";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 import {
   appendBlockerSupersession,
   appendChecklistChangeProposal,
@@ -163,6 +164,11 @@ import {
   runSummaryOnlyContinuationV1,
 } from "./implContinuationTextDispatchV1";
 import { IncompleteTask } from "../types/incompleteTask";
+import {
+  buildImplementationTypeCheckFailedDecisionInputV1,
+  buildImplementationTypeCheckPromptNoticeV1,
+  formatImplementationTypeCheckErrorsV1,
+} from "../utils/implementationTypeCheckHandOffV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { loadRetryFailedReviewOptionFieldsV1 } from "../utils/resumeActionPlanV1";
 import { stepNameV1, stepProgressLabelV1 } from "../utils/stepLabelsV1";
@@ -266,6 +272,7 @@ import * as fs from "fs";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { describeChainExhaustionTailV1 } from "../utils/chainExhaustionMessageV1";
 import {
   describeAutomationDefaultV1,
@@ -382,6 +389,7 @@ import {
   collectCompletionLintPreview,
   CompletionCheckDescriptor,
   CompletionLintResult,
+  parseRecordedCompletionChecksEvidenceV1,
   resolvePublishScopeFolder,
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
@@ -396,9 +404,14 @@ import {
 } from "../utils/reviewEvidenceNormalizerV1";
 import {
   checkPublishChecksFreshnessV1,
+  checkPublishChecksReuseEligibilityV1,
+  computeTreeFingerprintV1,
   describePublishChecksFreshnessFailureV1,
   ensurePublishReviewArtifactExistsV1,
   ensurePublishReviewLegacySectionsImportedV1,
+  isReusedPublishChecksRunStillCurrentV1,
+  PublishChecksFreshnessCheckV1,
+  readPublishChecksFile,
 } from "../utils/publishChecksFreshness";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { classifyFastForwardStageV1 } from "../utils/fastForwardStageDriftV1";
@@ -441,7 +454,13 @@ import {
 } from "../utils/reviewRouting";
 import { detectPlanArtifactDisagreementV1 } from "../utils/planArtifactMismatchV1";
 import { buildStandingBlockersNoticeV1 } from "../prompts/standingBlockersNoticeV1";
-import { escalateReviewToHuman, postEnvironmentalAdvanceNoticeV1 } from "../utils/reviewEscalation";
+import {
+  escalateReviewToHuman,
+  postEnvironmentalAdvanceNoticeV1,
+  postLatchedOpenItemsDecisionV1,
+  postUnbuiltStepsHoldDecisionV1,
+} from "../utils/reviewEscalation";
+import { findUnbuiltStepsWithoutCompletionBlockerV1 } from "../utils/reviewUnbuiltStepsV1";
 import {
   getAutoAdvanceMode,
   getAutoAdvanceScoreThreshold,
@@ -565,18 +584,122 @@ function handOverManualStepV1(stage: TaskStage, kind: HandOverKindV1): string {
  * The one warning for an automatic hand-over into the next stage that did not
  * start. Names the task, the stage, the real cause and the manual step.
  */
-export function warnHandOverNotStartedV1(
+export async function warnHandOverNotStartedV1(
   folderUri: vscode.Uri,
   displayName: string | undefined,
   stage: TaskStage,
   cause: HandOverNotStartedCauseV1,
   kind: HandOverKindV1 = "review"
-): void {
-  NotificationRouter.showWarning(
+): Promise<void> {
+  const actionLabel = kind === "implementation" ? "Run Implementation" : "Run Review";
+  const command = kind === "implementation"
+    ? "vs-code-ai-helper.runImplementationWithAI"
+    : "vs-code-ai-helper.runReviewWithAI";
+  const noticeText =
     `${formatNotificationTaskLabelV1(displayName, folderUri.fsPath)}: auto-advance reached ${STAGE_DISPLAY_NAMES[stage]}, ` +
-      `but its ${kind === "implementation" ? "Implementation round" : "review"} did not start because ` +
-      `${HAND_OVER_CAUSE_TEXT_V1[cause]}. ${handOverManualStepV1(stage, kind)}`
+    `but its ${kind === "implementation" ? "Implementation round" : "review"} did not start because ` +
+    `${HAND_OVER_CAUSE_TEXT_V1[cause]}. ${handOverManualStepV1(stage, kind)}`;
+  let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>>;
+  try {
+    chatPointer = await offerActionInChatV1({
+      taskFolderPath: folderUri.fsPath,
+      actionLabel,
+      command,
+      args: [{ taskFolderPath: folderUri.fsPath }],
+      noticeText,
+      optional: true,
+      taskLabel: displayName,
+    });
+  } catch (error) {
+    console.warn("Could not post the automatic hand-over action in chat:", error);
+    chatPointer = undefined;
+  }
+  NotificationRouter.showWarning(
+    noticeText /* displayName */,
+    undefined,
+    undefined,
+    undefined,
+    chatPointer
   );
+}
+
+/** Posts the manual stage transition used when review automation hands back. */
+export async function offerCompleteStageAndMoveOnInChatV1(
+  folderUri: vscode.Uri,
+  noticeText: string,
+  displayName?: string
+): Promise<Awaited<ReturnType<typeof offerActionInChatV1>>> {
+  return offerActionInChatV1({
+    taskFolderPath: folderUri.fsPath,
+    actionLabel: "Complete Stage & Move On",
+    command: "vs-code-ai-helper.nextStage",
+    args: [{ taskFolderPath: folderUri.fsPath }],
+    noticeText,
+    optional: true,
+    taskLabel: displayName,
+  });
+}
+
+/** The automatic route has reached Publish, but Publish review cannot start until checks are fresh. */
+export async function offerPublishChecksBeforeAutomaticReviewV1(folderUri: vscode.Uri): Promise<void> {
+  const noticeText = `${formatNotificationTaskLabelV1(undefined, folderUri.fsPath)}: Run Publish Checks, then Review.`;
+  let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>>;
+  try {
+    chatPointer = await offerActionInChatV1({
+      taskFolderPath: folderUri.fsPath,
+      actionLabel: "Run Publish Checks",
+      command: "vs-code-ai-helper.runPublishChecks",
+      args: [{ taskFolderPath: folderUri.fsPath }],
+      noticeText,
+      optional: true,
+    });
+  } catch (error) {
+    console.warn("Could not post the Publish Checks action in chat:", error);
+    chatPointer = undefined;
+  }
+  NotificationRouter.showInformation(
+    `${noticeText}${chatPointer ? " Open the decision in Chat to continue." : ""} /* folderName */`,
+    undefined,
+    undefined,
+    undefined,
+    chatPointer
+  );
+}
+
+/** Route an automatic Publish hand-off through the same freshness decision used by its caller. */
+export async function routeAutomaticPublishReviewAfterFreshnessV1(
+  folderUri: vscode.Uri,
+  freshnessStatus: PublishChecksFreshnessCheckV1["status"]
+): Promise<boolean> {
+  if (freshnessStatus === "valid") {
+    return false;
+  }
+  await offerPublishChecksBeforeAutomaticReviewV1(folderUri);
+  return true;
+}
+
+/**
+ * Route the exact post-advance review branch used by `routeReviewOutcomeV1`.
+ * Keeping the condition and freshness lookup together makes the stale Publish
+ * hand-back test exercise the same decision the automatic advance path runs.
+ */
+export async function routeAutomaticReviewAfterAdvanceV1(input: {
+  folderUri: vscode.Uri;
+  nextStage: TaskStage;
+  transitionShouldAutoReview: boolean;
+  autoAdvanceMode: ReturnType<typeof getAutoAdvanceMode>;
+  readPublishFreshnessStatus: () => Promise<PublishChecksFreshnessCheckV1["status"]>;
+}): Promise<boolean> {
+  const publishFollowUpReview = input.nextStage === "publish";
+  if (!input.transitionShouldAutoReview && !publishFollowUpReview) {
+    return false;
+  }
+
+  let freshnessStatus: PublishChecksFreshnessCheckV1["status"] = "valid";
+  if (publishFollowUpReview && input.autoAdvanceMode !== "auto-fast-forward") {
+    freshnessStatus = await input.readPublishFreshnessStatus();
+  }
+  return routeAutomaticPublishReviewAfterFreshnessV1(input.folderUri, freshnessStatus);
 }
 
 export interface FastForwardHandOverRecordV1 {
@@ -1058,6 +1181,8 @@ type ReviewCommandArg =
        * wrongly refuse a re-review whose verdict can differ.
        */
       skipUnchangedTreeGuardV1?: true;
+      /** Errors captured by the type-check recovery decision. */
+      implementationTypeCheckErrorsV1?: string;
     }
   | undefined;
 
@@ -1709,25 +1834,31 @@ async function resolveTask(
   } else {
     // Genuinely ambiguous: list the current task first (if it exists but
     // wasn't eligible, it won't be in `eligible` at all and this is a no-op)
-    // so it is pre-focused — showQuickPick focuses the first item by default
-    // (same trick as reopenTask.ts's pickReopenStage).
+    // so it is recommended first in the global chat choice.
     const ordered = currentTaskId
       ? [...eligible].sort((a, b) => Number(taskId(a) !== currentTaskId) - Number(taskId(b) !== currentTaskId))
       : eligible;
-    const items = ordered.map((task) => ({
-      label: "corrupt" in task ? task.folderName : task.progress.displayName ?? task.folderName,
-      description:
-        "corrupt" in task
-          ? `[Recovery Required] ${task.reason}`
-          : `Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
-      detail: task.folderName,
-      task,
-    }));
-    const selected = await vscode.window.showQuickPick(items, {
-      placeHolder: "Select a task",
-      title,
+    const globalTarget = await resolveGlobalChatTargetOrDefaultV1(allWorkspaceFolders[0]?.uri.fsPath);
+    const chosenId = await askChatChoiceV1({
+      target: globalTarget,
+      decisionKey: "resolveReviewActionTask",
+      whatHappened: `${title}: select which task to run this action on.`,
+      whyUserNeeded: "Multiple tasks are eligible for this action and none is currently active.",
+      options: ordered.map((task, index) => ({
+        optionId: `task_${index}`,
+        label: "corrupt" in task ? task.folderName : task.progress.displayName ?? task.folderName,
+        description:
+          "corrupt" in task
+            ? `${task.folderName} · [Recovery Required] ${task.reason}`
+            : `${task.folderName} · Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
+      })),
+      recommendedOptionId: "task_0",
     });
-    picked = selected?.task;
+    const chosenIndex =
+      chosenId !== undefined && chosenId.startsWith("task_")
+        ? Number.parseInt(chosenId.slice("task_".length), 10)
+        : Number.NaN;
+    picked = Number.isInteger(chosenIndex) ? ordered[chosenIndex] : undefined;
   }
   if (!picked) {
     NotificationRouter.showInformation("Task selection cancelled.");
@@ -2786,7 +2917,7 @@ export function reconcileReviewedCommitAfterChecksV1(
   };
 }
 
-async function buildVerifiedChecksVariable(
+export async function buildVerifiedChecksVariable(
   folderUri: vscode.Uri,
   relevantFiles: readonly string[] | undefined,
   token: vscode.CancellationToken | undefined,
@@ -2810,7 +2941,66 @@ async function buildVerifiedChecksVariable(
   // accumulator restores it between check batches instead of the stale
   // last-active-check origin.
   activityOptions?: { operation?: TaskOperationHandle; stageToken?: number; stageElapsedOrigin?: number }
-): Promise<{ verifiedChecks: string; planItemVerification?: string; mechanicalBlockers: ReviewBlocker[] }> {
+): Promise<{
+  verifiedChecks: string;
+  planItemVerification?: string;
+  mechanicalBlockers: ReviewBlocker[];
+  reusedPublishChecks?: { runId: string; treeFingerprint: string };
+}> {
+  if (targetStage === "publish") {
+    try {
+      const progressRead = await readTaskProgressStrictV1(folderUri);
+      const progress = progressRead.ok ? progressRead.decoded.progress : undefined;
+      const { folder: scopeFolder } = resolvePublishScopeFolder(folderUri, progress);
+      const headCommitSha = await resolveHeadCommitSha(scopeFolder);
+      const reuseEligibility = await checkPublishChecksReuseEligibilityV1(
+        folderUri,
+        scopeFolder,
+        headCommitSha,
+        (content) => {
+          const recorded = parseRecordedCompletionChecksEvidenceV1(content);
+          return Boolean(
+            recorded &&
+            recorded.passed === true &&
+            (recorded.passedModuloKnownFlakes ?? recorded.passed) &&
+            recorded.commandsRun &&
+            recorded.commandsRun.length > 0 &&
+            (!recorded.failedChecks || recorded.failedChecks.length === 0)
+          );
+        }
+      );
+      if (reuseEligibility.eligible && reuseEligibility.stamp) {
+        const reportContent = await readPublishChecksFile(folderUri);
+        const recordedResult = parseRecordedCompletionChecksEvidenceV1(reportContent);
+        if (
+          recordedResult &&
+          recordedResult.passed === true &&
+          (recordedResult.passedModuloKnownFlakes ?? recordedResult.passed) &&
+          recordedResult.commandsRun &&
+          recordedResult.commandsRun.length > 0 &&
+          (!recordedResult.failedChecks || recordedResult.failedChecks.length === 0)
+        ) {
+          const reuseNote =
+            `_Reused recorded passing Publish Checks run \`${reuseEligibility.stamp.runId}\` ` +
+            `(verified against matching tree fingerprint \`${reuseEligibility.currentFingerprint!.slice(0, 12)}\` ` +
+            `at commit \`${reuseEligibility.stamp.verifiedCommitSha.slice(0, 12)}\`)._`;
+          const baseSection = buildVerifiedChecksSection(recordedResult, reviewedCommitSha);
+          return {
+            verifiedChecks: `${baseSection}\n\n${reuseNote}`,
+            planItemVerification: undefined,
+            mechanicalBlockers: [],
+            reusedPublishChecks: {
+              runId: reuseEligibility.stamp.runId,
+              treeFingerprint: reuseEligibility.currentFingerprint!,
+            },
+          };
+        }
+      }
+    } catch {
+      // Fall through to run suite as today
+    }
+  }
+
   const checkActivity = createCompletionCheckActivityAccumulatorV1(
     activityOptions?.operation,
     activityOptions?.stageToken,
@@ -4806,6 +4996,11 @@ async function routeReviewOutcomeV1(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       NotificationRouter.showWarning(`Review was generated but stage could not advance: ${message}`);
+      await offerCompleteStageAndMoveOnInChatV1(
+        folderUri,
+        `The review was generated, but the stage transition stopped: ${message}.`,
+        outcomeRoutingProgress?.displayName
+      );
       return;
     }
     if (transitionToTarget?.persisted) {
@@ -4898,9 +5093,18 @@ async function routeReviewOutcomeV1(
           meetsAutoAdvanceThreshold(score, autoAdvanceThreshold) &&
           reviewNamesNoBlockersV1(folderUri, targetStage, content);
         const planIncomplete = !latchedCleanReview && isPlanIncomplete(progress);
+        // Post-1.0 fixes, item 10: a review whose own verdict / next-work text
+        // says plan steps are still to be built, with no `[completion]`
+        // blocker, contradicts itself. It is not advanced on; the card below
+        // says why. Implementation-side reviews with a real file scope only.
+        const unbuiltStepsContradiction =
+          !isPlanReviewStage(targetStage) && targetStage !== "publish" && !noTrackedFileSet
+            ? findUnbuiltStepsWithoutCompletionBlockerV1(content)
+            : undefined;
         const meetsThreshold =
           readyToAdvanceStage(score, autoAdvanceThreshold, latchedCleanReview ? null : progress) &&
-          !noTrackedFileSet;
+          !noTrackedFileSet &&
+          unbuiltStepsContradiction === undefined;
         if (noTrackedFileSet) {
           NotificationRouter.showWarning(
             `${STAGE_DISPLAY_NAMES[targetStage]} scored ${score ?? "unscored"}/10, but this task has no tracked ` +
@@ -5076,18 +5280,30 @@ async function routeReviewOutcomeV1(
             );
           }
         }
-        // v1 fixes 2, item 33: with auto-advance off, a passed Low-Level Code
-        // Review leaves the task at the gate before Publish. Say so plainly
-        // and put the action on the notice, rather than leaving a good score
-        // that reads as a stall.
-        if (!escalated && targetStage === "impl-low-review" && meetsThreshold && !isAutoAdvanceEnabled()) {
-          NotificationRouter.showInformation(
-            "Code reviews passed — advance to Publish when you're ready.",
-            undefined,
-            undefined,
-            undefined,
-            { command: "vs-code-ai-helper.nextStage", title: "Complete Stage & Move On" }
-          );
+        // A clean review with automatic advancement off is a deliberate
+        // hand-back: leave the next stage action in chat so the task does not
+        // look complete or silently stuck at a good score. This also covers
+        // review stages other than the Implementation pair (for example, a
+        // Plan review) whenever the configured stage order has a next step.
+        if (!escalated && meetsThreshold && !isAutoAdvanceEnabled() && targetStage !== "publish") {
+          const configuredStages = await resolveConfiguredReviewStages(folderUri);
+          const next = computeNextStage(targetStage, configuredStages);
+          if (next) {
+            const noticeText =
+              `Review passed — advance to ${STAGE_DISPLAY_NAMES[next]} when you're ready.`;
+            const chatPointer = await offerCompleteStageAndMoveOnInChatV1(
+              folderUri,
+              noticeText,
+              outcomeRoutingProgress?.displayName
+            );
+            NotificationRouter.showInformation(
+              `${noticeText}${chatPointer ? " Open the decision in Chat to continue." : ""}`,
+              undefined,
+              undefined,
+              undefined,
+              chatPointer
+            );
+          }
         }
         // Say WHY a high-scoring round is not advancing. Without this the
         // task looks silently stuck at a good score — indistinguishable from
@@ -5142,15 +5358,58 @@ async function routeReviewOutcomeV1(
             )
           );
         }
-        if (!escalated && isAutoAdvanceEnabled() && meetsThreshold) {
-          if (latchedCleanReview && ((await readPlanOfRecordV1(folderUri)).counts?.remaining ?? 0) > 0) {
-            NotificationRouter.showInformation(
-              `${formatNotificationTaskLabelV1(outcomeRoutingProgress?.displayName, folderUri.fsPath)}: Advancing: the review is clean; the plan checklist is behind and is not used to hold the stage.`
+        if (
+          !escalated &&
+          unbuiltStepsContradiction !== undefined &&
+          meetsAutoAdvanceThreshold(score, autoAdvanceThreshold)
+        ) {
+          const heldNext = computeNextStage(targetStage, await resolveConfiguredReviewStages(folderUri));
+          const heldTarget = {
+            canonicalId: folderUri.fsPath,
+            taskFolderPath: folderUri.fsPath,
+            taskName: outcomeRoutingProgress?.displayName,
+          };
+          const heldPosted = await postUnbuiltStepsHoldDecisionV1(
+            targetStage,
+            heldNext,
+            unbuiltStepsContradiction.sentence,
+            heldTarget
+          );
+          if (!heldPosted) {
+            NotificationRouter.showWarning(
+              `${STAGE_DISPLAY_NAMES[targetStage]} scored ${score}/10 but its own text says plan steps are still to be built ` +
+                `("${unbuiltStepsContradiction.sentence}"), so the stage was not advanced.`
             );
           }
-          NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Auto-advancing stage...`);
+          return;
+        }
+        if (!escalated && isAutoAdvanceEnabled() && meetsThreshold) {
           const configuredStages = await resolveConfiguredReviewStages(folderUri);
           const next = computeNextStage(targetStage, configuredStages);
+          if (latchedCleanReview && next) {
+            // Post-1.0 fixes, item 9: the verified ticks were applied above,
+            // so what is still open now is real. Do not advance silently —
+            // ask in chat. With nothing open the advance below runs as today.
+            const planAfterTicks = (await readPlanOfRecordV1(folderUri)).text;
+            const stillOpen = planAfterTicks
+              ? listUncheckedChecklistItemTextsV1(planAfterTicks, 10, { maxItemChars: 240 })
+              : { items: [] as string[], total: 0 };
+            if (stillOpen.total > 0) {
+              const cardPosted = await postLatchedOpenItemsDecisionV1(targetStage, next, stillOpen, {
+                canonicalId: folderUri.fsPath,
+                taskFolderPath: folderUri.fsPath,
+                taskName: outcomeRoutingProgress?.displayName,
+              });
+              if (!cardPosted) {
+                NotificationRouter.showWarning(
+                  `${STAGE_DISPLAY_NAMES[targetStage]} is clean, but ${stillOpen.total} plan item(s) are still open and the ` +
+                    "checklist is flagged as behind. The stage was not advanced; advance or return to Implementation yourself."
+                );
+              }
+              return;
+            }
+          }
+          NotificationRouter.showInformation(`Review score ${score}/10 reached the auto-advance threshold. Auto-advancing stage...`);
           if (next) {
             // Advancing into "impl" must promote plan.md -> plan-final.md.
             // Review fix (2026-09-22, architectural blocker): this used to
@@ -5165,8 +5424,13 @@ async function routeReviewOutcomeV1(
             if (next === "impl") {
               const promotion = await prepareStageEntryV1(folderUri, next);
               if (!promotion.ready) {
-                NotificationRouter.showWarning(
-                  "Review score reached the auto-advance threshold, but there is no plan to promote. Advance to Implementation manually once a plan exists."
+                const noticeText =
+                  "Review score reached the auto-advance threshold, but there is no plan to promote. Write or generate a plan, then advance to Implementation.";
+                NotificationRouter.showWarning(noticeText);
+                await offerCompleteStageAndMoveOnInChatV1(
+                  folderUri,
+                  noticeText,
+                  outcomeRoutingProgress?.displayName
                 );
                 return;
               }
@@ -5266,16 +5530,31 @@ async function routeReviewOutcomeV1(
                       implementationHandOver.state = "dropped";
                       implementationHandOver.warned = true;
                     }
-                    warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason, "implementation");
+                    void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason, "implementation");
                   },
                   onDeclined: () => {
-                    warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined", "implementation");
+                    void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined", "implementation");
                   },
                 }
               );
               if (!automaticImplementationScheduled && next === "impl") {
+                const noticeText =
+                  "Implementation is ready, but automatic Implementation is disabled. Run it from Chat when you're ready.";
+                const chatPointer = await offerActionInChatV1({
+                  taskFolderPath: folderUri.fsPath,
+                  actionLabel: "Run Implementation",
+                  command: "vs-code-ai-helper.runImplementationWithAI",
+                  args: [{ taskFolderPath: folderUri.fsPath }],
+                  noticeText,
+                  optional: true,
+                  taskLabel: handOverDisplayName,
+                });
                 NotificationRouter.showInformation(
-                  "Implementation is ready to start manually. Enable Automatically implement after review to run it automatically."
+                  `${noticeText}${chatPointer ? " Open the decision in Chat to continue." : ""}`,
+                  undefined,
+                  undefined,
+                  undefined,
+                  chatPointer
                 );
               }
               // Auto-advancing into another review stage must itself kick off
@@ -5301,28 +5580,26 @@ async function routeReviewOutcomeV1(
               // review+fix loop (fastForwardReviewWithAI), same as every other
               // landed-on review stage gets via this same block.
               const publishFollowUpReview = next === "publish";
-              // RC5 item 2: auto-advancing into Publish only chains a review
-              // when Fast Forward may continue (it runs Publish Checks first);
-              // otherwise a single review would be refused for stale checks,
-              // so stop with the one next-step line instead.
-              let publishChecksFirst = false;
-              if (publishFollowUpReview && getAutoAdvanceMode() !== "auto-fast-forward") {
-                const publishProgress = await readTaskProgressAdvisoryV1(folderUri);
-                if (publishProgress) {
-                  const publishScopeFolder = resolvePublishScopeFolder(folderUri, publishProgress).folder;
-                  const publishFreshness = await checkPublishChecksFreshnessV1(
-                    folderUri,
-                    publishScopeFolder,
-                    await resolveHeadCommitSha(publishScopeFolder)
-                  );
-                  publishChecksFirst = publishFreshness.status !== "valid";
-                }
-              }
-              if (publishChecksFirst) {
-                NotificationRouter.showInformation(
-                  `${formatNotificationTaskLabelV1(undefined, folderUri.fsPath)}: Run Publish Checks, then Review.`
-                );
-              } else if (transition.shouldAutoReview || publishFollowUpReview) {
+              const publishChecksRouted = await routeAutomaticReviewAfterAdvanceV1({
+                folderUri,
+                nextStage: next,
+                transitionShouldAutoReview: transition.shouldAutoReview,
+                autoAdvanceMode: getAutoAdvanceMode(),
+                readPublishFreshnessStatus: async () => {
+                  const publishProgress = await readTaskProgressAdvisoryV1(folderUri);
+                  if (publishProgress) {
+                    const publishScopeFolder = resolvePublishScopeFolder(folderUri, publishProgress).folder;
+                    const publishFreshness = await checkPublishChecksFreshnessV1(
+                      folderUri,
+                      publishScopeFolder,
+                      await resolveHeadCommitSha(publishScopeFolder)
+                    );
+                    return publishFreshness.status;
+                  }
+                  return "missing";
+                },
+              });
+              if (!publishChecksRouted && (transition.shouldAutoReview || publishFollowUpReview)) {
                 // Deferred, never inline: the caller's tracked operation still
                 // holds this task's exclusive lock, so the follow-up review is
                 // scheduled through the single automation dispatcher and only
@@ -5414,14 +5691,10 @@ async function routeReviewOutcomeV1(
                         reviewHandOver.state = "dropped";
                         reviewHandOver.warned = true;
                       }
-                      if (next !== "publish") {
-                        warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason);
-                      }
+                      void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason);
                     },
                     onDeclined: () => {
-                      if (next !== "publish") {
-                        warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined");
-                      }
+                      void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined");
                     },
                     intent: {
                       trigger: "auto-review after advancing to the next stage",
@@ -5494,6 +5767,13 @@ async function routeReviewOutcomeV1(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         const isPublishReview = targetStage === "publish";
+        if (!isPublishReview) {
+          await offerCompleteStageAndMoveOnInChatV1(
+            folderUri,
+            `The review passed its score threshold, but automatic stage advance stopped: ${message}.`,
+            outcomeRoutingProgress?.displayName
+          );
+        }
         // Review blocker 2026-08-31 (item 13/35, round 3): open in chat
         // rather than dispatching commitAndPushTask directly.
         NotificationRouter.showWarning(
@@ -6302,6 +6582,9 @@ export async function runReviewForFolder(
   }
 
   const variables: Record<string, string> = {};
+  if (options.automationDispatch) {
+    variables.automationDispatch = "true";
+  }
   const isPlanReview = isPlanReviewStage(targetStage);
   // Captured (publish stage only) when the entry-point freshness gate below
   // accepts a stamp, and carried all the way to the CAS write so
@@ -6495,30 +6778,40 @@ export async function runReviewForFolder(
       // shows both there) and the "Restore Last Usable Summary" command, and
       // the remedy TEXT below still names it.
       const hasLiveImplRecovery = (await readTaskProgressAdvisoryV1(folderUri))?.implRecovery !== undefined;
-      NotificationRouter.showWarning(
+      const noticeText =
         "The last implementation round did not produce usable implementation notes, so there is " +
-          `nothing to review it against (see ${IMPLEMENTATION_SUMMARY_FILENAME} and the run log). ` +
-          describeUnusableSummaryRemedyV1(canRestorePreviousImplSummary, checklistFullySettled),
+        `nothing to review it against (see ${IMPLEMENTATION_SUMMARY_FILENAME} and the run log). ` +
+        describeUnusableSummaryRemedyV1(canRestorePreviousImplSummary, checklistFullySettled);
+      let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>> | undefined;
+      if (shouldOfferRunImplementationForUnusableSummaryV1(hasLiveImplRecovery)) {
+        chatPointer = await offerActionInChatV1({
+          taskFolderPath: folderUri.fsPath,
+          actionLabel: "Run Implementation",
+          command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+          args: [{ taskFolderPath: folderUri.fsPath }],
+          noticeText,
+          optional: true,
+        });
+      } else if (canRestorePreviousImplSummary) {
+        chatPointer = await offerActionInChatV1({
+          taskFolderPath: folderUri.fsPath,
+          actionLabel: "Restore Last Usable Summary",
+          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+          args: [
+            folderUri.fsPath,
+            targetStage,
+            options.rerunCommandId ?? "vs-code-ai-helper.runReviewWithAI",
+          ],
+          noticeText,
+          optional: true,
+        });
+      }
+      NotificationRouter.showWarning(
+        noticeText,
         undefined,
         undefined,
         undefined,
-        shouldOfferRunImplementationForUnusableSummaryV1(hasLiveImplRecovery)
-          ? {
-              command: "vs-code-ai-helper.resumeAndDispatchImplementation",
-              title: "Run Implementation",
-              args: [{ taskFolderPath: folderUri.fsPath }],
-            }
-          : canRestorePreviousImplSummary
-            ? {
-                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-                title: "Restore Last Usable Summary",
-                args: [
-                  folderUri.fsPath,
-                  targetStage,
-                  options.rerunCommandId ?? "vs-code-ai-helper.runReviewWithAI",
-                ],
-              }
-            : undefined
+        chatPointer
       );
       return;
     }
@@ -6592,6 +6885,37 @@ export async function runReviewForFolder(
         return;
       }
       publishFreshnessGuard = freshnessGateBeforeDispatch.guard;
+      if (checks.reusedPublishChecks) {
+        // B4 / Step 30: Revalidate and retain the consumed run's identity through dispatch and save.
+        // If a new Publish Checks run replaced the consumed run, refuse rather than citing the old run.
+        if (
+          !isReusedPublishChecksRunStillCurrentV1(
+            checks.reusedPublishChecks.runId,
+            freshnessGateBeforeDispatch.guard?.runId
+          )
+        ) {
+          NotificationRouter.showWarning(
+            "A new Publish Checks run finished while this review was being generated, so the reused Publish Checks results are no longer valid. Run Publish Checks again and retry the review."
+          );
+          return;
+        }
+        const progress = await readTaskProgressAdvisoryV1(folderUri);
+        const { folder: scopeFolder } = resolvePublishScopeFolder(folderUri, progress);
+        const currentFingerprint = await computeTreeFingerprintV1(scopeFolder);
+        if (!currentFingerprint || currentFingerprint !== checks.reusedPublishChecks.treeFingerprint) {
+          NotificationRouter.showWarning(
+            "Working tree changed after Publish Checks were reused; Publish review cancelled."
+          );
+          return;
+        }
+        if (publishFreshnessGuard) {
+          publishFreshnessGuard = {
+            ...publishFreshnessGuard,
+            runId: checks.reusedPublishChecks.runId,
+            treeFingerprint: checks.reusedPublishChecks.treeFingerprint,
+          };
+        }
+      }
       variables.siblingReviewDisagreement = await buildSiblingReviewDisagreementVariable(
         folderUri,
         variables.reviewedCommitSha
@@ -8321,7 +8645,7 @@ export async function runReviewWithAI(
 
   try {
     // ── Consent gate ───────────────────────────────────────────────────────
-    const consented = await ensureAiConsent(context);
+    const consented = await ensureAiConsent(context, earlyFolderPath);
     if (!consented) {
       return;
     }
@@ -8655,7 +8979,7 @@ export async function applyReviewWithAI(
   // dead weight; `runReviewWithAI`/`fastForwardReviewWithAI` never had it.
 
   // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
+  const consented = await ensureAiConsent(context, extractSynchronousReviewFolderPathV1(arg));
   if (!consented) {
     return false;
   }
@@ -9296,7 +9620,7 @@ export async function fastForwardReviewWithAI(
     return;
   }
 
-  const consented = await ensureAiConsent(context);
+  const consented = await ensureAiConsent(context, ffEarlyFolderPath);
   if (!consented) {
     return;
   }
@@ -9714,32 +10038,36 @@ export async function fastForwardReviewWithAI(
         return false;
       }
       const block = await describeUnusableReviewBlockV1(resolved.folderUri, targetStage);
-      // Run Implementation takes priority as the toast one action button when
-      // both it and Restore apply (2026-09-24 review, narrowed completion
-      // blocker — see describeUnusableReviewBlockV1's offerRunImplementation
-      // doc comment). Restore stays reachable via the tree row and the
-      // Restore Last Usable Summary command.
+      let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>> | undefined;
+      if (block.offerRunImplementation) {
+        chatPointer = await offerActionInChatV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          progress: resolved.progress,
+          actionLabel: "Run Implementation",
+          command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+          args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+          noticeText: block.warning,
+          optional: true,
+          taskLabel: resolved.progress.displayName,
+        });
+      } else if (block.canRestorePreviousImplSummary) {
+        chatPointer = await offerActionInChatV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          progress: resolved.progress,
+          actionLabel: "Restore Last Usable Summary",
+          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+          args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+          noticeText: block.warning,
+          optional: true,
+          taskLabel: resolved.progress.displayName,
+        });
+      }
       NotificationRouter.showWarning(
         block.warning,
         undefined,
         undefined,
         undefined,
-        block.offerRunImplementation
-          ? {
-              command: "vs-code-ai-helper.resumeAndDispatchImplementation",
-              title: "Run Implementation",
-              args: [{ taskFolderPath: resolved.folderUri.fsPath }],
-            }
-          : block.canRestorePreviousImplSummary
-            ? {
-                command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-                title: "Restore Last Usable Summary",
-                // Restoring from this surface should re-enter Fast Forward, the
-                // command whose own refusal this is — same rationale as the
-                // rerunCommandId default in runReviewForFolder.
-                args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
-              }
-            : undefined
+        chatPointer
       );
       // The review this run exists to build on never ran: "refused", not "completed".
       return false;
@@ -9778,24 +10106,36 @@ export async function fastForwardReviewWithAI(
   const initialScore = parseReadiness(initialContent).score;
   if (initialScore === null) {
     const block = await describeUnusableReviewBlockV1(resolved.folderUri, targetStage);
+    let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>> | undefined;
+    if (block.offerRunImplementation) {
+      chatPointer = await offerActionInChatV1({
+        taskFolderPath: resolved.folderUri.fsPath,
+        progress: resolved.progress,
+        actionLabel: "Run Implementation",
+        command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+        args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+        noticeText: block.warning,
+        optional: true,
+        taskLabel: resolved.progress.displayName,
+      });
+    } else if (block.canRestorePreviousImplSummary) {
+      chatPointer = await offerActionInChatV1({
+        taskFolderPath: resolved.folderUri.fsPath,
+        progress: resolved.progress,
+        actionLabel: "Restore Last Usable Summary",
+        command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+        args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
+        noticeText: block.warning,
+        optional: true,
+        taskLabel: resolved.progress.displayName,
+      });
+    }
     NotificationRouter.showWarning(
       block.warning,
       undefined,
       undefined,
       undefined,
-      block.offerRunImplementation
-        ? {
-            command: "vs-code-ai-helper.resumeAndDispatchImplementation",
-            title: "Run Implementation",
-            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
-          }
-        : block.canRestorePreviousImplSummary
-          ? {
-              command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-              title: "Restore Last Usable Summary",
-              args: [resolved.folderUri.fsPath, targetStage, "vs-code-ai-helper.fastForwardReviewWithAI"],
-            }
-          : undefined
+      chatPointer
     );
     return false;
   }
@@ -11070,17 +11410,28 @@ export async function viewReview(
   const content = await readNonEmptyText(reviewUri);
   if (!content) {
     const viewReviewTaskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath);
-    const choice = await vscode.window.showInformationMessage(
-      `${viewReviewTaskLabel}: no ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`,
-      "Review with AI",
-      "Create Manually"
-    );
-    if (choice === "Review with AI") {
+    const choice = await askChatChoiceV1({
+      decisionKey: "viewReviewMissingArtifact",
+      target: {
+        canonicalId: normalizePath(resolved.folderUri.fsPath),
+        taskFolderPath: resolved.folderUri.fsPath,
+        stage,
+        taskName: resolved.progress.displayName ?? path.basename(resolved.folderUri.fsPath),
+      },
+      whatHappened: `${viewReviewTaskLabel}: no ${STAGE_ARTIFACT_FILENAMES[stage]} yet for this task.`,
+      whyUserNeeded: "Choose whether to generate the review with AI or create the artifact by hand.",
+      options: [
+        { optionId: "reviewWithAI", label: "Review with AI", consequence: "Runs a review for this task's current stage." },
+        { optionId: "createManually", label: "Create Manually", consequence: "Opens the review file so you can write it." },
+      ],
+      detail: "Answering continues this command; cancel leaves the review unchanged.",
+    });
+    if (choice === "reviewWithAI") {
       await vscode.commands.executeCommand(
         "vs-code-ai-helper.runReviewWithAI",
         arg
       );
-    } else if (choice === "Create Manually") {
+    } else if (choice === "createManually") {
       await openOrCreateDocument(reviewUri);
     }
     return;
@@ -11436,17 +11787,25 @@ export async function nextStage(
   );
   if (missingCompletionArtifacts.length > 0 && !artifactOverride) {
     const artifactName = missingCompletionArtifacts.join(", ");
-    NotificationRouter.showWarning(
+    const noticeText =
       `${artifactName} hasn't been created yet. Write or generate it before advancing, ` +
-        "or explicitly complete this stage anyway.",
+      "or explicitly complete this stage anyway.";
+    const chatPointer = await offerActionInChatV1({
+      taskFolderPath: resolved.folderUri.fsPath,
+      progress: resolved.progress,
+      actionLabel: "Complete Anyway",
+      command: "vs-code-ai-helper.completeStageAnywayV1",
+      args: [{ taskFolderPath: resolved.folderUri.fsPath, artifactOverride: "user" }],
+      noticeText,
+      optional: true,
+      taskLabel: resolved.progress.displayName,
+    });
+    NotificationRouter.showWarning(
+      noticeText,
       undefined,
       undefined,
       undefined,
-      {
-        command: "vs-code-ai-helper.completeStageAnywayV1",
-        title: "Complete Anyway",
-        args: [{ taskFolderPath: resolved.folderUri.fsPath, artifactOverride: "user" }],
-      }
+      chatPointer
     );
     return;
   }
@@ -11470,19 +11829,27 @@ export async function nextStage(
     );
     if (outstandingBlockers.length > 0) {
       const blockerList = outstandingBlockers.map((b) => `- ${b.description}`).join("\n");
-      NotificationRouter.showWarning(
+      const noticeText =
         `${resolved.progress.taskFolder}: ${STAGE_DISPLAY_NAMES[resolved.progress.currentStage]}'s review still ` +
-          `lists ${outstandingBlockers.length} blocker(s) not recorded as resolved:\n${blockerList}\n\n` +
-          "If you resolved this in stage chat, confirm the plan.md edit there so it's recorded. Otherwise, " +
-          "advance anyway if you've verified it some other way — a full re-review is a stronger option but not required.",
+        `lists ${outstandingBlockers.length} blocker(s) not recorded as resolved:\n${blockerList}\n\n` +
+        "If you resolved this in stage chat, confirm the plan.md edit there so it's recorded. Otherwise, " +
+        "advance anyway if you've verified it some other way — a full re-review is a stronger option but not required.";
+      const chatPointer = await offerActionInChatV1({
+        taskFolderPath: resolved.folderUri.fsPath,
+        progress: resolved.progress,
+        actionLabel: "Complete Anyway",
+        command: "vs-code-ai-helper.completeStageAnywayV1",
+        args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+        noticeText,
+        optional: true,
+        taskLabel: resolved.progress.displayName,
+      });
+      NotificationRouter.showWarning(
+        noticeText,
         undefined,
         undefined,
         undefined,
-        {
-          command: "vs-code-ai-helper.completeStageAnywayV1",
-          title: "Complete Anyway",
-          args: [{ taskFolderPath: resolved.folderUri.fsPath }],
-        }
+        chatPointer
       );
       return;
     }
@@ -11702,17 +12069,22 @@ export async function nextStage(
         // false promise the preflight gate exists to prevent. Warn like
         // every sibling skip path instead of leaving the task silently
         // stuck on Publish with nothing running.
-        NotificationRouter.showWarning(
+        const publishAnywayNotice =
           `${resolved.progress.taskFolder}: a Publish review could not be started automatically because another review is already in progress for this task. ` +
-            "Run the review manually once it finishes, or use Publish Anyway from Commit and Push.",
+          "Run the review manually once it finishes, or use Publish Anyway from Commit and Push.";
+        NotificationRouter.showWarning(
+          publishAnywayNotice,
           undefined,
           undefined,
           undefined,
-          {
+          await offerActionInChatV1({
+            taskFolderPath: resolved.folderUri.fsPath,
+            actionLabel: "Publish Anyway",
             command: "vs-code-ai-helper.commitAndPushTask",
-            title: "Publish Anyway",
             args: [{ taskFolderPath: resolved.folderUri.fsPath }],
-          }
+            noticeText: publishAnywayNotice,
+            optional: true,
+          })
         );
       }
       return;
@@ -11728,31 +12100,41 @@ export async function nextStage(
   // Gated on the checkPublishPreflight result captured in Step 3 above.
   if (next === "publish") {
     if (publishPreflight?.ok === false) {
+      const failedChecksNotice =
+        `${resolved.progress.taskFolder} checks failed: ${publishPreflight.reason}. Publish manually once checks pass, or use Publish Anyway from Commit and Push.`;
       NotificationRouter.showWarning(
-        `${resolved.progress.taskFolder} checks failed: ${publishPreflight.reason}. Publish manually once checks pass, or use Publish Anyway from Commit and Push.`,
+        failedChecksNotice,
         undefined,
         undefined,
         undefined,
-        {
+        await offerActionInChatV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          actionLabel: "Publish Anyway",
           command: "vs-code-ai-helper.commitAndPushTask",
-          title: "Publish Anyway",
           args: [{ taskFolderPath: resolved.folderUri.fsPath }],
-        }
+          noticeText: failedChecksNotice,
+          optional: true,
+        })
       );
     } else {
       // Commit and Push must only ever run from the user's own button
       // click — never scheduled here, even once checks pass. Nudge toward
       // the manual action instead.
+      const passedChecksNotice =
+        `${resolved.progress.taskFolder} passed its Publish checks. Publish manually when you're ready.`;
       NotificationRouter.showWarning(
-        `${resolved.progress.taskFolder} passed its Publish checks. Publish manually when you're ready.`,
+        passedChecksNotice,
         undefined,
         undefined,
         undefined,
-        {
+        await offerActionInChatV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          actionLabel: "Publish",
           command: "vs-code-ai-helper.commitAndPushTask",
-          title: "Publish",
           args: [{ taskFolderPath: resolved.folderUri.fsPath }],
-        }
+          noticeText: passedChecksNotice,
+          optional: true,
+        })
       );
     }
     return;
@@ -12071,7 +12453,7 @@ export async function generateImplementationWithAI(
   }
 
   // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
+  const consented = await ensureAiConsent(context, extractSynchronousReviewFolderPathV1(arg));
   if (!consented) {
     return;
   }
@@ -12504,25 +12886,45 @@ async function executeImplementationRun(
       // default is to not start an edit run whose changes cannot be tracked
       // or reverted; say so instead of hanging.
       console.log(describeAutomationDefaultV1("Implementation run in a workspace not tracked by git", "cancelled"));
-      NotificationRouter.showWarning(
+      const handbackNotice =
         "An automated implementation round was not started: this workspace is not tracked by git, so its edits " +
-          "could not be reviewed or undone, and starting it needs a confirmation no one was attached to give. " +
-          "Run Implementation yourself to confirm, or put the workspace under git."
+        "could not be reviewed or undone, and starting it needs a confirmation no one was attached to give. " +
+        "Run Implementation from Chat to confirm, or put the workspace under git.";
+      NotificationRouter.showWarning(
+        handbackNotice,
+        undefined,
+        undefined,
+        undefined,
+        await offerActionInChatV1({
+          taskFolderPath: folderUri.fsPath,
+          actionLabel: "Run Implementation",
+          command: "vs-code-ai-helper.runImplementationWithAI",
+          args: [{ taskFolderPath: folderUri.fsPath }],
+          noticeText: handbackNotice,
+          optional: true,
+          taskLabel: executeImplRunProgress?.displayName,
+        })
       );
       return false;
     }
     if (!isGit) {
       // Non-git workspace: changes cannot be tracked or reverted
-      const proceed = await vscode.window.showWarningMessage(
-        "⚠️ This workspace is not tracked by git.\n\n" +
+      const proceed = await askChatChoiceV1({
+        target: { canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage: "impl" },
+        decisionKey: "confirmNonGitImplementation",
+        whatHappened:
+          "⚠️ This workspace is not tracked by git.\n\n" +
           "The AI implementation run will edit files in your workspace, " +
           "but there is no git history to track or revert those changes. " +
           "You will not be able to see exactly what was changed or undo it via git.\n\n" +
           "Back up your workspace before proceeding.",
-        { modal: true },
-        "Proceed Anyway",
-      );
-      if (proceed !== "Proceed Anyway") {
+        whyUserNeeded: "Edits in a non-git workspace cannot be tracked or reverted via git.",
+        options: [
+          { optionId: "proceed", label: "Proceed Anyway" },
+          { optionId: "cancel", label: "Cancel" },
+        ],
+      });
+      if (proceed !== "proceed") {
         NotificationRouter.showInformation("Implementation run cancelled.");
         return false;
       }
@@ -12547,15 +12949,20 @@ async function executeImplementationRun(
         const more = unrelatedChanges.length > 5
           ? `\n• … and ${unrelatedChanges.length - 5} more`
           : "";
-        const proceed = await vscode.window.showWarningMessage(
-          "⚠️ Your workspace has unrelated uncommitted changes.\n\n" +
+        const proceed = await askChatChoiceV1({
+          target: { canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage: "impl" },
+          decisionKey: "confirmDirtyWorkspaceImplementation",
+          whatHappened:
+            "⚠️ Your workspace has unrelated uncommitted changes.\n\n" +
             "The AI implementation run may edit workspace files. Commit, stash, " +
             "or review these unrelated changes first:\n\n" + preview + more,
-          { modal: false },
-          "Proceed",
-          "Cancel",
-        );
-        if (proceed !== "Proceed") {
+          whyUserNeeded: "Confirming prevents unrelated uncommitted changes from being mixed into the implementation round.",
+          options: [
+            { optionId: "proceed", label: "Proceed" },
+            { optionId: "cancel", label: "Cancel" },
+          ],
+        });
+        if (proceed !== "proceed") {
           NotificationRouter.showInformation("Implementation run cancelled.");
           return false;
         }
@@ -13432,6 +13839,30 @@ async function executeImplementationRun(
       }
     };
 
+    const postImplementationTypeCheckDecisionV1 = async (errors: string): Promise<void> => {
+      // A continuation owns the next step only while it can still be
+      // dispatched. At the cap, recovery has handed the task back to the
+      // owner, so the build-fix decision must remain available as well.
+      if (recovery && !recovery.capReached) {
+        return;
+      }
+      try {
+        const canonicalId = normalizePath(folderUri.fsPath);
+        await postWorkflowDecisionV1(
+          buildImplementationTypeCheckFailedDecisionInputV1({
+            taskCanonicalId: canonicalId,
+            taskFolderPath: folderUri.fsPath,
+            stage: postRunReviewStage,
+            errors,
+            logFilePath: logUri.fsPath,
+          }),
+          { canonicalId, taskFolderPath: folderUri.fsPath, stage: postRunReviewStage }
+        );
+      } catch (error) {
+        console.warn("Could not post the type-check recovery decision:", error);
+      }
+    };
+
     if (incompleteRound && recovery) {
       // A detected deferred/cut-short round is recorded INCOMPLETE and
       // recovered through an explicit continuation — never banked as a
@@ -13630,6 +14061,15 @@ async function executeImplementationRun(
           { filesChanged: [] },
           {
             taskFolderUri: folderUri,
+            ...(result.typeCheckFailed
+              ? {
+                  extraPatch: (current) =>
+                    recordImplementationTypeCheckFailure(current, {
+                      at: new Date().toISOString(),
+                      output: completedResult.typeCheckOutput ?? "",
+                    }),
+                }
+              : {}),
             ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
             ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
             roundOutcomeClassification: {
@@ -13661,6 +14101,13 @@ async function executeImplementationRun(
         // `implementation-summary-unusable` stamp, in the reported case), the
         // exact three-round deadlock this item describes.
         await bankValidImplementationSummaryV1();
+        if (result.typeCheckFailed) {
+          await postImplementationTypeCheckDecisionV1(
+            formatImplementationTypeCheckErrorsV1(result.typeCheckOutput ?? "")
+          );
+          await safeOpenTextDocument(logUri, "implementation run log", folderUri);
+          return false;
+        }
         // wf10 item 3 / item 6b / Part 5 step 13: a fallback provider that has
         // now produced `fallbackProviderBreakerRounds` consecutive zero-file
         // rounds is a known-broken path — stop and name it instead of letting
@@ -14330,7 +14777,15 @@ async function executeImplementationRun(
             taskFolderUri: folderUri,
             ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
             ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
-            extraPatch: (current) => setZeroChangeImplRounds(current, undefined),
+            extraPatch: (current) => {
+              const withoutStreak = setZeroChangeImplRounds(current, undefined);
+              return result!.typeCheckFailed
+                ? recordImplementationTypeCheckFailure(withoutStreak, {
+                    at: new Date().toISOString(),
+                    output: result!.typeCheckOutput ?? "",
+                  })
+                : withoutStreak;
+            },
             roundOutcomeClassification: {
               classification: "edits-produced",
               attemptId: implRoundId,
@@ -14374,6 +14829,15 @@ async function executeImplementationRun(
         result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
         {
           taskFolderUri: folderUri,
+          ...(result.typeCheckFailed
+            ? {
+                extraPatch: (current) =>
+                  recordImplementationTypeCheckFailure(current, {
+                    at: new Date().toISOString(),
+                    output: completedResult.typeCheckOutput ?? "",
+                  }),
+              }
+            : {}),
           ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
           ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
           roundOutcomeClassification: {
@@ -14993,6 +15457,7 @@ async function executeImplementationRun(
     // build, or the next implementation round can retry — but auto-advance
     // and any review dispatch below must not run against a broken build.
     if (result.typeCheckFailed) {
+      const typeCheckErrors = formatImplementationTypeCheckErrorsV1(result.typeCheckOutput ?? "");
       NotificationRouter.showWarning(
         "⚠️ Implementation finished, but the project no longer type-checks. " +
           (roundMayHaveChangedFiles
@@ -15012,6 +15477,7 @@ async function executeImplementationRun(
       if (recovery) {
         await recovery.finishDispatch();
       }
+      await postImplementationTypeCheckDecisionV1(typeCheckErrors);
       await safeOpenTextDocument(logUri, "implementation run log", folderUri);
       return false;
     }
@@ -15047,6 +15513,7 @@ async function executeImplementationRun(
     // starts that review. Runs before the legacy auto-review-in-place setting
     // below; when it fires, the legacy path is skipped to avoid a duplicate.
     let autoAdvancedToHighReview = false;
+    let followUpReviewScheduled = false;
     // Deferred, never inline: both follow-up shapes (a single review pass, or
     // the "auto-fast-forward" review + fixes loop) are commands that acquire
     // the task's exclusive lock themselves, so while this run's parent
@@ -15113,6 +15580,7 @@ async function executeImplementationRun(
               `Implementation complete. Advanced to ${STAGE_DISPLAY_NAMES["impl-high-review"]}.`
             );
             if (transition.shouldAutoReview) {
+              followUpReviewScheduled = true;
               dispatchReviewChainAfterLockRelease(
                 strongestAutoTriggerMode(
                   getAutoAdvanceMode(),
@@ -15152,6 +15620,7 @@ async function executeImplementationRun(
         options.followUpReviewMode
       );
       if (reviewMode !== "off") {
+        followUpReviewScheduled = true;
         dispatchReviewChainAfterLockRelease(
           reviewMode === "auto-fast-forward"
             ? "vs-code-ai-helper.fastForwardReviewWithAI"
@@ -15169,6 +15638,25 @@ async function executeImplementationRun(
             retryNote: "Not retried automatically if dropped — run the review manually.",
           }
         );
+      }
+    }
+    if (!followUpReviewScheduled && !options.suppressAutoReviewDispatch) {
+      // A completed Implementation round otherwise leaves no chat next step
+      // when review automation is off (or a stage move did not start its
+      // review). A scheduled review owns the next action, so only offer this
+      // after confirming neither automatic path arranged one.
+      try {
+        await offerActionInChatV1({
+          taskFolderPath: folderUri.fsPath,
+          actionLabel: "Run Review",
+          command: "vs-code-ai-helper.runReviewWithAI",
+          args: [{ taskFolderPath: folderUri.fsPath }],
+          noticeText:
+            "Implementation finished and no review was started automatically. Run the stage review next, or leave the task here.",
+          optional: true,
+        });
+      } catch (error) {
+        console.warn("Could not post the Implementation follow-up review offer:", error);
       }
     }
     return true;
@@ -15445,7 +15933,7 @@ export async function runImplementationWithAI(
   }
 
   // ── Consent gate ─────────────────────────────────────────────────────────
-  const consented = await ensureAiConsent(context);
+  const consented = await ensureAiConsent(context, extractSynchronousReviewFolderPathV1(arg));
   if (!consented) {
     return false;
   }
@@ -16266,11 +16754,21 @@ export async function runImplementationWithAI(
         : templatePrompt;
     })();
 
-    const prompt = buildImplementationContinuationPromptV1(basePrompt, {
+    const continuationPrompt = buildImplementationContinuationPromptV1(basePrompt, {
       mode: recoveryRecord?.mode,
       pendingFiles,
       reviewedFiles,
     });
+    const suppliedTypeCheckErrors =
+      arg &&
+      typeof arg === "object" &&
+      "implementationTypeCheckErrorsV1" in arg &&
+      typeof arg.implementationTypeCheckErrorsV1 === "string"
+        ? arg.implementationTypeCheckErrorsV1.slice(0, 1800)
+        : undefined;
+    const prompt = suppliedTypeCheckErrors
+      ? continuationPrompt + buildImplementationTypeCheckPromptNoticeV1(suppliedTypeCheckErrors)
+      : continuationPrompt;
 
     // ── Prompt-size gate (applied before executeImplementationRun) ────────────
     const sizeCheck = await checkAndConfirmPromptSize(prompt, providerLabel, 0, {
@@ -16586,7 +17084,7 @@ export async function applyReviewEditWithAI(
   // against `resolved.progress`'s stale pre-reconciliation snapshot could
   // only ever misfire on the "notPaused" branch.
 
-  const consented = await ensureAiConsent(context);
+  const consented = await ensureAiConsent(context, extractSynchronousReviewFolderPathV1(arg));
   if (!consented) {
     return false;
   }
@@ -16988,15 +17486,34 @@ export function registerReviewActionCommands(
       async (taskFolderPath: string) => {
         const discardOwedProgress = await readTaskProgressAdvisoryV1(vscode.Uri.file(taskFolderPath));
         const discardOwedTaskLabel = formatNotificationTaskLabelV1(discardOwedProgress?.displayName, taskFolderPath);
-        const confirmation = await vscode.window.showWarningMessage(
-          `${discardOwedTaskLabel}: discard this owed implementation continuation?\n\n` +
+        const confirmation = await askChatChoiceV1({
+          decisionKey: "confirmDiscardOwedImplRecovery",
+          target: {
+            canonicalId: normalizePath(taskFolderPath),
+            taskFolderPath,
+            stage: discardOwedProgress?.currentStage ?? "desc",
+            taskName: discardOwedProgress?.displayName ?? path.basename(taskFolderPath),
+          },
+          whatHappened:
+            `${discardOwedTaskLabel}: discard this owed implementation continuation?\n\n` +
             "This stops waiting for a conforming re-report of the round that made these edits, and moves its " +
             "already-applied files into normal review scope so the next review judges them like any other " +
             "change. It never runs the round it was waiting for, and it cannot be undone.",
-          { modal: true },
-          "Discard Continuation"
-        );
-        if (confirmation !== "Discard Continuation") {
+          whyUserNeeded: "Discarding is irreversible and changes how the next review treats these files.",
+          options: [
+            {
+              optionId: "discard",
+              label: "Discard Continuation",
+              consequence: "Stops waiting for the owed round and moves its files into normal review scope.",
+              destructive: true,
+            },
+            { optionId: "cancel", label: "Cancel", consequence: "Keeps waiting for the owed continuation." },
+          ],
+          recommendedOptionId: "cancel",
+          recommendationReasoning: "Only discard when the owed round will never finalize.",
+          detail: "Answering continues this command; cancel leaves the task as-is.",
+        });
+        if (confirmation !== "discard") {
           return;
         }
         const discarded = await discardOwedImplRecoveryV1(vscode.Uri.file(taskFolderPath));
@@ -17067,11 +17584,21 @@ export function registerReviewActionCommands(
         }
         let folder = folders[0];
         if (folders.length > 1) {
-          const picked = await vscode.window.showWorkspaceFolderPick({
-            placeHolder: "Workspace folder whose release target to change",
+          const globalTarget = await resolveGlobalChatTargetOrDefaultV1(folders[0]?.uri.fsPath);
+          const pickedOptionId = await askChatChoiceV1({
+            target: globalTarget,
+            decisionKey: "chooseReleaseTargetWorkspaceFolder",
+            whatHappened: "Select the workspace folder whose release target should be changed.",
+            whyUserNeeded: "Multiple workspace folders are open; each folder stores its own release target.",
+            options: folders.map((f, index) => ({
+              optionId: `folder_${index}`,
+              label: f.name,
+              description: f.uri.fsPath,
+            })),
           });
-          if (!picked) { return; }
-          folder = folders.find((f) => f.uri.toString() === picked.uri.toString());
+          if (!pickedOptionId) { return; }
+          const pickedIndex = Number.parseInt(pickedOptionId.replace(/^folder_/, ""), 10);
+          folder = Number.isFinite(pickedIndex) ? folders[pickedIndex] : undefined;
         }
         if (!folder) { return; }
         const chosen = await resolveReleaseTargetPackageJson(context, folder.uri.fsPath, true);
@@ -17245,7 +17772,8 @@ async function resolveReleaseTargetPackageJson(
   context: vscode.ExtensionContext,
   workspaceRoot: string,
   forcePrompt = false,
-  publishScopeFolder?: string
+  publishScopeFolder?: string,
+  chatTarget?: ChatTarget
 ): Promise<string | undefined> {
   const key = releaseTargetStateKey(workspaceRoot);
   const stored = context.workspaceState.get<string>(key);
@@ -17266,7 +17794,7 @@ async function resolveReleaseTargetPackageJson(
     NotificationRouter.showError("No package.json was found in this workspace.");
     return undefined;
   }
-  const items = orderReleaseTargetItems(
+  const items = orderReleaseTargetItems<{ label: string; description?: string; uri: vscode.Uri }>(
     uris.map((uri) => ({
       label: path.relative(workspaceRoot, uri.fsPath) || "package.json",
       uri,
@@ -17274,10 +17802,23 @@ async function resolveReleaseTargetPackageJson(
     workspaceRoot,
     publishScopeFolder
   );
-  const picked = await vscode.window.showQuickPick(items, {
-    title: "Select the package.json to release",
-    placeHolder: `The chosen file must define a "${RELEASE_SCRIPT_NAME}" script; the choice is remembered for this workspace folder`,
+  const target = chatTarget ?? (await resolveGlobalChatTargetOrDefaultV1(workspaceRoot));
+  const pickedOptionId = await askChatChoiceV1({
+    target,
+    decisionKey: "chooseReleaseTargetPackage",
+    whatHappened: "Select the package.json to release.",
+    whyUserNeeded: `The chosen file must define a "${RELEASE_SCRIPT_NAME}" script; the choice is remembered for this workspace folder.`,
+    options: items.map((item, index) => ({
+      optionId: `pkg_${index}`,
+      label: item.label,
+      description: item.description,
+    })),
   });
+  if (!pickedOptionId) {
+    return undefined;
+  }
+  const pickedIndex = Number.parseInt(pickedOptionId.replace(/^pkg_/, ""), 10);
+  const picked = Number.isFinite(pickedIndex) ? items[pickedIndex] : undefined;
   if (!picked) {
     return undefined;
   }
@@ -17355,7 +17896,8 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
       context,
       root,
       false,
-      resolvePublishScopeFolder(vscode.Uri.file(candidate), progress).folder
+      resolvePublishScopeFolder(vscode.Uri.file(candidate), progress).folder,
+      { canonicalId: candidate, taskFolderPath: candidate, stage: "publish" }
     );
     if (!packageJsonPath) { releaseOp.settleAs("refused", "no release target package.json was chosen"); return; }
     const packageDir = path.dirname(packageJsonPath);
@@ -17424,8 +17966,31 @@ async function runRelease(context: vscode.ExtensionContext, arg?: TaskNodeArg): 
     // "ensemble:release" is a one-line indirection, the reviewed script is
     // the resolved target's body — what will actually run — not the
     // pass-through text.
-    const confirmation = await vscode.window.showWarningMessage(`Run release?\n\nCommand: ${commandText}\nWorking directory: ${packageDir}\nPackage manager: ${manager}\nScript (${scriptLabel}): ${effectiveScript}\nSHA-256: ${scriptHash}`, { modal: true }, "Run Release");
-    if (confirmation !== "Run Release") {
+    const releaseChoice = await askChatChoiceV1({
+      decisionKey: "runReleaseConfirmation",
+      target: { canonicalId: candidate, taskFolderPath: candidate, stage: "publish" },
+      whatHappened:
+        `Run release?\n\nCommand: ${commandText}\nWorking directory: ${packageDir}\n` +
+        `Package manager: ${manager}\nScript (${scriptLabel}): ${effectiveScript}\nSHA-256: ${scriptHash}`,
+      whyUserNeeded:
+        "The release runs a project-defined script with real, outward-facing effects, so it only starts on your confirmation.",
+      options: [
+        {
+          optionId: "runRelease",
+          label: "Run Release",
+          consequence: "Runs the release script in a visible terminal.",
+        },
+        {
+          optionId: "cancel",
+          label: "Cancel",
+          consequence: "Stops here. Nothing runs.",
+        },
+      ],
+      recommendedOptionId: "runRelease",
+      recommendationReasoning: "Run it once the command, directory, script, and hash look right.",
+      detail: "Choosing an option starts or cancels this release.",
+    });
+    if (releaseChoice !== "runRelease") {
       releaseOp.settleAs("refused", "release was not confirmed");
       return;
     }

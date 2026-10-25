@@ -1702,7 +1702,11 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
       const inv = makeInventoryStub(folderPath, folderPath, "paused");
       const currentStore = makeCurrentTaskStoreStub(undefined);
 
-      await resumeAndDispatchImplementationV1(inv, currentStore, { taskFolderPath: folderPath });
+      const typeCheckErrors = "src/broken.ts(7,3): error TS2322: expected number.";
+      await resumeAndDispatchImplementationV1(inv, currentStore, {
+        taskFolderPath: folderPath,
+        implementationTypeCheckErrorsV1: typeCheckErrors,
+      });
 
       const stored = await readStoredProgress(store, folderUri);
       assert.strictEqual(
@@ -1734,11 +1738,21 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
       // call's already-live marker instead of racing a fresh genesis and
       // self-refusing busy.
       const implArg = implDispatch.arg as
-        | { taskFolderPath?: string; admissionHandoffTokenV1?: string }
+        | {
+            taskFolderPath?: string;
+            admissionHandoffTokenV1?: string;
+            implementationTypeCheckErrorsV1?: string;
+          }
         | undefined;
       assert.equal(implArg?.taskFolderPath, folderPath);
       assert.equal(typeof implArg?.admissionHandoffTokenV1, "string");
       assert.ok((implArg?.admissionHandoffTokenV1?.length ?? 0) > 0);
+      assert.equal(implArg?.implementationTypeCheckErrorsV1, typeCheckErrors);
+      assert.equal(
+        execCmd.captured.filter((entry) => entry.command === "vs-code-ai-helper.runImplementationWithAI").length,
+        1,
+        "selecting the combined resume action starts exactly one Implementation dispatch"
+      );
     } finally {
       execCmd.restore();
       msgs.restore();

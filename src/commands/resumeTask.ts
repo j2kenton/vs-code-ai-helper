@@ -23,6 +23,7 @@ import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 import { NotificationRouter } from "../utils/notificationRouter";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
@@ -44,7 +45,12 @@ import { FastForwardResumeStateV1, isFastForwardResumeStateTrustedV1 } from "./f
  */
 type ResumeTaskArg =
   | { task?: IncompleteTask }
-  | { canonicalId?: string; taskFolderPath?: string };
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      /** Errors carried by the Implementation type-check decision. */
+      implementationTypeCheckErrorsV1?: string;
+    };
 
 /**
  * Normalize a ResumeTaskArg into the shape resolveTaskContext expects.
@@ -801,29 +807,36 @@ async function resumeThenDispatchV1<T>(
 
 /**
  * Says a resume stays paused because the action it names cannot start, and
- * offers the restore action when the refusal is the unusable-summary stamp. No
- * rerun command is passed: the task is still paused, so the restore only clears
+ * offers the restore action in chat when the refusal is the unusable-summary stamp.
+ * No rerun command is passed: the task is still paused, so the restore only clears
  * the refusal and the user resumes again afterwards.
  */
-function showResumeStaysPausedV1(
+export async function showResumeStaysPausedV1(
   taskName: string,
   taskFolderPath: string,
   stage: TaskStage,
   precondition: string,
   restoreSummary: boolean | undefined
-): void {
+): Promise<void> {
+  const noticeText = `"${taskName}" stays paused: ${precondition}`;
+  let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>> | undefined;
+  if (restoreSummary) {
+    chatPointer = await offerActionInChatV1({
+      taskFolderPath,
+      actionLabel: "Restore Last Usable Summary",
+      command: "vs-code-ai-helper.restoreRejectedImplementationRound",
+      args: [taskFolderPath, stage],
+      noticeText,
+      optional: true,
+      taskLabel: taskName,
+    });
+  }
   NotificationRouter.showWarning(
-    `"${taskName}" stays paused: ${precondition}`,
+    noticeText /* taskName */,
     undefined,
     undefined,
     undefined,
-    restoreSummary
-      ? {
-          command: "vs-code-ai-helper.restoreRejectedImplementationRound",
-          title: "Restore Last Usable Summary",
-          args: [taskFolderPath, stage],
-        }
-      : undefined
+    chatPointer
   );
 }
 
@@ -865,7 +878,7 @@ async function refuseFixedDispatchV1(
   if (!refusal) {
     return false;
   }
-  showResumeStaysPausedV1(taskName, target.taskFolderPath, stage, refusal.precondition, refusal.restoreSummary);
+  await showResumeStaysPausedV1(taskName, target.taskFolderPath, stage, refusal.precondition, refusal.restoreSummary);
   return true;
 }
 
@@ -883,7 +896,12 @@ async function resumeCompletedTask(
   resolvedTask: ResolvedTaskContext
 ): Promise<void> {
   const capturedCompletedAt = resolvedTask.progress.completedAt;
-  const chosenStage = await pickReopenStage(resolvedTask.folderName);
+  const chosenStage = await pickReopenStage(resolvedTask.folderName, {
+    canonicalId: resolvedTask.canonicalId,
+    taskFolderPath: resolvedTask.taskFolderPath,
+    stage: resolvedTask.progress.currentStage,
+    taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName,
+  });
   if (!chosenStage) {
     return;
   }
@@ -1062,6 +1080,10 @@ export async function resumeAndDispatchImplementationV1(
     vscode.commands.executeCommand("vs-code-ai-helper.runImplementationWithAI", {
       taskFolderPath: target.taskFolderPath,
       admissionHandoffTokenV1: admissionHandoffToken,
+      ...(explicitArg && "implementationTypeCheckErrorsV1" in explicitArg &&
+      typeof explicitArg.implementationTypeCheckErrorsV1 === "string"
+        ? { implementationTypeCheckErrorsV1: explicitArg.implementationTypeCheckErrorsV1 }
+        : {}),
     })
   );
 }
@@ -1198,7 +1220,7 @@ export async function resumeAndApplyCurrentStageActionV1(
   const plan = await loadResumeActionPlanV1(target.taskFolderPath, currentProgress);
   const taskName = currentProgress.displayName ?? target.folderName;
   if (plan.kind === "blocked") {
-    showResumeStaysPausedV1(
+    await showResumeStaysPausedV1(
       taskName,
       target.taskFolderPath,
       currentProgress.currentStage,
@@ -1464,11 +1486,24 @@ export async function resumeAndSetTaskStageV1(
         await patchTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath), (p) =>
           setNextActorV1(p, "human")
         );
-        NotificationRouter.showWarning(
+        const handbackNotice =
           `${taskName}: moved to ${STAGE_DISPLAY_NAMES[stage]}, but a previously running operation for the prior stage could ` +
-            `not be stopped: ${advanceCancelResult.reason} No automatic follow-up was started — stop the stale ` +
-            `operation from its Notifications row (or wait for it to actually finish), then use the stage's own ` +
-            `action to continue.`
+          `not be stopped: ${advanceCancelResult.reason} No automatic follow-up was started — stop the stale ` +
+          `operation from its Notifications row (or wait for it to actually finish), then resume this task to continue.`;
+        NotificationRouter.showWarning(
+          handbackNotice,
+          undefined,
+          undefined,
+          undefined,
+          await offerActionInChatV1({
+            taskFolderPath: target.taskFolderPath,
+            taskLabel: taskName,
+            actionLabel: "Resume",
+            command: "vs-code-ai-helper.resumeTask",
+            args: [{ taskFolderPath: target.taskFolderPath }],
+            noticeText: handbackNotice,
+            optional: true,
+          })
         );
         return true;
       }
@@ -1514,8 +1549,32 @@ export async function resumeAndSetTaskStageV1(
         await patchTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath), (p) =>
           setNextActorV1(p, "human")
         );
+        const nextActionNotice =
+          `${taskName}: moved to ${STAGE_DISPLAY_NAMES[stage]}. ${plan.kind === "blocked" ? plan.precondition : plan.reason}`;
+        const nextAction = stage === "desc"
+          ? {
+              label: "Draft with AI",
+              command: "vs-code-ai-helper.draftTaskWithAI",
+            }
+          : {
+              label: "Run Current Stage Action",
+              command: "vs-code-ai-helper.applyCurrentStageAction",
+            };
+        const chatPointer = await offerActionInChatV1({
+          taskFolderPath: target.taskFolderPath,
+          taskLabel: taskName,
+          actionLabel: nextAction.label,
+          command: nextAction.command,
+          args: [{ taskFolderPath: target.taskFolderPath }],
+          noticeText: nextActionNotice,
+          optional: true,
+        });
         NotificationRouter.showInformation(
-          `${taskName}: moved to ${STAGE_DISPLAY_NAMES[stage]}. ${plan.kind === "blocked" ? plan.precondition : plan.reason}`
+          `${nextActionNotice}${chatPointer ? " Open the decision in Chat to continue." : ""} /* taskName */`,
+          undefined,
+          undefined,
+          undefined,
+          chatPointer
         );
         return true;
       }
@@ -1632,8 +1691,8 @@ export function registerResumeTaskCommand(
 
   const resumeAndRerunReview = vscode.commands.registerCommand(
     "vs-code-ai-helper.resumeAndRerunReview",
-    (arg?: ResumeTaskArg) =>
-      resumeAndRerunReviewV1(inventory, currentTaskStore, arg)
+    (arg?: ResumeTaskArg, reviewOptionsV1?: { readonly skipUnchangedTreeGuardV1?: true }) =>
+      resumeAndRerunReviewV1(inventory, currentTaskStore, arg, reviewOptionsV1)
   );
   context.subscriptions.push(resumeAndRerunReview);
 

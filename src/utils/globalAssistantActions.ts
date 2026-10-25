@@ -16,6 +16,8 @@ import { cancelRunningOperationsForArchive } from "../commands/archiveTask";
 import { PendingOperationsStore } from "../state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "../state/taskActivationCoordinator";
 import { runTrackedOperation, taskOperations } from "./taskOperations";
+import { askChatChoiceV1 } from "./chatChoiceV1";
+import { GLOBAL_ASSISTANT_CANONICAL_ID } from "./chatHistoryConstants";
 
 /**
  * The global assistant's structured action layer: a typed registry of
@@ -1100,12 +1102,23 @@ export async function executeProposedAction(
       affected.length > 0
         ? affected.map((t) => `• ${t.progress.displayName ?? t.folderName}`).join("\n")
         : "(no tasks match)";
-    const choice = await vscode.window.showWarningMessage(
-      `The global assistant wants to run "${operation.id}".\n\nAffected tasks:\n${taskList}\n\nProceed?`,
-      { modal: true },
-      "Run Action"
-    );
-    if (choice !== "Run Action") {
+    const choice = await askChatChoiceV1({
+      target: {
+        canonicalId: GLOBAL_ASSISTANT_CANONICAL_ID,
+        taskFolderPath: ctx.assistantFolderUri.fsPath,
+        stage: "desc",
+        taskName: "Global Assistant",
+      },
+      decisionKey: "confirmGlobalAssistantAction",
+      whatHappened: `The global assistant wants to run "${operation.id}".\n\nAffected tasks:\n${taskList}`,
+      whyUserNeeded: "Consequential global assistant actions require explicit confirmation before executing.",
+      options: [
+        { optionId: "runAction", label: "Run Action", description: `Execute "${operation.id}" on the affected tasks` },
+        { optionId: "cancel", label: "Cancel", description: "Do not execute this action" },
+      ],
+      recommendedOptionId: "runAction",
+    });
+    if (choice !== "runAction") {
       await appendAudit(ctx, operation.id, proposal.payload, [], "declined by user");
       return `_The ${operation.id} action was not confirmed; nothing was executed._`;
     }

@@ -19,7 +19,7 @@ import {
   resolveFreshModelForStage,
   resolveModelForStage,
 } from "../utils/modelSelection";
-import { isAuthenticationFailure } from "../utils/quota";
+import { __quotaTestOnly, isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
 import { resetCliCommandLookupCacheForTest } from "../runners/cliAgentRunner";
 import {
   LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0,
@@ -2378,6 +2378,80 @@ void describe("runImplementationForModel", () => {
         } finally {
           rowStub.restore();
         }
+
+        // Post-1.0 fixes, item 4: when the running model is a backup and it
+        // fails, the stage's enabled primary is tried too, and the message
+        // names it with its outcome.
+        let spawnCount = 0;
+        const countingSpawn = childProcess.spawn;
+        childProcess.spawn = ((...args: Parameters<typeof childProcess.spawn>) => {
+          if (!/^(which|where\.exe)$/.test(String(args[0]))) {
+            spawnCount++;
+          }
+          return (countingSpawn as unknown as (...a: unknown[]) => import("node:child_process").ChildProcess)(...args);
+        }) as typeof childProcess.spawn;
+        try {
+          __quotaTestOnly.clear();
+          resetFolder();
+          const primaryStub = installProviderSelection(
+            { "opencode-cli": true, copilot: true },
+            { impl: { primary: "opencode-cli:default", backups: ["opencode-cli:other"], strategy: "switch-to-backup" } }
+          );
+          try {
+            const before = spawnCount;
+            const backupFailed = await runImplementationForModel({ ...common, modelId: "opencode-cli:other" });
+            assert.strictEqual(backupFailed.status, "failed");
+            assert.ok(spawnCount - before >= 2, `the enabled primary runs after the failing backup: ${backupFailed.errorMessage}`);
+            assert.match(backupFailed.errorMessage ?? "", /The stage's primary .*default was tried and failed/);
+          } finally {
+            primaryStub.restore();
+          }
+
+          // The primary just failed, so it is now known to be limited: the
+          // next backup failure holds it back and says why instead of
+          // running it again.
+          resetFolder();
+          const limitedStub = installProviderSelection(
+            { "opencode-cli": true, copilot: true },
+            { impl: { primary: "opencode-cli:default", backups: ["opencode-cli:other"], strategy: "switch-to-backup" } }
+          );
+          try {
+            const limitedFailed = await runImplementationForModel({ ...common, modelId: "opencode-cli:other" });
+            assert.match(limitedFailed.errorMessage ?? "", /The stage's primary .*default was held back: .*known to be limited/);
+          } finally {
+            limitedStub.restore();
+          }
+
+          // Configured primary off: the first enabled model is the effective
+          // primary and is tried; the off primary is listed as disabled.
+          __quotaTestOnly.clear();
+          resetFolder();
+          const effectiveStub = installProviderSelection(
+            { "opencode-cli": true, copilot: true },
+            {
+              impl: {
+                primary: "auto",
+                primaryEnabled: false,
+                backups: ["opencode-cli:default", "opencode-cli:other"],
+                backupsEnabled: [true, false],
+                strategy: "switch-to-backup",
+              },
+            }
+          );
+          try {
+            const before = spawnCount;
+            const effectiveFailed = await runImplementationForModel({ ...common, modelId: "opencode-cli:third" });
+            assert.strictEqual(effectiveFailed.status, "failed");
+            assert.ok(spawnCount - before >= 2, "the effective primary runs after the failing backup");
+            assert.match(effectiveFailed.errorMessage ?? "", /The stage's primary .*default was tried and failed/);
+            assert.match(effectiveFailed.errorMessage ?? "", /auto is disabled in the stage's chain/);
+            assert.match(effectiveFailed.errorMessage ?? "", /other is disabled in the stage's chain/);
+          } finally {
+            effectiveStub.restore();
+          }
+        } finally {
+          childProcess.spawn = countingSpawn;
+        }
       } finally {
         settings.restore();
       }
@@ -3007,6 +3081,14 @@ void describe("runImplementationForModel", () => {
     );
 
     try {
+      await recordQuotaObservation(
+        "impl",
+        "opencode-cli:default",
+        "quota",
+        "usage limit exceeded",
+        undefined,
+        new Date(Date.now() + 3600000).toISOString()
+      );
       const settings = installModelSettings({
         impl: {
           primary: "opencode-cli:default",
@@ -3050,6 +3132,289 @@ void describe("runImplementationForModel", () => {
         settings.restore();
       }
     } finally {
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      safeRemoveDir(metaRoot);
+    }
+  });
+
+  void it("hands off a dirty tree to the enabled effective primary when configured primary is disabled and backup fails mid-round", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-effective-primary-handoff-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-opencode.txt");
+    let codexInvokedWithRealWork = false;
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5565 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      if (command === "opencode") {
+        process.nextTick(() => {
+          fs.writeFileSync(mutatedFile, "partial edit from opencode before failure");
+          child.stdout?.emit(
+            "data",
+            Buffer.from(
+              `${JSON.stringify({ type: "error", message: "service temporarily unavailable" })}\n`
+            )
+          );
+          child.emit("close", 1);
+        });
+        return child;
+      }
+
+      codexInvokedWithRealWork = true;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: "task-a",
+          currentStage: "impl",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          fallbackActive: { impl: true },
+          fallbackModelId: { impl: "opencode-cli:default" },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const chainPatch = patchModule(automationChainModule, "scheduleAutomationChain", (): Promise<boolean> =>
+      Promise.resolve(true)
+    );
+    const routerPatch = installNoopNotificationRouterV1();
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "claude-cli:default",
+          primaryEnabled: false,
+          backups: ["opencode-cli:default", "codex-cli:default"],
+          backupsEnabled: [false, true],
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "opencode-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          codexInvokedWithRealWork,
+          false,
+          "the effective primary must not be invoked inline against the dirty tree"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        assert.match(
+          result.errorMessage ?? "",
+          /handed the work to (OpenAI Codex|Codex)/,
+          "expected the failure message to name the effective primary as the handoff target"
+        );
+
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+          implRecovery?: { trigger?: string; mode?: string; dispatch?: string };
+        };
+        assert.strictEqual(progress.fallbackActive?.impl, true);
+        assert.strictEqual(progress.fallbackModelId?.impl, "codex-cli:default");
+        assert.strictEqual(progress.implRecovery?.trigger, "providerFailedMidRound");
+        assert.strictEqual(progress.implRecovery?.mode, "inspect-and-complete");
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      routerPatch.restore();
+      chainPatch.restore();
+      childProcess.spawn = originalSpawn;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      safeRemoveDir(metaRoot);
+    }
+  });
+
+  void it("hands off a dirty tree to the enabled configured primary when backup started from fallbackActive fails mid-round", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-dirty-tree-configured-primary-handoff-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const mutatedFile = path.join(taskFolder, "mutated-by-opencode.txt");
+    let claudeInvokedWithRealWork = false;
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5566 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      if (command === "opencode") {
+        process.nextTick(() => {
+          fs.writeFileSync(mutatedFile, "partial edit from opencode before failure");
+          child.stdout?.emit(
+            "data",
+            Buffer.from(
+              `${JSON.stringify({ type: "error", message: "service temporarily unavailable" })}\n`
+            )
+          );
+          child.emit("close", 1);
+        });
+        return child;
+      }
+
+      claudeInvokedWithRealWork = true;
+      process.nextTick(() => child.emit("close", 1));
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        {
+          taskFolder: "task-a",
+          currentStage: "impl",
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+          fallbackActive: { impl: true },
+          fallbackModelId: { impl: "opencode-cli:default" },
+        },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    const chainPatch = patchModule(automationChainModule, "scheduleAutomationChain", (): Promise<boolean> =>
+      Promise.resolve(true)
+    );
+    const routerPatch = installNoopNotificationRouterV1();
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "claude-cli:default",
+          primaryEnabled: true,
+          backups: ["opencode-cli:default"],
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "opencode-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(
+          claudeInvokedWithRealWork,
+          false,
+          "the configured primary must not be invoked inline against the dirty tree"
+        );
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        assert.match(
+          result.errorMessage ?? "",
+          /handed the work to (Claude Code|Claude)/,
+          "expected the failure message to name the configured primary as the handoff target"
+        );
+
+        const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as {
+          fallbackActive?: Partial<Record<string, boolean>>;
+          fallbackModelId?: Partial<Record<string, string>>;
+          implRecovery?: { trigger?: string; mode?: string; dispatch?: string };
+        };
+        assert.strictEqual(progress.fallbackActive?.impl, true);
+        assert.strictEqual(progress.fallbackModelId?.impl, "claude-cli:default");
+        assert.strictEqual(progress.implRecovery?.trigger, "providerFailedMidRound");
+        assert.strictEqual(progress.implRecovery?.mode, "inspect-and-complete");
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      routerPatch.restore();
+      chainPatch.restore();
       childProcess.spawn = originalSpawn;
       workspace.fs.readFile = originalReadFile;
       workspace.fs.writeFile = originalWriteFile;
@@ -3387,6 +3752,140 @@ void describe("runImplementationForModel", () => {
           progress.quotaParkRecord,
           undefined,
           "an authentication failure must never record a durable quota-park block — there is no reset time to wait out"
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      safeRemoveDir(metaRoot);
+    }
+  });
+
+  void it("explains authentication failure with full chain outcomes when disabled models are present in the chain", async () => {
+    const originalSpawn = childProcess.spawn;
+
+    const metaRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), "ensemble-impl-auth-disabled-models-")
+    );
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 5559 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      process.nextTick(() => {
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify({
+              type: "error",
+              message: "403 Unable to verify organization membership",
+            })}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "auto",
+          vendor: "copilot",
+          family: "gpt-4o",
+          version: "1",
+          maxInputTokens: 8000,
+          sendRequest: () => Promise.reject(new Error("should not be reached")),
+          countTokens: () => Promise.resolve(10),
+        },
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> =>
+      fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const progressPath = path.join(taskFolder, "task-progress.json");
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      progressPath,
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "claude-cli:default",
+          primaryEnabled: true,
+          backups: ["copilot-cli:default", "opencode-cli:default"],
+          backupsEnabled: [true, false],
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "claude-cli:default",
+          prompt: "fix something",
+          workspaceUri: vscode.Uri.file(taskFolder),
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(result.authFailure, true);
+        assert.match(
+          result.errorMessage ?? "",
+          /Hit an authentication failure on Claude/,
+          "must report authentication failure, not usage limit or backupsExhausted"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /Backup OpenCode.*is disabled in the stage's chain; enable it to use it here\./,
+          "expected disabled models to be named in the explanation"
+        );
+        assert.match(
+          result.errorMessage ?? "",
+          /Backup Copilot.*was held back: an authentication failure is not auto-retried against a different model\./,
+          "expected untried enabled models to be named as held back"
         );
       } finally {
         settings.restore();

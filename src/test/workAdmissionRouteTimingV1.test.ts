@@ -85,14 +85,14 @@ const ROUTE_TIMING_CASES_V1: readonly RouteTimingCaseV1[] = [
     file: "src/commands/generatePlanWithAI.ts",
     fn: "export async function generatePlanWithAI(",
     admissionCall: "acquireOrAdoptWorkAdmissionV1({",
-    firstUnprotectedStep: "ensureAiConsent(context)",
+    firstUnprotectedStep: "ensureAiConsent(context, earlyFolderPath)",
   },
   {
     routeId: "runReviewWithAI",
     file: "src/commands/reviewActions.ts",
     fn: "export async function runReviewWithAI(",
     admissionCall: "acquireOrAdoptWorkAdmissionV1({",
-    firstUnprotectedStep: "ensureAiConsent(context)",
+    firstUnprotectedStep: "ensureAiConsent(context, earlyFolderPath)",
   },
   {
     routeId: "applyReviewWithAI",

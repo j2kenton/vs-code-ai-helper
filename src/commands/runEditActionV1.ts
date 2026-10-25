@@ -33,6 +33,7 @@ import {
 } from "../actions/productionTaskActionRuntimeV1";
 import { ImplementationRunResult } from "../runners/copilotImplementationRunner";
 import { describeModelWithProviderV1 } from "../runners/providers";
+import type { ConfiguredCheckCommandV1 } from "../runners/cliAgentRunner";
 import {
   isSummaryOnlyDispatchAvailableV1,
   runSealedEditContinuationReportV1,
@@ -579,6 +580,10 @@ export interface RunTwoPhaseEditOptionsV1 {
    * still timing out or mid-cancellation.
    */
   readonly dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
+  /** Configured failing check commands for check execution feedback (Step 27 / Defect 13). */
+  readonly configuredFailingCommands?: readonly (string | ConfiguredCheckCommandV1)[];
+  /** Host check runner for fallback execution (Step 27 / Defect 13). */
+  readonly hostCheckRunner?: (cwd: string, command: string) => Promise<{ code: number; output: string }>;
 }
 
 /** SHA-256 the plan must echo (§7.3): digest of the exact prompt bytes. */
@@ -1035,6 +1040,10 @@ export interface RunSealedImplementationOptionsV1 {
    * it unset — correctly, since there is no coordinator invocation to report.
    */
   readonly dispatchProbe?: { coordinatorOutcome?: TaskActionOutcomeV1 };
+  /** Configured failing check commands for check execution feedback (Step 27 / Defect 13). */
+  readonly configuredFailingCommands?: readonly (string | ConfiguredCheckCommandV1)[];
+  /** Host check runner for fallback execution (Step 27 / Defect 13). */
+  readonly hostCheckRunner?: (cwd: string, command: string) => Promise<{ code: number; output: string }>;
 }
 
 /**
@@ -1625,6 +1634,8 @@ export async function runImplementationOrSealedV1(
       // active fallback. configuredPrimaryModelId tells that function the
       // TRUE primary so it can record correctly (see its own header).
       configuredPrimaryModelId: options.modelId,
+      configuredFailingCommands: options.configuredFailingCommands,
+      hostCheckRunner: options.hostCheckRunner,
     });
     // Review finding (this round): `availability.providerLabel`/`.modelId`
     // are only the PRE-invocation winning candidate. `cliResult` now always

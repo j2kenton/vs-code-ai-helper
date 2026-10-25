@@ -145,7 +145,12 @@ import {
 } from "../types/agentExecutionV1";
 import { RequestLocalToolHandlerV1 } from "../services/requestLocalToolHandlerV1";
 import { currentRoundProcessRecordingTargetV1 } from "../state/roundProcessContextV1";
-import { classifyFailure, parseQuotaResetV1 } from "../utils/quota";
+import {
+  classifyFailure,
+  MAX_PROVIDER_CAPACITY_RETRIES_V1,
+  parseQuotaResetV1,
+  PROVIDER_CAPACITY_RETRY_DELAY_MS_V1,
+} from "../utils/quota";
 import { ObservationLedgerV1 } from "../types/preflightPlanV1";
 import {
   AiResultEnvelopeV1,
@@ -577,7 +582,7 @@ function reportCandidateSkipped(
 
 /** Retry delays for bounded same-candidate recovery attempts. */
 const DEFAULT_NETWORK_FAULT_RETRY_DELAY_MS_V1 = 750;
-const DEFAULT_PROVIDER_CAPACITY_RETRY_DELAY_MS_V1 = 5_000;
+const DEFAULT_PROVIDER_CAPACITY_RETRY_DELAY_MS_V1 = PROVIDER_CAPACITY_RETRY_DELAY_MS_V1;
 
 export interface TaskActionCoordinatorDepsV1 {
   /** Delay before a network-fault retry; defaults to 750 ms. Tests pass 0. */
@@ -1993,7 +1998,7 @@ export function createTaskActionCoordinatorV1(
     let networkFaultRetriesUsedV1 = 0;
     const MAX_NETWORK_FAULT_RETRIES_PER_CANDIDATE_V1 = 1;
     let providerCapacityRetriesUsedV1 = 0;
-    const MAX_PROVIDER_CAPACITY_RETRIES_PER_CANDIDATE_V1 = 2;
+    const MAX_PROVIDER_CAPACITY_RETRIES_PER_CANDIDATE_V1 = MAX_PROVIDER_CAPACITY_RETRIES_V1;
     // Attempt ids this coordinator itself allocated as a same-candidate
     // retry — the authoritative record `enrichChainExhaustionWithAttemptOutcomesV1`
     // needs to fold a retry into its original candidate's entry without

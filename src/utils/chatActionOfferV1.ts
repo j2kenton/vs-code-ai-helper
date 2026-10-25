@@ -10,10 +10,12 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { ChatTarget } from "../views/chatView";
 import { postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
 import { formatNotificationTaskLabelV1 } from "./notificationTaskContextV1";
+import type { TaskProgress } from "../types/taskProgress";
 import * as path from "path";
 
 export interface ChatActionOfferInputV1 {
   readonly taskFolderPath: string;
+  readonly progress?: TaskProgress;
   /** Label of the action option, e.g. "Run Publish Checks". */
   readonly actionLabel: string;
   readonly command: string;
@@ -42,13 +44,18 @@ export interface ChatPointerActionV1 {
 export async function offerActionInChatV1(
   input: ChatActionOfferInputV1
 ): Promise<ChatPointerActionV1 | undefined> {
-  const read = await readTaskProgressStrictV1(vscode.Uri.file(input.taskFolderPath), {
-    expectedTaskFolder: path.basename(input.taskFolderPath),
-  });
-  if (!read.ok) {
+  let progress: TaskProgress | undefined = input.progress;
+  if (!progress) {
+    const read = await readTaskProgressStrictV1(vscode.Uri.file(input.taskFolderPath), {
+      expectedTaskFolder: path.basename(input.taskFolderPath),
+    });
+    if (read.ok) {
+      progress = read.decoded.progress;
+    }
+  }
+  if (!progress) {
     return undefined;
   }
-  const progress = read.decoded.progress;
   const target: ChatTarget = {
     canonicalId: input.taskFolderPath,
     taskFolderPath: input.taskFolderPath,
@@ -89,6 +96,7 @@ export async function offerActionInChatV1(
         unblocksProgress: input.optional !== true,
         detail: `Choosing "${input.actionLabel}" runs it now; "Not now" leaves the task as it is.`,
       },
+      suppressNotification: true,
     },
     target
   );

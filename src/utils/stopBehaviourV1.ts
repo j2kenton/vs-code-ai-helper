@@ -163,6 +163,8 @@ export interface BackupAttemptRecordV1 {
   /** Display label, e.g. "Copilot claude-sonnet-5.5". */
   readonly label: string;
   readonly outcome: "tried-and-failed" | "held-back" | "disabled";
+  /** True for the stage's primary (configured or effective), which is not a backup. */
+  readonly isPrimary?: boolean;
   /** The backup's own error, or the reason it was held back. */
   readonly reason: string;
 }
@@ -182,6 +184,8 @@ export type MidRoundStopOutcomeV1 =
       readonly heldBackBackupLabel?: string;
       /** Human name of the stage action to run again, e.g. "Apply Review". */
       readonly rerunActionLabel?: string;
+      /** All models in the chain with their respective outcomes. */
+      readonly backups?: readonly BackupAttemptRecordV1[];
     }
   | {
       /**
@@ -192,6 +196,8 @@ export type MidRoundStopOutcomeV1 =
       readonly kind: "backupsExhausted";
       readonly backups: readonly BackupAttemptRecordV1[];
       readonly remedyText: string;
+      /** The failure was a provider "at capacity" reply, not a usage limit. */
+      readonly capacity?: boolean;
     }
   | {
       readonly kind: "handedToBackup";
@@ -208,20 +214,34 @@ export type MidRoundStopOutcomeV1 =
   | {
       readonly kind: "noBackupConfigured";
       readonly failureKind: MidRoundFailureKindV1;
+      readonly capacity?: boolean;
     }
   | {
       readonly kind: "neverSwitchConfigured";
       readonly failureKind: MidRoundFailureKindV1;
+      readonly capacity?: boolean;
     }
   | {
       readonly kind: "treeStateUnknown";
       readonly failureKind: MidRoundFailureKindV1;
+      readonly capacity?: boolean;
     }
   | {
       readonly kind: "authFailureBackupWithheld";
       readonly dirtyTree: boolean;
       readonly filesChangedCount?: number;
+      readonly backups?: readonly BackupAttemptRecordV1[];
     };
+
+/** "X hit a quota failure" — or, for a provider overload, the capacity wording. */
+function hitDescriptionV1(
+  providerLabel: string,
+  outcome: { readonly failureKind: MidRoundFailureKindV1; readonly capacity?: boolean }
+): string {
+  return outcome.capacity
+    ? `${providerLabel}: the model was at capacity (a temporary overload at OpenAI)`
+    : `${providerLabel} hit ${outcome.failureKind ?? "a"} failure`;
+}
 
 export function describeMidRoundOutcomeV1(
   primaryProviderLabel: string,
@@ -229,7 +249,21 @@ export function describeMidRoundOutcomeV1(
   outcome: MidRoundStopOutcomeV1
 ): string {
   switch (outcome.kind) {
-    case "cascadeWithheldDirtyTree":
+    case "cascadeWithheldDirtyTree": {
+      const backupDetails =
+        outcome.backups && outcome.backups.length > 0
+          ? " " +
+            outcome.backups
+              .map((backup) => {
+                const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
+                return backup.outcome === "tried-and-failed"
+                  ? `${subject} was tried and failed: ${backup.reason}.`
+                  : backup.outcome === "disabled"
+                    ? `${subject} is disabled in the stage's chain; enable it to use it here.`
+                    : `${subject} was held back: ${backup.reason}.`;
+              })
+              .join(" ")
+          : "";
       return (
         `Hit ${outcome.limitLabel} on ${primaryProviderLabel}` +
         (errorMessage ? ` (${errorMessage})` : "") +
@@ -241,21 +275,26 @@ export function describeMidRoundOutcomeV1(
             `${outcome.filesChangedCount} file(s). Once the tree is settled, run ` +
             `${outcome.rerunActionLabel ?? "this stage's action"} again: Ensemble will use ` +
             `${outcome.heldBackBackupLabel} if ${primaryProviderLabel} is still limited.`
-          : "")
+          : "") +
+        backupDetails
       );
+    }
     case "backupsExhausted":
       return (
-        `${primaryProviderLabel} hit a usage limit` +
+        (outcome.capacity
+          ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)`
+          : `${primaryProviderLabel} hit a usage limit`) +
         (errorMessage ? `: ${errorMessage}` : "") +
         ". " +
         outcome.backups
-          .map((backup) =>
-            backup.outcome === "tried-and-failed"
-              ? `Backup ${backup.label} was tried and failed: ${backup.reason}.`
+          .map((backup) => {
+            const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
+            return backup.outcome === "tried-and-failed"
+              ? `${subject} was tried and failed: ${backup.reason}.`
               : backup.outcome === "disabled"
-                ? `Backup ${backup.label} is disabled in the stage's chain; enable it to use it here.`
-                : `Backup ${backup.label} was held back: ${backup.reason}.`
-          )
+                ? `${subject} is disabled in the stage's chain; enable it to use it here.`
+                : `${subject} was held back: ${backup.reason}.`;
+          })
           .join(" ") +
         ` ${outcome.remedyText}`
       );
@@ -286,25 +325,39 @@ export function describeMidRoundOutcomeV1(
       );
     case "noBackupConfigured":
       return (
-        `${primaryProviderLabel} hit ${outcome.failureKind ?? "a"} failure; no backup model is ` +
+        `${hitDescriptionV1(primaryProviderLabel, outcome)}; no backup model is ` +
         "configured for this stage/chain, so no automatic fallback was attempted."
       );
     case "neverSwitchConfigured":
       return (
-        `${primaryProviderLabel} hit ${outcome.failureKind ?? "a"} failure. This stage's fallback ` +
+        `${hitDescriptionV1(primaryProviderLabel, outcome)}. This stage's fallback ` +
         "setting is Never switch, so the backup model was withheld even though one is configured " +
         "— set it to Fall back to backup models to allow a switch, or rerun this stage to retry " +
         "with the same model."
       );
     case "treeStateUnknown":
       return (
-        `${primaryProviderLabel} hit ${outcome.failureKind ?? "a"} failure with the working ` +
+        `${hitDescriptionV1(primaryProviderLabel, outcome)} with the working ` +
         "tree state unknown (git unavailable or not a repository); Ensemble withheld the " +
         "automatic switch to this stage's backup model because a dirty-vs-clean tree could " +
         "not be confirmed."
       );
-    case "authFailureBackupWithheld":
-      return outcome.dirtyTree
+    case "authFailureBackupWithheld": {
+      const backupDetails =
+        outcome.backups && outcome.backups.length > 0
+          ? " " +
+            outcome.backups
+              .map((backup) => {
+                const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
+                return backup.outcome === "tried-and-failed"
+                  ? `${subject} was tried and failed: ${backup.reason}.`
+                  : backup.outcome === "disabled"
+                    ? `${subject} is disabled in the stage's chain; enable it to use it here.`
+                    : `${subject} was held back: ${backup.reason}.`;
+              })
+              .join(" ")
+          : "";
+      return (outcome.dirtyTree
         ? `Hit an authentication failure on ${primaryProviderLabel}` +
             (errorMessage ? ` (${errorMessage})` : "") +
             `. This round already changed ${outcome.filesChangedCount ?? 0} file(s), so Ensemble ` +
@@ -316,6 +369,7 @@ export function describeMidRoundOutcomeV1(
             (errorMessage ? ` (${errorMessage})` : "") +
             ". Ensemble does not automatically switch to a backup model on an authentication failure " +
             "— a different model would not resolve a sign-in problem with this account. Sign in " +
-            "again, then rerun this stage.";
+            "again, then rerun this stage.") + backupDetails;
+    }
   }
 }

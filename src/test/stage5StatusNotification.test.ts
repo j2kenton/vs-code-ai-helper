@@ -572,25 +572,27 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const tasks = [makeTask("/workspace/task-a", "task-a", "impl", "paused", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
-      const win = getWindowStub();
-      const origShowQuickPick = win.showQuickPick;
-      let capturedItems: vscode.QuickPickItem[] = [];
-      win.showQuickPick = async <T extends vscode.QuickPickItem>(
-        items: readonly T[] | Thenable<readonly T[]>
-      ): Promise<T | undefined> => {
-        const resolvedItems = await Promise.resolve(items);
-        capturedItems = [...resolvedItems];
-        return undefined;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+      const chatChoiceMod = require("../utils/chatChoiceV1") as {
+        askChatChoiceV1: (req: {
+          options: ReadonlyArray<{ optionId: string; label: string }>;
+        }) => Promise<string | undefined>;
+      };
+      const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+      let capturedOptions: ReadonlyArray<{ optionId: string; label: string }> = [];
+      chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+        capturedOptions = req.options;
+        return Promise.resolve(undefined);
       };
 
       try {
         await bar.showMenu();
-        const labels = capturedItems.map((item) => item.label);
+        const labels = capturedOptions.map((item) => item.label);
         assert.ok(labels.includes("$(debug-continue) Resume shown task"));
         assert.ok(!labels.includes("$(file-text) Open shown task"));
         assert.ok(labels.includes("$(add) New task..."));
       } finally {
-        win.showQuickPick = origShowQuickPick;
+        chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
         bar.dispose();
       }
     });
@@ -601,25 +603,27 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const tasks = [makeTask("/workspace/task-a", "task-a", "impl", "active", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
-      const win = getWindowStub();
-      const origShowQuickPick = win.showQuickPick;
-      let capturedItems: vscode.QuickPickItem[] = [];
-      win.showQuickPick = async <T extends vscode.QuickPickItem>(
-        items: readonly T[] | Thenable<readonly T[]>
-      ): Promise<T | undefined> => {
-        const resolvedItems = await Promise.resolve(items);
-        capturedItems = [...resolvedItems];
-        return undefined;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+      const chatChoiceMod = require("../utils/chatChoiceV1") as {
+        askChatChoiceV1: (req: {
+          options: ReadonlyArray<{ optionId: string; label: string }>;
+        }) => Promise<string | undefined>;
+      };
+      const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+      let capturedOptions: ReadonlyArray<{ optionId: string; label: string }> = [];
+      chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+        capturedOptions = req.options;
+        return Promise.resolve(undefined);
       };
 
       try {
         await bar.showMenu();
-        const labels = capturedItems.map((item) => item.label);
+        const labels = capturedOptions.map((item) => item.label);
         assert.ok(!labels.includes("$(debug-continue) Resume shown task"));
         assert.ok(labels.includes("$(file-text) Open shown task"));
         assert.ok(labels.includes("$(add) New task..."));
       } finally {
-        win.showQuickPick = origShowQuickPick;
+        chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
         bar.dispose();
       }
     });
@@ -630,25 +634,27 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const tasks = [makeTask("/workspace/task-a", "task-a", "publish", "completed", "/workspace/task-a")];
       bar.update(tasks, "/workspace/task-a");
 
-      const win = getWindowStub();
-      const origShowQuickPick = win.showQuickPick;
-      let capturedItems: vscode.QuickPickItem[] = [];
-      win.showQuickPick = async <T extends vscode.QuickPickItem>(
-        items: readonly T[] | Thenable<readonly T[]>
-      ): Promise<T | undefined> => {
-        const resolvedItems = await Promise.resolve(items);
-        capturedItems = [...resolvedItems];
-        return undefined;
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+      const chatChoiceMod = require("../utils/chatChoiceV1") as {
+        askChatChoiceV1: (req: {
+          options: ReadonlyArray<{ optionId: string; label: string }>;
+        }) => Promise<string | undefined>;
+      };
+      const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+      let capturedOptions: ReadonlyArray<{ optionId: string; label: string }> = [];
+      chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+        capturedOptions = req.options;
+        return Promise.resolve(undefined);
       };
 
       try {
         await bar.showMenu();
-        const labels = capturedItems.map((item) => item.label);
+        const labels = capturedOptions.map((item) => item.label);
         assert.ok(!labels.includes("$(debug-continue) Resume shown task"));
         assert.ok(labels.includes("$(file-text) Open shown task"));
         assert.ok(labels.includes("$(add) New task..."));
       } finally {
-        win.showQuickPick = origShowQuickPick;
+        chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
         bar.dispose();
       }
     });
@@ -1250,7 +1256,9 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
         Promise.resolve(undefined);
       win.showWarningMessage = (): Thenable<string | undefined> =>
         Promise.resolve(undefined);
-      // The user picks the second folder in the workspace quick pick.
+      // The user picks the second folder in the workspace choice, which the
+      // chat control now answers by re-invoking startNewTask with the chosen
+      // folder (there is no QuickPick any more).
       win.showQuickPick = (<T>(items: readonly T[]): Thenable<T | undefined> =>
         Promise.resolve(items[1])) as typeof win.showQuickPick;
 
@@ -1268,7 +1276,9 @@ void describe("Stage 5 — Status Surface & Notifications", () => {
       const creationFilesystem = isolateTaskCreationFilesystem();
 
       try {
-        await startNewTask(inventory, vscode.Uri.file("/extension"), store, context);
+        await startNewTask(inventory, vscode.Uri.file("/extension"), store, context, {
+          workspaceFolderPath: secondFolder.uri.fsPath,
+        });
         assert.strictEqual(
           gitIgnoreCalls.length,
           1,

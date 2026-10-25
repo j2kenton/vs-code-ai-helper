@@ -12,6 +12,7 @@ import {
 } from "../utils/implementationChecklist";
 import { TaskStage } from "../types/taskProgress";
 import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
 
 /**
  * The hand-off card (v1 fixes 2, item 31, step 13): what the user meets when
@@ -225,7 +226,7 @@ export async function applyHandoffTicksV1(
 
 /** What the two commands need from their surroundings — injectable so the lifecycle is testable. */
 export interface HandoffCommandIoV1 {
-  askNote(itemText: string): Promise<string | undefined>;
+  askNote(itemText: string, arg?: HandoffChecksArgV1): Promise<string | undefined>;
   refresh(): Promise<void>;
   /** Posts the successor card listing what is still outstanding. */
   repost(arg: HandoffChecksArgV1, remaining: readonly string[]): Promise<void>;
@@ -294,7 +295,7 @@ export async function tickHandoffCheckV1(arg: HandoffChecksArgV1 | undefined, io
     NotificationRouter.showWarning("Nothing to tick — no check was supplied.");
     return false;
   }
-  const note = await io.askNote(arg.itemText);
+  const note = await io.askNote(arg.itemText, arg);
   const result: HandoffTickResultV1 | { readonly kind: "cancelled" } =
     note === undefined
       ? { kind: "cancelled" }
@@ -336,15 +337,18 @@ export async function keepHandoffChecksV1(arg: HandoffChecksArgV1 | undefined, i
 
 export function registerHandoffChecksCommandsV1(context: vscode.ExtensionContext, inventory: TaskInventory): void {
   const io: HandoffCommandIoV1 = {
-    askNote: (itemText) =>
-      Promise.resolve(
-        vscode.window.showInputBox({
-          title: "Tick this check",
-          prompt: `What did you see? Recorded beside the check: ${truncateChecklistItemTextV1(itemText, 100)}`,
-          placeHolder: "e.g. clicked through the card in a live window; it read correctly",
-          ignoreFocusOut: true,
-        })
-      ),
+    askNote: (itemText, arg) =>
+      askChatFreeTextV1({
+        target: {
+          canonicalId: arg?.taskFolderPath ?? "",
+          taskFolderPath: arg?.taskFolderPath ?? "",
+          stage: arg?.stage ?? "impl",
+          taskName: arg?.displayName,
+        },
+        title: "Tick this check",
+        prompt: `What did you see? Recorded beside the check: ${truncateChecklistItemTextV1(itemText, 100)}`,
+        placeHolder: "e.g. clicked through the card in a live window; it read correctly",
+      }),
     refresh: () => inventory.refresh(),
     repost: async (arg, remaining) => {
       if (!arg.stage) {

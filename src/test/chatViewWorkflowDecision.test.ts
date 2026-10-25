@@ -86,6 +86,7 @@ import * as chatHistoryStoreModule from "../utils/chatHistoryStore";
 import * as effectiveReviewProgressModule from "../utils/effectiveReviewProgress";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { formatDisplayTimestampPairV1 } from "../utils/timeFormat";
+import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
 
 const QUESTIONS: readonly StructuredQuestionV1[] = [
   {
@@ -523,7 +524,7 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
     }
   });
 
-  void it("render() excludes decisions when the global assistant is open", async () => {
+  void it("render() excludes task decisions when the global assistant is open", async () => {
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
@@ -536,6 +537,63 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
       await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl", kind: "global" });
       await waitForStateMessage(fake);
 
+      assert.equal(lastDecisions(fake).length, 0);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("renders and resolves a Global Assistant task-selection decision in global chat", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      await provider.workflowDecisionStore.post(
+        decisionInput(GLOBAL_ASSISTANT_CANONICAL_ID, {
+          decisionId: "global-task-selection",
+          decisionKey: "selectTaskForStageChange",
+          stage: "desc",
+          options: [
+            {
+              optionId: "task-0",
+              label: "Choose task one",
+              consequence: "Set the selected task's stage.",
+              resumeKind: "unpause",
+              effect: {
+                kind: "command",
+                command: "vs-code-ai-helper.setTaskStage",
+                args: [{ canonicalId: folder, stage: "impl", expectedSourceStage: "desc" }],
+              },
+            },
+          ],
+          recommendation: { kind: "none", reasoning: "The task is a personal choice." },
+        })
+      );
+      provider.resolveWebviewView(fake.view);
+      await provider.open({
+        canonicalId: GLOBAL_ASSISTANT_CANONICAL_ID,
+        taskFolderPath: folder,
+        stage: "desc",
+        taskName: "Global Assistant",
+        kind: "global",
+      });
+      await waitForStateMessage(fake);
+      assert.equal(lastDecisions(fake).length, 1);
+      cmds.calls.length = 0;
+
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "global-task-selection", optionId: "task-0" });
+
+      assert.deepEqual(cmds.calls, [
+        {
+          id: "vs-code-ai-helper.setTaskStage",
+          args: [{ canonicalId: folder, stage: "impl", expectedSourceStage: "desc" }],
+        },
+      ]);
       assert.equal(lastDecisions(fake).length, 0);
     } finally {
       notify.restore();
@@ -626,6 +684,58 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
 
       assert.deepEqual(cmds.calls, [{ id: "ensemble.doIt", args: ["arg1"] }]);
       assert.equal(lastDecisions(fake).length, 0, "a resolved decision must no longer render as pending");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("selecting the exhausted type-check recovery option dispatches one resume-and-implementation command with its errors", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const errors = "src/rejected.ts(1,1): error TS2304: Cannot find name 'x'.";
+    try {
+      await provider.workflowDecisionStore.post(
+        decisionInput(folder, {
+          decisionKey: "implementationTypeCheckFailed",
+          options: [
+            {
+              optionId: "runImplementationFix",
+              label: "Run another Implementation round to fix the build",
+              consequence: "Starts an Implementation round with the reported errors in its prompt.",
+              resumeKind: "continue",
+              effect: {
+                kind: "command",
+                command: "vs-code-ai-helper.resumeAndDispatchImplementation",
+                args: [{ taskFolderPath: folder, implementationTypeCheckErrorsV1: errors }],
+              },
+            },
+          ],
+          recommendation: {
+            kind: "option",
+            optionId: "runImplementationFix",
+            reasoning: "The reported build errors need to be cleared before review can continue.",
+          },
+        })
+      );
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      cmds.calls.length = 0;
+
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "runImplementationFix" });
+
+      assert.deepEqual(cmds.calls, [
+        {
+          id: "vs-code-ai-helper.resumeAndDispatchImplementation",
+          args: [{ taskFolderPath: folder, implementationTypeCheckErrorsV1: errors }],
+        },
+      ]);
     } finally {
       notify.restore();
       cmds.restore();
@@ -1465,6 +1575,56 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       // and proves the fix is in rendering, not in silently mutating history.
       const persisted = await readChatHistory(folder);
       assert.equal(persisted[0]!.pending, true, "the persisted flag itself is untouched by design");
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("owner-evidence submission writes the answer and starts one stage review instead of Apply Review", async () => {
+    const folder = makeFolder();
+    fs.writeFileSync(path.join(folder, "task.md"), "# Task\n\n## Draft with AI\n\nDraft\n");
+    const provider = new ChatViewProvider(makeMemento());
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture(true);
+    try {
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" };
+      await provider.open(target);
+      await provider.ask({
+        ...target,
+        question:
+          "Owner evidence needed — <!-- ensemble:owner-evidence-answer -->\n" +
+          "Paste the output, or type what you found.\n\nBlocker: Owner evidence needed: inspect the installed UI",
+      }, true, false);
+      const question = (await readChatHistory(folder)).find((entry) => entry.role === "question");
+      assert.ok(question);
+      await provider.workflowDecisionStore.post(decisionInput(folder, {
+        decisionId: "owner-evidence-decision",
+        decisionKey: "reviewPlateauEscalation",
+        stage: "impl-high-review",
+        whatHappened: "Owner evidence needed: inspect the installed UI",
+        options: [{
+          optionId: "keepIterating",
+          label: "Keep iterating: run Apply Review",
+          consequence: "Apply Review edits and re-reviews.",
+          resumeKind: "continue",
+          effect: { kind: "command", command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction", args: [{ taskFolderPath: folder }] },
+        }],
+        recommendation: { kind: "option", optionId: "keepIterating", reasoning: "Continue." },
+      }));
+      cmds.calls.length = 0;
+
+      await provider.answerQuestion(target, question.id ?? question.at, "Installed UI output\nline two", "impl-high-review");
+
+      assert.deepEqual(cmds.calls.map(({ id }) => id), ["vs-code-ai-helper.resumeAndRerunReview"]);
+      assert.deepEqual(cmds.calls[0]!.args, [
+        { taskFolderPath: folder },
+        { skipUnchangedTreeGuardV1: true },
+      ]);
+      assert.match(fs.readFileSync(path.join(folder, "task.md"), "utf8"), /Installed UI output\nline two/);
+      assert.equal(provider.workflowDecisionStore.listPending().length, 0, "the superseded plateau card should be withdrawn");
     } finally {
       notify.restore();
       cmds.restore();

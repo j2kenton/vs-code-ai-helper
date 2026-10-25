@@ -9,6 +9,8 @@ import { formatTimestampForDisplay } from "../utils/timeFormat";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { REVIEW_TARGETS } from "../utils/reviewReadiness";
 import { describeModelWithProviderV1 } from "../runners/providers";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -112,6 +114,14 @@ const LEVEL_FILTER_STATE_KEY = "ensemble.notificationLevelFilter";
 const ALL_LEVELS: ReadonlyArray<StatusEntry["level"]> = ["info", "warning", "error"];
 /** Label text above this length is truncated with an ellipsis; the full text is still in the hover tooltip. */
 const LABEL_TRUNCATE_LENGTH = 150;
+/** A notification's hover tooltip is cut at this many characters (the click target keeps the full text). */
+export const TOOLTIP_MESSAGE_MAX_CHARS = 4000;
+/**
+ * A stored notification is cut at this many characters. Notifications are
+ * summaries; check output and run logs live in the report and run-log files,
+ * which are never truncated by this.
+ */
+export const MAX_STATUS_MESSAGE_CHARS = 20_000;
 /**
  * 1.0.0 gate, A4 (task "1.0.0 Gate", Part A): `ensemble.notifications` is the
  * same kind of unbounded Memento-backed array as `workflowDecisions` — VS
@@ -128,7 +138,14 @@ const LABEL_TRUNCATE_LENGTH = 150;
 const MAX_STATUS_ENTRIES = 500;
 
 export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNode>, StatusSurface, vscode.Disposable {
-  private readonly _onDidChangeTreeData = new vscode.EventEmitter<StatusTreeNode | undefined | null | void>();
+  private readonly _onDidChangeTreeData = new vscode.EventEmitter<StatusTreeNode | StatusTreeNode[] | undefined | null | void>();
+  /**
+   * The operation row objects handed to the tree, kept by operation id so the
+   * 1 Hz elapsed-time tick can repaint exactly those rows (an element-targeted
+   * refresh needs the same object the tree already holds). Refilled by
+   * `getChildren`, pruned to the live roots.
+   */
+  private readonly operationNodeCache = new Map<string, StatusOperationNode>();
   readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
   private entries: StatusEntry[];
@@ -221,7 +238,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
   private ensureTicking(): void {
     const hasLiveRoot = taskOperations.getRootOperations().length > 0;
     if (hasLiveRoot && !this.tickTimer) {
-      this.tickTimer = setInterval(() => this.refresh(), 1000);
+      this.tickTimer = setInterval(() => this.repaintRunningOperations(), 1000);
       // Node-only API (absent from the browser typings vscode's own lib
       // pulls in for webviews) — never let this timer keep the extension
       // host process alive on its own.
@@ -256,7 +273,9 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     const entry: StatusEntry = {
       // Keep the complete process/result text. The tree label is compacted
       // separately, while the persisted entry remains useful after reload.
-      message,
+      message: message.length > MAX_STATUS_MESSAGE_CHARS
+        ? `${message.slice(0, MAX_STATUS_MESSAGE_CHARS)}… (${message.length - MAX_STATUS_MESSAGE_CHARS} more characters not kept here; the full text is in the run log or report)`
+        : message,
       level,
       timestamp: new Date(),
       filePath,
@@ -279,20 +298,45 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
   }
 
   /**
-   * QuickPick for filtering notifications by type (info / warning / error).
+   * Chat choice for filtering notifications by type (info / warning / error).
    * Running-operation rows are never filtered out.
    */
   async chooseLevelFilter(): Promise<void> {
-    const picked = await vscode.window.showQuickPick(
-      ALL_LEVELS.map((level) => ({
-        label: level[0]!.toUpperCase() + level.slice(1),
-        picked: this.levelFilter.has(level),
-        level,
-      })),
-      { canPickMany: true, title: "Filter notifications by type", placeHolder: "Select the notification types to show" }
-    );
-    if (!picked) return;
-    this.levelFilter = picked.length === 0 ? new Set(ALL_LEVELS) : new Set(picked.map((item) => item.level));
+    const globalTarget = await resolveGlobalChatTargetOrDefaultV1();
+    const chosenId = await askChatChoiceV1({
+      target: globalTarget,
+      decisionKey: "chooseNotificationLevelFilter",
+      whatHappened: "Filter notifications by type in the Notifications view.",
+      whyUserNeeded: "Select which notification types to display or toggle an individual type.",
+      options: [
+        {
+          optionId: "all",
+          label: "All notification types",
+          description: "Show info, warning, and error notifications",
+        },
+        ...ALL_LEVELS.map((level) => ({
+          optionId: level,
+          label: level[0]!.toUpperCase() + level.slice(1),
+          description: `${this.levelFilter.has(level) ? "[Shown]" : "[Hidden]"} Toggle ${level} notifications`,
+        })),
+      ],
+      recommendedOptionId: "all",
+    });
+    if (!chosenId) return;
+    if (chosenId === "all") {
+      this.levelFilter = new Set(ALL_LEVELS);
+    } else if ((ALL_LEVELS as readonly string[]).includes(chosenId)) {
+      const level = chosenId as StatusEntry["level"];
+      const next = new Set(this.levelFilter);
+      if (next.has(level)) {
+        next.delete(level);
+      } else {
+        next.add(level);
+      }
+      this.levelFilter = next.size === 0 ? new Set(ALL_LEVELS) : next;
+    } else {
+      return;
+    }
     await this.state?.update(LEVEL_FILTER_STATE_KEY, [...this.levelFilter]);
     this.refresh();
   }
@@ -315,6 +359,25 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
   refresh(): void {
     this._onDidChangeTreeData.fire();
+  }
+
+  /**
+   * The elapsed-time tick. A full `refresh()` once a second re-sent every
+   * notification row (up to MAX_STATUS_ENTRIES, each with its complete
+   * message in the tooltip and in the row's click target) to the window's UI
+   * process for as long as any operation ran — about 2 GB an hour of renderer
+   * memory during a long Fix Linting & Code Errors or Publish Checks run
+   * (post-1.0 fixes, item 12). Only the running-operation rows show elapsed
+   * time, so only those are repainted; real changes still go through
+   * `refresh()`.
+   */
+  private repaintRunningOperations(): void {
+    const rows = [...this.operationNodeCache.values()];
+    if (rows.length === 0) {
+      this.refresh();
+      return;
+    }
+    this._onDidChangeTreeData.fire(rows);
   }
 
   private persist(): void {
@@ -417,6 +480,13 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       return item;
     }
 
+    // Tooltips are re-sent whenever the tree repaints; a check report pasted
+    // into a notification must not ride along in full (item 12). The row's
+    // click target still carries the complete text.
+    const tooltipMessage =
+      element.message.length > TOOLTIP_MESSAGE_MAX_CHARS
+        ? `${element.message.slice(0, TOOLTIP_MESSAGE_MAX_CHARS)}… (${element.message.length - TOOLTIP_MESSAGE_MAX_CHARS} more characters)`
+        : element.message;
     const isTruncated = element.message.length > LABEL_TRUNCATE_LENGTH;
     const label = isTruncated ? `${element.message.slice(0, LABEL_TRUNCATE_LENGTH)}…` : element.message;
     const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
@@ -438,7 +508,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         arguments: [vscode.Uri.file(element.filePath)],
       };
       item.tooltip = new vscode.MarkdownString(
-        `**[${element.level.toUpperCase()}]** ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}\n\nClick to open the related file.`
+        `**[${element.level.toUpperCase()}]** ${tooltipMessage}\n\nTime: ${element.timestamp.toLocaleString()}\n\nClick to open the related file.`
       );
     } else if (element.resultTargetUri) {
       let targetUri: vscode.Uri | undefined;
@@ -454,10 +524,10 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
           arguments: [targetUri],
         };
         item.tooltip = new vscode.MarkdownString(
-          `**[${element.level.toUpperCase()}]** ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}\n\nClick to open the result.`
+          `**[${element.level.toUpperCase()}]** ${tooltipMessage}\n\nTime: ${element.timestamp.toLocaleString()}\n\nClick to open the result.`
         );
       } else {
-        item.tooltip = `[${element.level.toUpperCase()}] ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}`;
+        item.tooltip = `[${element.level.toUpperCase()}] ${tooltipMessage}\n\nTime: ${element.timestamp.toLocaleString()}`;
       }
     } else {
       // Nothing real to navigate to — open a read-only virtual document with
@@ -467,7 +537,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         title: "Show Full Notification",
         arguments: [notificationFallbackUri(element.message, element.level, element.timestamp)],
       };
-      item.tooltip = `[${element.level.toUpperCase()}] ${element.message}\n\nTime: ${element.timestamp.toLocaleString()}`;
+      item.tooltip = `[${element.level.toUpperCase()}] ${tooltipMessage}\n\nTime: ${element.timestamp.toLocaleString()}`;
     }
 
     // Icon based on severity
@@ -507,7 +577,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       const actionTitle = element.actionCommand.title;
       const baseTooltip = item.tooltip instanceof vscode.MarkdownString
         ? item.tooltip.value
-        : item.tooltip ?? `[${element.level.toUpperCase()}] ${element.message}`;
+        : item.tooltip ?? `[${element.level.toUpperCase()}] ${tooltipMessage}`;
       item.tooltip = new vscode.MarkdownString(`${baseTooltip}\n\nAction available: ${actionTitle}.`);
     }
 
@@ -555,7 +625,20 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         activity: op.activity,
         activityStartedAt: op.activityStartedAt,
         startedAt: op.startedAt,
-      }));
+      })).map((fresh): StatusOperationNode => {
+        // Reuse the row object the tree already holds, updated in place.
+        const cached = this.operationNodeCache.get(fresh.id);
+        if (cached) {
+          return Object.assign(cached, fresh);
+        }
+        this.operationNodeCache.set(fresh.id, fresh);
+        return fresh;
+      });
+      for (const id of [...this.operationNodeCache.keys()]) {
+        if (!runningNodes.some((node) => node.id === id)) {
+          this.operationNodeCache.delete(id);
+        }
+      }
       return [...runningNodes, ...this.filteredEntries()];
     }
     return [];

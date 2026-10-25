@@ -37,6 +37,8 @@ import {
   resolveWorkflowAllocatedFsPathV1,
 } from "../services/workflowRuntimeServicesV1";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
+import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { resolveGlobalAssistantTarget } from "./openGeneralAssistant";
 
 /**
  * Describe a `TaskCreationIntentStoreResultV1` for a diagnostics log line.
@@ -305,7 +307,8 @@ export async function startNewTask(
   inventory: TaskInventory,
   extensionUri: vscode.Uri,
   currentTaskStore: CurrentTaskStore,
-  context?: vscode.ExtensionContext
+  context?: vscode.ExtensionContext,
+  selection?: { workspaceFolderPath?: string }
 ): Promise<string | undefined> {
   // Block on the startup gate's classification pass before this command body
   // performs its first read, so it cannot race the read-only reconciliation
@@ -314,12 +317,38 @@ export async function startNewTask(
   await TaskCreationStartupReconcilerV1.waitUntilReady();
 
   const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
-  const workspaceRoot = workspaceFolders.length <= 1
+  const requestedRoot = selection?.workspaceFolderPath;
+  const workspaceRoot = requestedRoot
+    ? workspaceFolders.find(folder => normalizePath(folder.uri.fsPath) === normalizePath(requestedRoot))
+    : workspaceFolders.length <= 1
     ? workspaceFolders[0]
-    : await vscode.window.showQuickPick(
-        workspaceFolders.map(folder => ({ label: folder.name, description: folder.uri.fsPath, folder })),
-        { title: "Choose the workspace for this task", placeHolder: "Tasks must belong to exactly one workspace folder" }
-      ).then(selection => selection?.folder);
+    : undefined;
+  if (!workspaceRoot && !requestedRoot && workspaceFolders.length > 1) {
+    const globalTarget = await resolveGlobalAssistantTarget();
+    if (globalTarget) {
+      await postWorkflowDecisionV1({
+        decisionKey: "chooseWorkspaceForNewTask",
+        taskCanonicalId: globalTarget.canonicalId,
+        stage: globalTarget.stage,
+        whatHappened: "Choose the workspace folder where the new task should be created.",
+        whyUserNeeded: "Tasks must belong to exactly one workspace folder, and several folders are open.",
+        options: workspaceFolders.map((folder, index) => ({
+          optionId: `workspace-${index}`,
+          label: folder.name,
+          resumeKind: "continue" as const,
+          consequence: `Creates the task under ${folder.uri.fsPath}.`,
+          effect: {
+            kind: "command" as const,
+            command: "vs-code-ai-helper.startNewTask",
+            args: [{ workspaceFolderPath: folder.uri.fsPath }],
+          },
+        })),
+        recommendation: { kind: "none", reasoning: "The workspace choice is yours." },
+        gating: { holdsTaskPaused: false, unblocksProgress: false, detail: "Choosing a workspace starts task creation there." },
+      }, globalTarget);
+    }
+    return undefined;
+  }
   if (!workspaceRoot) {
     NotificationRouter.showWarning(
       "Open your repo folder in VS Code before starting a task. Ensemble will create .ensemble there automatically."
@@ -570,7 +599,8 @@ export function registerStartNewTaskCommand(
 ): void {
   const disposable = vscode.commands.registerCommand(
     "vs-code-ai-helper.startNewTask",
-    () => startNewTask(inventory, context.extensionUri, currentTaskStore, context)
+    (selection?: { workspaceFolderPath?: string }) =>
+      startNewTask(inventory, context.extensionUri, currentTaskStore, context, selection)
   );
   context.subscriptions.push(disposable);
 }

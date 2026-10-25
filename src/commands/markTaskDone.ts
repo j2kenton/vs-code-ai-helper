@@ -14,6 +14,7 @@ import { MARK_TASK_DONE_ACTION_KEY_V1 } from "../actions/rows/markTaskDoneRowV1"
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { missingCompletionArtifactsV1 } from "../utils/stageArtifactRequirementsV1";
 import { retirePendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisionDispatchV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -181,17 +182,25 @@ export async function markTaskDone(
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const missingArtifacts = await missingCompletionArtifactsV1(taskFolderUri, "publish");
   if (missingArtifacts.length > 0 && resolverArg?.artifactOverride !== "user") {
-    NotificationRouter.showWarning(
+    const noticeText =
       `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: cannot complete — ${missingArtifacts.join(", ")} has not been created. ` +
-        "Run or create the Publish review first, or explicitly complete anyway.",
+      "Run or create the Publish review first, or explicitly complete anyway.";
+    const chatPointer = await offerActionInChatV1({
+      taskFolderPath: taskFolderUri.fsPath,
+      progress: resolvedTask.progress,
+      actionLabel: "Complete Anyway",
+      command: "vs-code-ai-helper.markTaskDone",
+      args: [{ taskFolderPath: taskFolderUri.fsPath, artifactOverride: "user" }],
+      noticeText,
+      optional: true,
+      taskLabel: resolvedTask.progress.displayName,
+    });
+    NotificationRouter.showWarning(
+      noticeText /* taskLabel */,
       undefined,
       undefined,
       undefined,
-      {
-        command: "vs-code-ai-helper.markTaskDone",
-        title: "Complete Anyway",
-        args: [{ taskFolderPath: taskFolderUri.fsPath, artifactOverride: "user" }],
-      }
+      chatPointer
     );
     return;
   }

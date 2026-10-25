@@ -470,7 +470,19 @@ export type TerminalizeRoundNoLiveRowResultV1 =
 export function formatRoundOutcomeMessageV1(
   entry: RoundLedgerEntryV1,
   sourceStartedAt?: string,
-  progress?: Pick<TaskProgress, "reviewScoreHistory" | "roundOutcomes">,
+  progress?: Partial<Pick<
+    TaskProgress,
+    | "reviewScoreHistory"
+    | "roundOutcomes"
+    | "implementationTypeCheckFailure"
+    | "status"
+    | "nextActor"
+    | "currentStage"
+    | "implRecovery"
+    | "scheduledRun"
+    | "scheduledResumeTime"
+    | "roundLedger"
+  >>,
   chatAttributionNote?: string
 ): string {
   const stageName = STAGE_DISPLAY_NAMES[entry.stage] ?? entry.stage;
@@ -485,6 +497,16 @@ export function formatRoundOutcomeMessageV1(
     parts.push(`continuation of the round started ${started}`);
   }
   const outcome = entry.outcome;
+  const typeCheckFailureAt = progress?.implementationTypeCheckFailure?.at;
+  if (
+    entry.mode === "implementation" &&
+    typeCheckFailureAt &&
+    entry.endedAt &&
+    typeCheckFailureAt >= entry.startedAt &&
+    typeCheckFailureAt <= entry.endedAt
+  ) {
+    parts.push("type-check failed");
+  }
   if (outcome) {
     if (outcome.rejectionReason) {
       parts.push(outcome.rejectionReason);
@@ -518,6 +540,21 @@ export function formatRoundOutcomeMessageV1(
         `task.md is ${kb} KB — ${outcome.taskMdSizeBand.percentOfLimit}% of the review-input limit; shorten task.md (once a plan exists, reviews only receive its first part)`
       );
     }
+  }
+  const noFollowUpScheduled =
+    progress?.status === "active" &&
+    progress.nextActor === "human" &&
+    progress.currentStage === entry.stage &&
+    progress.implRecovery === undefined &&
+    progress.scheduledRun === undefined &&
+    progress.scheduledResumeTime === undefined &&
+    !(progress.roundLedger ?? []).some((row) => row.state === "scheduled" || row.state === "open");
+  if (entry.state === "completed" && entry.mode === "implementation" && entry.stage === "impl" && noFollowUpScheduled) {
+    parts.push(
+      typeCheckFailureAt && entry.endedAt && typeCheckFailureAt >= entry.startedAt && typeCheckFailureAt <= entry.endedAt
+        ? "No follow-up was scheduled; fix the type-check errors before review can continue."
+        : "Review the changes or run another Implementation round if automatic review does not start."
+    );
   }
   // The dispatch mode is part of the terminal record, not merely metadata in
   // task-progress.json.  A reader needs it to distinguish checklist-driven

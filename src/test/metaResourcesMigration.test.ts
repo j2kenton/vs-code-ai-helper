@@ -122,16 +122,26 @@ interface PromptControl {
   restore: () => void;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const chatChoiceModule = require("../utils/chatChoiceV1") as {
+  askChatChoiceV1: (input: { whatHappened: string; options: { optionId: string; label: string }[] }) => Promise<string | undefined>;
+};
+
 /** Answer the migration offer with `answer`, capturing prompts and errors. */
 function installPrompts(answer: string | undefined): PromptControl {
   const win = vscode.window as unknown as Record<string, unknown>;
   const origInfo = win.showInformationMessage;
   const origErr = win.showErrorMessage;
   const origWarn = win.showWarningMessage;
+  const origAskChoice = chatChoiceModule.askChatChoiceV1;
   const prompts: string[] = [];
   const errors: string[] = [];
   win.showInformationMessage = (message: string): Promise<string | undefined> => {
     prompts.push(message);
+    return Promise.resolve(answer);
+  };
+  chatChoiceModule.askChatChoiceV1 = (input): Promise<string | undefined> => {
+    prompts.push(input.whatHappened);
     return Promise.resolve(answer);
   };
   win.showErrorMessage = (message: string): Promise<undefined> => {
@@ -149,6 +159,7 @@ function installPrompts(answer: string | undefined): PromptControl {
       win.showInformationMessage = origInfo;
       win.showErrorMessage = origErr;
       win.showWarningMessage = origWarn;
+      chatChoiceModule.askChatChoiceV1 = origAskChoice;
     },
   };
 }

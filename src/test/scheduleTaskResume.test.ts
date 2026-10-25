@@ -87,6 +87,30 @@ setWorkAdmissionRootOverrideForTestV1((taskFolderPath) =>
   path.join(admissionTestRootV1, Buffer.from(taskFolderPath).toString("hex"))
 );
 
+/**
+ * The same placeholders also reach `withTaskLock`'s on-disk session, meta-root
+ * and task lock files (task-state writes reached from the watchdog sweep),
+ * which created an empty `C:\tasks\task/` in the working directory and failed
+ * the unit-test run's repository leak check. Map each placeholder to a folder
+ * under the same temp root, keeping a task's siblings under one shared parent
+ * so the meta-root lock is shared between them exactly as in production.
+ * Restored in the teardown below.
+ */
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const taskStateStoreModule = require("../state/taskStateStore") as {
+  withTaskLock: <T>(taskFolderPath: string, operation: () => Promise<T>) => Promise<T>;
+};
+const originalWithTaskLock = taskStateStoreModule.withTaskLock;
+taskStateStoreModule.withTaskLock = <T>(taskFolderPath: string, operation: () => Promise<T>): Promise<T> =>
+  originalWithTaskLock(
+    path.join(
+      admissionTestRootV1,
+      Buffer.from(path.dirname(taskFolderPath)).toString("hex"),
+      path.basename(taskFolderPath)
+    ),
+    operation
+  );
+
 /** Same redirection this file's admission-root override above installs,
  * applied by hand so a test can plant a FAKE marker directly — mirrors
  * `workAdmissionV1.test.ts`'s own `writeFakeMarkerV1`, adapted to this file's
@@ -148,6 +172,7 @@ function spawnAndWaitForDeadPidV1(): Promise<number> {
 }
 after(() => {
   setWorkAdmissionRootOverrideForTestV1(undefined);
+  taskStateStoreModule.withTaskLock = originalWithTaskLock;
   safeRemoveDir(admissionTestRootV1);
 });
 
@@ -2160,33 +2185,44 @@ void test("armAll surfaces a takeover notice only after 3 consecutive sweeps obs
   try {
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "1 observation must not yet surface a notice"
     );
 
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "2 observations must not yet surface a notice"
     );
 
     await scheduler.armAll();
-    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission");
+    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
     assert.equal(takeoverEntries.length, 1, "the 3rd consecutive observation must surface exactly one notice");
     assert.equal(takeoverEntries[0]?.level, "warning");
     assert.match(takeoverEntries[0]?.message ?? "", /not this one|foreign/i);
-    assert.deepEqual(takeoverEntries[0]?.actionCommand?.args, [
-      { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: "stuck-foreign-owner-claim" },
-    ]);
+    assert.equal(takeoverEntries[0]?.actionCommand?.title, "Open in Chat");
+
+    const store = new WorkflowDecisionStoreV1(fakeContext.memento);
+    const decisions = store.listPending(taskFolderPath);
+    assert.equal(decisions.length, 1);
+    const decision = decisions[0];
+    assert.ok(decision);
+    assert.equal(decision.options[0]?.effect?.kind, "command");
+    if (decision.options[0]?.effect?.kind === "command") {
+      assert.equal(decision.options[0].effect.command, "vs-code-ai-helper.takeOverStaleWorkAdmission");
+      assert.deepEqual(decision.options[0].effect.args, [
+        { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: "stuck-foreign-owner-claim" },
+      ]);
+    }
 
     // A 4th consecutive observation of the SAME stuck owner must not spam a
     // second notice — this is a one-shot notice per stuck streak, not a
     // repeating alarm.
     await scheduler.armAll();
     assert.equal(
-      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission").length,
+      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision").length,
       1,
       "the notice must not repeat for the same unresolved streak"
     );
@@ -2225,7 +2261,7 @@ void test("armAll's takeover-notice streak resets when a DIFFERENT owner is obse
     await scheduler.armAll();
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "owner-a has only 2 observations so far"
     );
@@ -2245,7 +2281,7 @@ void test("armAll's takeover-notice streak resets when a DIFFERENT owner is obse
     backdateFileV1(markerPathB, WORK_ADMISSION_LIKELY_STALE_MS_V1 + 60_000, clock.now());
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "owner-b's streak must start over at 1, not continue owner-a's count of 2"
     );
@@ -2299,32 +2335,43 @@ void test("armAll surfaces a takeover notice only after 3 consecutive sweeps obs
   try {
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "1 observation must not yet surface a notice"
     );
 
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "2 observations must not yet surface a notice"
     );
 
     await scheduler.armAll();
-    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission");
+    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
     assert.equal(takeoverEntries.length, 1, "the 3rd consecutive observation must surface exactly one notice");
     assert.equal(takeoverEntries[0]?.level, "warning");
     // sameHostAlive is the one liveness kind carrying a strong warning — see
     // `describeStaleWorkAdmissionTakeoverNoticeV1`'s own dedicated wording test.
     assert.match(takeoverEntries[0]?.message ?? "", /still respond|alive|running/i);
-    assert.deepEqual(takeoverEntries[0]?.actionCommand?.args, [
-      { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: "stuck-alive-owner-claim" },
-    ]);
+    assert.equal(takeoverEntries[0]?.actionCommand?.title, "Open in Chat");
+
+    const store = new WorkflowDecisionStoreV1(fakeContext.memento);
+    const decisions = store.listPending(taskFolderPath);
+    assert.equal(decisions.length, 1);
+    const decision = decisions[0];
+    assert.ok(decision);
+    assert.equal(decision.options[0]?.effect?.kind, "command");
+    if (decision.options[0]?.effect?.kind === "command") {
+      assert.equal(decision.options[0].effect.command, "vs-code-ai-helper.takeOverStaleWorkAdmission");
+      assert.deepEqual(decision.options[0].effect.args, [
+        { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: "stuck-alive-owner-claim" },
+      ]);
+    }
 
     await scheduler.armAll();
     assert.equal(
-      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission").length,
+      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision").length,
       1,
       "the notice must not repeat for the same unresolved streak"
     );
@@ -2365,33 +2412,41 @@ void test("armAll surfaces a takeover notice only after 3 consecutive sweeps obs
   try {
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "1 observation must not yet surface a notice"
     );
 
     await scheduler.armAll();
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "2 observations must not yet surface a notice"
     );
 
     await scheduler.armAll();
-    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission");
+    const takeoverEntries = surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
     assert.equal(takeoverEntries.length, 1, "the 3rd consecutive observation must surface exactly one notice");
     assert.equal(takeoverEntries[0]?.level, "warning");
     assert.match(takeoverEntries[0]?.message ?? "", /unreadable record|cannot be determined/i);
-    // A corrupt record carries no readable `claimId`, so the notice-state
-    // identity key falls back to the marker path itself — the takeover
-    // command args must still name the exact observed marker.
-    assert.deepEqual(takeoverEntries[0]?.actionCommand?.args, [
-      { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: undefined },
-    ]);
+    assert.equal(takeoverEntries[0]?.actionCommand?.title, "Open in Chat");
+
+    const store = new WorkflowDecisionStoreV1(fakeContext.memento);
+    const decisions = store.listPending(taskFolderPath);
+    assert.equal(decisions.length, 1);
+    const decision = decisions[0];
+    assert.ok(decision);
+    assert.equal(decision.options[0]?.effect?.kind, "command");
+    if (decision.options[0]?.effect?.kind === "command") {
+      assert.equal(decision.options[0].effect.command, "vs-code-ai-helper.takeOverStaleWorkAdmission");
+      assert.deepEqual(decision.options[0].effect.args, [
+        { taskFolderPath, expectedMarkerPath: markerPath, expectedClaimId: undefined },
+      ]);
+    }
 
     await scheduler.armAll();
     assert.equal(
-      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission").length,
+      surface.entries.filter((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision").length,
       1,
       "the notice must not repeat for the same unresolved streak"
     );
@@ -2445,7 +2500,7 @@ void test("armAll never surfaces a takeover notice for a fresh (non-stale) admis
       await scheduler.armAll();
     }
     assert.equal(
-      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.takeOverStaleWorkAdmission"),
+      surface.entries.some((e) => e.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"),
       false,
       "a fresh marker must never surface a takeover notice, however many consecutive sweeps observe it"
     );

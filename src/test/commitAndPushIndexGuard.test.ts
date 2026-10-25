@@ -184,7 +184,7 @@ void describe("commitAndPushTask.ts / commitPushRowV1.ts source order (§10.2, f
     const readinessIdx = source.indexOf("checkGitPublishReadiness(", scopeStart);
     assert.ok(readinessIdx > scopeStart, "could not find the readiness check");
 
-    const promptIdx = source.indexOf("showWarningMessage", gateIdx);
+    const promptIdx = source.indexOf("askCommitPushInChatV1(", gateIdx);
     assert.ok(promptIdx > gateIdx, "could not find a prompt after the gate");
 
     assert.ok(

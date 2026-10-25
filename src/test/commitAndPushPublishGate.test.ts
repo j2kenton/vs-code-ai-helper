@@ -49,6 +49,14 @@ const completionLintModule = require("../utils/completionLint") as {
 const runLintingFixesModule = require("../commands/runLintingFixes") as {
   runLintingFixes: (...args: unknown[]) => Promise<void>;
 };
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const workflowDecisionModule = require("../utils/workflowDecisionDispatchV1") as {
+  awaitWorkflowDecisionAnswerV1: (input: {
+    decisionKey: string;
+    whatHappened: string;
+    options: { optionId: string; label: string }[];
+  }) => Promise<string | undefined>;
+};
 
 function git(cwd: string, args: string[]): void {
   cp.execFileSync("git", args, { cwd, stdio: "ignore", windowsHide: true });
@@ -170,6 +178,7 @@ function installGateHarness(
   const originalWorkspaceFolders = vscode.workspace.workspaceFolders;
   const originalRunCompletionLint = completionLintModule.runCompletionLint;
   const originalShowWarningMessage = vscode.window.showWarningMessage;
+  const originalAwaitDecision = workflowDecisionModule.awaitWorkflowDecisionAnswerV1;
   (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = [
     { uri: vscode.Uri.file(repoRoot), name: "root", index: 0 },
   ];
@@ -200,18 +209,28 @@ function installGateHarness(
   };
 
   const warningCalls: { message: string; items: string[] }[] = [];
-  vscode.window.showWarningMessage = ((...args: unknown[]): Promise<string | undefined> => {
-    const message = String(args[0]);
-    const items = args.slice(1).filter((a): a is string => typeof a === "string");
-    warningCalls.push({ message, items });
-    // The failing-checks decision modal is answered by the test; every other
-    // warning modal (the staging confirmation) is dismissed, cancelling
-    // cleanly before any git mutation.
-    const answer = /completion checks failed/i.test(message)
-      ? answerChecksModal()
-      : undefined;
-    return Promise.resolve(answer);
-  }) as unknown as typeof vscode.window.showWarningMessage;
+  workflowDecisionModule.awaitWorkflowDecisionAnswerV1 = (
+    input
+  ): Promise<string | undefined> => {
+    const items = input.options.map((option) => option.label);
+    warningCalls.push({ message: input.whatHappened, items });
+    if (input.decisionKey === "commitPushCompletionChecksFailed") {
+      const answer = answerChecksModal();
+      return Promise.resolve(
+        answer === "Publish Anyway"
+          ? "publishAnyway"
+          : answer === "Fix with AI"
+            ? "fixWithAi"
+            : undefined
+      );
+    }
+    // Every other confirmation (the staging scope gate) is dismissed,
+    // cancelling cleanly before any git mutation — same as the old modal
+    // stub.
+    return Promise.resolve(undefined);
+  };
+  vscode.window.showWarningMessage =
+    (() => Promise.resolve(undefined)) as unknown as typeof vscode.window.showWarningMessage;
 
   return {
     repoRoot,
@@ -222,6 +241,7 @@ function installGateHarness(
     restore(): void {
       completionLintModule.runCompletionLint = originalRunCompletionLint;
       vscode.window.showWarningMessage = originalShowWarningMessage;
+      workflowDecisionModule.awaitWorkflowDecisionAnswerV1 = originalAwaitDecision;
       (vscode.workspace as unknown as Record<string, unknown>).workspaceFolders = originalWorkspaceFolders;
       (vscode.workspace.fs as unknown as Record<string, unknown>).readFile = originalReadFile;
       deactivateNotificationRouter();
@@ -240,8 +260,8 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
       assert.ok(checksModal, "the failing-checks decision modal must be shown");
       assert.deepEqual(
         checksModal.items,
-        ["Publish Anyway", "Fix with AI"],
-        "the modal must offer Publish Anyway and Fix with AI (Cancel is the modal's dismiss affordance)"
+        ["Publish Anyway", "Fix with AI", "Cancel"],
+        "the chat decision must offer Publish Anyway, Fix with AI, and an explicit Cancel"
       );
 
       const reviewPath = path.join(harness.taskFolderPath, "publish-review.md");

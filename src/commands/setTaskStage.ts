@@ -26,9 +26,12 @@ import {
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
-import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { resolveGlobalAssistantTarget } from "./openGeneralAssistant";
 import { LifecycleStageMismatchError } from "../actions/rows/lifecyclePolicyRejection";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import type { ChatTarget } from "../views/chatView";
 
 /**
  * Accepted argument shapes for setTaskStage.
@@ -229,33 +232,56 @@ export async function setTaskStage(
       task,
     }));
 
-    const selectedTaskItem =
-      taskItems.length === 1
-        ? taskItems[0]
-        : await vscode.window.showQuickPick(taskItems, {
-            placeHolder: "Select a task",
-            title: "Set Task Stage",
-          });
-
-    if (!selectedTaskItem) {
-      return false;
+    if (taskItems.length === 1) {
+      const selected = taskItems[0]!;
+      return setTaskStage(
+        inventory,
+        currentTaskStore,
+        {
+          canonicalId: selected.task.canonicalId,
+          stage: requestedStage,
+          expectedSourceStage: selected.task.progress.currentStage,
+          cancelResultOutV1,
+        },
+        kind
+      );
     }
 
-    // Re-enter with an explicit canonical ID so the resolver path is taken on
-    // the recursive call. The hasExplicitTask guard above ensures that if this
-    // new lookup also fails (very unlikely after a fresh pick), it will report
-    // an error rather than looping.
-    return setTaskStage(
-      inventory,
-      currentTaskStore,
-      {
-        canonicalId: selectedTaskItem.task.canonicalId,
-        stage: requestedStage,
-        expectedSourceStage,
-        cancelResultOutV1,
+    const globalTarget = await resolveGlobalAssistantTarget();
+    if (!globalTarget) {
+      NotificationRouter.showWarning("Open a workspace folder before choosing a task in Chat.");
+      return false;
+    }
+    const options = taskItems.map((item, index) => ({
+      optionId: `task-${index}`,
+      label: item.label,
+      resumeKind: "unpause" as const,
+      consequence: `Choose ${item.label} (currently at ${item.description?.replace(/^Stage: /, "")}) to set its stage.`,
+      effect: {
+        kind: "command" as const,
+        command: "vs-code-ai-helper.setTaskStage",
+        args: [{
+          canonicalId: item.task.canonicalId,
+          stage: requestedStage,
+          expectedSourceStage: item.task.progress.currentStage,
+        }],
       },
-      kind
-    );
+    }));
+    await postWorkflowDecisionV1({
+      decisionKey: "selectTaskForStageChange",
+      taskCanonicalId: globalTarget.canonicalId,
+      stage: globalTarget.stage,
+      whatHappened: "Choose which task to change stage for.",
+      whyUserNeeded: "Several eligible tasks are available, and the stage change should be applied only to the task you choose.",
+      options,
+      recommendation: { kind: "none", reasoning: "The task is a personal choice." },
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: false,
+        detail: "Choosing a task only selects the target for the stage change.",
+      },
+    }, globalTarget);
+    return false;
   }
 
   const task = resolvedTask;
@@ -271,7 +297,7 @@ export async function setTaskStage(
     return setTaskStageOnCompletedTask(inventory, currentTaskStore, task, requestedStage);
   }
 
-  let newStage: TaskStage | undefined = requestedStage;
+  const newStage: TaskStage | undefined = requestedStage;
 
   if (!newStage) {
     const stageItems = STAGE_ORDER.filter(
@@ -281,15 +307,49 @@ export async function setTaskStage(
       stage,
     }));
 
-    const selectedStageItem = await vscode.window.showQuickPick(stageItems, {
-      placeHolder: "Select the stage this task should be on",
-      title: `Set Stage: ${task.folderName}`,
-    });
-
-    if (!selectedStageItem) {
-      return false;
-    }
-    newStage = selectedStageItem.stage;
+    const options = stageItems.map((item) => ({
+      optionId: `stage-${item.stage}`,
+      label: item.label,
+      resumeKind: "unpause" as const,
+      consequence: `Moves this task to ${item.label}.`,
+      effect: {
+        kind: "command" as const,
+        command: "vs-code-ai-helper.setTaskStage",
+        args: [{
+          canonicalId: task.canonicalId,
+          stage: item.stage,
+          expectedSourceStage: task.progress.currentStage,
+        }],
+      },
+    }));
+    const nextInOrder = STAGE_ORDER[(STAGE_ORDER.indexOf(task.progress.currentStage) + 1) % STAGE_ORDER.length];
+    const recommendedOptionId =
+      options.find((option) => option.optionId === `stage-${nextInOrder}`)?.optionId ?? options[0]!.optionId;
+    const target: ChatTarget = {
+      canonicalId: task.canonicalId,
+      taskFolderPath: task.taskFolderPath,
+      stage: task.progress.currentStage,
+      taskName: task.progress.displayName ?? task.folderName,
+    };
+    await postWorkflowDecisionV1({
+      decisionKey: "selectTaskStage",
+      taskCanonicalId: task.canonicalId,
+      stage: task.progress.currentStage,
+      whatHappened: `Choose a stage for ${task.progress.displayName ?? task.folderName}.`,
+      whyUserNeeded: "Several stages are available, and the task should only move when you choose one.",
+      options,
+      recommendation: {
+        kind: "option",
+        optionId: recommendedOptionId,
+        reasoning: "This is the next stage in the workflow.",
+      },
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: false,
+        detail: "Choosing a stage changes this task's current stage.",
+      },
+    }, target);
+    return false;
   }
 
   if (newStage === task.progress.currentStage) {
@@ -534,16 +594,22 @@ export async function setTaskStage(
   // surfacing immediately, with a one-click "Publish Anyway" affordance,
   // instead of only being discovered later inside Commit and Push's own gate.
   if (newStage === "publish" && publishPreflight?.ok === false) {
+    const publishAnywayNotice =
+      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: ${publishPreflight.reason}. ` +
+      "Publish once checks pass, or use Publish Anyway from Commit and Push.";
     NotificationRouter.showWarning(
-      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: ${publishPreflight.reason}. Publish once checks pass, or use Publish Anyway from Commit and Push.`,
+      publishAnywayNotice /* taskLabel */,
       undefined,
       undefined,
       undefined,
-      {
+      await offerActionInChatV1({
+        taskFolderPath: task.taskFolderPath,
+        actionLabel: "Publish Anyway",
         command: "vs-code-ai-helper.commitAndPushTask",
-        title: "Publish Anyway",
         args: [{ taskFolderPath: task.taskFolderPath }],
-      }
+        noticeText: publishAnywayNotice,
+        optional: true,
+      })
     );
   }
 
@@ -628,7 +694,14 @@ async function setTaskStageOnCompletedTask(
   requestedStage: TaskStage | undefined
 ): Promise<boolean> {
   const capturedCompletedAt = task.progress.completedAt;
-  const chosenStage = requestedStage ?? (await pickReopenStage(task.folderName));
+  const chosenStage =
+    requestedStage ??
+    (await pickReopenStage(task.folderName, {
+      canonicalId: task.canonicalId,
+      taskFolderPath: task.taskFolderPath,
+      stage: task.progress.currentStage,
+      taskName: task.progress.displayName ?? task.folderName,
+    }));
   if (!chosenStage) {
     return false;
   }

@@ -3,6 +3,8 @@ import { getConfiguredTaskRoot } from "./taskRoot";
 import { findIncompleteTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "./notificationRouter";
+import { askChatChoiceV1 } from "./chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "./globalChatTargetV1";
 
 /**
  * Prompt the user to pick a task folder to operate on, restricted to
@@ -50,18 +52,23 @@ export async function pickTaskFolder(
     return tasks[0]?.folderUri;
   }
 
-  const items = tasks.map((task) => ({
-    label: task.progress.displayName ?? task.folderName,
-    // wf10 item 21: folder id as description alongside stage, rather than
-    // rendering only the unrecognizable folder id as the whole label.
-    description: `${task.folderName} · Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
-    folderUri: task.folderUri,
-  }));
-
-  const selected = await vscode.window.showQuickPick(items, {
-    placeHolder: "Select a task",
-    title: quickPickTitle,
+  const target = await resolveGlobalChatTargetOrDefaultV1(workspaceRoot.uri.fsPath);
+  const pickedOptionId = await askChatChoiceV1({
+    target,
+    decisionKey: "pickTaskFolder",
+    whatHappened: `${quickPickTitle} — Select a task.`,
+    whyUserNeeded: "Multiple tasks are eligible for this action.",
+    options: tasks.map((task, index) => ({
+      optionId: `task_${index}`,
+      label: task.progress.displayName ?? task.folderName,
+      // wf10 item 21: folder id as description alongside stage, rather than
+      // rendering only the unrecognizable folder id as the whole label.
+      description: `${task.folderName} · Stage: ${STAGE_DISPLAY_NAMES[task.progress.currentStage]}`,
+    })),
   });
-
-  return selected?.folderUri;
+  if (!pickedOptionId) {
+    return undefined;
+  }
+  const pickedIndex = Number.parseInt(pickedOptionId.replace(/^task_/, ""), 10);
+  return Number.isFinite(pickedIndex) ? tasks[pickedIndex]?.folderUri : undefined;
 }

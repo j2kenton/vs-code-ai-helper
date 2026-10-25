@@ -55,6 +55,21 @@ export function setProcessStartTimeIoOverrideForTestV1(override: ProcessStartTim
   ioOverrideForTestV1 = override;
 }
 
+export interface ProcessLivenessTestHooksV1 {
+  /** Replaces the raw pid-existence check (`process.kill(pid, 0)`). */
+  readonly checkPidLiveness?: (pid: number) => "alive" | "dead";
+  /** Replaces the current-occupant start-time read. */
+  readonly readOtherProcessStartEpochMs?: (pid: number) => Promise<number | undefined>;
+}
+let livenessTestHooksV1: ProcessLivenessTestHooksV1 | undefined;
+/** `undefined` (the default) means production behavior is unchanged. */
+export function setProcessLivenessTestHooksForTestV1(hooks: ProcessLivenessTestHooksV1 | undefined): void {
+  livenessTestHooksV1 = hooks;
+}
+export function getProcessLivenessTestHooksForTestV1(): ProcessLivenessTestHooksV1 | undefined {
+  return livenessTestHooksV1;
+}
+
 function readFileUtf8SyncV1(filePath: string): string | undefined {
   if (ioOverrideForTestV1?.readFileUtf8Sync) {
     return ioOverrideForTestV1.readFileUtf8Sync(filePath);
@@ -211,6 +226,9 @@ async function readMacProcessStartEpochMsV1(pid: number): Promise<number | undef
 export async function readOtherProcessStartEpochMsV1(pid: number, nowMs: number = Date.now()): Promise<number | undefined> {
   if (!Number.isInteger(pid) || pid <= 0) {
     return undefined;
+  }
+  if (livenessTestHooksV1?.readOtherProcessStartEpochMs) {
+    return livenessTestHooksV1.readOtherProcessStartEpochMs(pid);
   }
   try {
     const platform = currentPlatformV1();

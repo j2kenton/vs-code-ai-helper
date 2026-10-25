@@ -132,19 +132,30 @@ void describe(
       }
     });
 
-    void it("falls back to the raw modal and resolves undefined with no taskFolderUri/stage (test-only path)", async () => {
+    void it("routes to global chat and resolves undefined on cancellation when no taskFolderUri/stage is bound", async () => {
       const context = fakeExtensionContext();
       __extensionContextV1TestOnly.set(context);
       const originalShowWarningMessage = vscode.window.showWarningMessage;
-      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (): Promise<undefined> =>
-        Promise.resolve(undefined);
+      let modalCalls = 0;
+      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (): Promise<undefined> => {
+        modalCalls += 1;
+        return Promise.resolve(undefined);
+      };
       try {
         await withHarness(async () => {
-          const choice = await resolveRoundLimitDecisionV1({
+          const cts = new vscode.CancellationTokenSource();
+          const resultPromise = resolveRoundLimitDecisionV1({
             maxIterations: 40,
             workspaceUri: vscode.Uri.file("/task-round-limit-no-task"),
-            token: new vscode.CancellationTokenSource().token,
+            token: cts.token,
           });
+          await new Promise((resolve) => setImmediate(resolve));
+          const store = new WorkflowDecisionStoreV1(context.workspaceState);
+          const pending = store.listPending().find((d) => d.decisionKey === "implementationRoundLimitReached");
+          assert.ok(pending, "no-task round limit question must post to global chat");
+          assert.equal(modalCalls, 0, "no modal popup may be used");
+          cts.cancel();
+          const choice = await resultPromise;
           assert.equal(choice, undefined);
         });
       } finally {

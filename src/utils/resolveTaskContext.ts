@@ -8,6 +8,8 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { resolveTaskRootCandidates } from "./taskRoot";
 import { migrateStatus, TASK_PROGRESS_FILENAME } from "../types/taskProgress";
 import { resolveEffectivePauseStatusV1 } from "../state/effectivePauseStatusV1";
+import { askChatChoiceV1 } from "./chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "./globalChatTargetV1";
 
 /**
  * Normalize a path for comparison: on Windows, path.resolve/normalize
@@ -134,25 +136,40 @@ async function resolveAmbiguousOwnership(
   if (containingRoots.length === 1) {
     rebindRoot = containingRoots[0];
   } else if (containingRoots.length > 1) {
-    const items = containingRoots.map((root) => ({
-      label: path.basename(root),
-      description: root,
-      root,
-    }));
-    const picked = await vscode.window.showQuickPick(items, {
-      title: `Which workspace owns "${task.folderName}"?`,
-      placeHolder: "This task's saved workspace no longer matches one open folder — select the owning one",
+    const pickedOptionId = await askChatChoiceV1({
+      target: {
+        canonicalId: task.taskFolderPath,
+        taskFolderPath: task.taskFolderPath,
+        stage: task.progress.currentStage,
+      },
+      decisionKey: "resolveTaskWorkspaceOwnership",
+      whatHappened: `Which workspace owns "${task.folderName}"?`,
+      whyUserNeeded: "This task's saved workspace no longer matches one open folder — select the owning one.",
+      options: containingRoots.map((root, index) => ({
+        optionId: `root_${index}`,
+        label: path.basename(root),
+        description: root,
+      })),
     });
-    rebindRoot = picked?.root;
-  } else {
-    const picked = await vscode.window.showOpenDialog({
-      canSelectFiles: false,
-      canSelectFolders: true,
-      canSelectMany: false,
-      openLabel: "Bind Workspace",
-      title: `Select the workspace containing "${task.folderName}"`,
+    if (pickedOptionId) {
+      const pickedIndex = Number.parseInt(pickedOptionId.replace(/^root_/, ""), 10);
+      rebindRoot = Number.isFinite(pickedIndex) ? containingRoots[pickedIndex] : undefined;
+    }
+  } else if (workspaceRoots.length > 0) {
+    const target = await resolveGlobalChatTargetOrDefaultV1(workspaceRoots[0]);
+    const pickedOptionId = await askChatChoiceV1({
+      target,
+      decisionKey: "bindTaskWorkspaceFolder",
+      whatHappened: `Select the workspace containing "${task.folderName}".`,
+      whyUserNeeded: "This task is not inside a single matched workspace root — choose the open workspace to bind it to.",
+      options: workspaceRoots.map((root, index) => ({
+        optionId: `workspace_${index}`,
+        label: path.basename(root),
+        description: root,
+      })),
     });
-    const candidate = picked?.[0]?.fsPath;
+    const pickedIndex = pickedOptionId ? Number.parseInt(pickedOptionId.replace(/^workspace_/, ""), 10) : NaN;
+    const candidate = Number.isFinite(pickedIndex) ? workspaceRoots[pickedIndex] : undefined;
     if (candidate && isSameOrUnder(task.taskFolderPath, candidate)) {
       rebindRoot = path.resolve(candidate);
     }

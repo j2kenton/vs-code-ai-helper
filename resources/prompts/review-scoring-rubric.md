@@ -17,6 +17,7 @@ How to apply the rubric:
 - 5-7 means further changes are advisable.
 - 0-4 means significant work remains or readiness cannot responsibly be assessed.
 - Blockers of any category this review uses (architectural, defect, completion, shipping, or review-confidence) should normally keep the score at 7 or below.
+- Plan steps that are not built (as opposed to built but not ticked) are filed as one `[completion]` blocker that names them; like any other open blocker it keeps the score at 7 or below. Built-but-unticked items are never a blocker: name them in `## Verified Complete`.
 - Missing evidence should lower the score only when it prevents readiness from being established. Optional extra evidence is non-blocking.
 - Score the current artifact, not model effort, the number of changed files, or improvement since a previous attempt.
 - Scores need not be monotonic across re-reviews. When re-reviewing, reconcile previous findings and explain score movement whenever newly discovered real issues change the score.

@@ -249,19 +249,25 @@ void describe("resumePausedTask on a completed task", () => {
     const msgs = installMessageCapture();
     const bridge = installOperationNotificationBridge();
 
-    let pickedItems: Array<{ label: string; stage: string }> | undefined;
-    (vscode.window as unknown as Record<string, unknown>).showQuickPick = (
-      items: Array<{ label: string; stage: string }>
-    ): Promise<{ label: string; stage: string } | undefined> => {
-      pickedItems = items;
-      return Promise.resolve(items[0]);
+    let pickedOptions: ReadonlyArray<{ optionId: string; label: string }> | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+    const chatChoiceMod = require("../utils/chatChoiceV1") as {
+      askChatChoiceV1: (req: {
+        options: ReadonlyArray<{ optionId: string; label: string }>;
+        recommendedOptionId?: string;
+      }) => Promise<string | undefined>;
+    };
+    const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+    chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+      pickedOptions = req.options;
+      return Promise.resolve(req.options[0]?.optionId);
     };
 
     try {
       await resumePausedTask(inv, store, { canonicalId });
 
-      assert.ok(pickedItems, "expected the reopen picker to be shown");
-      assert.equal(pickedItems[0]!.stage, "publish", "Publish must be the first (preselected) item");
+      assert.ok(pickedOptions, "expected the reopen chat choice to be shown");
+      assert.equal(pickedOptions[0]!.optionId, "publish", "Publish must be the first (preselected) option");
 
       const stored = await readTaskProgress(vscode.Uri.file(folderPath));
       assert.equal(stored?.status, "active");
@@ -273,6 +279,7 @@ void describe("resumePausedTask on a completed task", () => {
         "the bridge produces exactly one terminal reopen notification"
       );
     } finally {
+      chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
       bridge.dispose();
       msgs.restore();
       ws.restore();
@@ -291,7 +298,12 @@ void describe("resumePausedTask on a completed task", () => {
     const ws = installWorkspaceFoldersStub();
     const rf = installReadFileBridge();
     const msgs = installMessageCapture();
-    // installMessageCapture's default showQuickPick resolves undefined (cancel).
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+    const chatChoiceMod = require("../utils/chatChoiceV1") as {
+      askChatChoiceV1: () => Promise<string | undefined>;
+    };
+    const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+    chatChoiceMod.askChatChoiceV1 = (): Promise<string | undefined> => Promise.resolve(undefined);
 
     try {
       await resumePausedTask(inv, store, { canonicalId });
@@ -301,6 +313,7 @@ void describe("resumePausedTask on a completed task", () => {
       assert.equal(stored?.completedAt, progress.completedAt);
       assert.deepEqual(setCalls, [], "cancelling must not persist a current-task change");
     } finally {
+      chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
       msgs.restore();
       ws.restore();
       rf.restore();
@@ -319,15 +332,18 @@ void describe("resumePausedTask on a completed task", () => {
     const rf = installReadFileBridge();
     const msgs = installMessageCapture();
 
-    (vscode.window as unknown as Record<string, unknown>).showQuickPick = async (
-      items: Array<{ label: string; stage: string }>
-    ): Promise<{ label: string; stage: string } | undefined> => {
-      // Simulate another window re-completing the task while this picker was open.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+    const chatChoiceMod = require("../utils/chatChoiceV1") as {
+      askChatChoiceV1: (req: { options: ReadonlyArray<{ optionId: string }> }) => Promise<string | undefined>;
+    };
+    const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+    chatChoiceMod.askChatChoiceV1 = async (req): Promise<string | undefined> => {
+      // Simulate another window re-completing the task while this choice was open.
       await patchTaskProgress(vscode.Uri.file(folderPath), (current) => ({
         ...current,
         completedAt: "2026-06-01T00:00:00.000Z",
       }));
-      return items[0];
+      return req.options[0]?.optionId;
     };
 
     try {
@@ -341,6 +357,7 @@ void describe("resumePausedTask on a completed task", () => {
         "expected a stale-picker warning"
       );
     } finally {
+      chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
       msgs.restore();
       ws.restore();
       rf.restore();
@@ -401,9 +418,12 @@ void describe("reopenCompletedTask proactive recovery (Part 2, item 15 hardening
       const msgs = installMessageCapture();
       const bridge = installOperationNotificationBridge();
 
-      (vscode.window as unknown as Record<string, unknown>).showQuickPick = (
-        items: Array<{ label: string; stage: string }>
-      ): Promise<{ label: string; stage: string } | undefined> => Promise.resolve(items[0]);
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+      const chatChoiceMod = require("../utils/chatChoiceV1") as {
+        askChatChoiceV1: (req: { options: ReadonlyArray<{ optionId: string }> }) => Promise<string | undefined>;
+      };
+      const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+      chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => Promise.resolve(req.options[0]?.optionId);
 
       try {
         await resumePausedTask(inv, store, { canonicalId });
@@ -424,6 +444,7 @@ void describe("reopenCompletedTask proactive recovery (Part 2, item 15 hardening
           "a journal Phase A finds already committed must leave the canonical artifact untouched"
         );
       } finally {
+        chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
         bridge.dispose();
         msgs.restore();
         ws.restore();
@@ -449,16 +470,21 @@ void describe("setTaskStage on a completed task", () => {
     const ws = installWorkspaceFoldersStub();
     const rf = installReadFileBridge();
     const msgs = installMessageCapture();
-    let quickPickCalled = false;
-    (vscode.window as unknown as Record<string, unknown>).showQuickPick = (): Promise<undefined> => {
-      quickPickCalled = true;
+    let chatChoiceCalled = false;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+    const chatChoiceMod = require("../utils/chatChoiceV1") as {
+      askChatChoiceV1: () => Promise<string | undefined>;
+    };
+    const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+    chatChoiceMod.askChatChoiceV1 = (): Promise<undefined> => {
+      chatChoiceCalled = true;
       return Promise.resolve(undefined);
     };
 
     try {
       await setTaskStage(inv, store, { canonicalId, stage: "impl-high-review" }, "jump");
 
-      assert.equal(quickPickCalled, false, "an explicit stage must skip the picker entirely");
+      assert.equal(chatChoiceCalled, false, "an explicit stage must skip the picker entirely");
       const stored = await readTaskProgress(vscode.Uri.file(folderPath));
       assert.equal(stored?.status, "active");
       assert.equal(stored?.currentStage, "impl-high-review");
@@ -466,6 +492,7 @@ void describe("setTaskStage on a completed task", () => {
       // impl-high-review consumes implReviewFiles as its review scope.
       assert.deepEqual(stored?.implReviewFiles, ["src/a.ts"]);
     } finally {
+      chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
       msgs.restore();
       ws.restore();
       rf.restore();
@@ -483,23 +510,29 @@ void describe("setTaskStage on a completed task", () => {
     const ws = installWorkspaceFoldersStub();
     const rf = installReadFileBridge();
     const msgs = installMessageCapture();
-    let pickedItems: Array<{ label: string; stage: string }> | undefined;
-    (vscode.window as unknown as Record<string, unknown>).showQuickPick = (
-      items: Array<{ label: string; stage: string }>
-    ): Promise<{ label: string; stage: string } | undefined> => {
-      pickedItems = items;
-      return Promise.resolve(items[0]);
+    let pickedOptions: ReadonlyArray<{ optionId: string; label: string }> | undefined;
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+    const chatChoiceMod = require("../utils/chatChoiceV1") as {
+      askChatChoiceV1: (req: {
+        options: ReadonlyArray<{ optionId: string; label: string }>;
+      }) => Promise<string | undefined>;
+    };
+    const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+    chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+      pickedOptions = req.options;
+      return Promise.resolve(req.options[0]?.optionId);
     };
 
     try {
       await setTaskStage(inv, store, { canonicalId }, "jump");
 
-      assert.ok(pickedItems?.some((i) => i.stage === "publish"), "Publish must be selectable for a completed task's reopen picker");
-      assert.equal(pickedItems![0]!.stage, "publish", "Publish must be preselected");
+      assert.ok(pickedOptions?.some((i) => i.optionId === "publish"), "Publish must be selectable for a completed task's reopen picker");
+      assert.equal(pickedOptions![0]!.optionId, "publish", "Publish must be preselected");
       const stored = await readTaskProgress(vscode.Uri.file(folderPath));
       assert.equal(stored?.status, "active");
       assert.equal(stored?.currentStage, "publish");
     } finally {
+      chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
       msgs.restore();
       ws.restore();
       rf.restore();

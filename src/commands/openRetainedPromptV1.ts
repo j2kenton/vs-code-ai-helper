@@ -24,6 +24,8 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { safeOpenTextDocument, statIfExists } from "../utils/fileUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
+import { resolveGlobalChatTargetV1 } from "../utils/globalChatTargetV1";
 
 interface OpenRetainedPromptArg {
   task?: IncompleteTask;
@@ -105,15 +107,25 @@ async function pickTaskV1(): Promise<IncompleteTask | undefined> {
     NotificationRouter.showInformation("No tasks found.");
     return undefined;
   }
-  const picked = await vscode.window.showQuickPick(
-    tasks.map((task) => ({
+  const target = await resolveGlobalChatTargetV1();
+  if (!target) {
+    NotificationRouter.showError("No workspace folder open. Please open a folder first.");
+    return undefined;
+  }
+  const chosen = await askChatChoiceV1({
+    decisionKey: "openRetainedPromptTask",
+    target,
+    whatHappened: "Choose the task whose retained implementation prompt you want to inspect.",
+    whyUserNeeded: "Retained prompts are per task, so the task must be chosen first.",
+    options: tasks.map((task, index) => ({
+      optionId: `task-${index}`,
       label: task.progress.displayName ?? task.folderName,
       description: task.folderName,
-      task,
     })),
-    { title: "Open Retained Prompt", placeHolder: "Select a task" }
-  );
-  return picked?.task;
+    detail: "Answering asks which of that task's rounds to open.",
+  });
+  const index = chosen === undefined ? -1 : tasks.findIndex((_task, i) => `task-${i}` === chosen);
+  return index >= 0 ? tasks[index] : undefined;
 }
 
 export async function openRetainedPromptV1(arg?: OpenRetainedPromptArg): Promise<void> {
@@ -130,23 +142,32 @@ export async function openRetainedPromptV1(arg?: OpenRetainedPromptArg): Promise
     return;
   }
 
-  const selected =
-    prompts.length === 1
-      ? prompts[0]
-      : (
-          await vscode.window.showQuickPick(
-            prompts.map((entry) => ({
-              label: entry.label,
-              description: entry.attemptId
-                ? `Attempt ID: ${entry.attemptId}${entry.roundId ? ` (round ${entry.roundId})` : ""}`
-                : entry.roundId
-                  ? `Round ID: ${entry.roundId}`
-                  : undefined,
-              entry,
-            })),
-            { title: "Open Retained Prompt", placeHolder: "Select a round" }
-          )
-        )?.entry;
+  let selected = prompts.length === 1 ? prompts[0] : undefined;
+  if (!selected) {
+    const chosen = await askChatChoiceV1({
+      decisionKey: "openRetainedPromptRound",
+      target: {
+        canonicalId: task.canonicalId ?? task.folderUri.fsPath,
+        taskFolderPath: task.folderUri.fsPath,
+        stage: task.progress.currentStage,
+        taskName: task.progress.displayName ?? task.folderName,
+      },
+      whatHappened: "Choose which retained implementation prompt to open.",
+      whyUserNeeded: "More than one prompt was retained for this task.",
+      options: prompts.map((entry, index) => ({
+        optionId: `prompt-${index}`,
+        label: entry.label,
+        description: entry.attemptId
+          ? `Attempt ID: ${entry.attemptId}${entry.roundId ? ` (round ${entry.roundId})` : ""}`
+          : entry.roundId
+            ? `Round ID: ${entry.roundId}`
+            : undefined,
+      })),
+      detail: "Answering opens the chosen prompt file.",
+    });
+    const index = chosen === undefined ? -1 : prompts.findIndex((_entry, i) => `prompt-${i}` === chosen);
+    selected = index >= 0 ? prompts[index] : undefined;
+  }
   if (!selected) {
     return;
   }

@@ -100,6 +100,7 @@ import {
   RoundLedgerTerminalStateV1,
   TerminalizeRoundResultV1,
 } from "../utils/roundLedgerV1";
+import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
 
 /**
  * How long the transition's own lease on the pending dispatch lasts. Short by
@@ -114,9 +115,90 @@ const RECOVERY_TRANSITION_LEASE_MS = 10 * 60 * 1000;
 /** Chain identity for every recovery continuation dispatch (all windows). */
 export const IMPL_CONTINUATION_CHAIN_ID_V1 = "impl-continuation";
 
+/**
+ * Start time of THIS extension-host process in epoch milliseconds, computed
+ * once at module load with the same wall-clock-minus-uptime formula
+ * `workAdmissionV1.ts` uses so `classifyRecordedProcessV1` can compare it
+ * against `readOtherProcessStartEpochMsV1(pid)`.
+ */
+const SELF_PROCESS_START_TIME_MS_V1 = Date.now() - Math.floor(process.uptime() * 1000);
+
+export interface RecoveryClaimOwnerIdentityV1 {
+  readonly hostId: string;
+  readonly pid: number;
+  readonly processStartTime: number;
+  readonly sessionToken?: string;
+}
+
+/**
+ * Encode host, PID, and process start time into the existing `leaseOwner`
+ * string field on `ImplRecoveryV1` (`task-progress.json` schema unchanged,
+ * well within the decoder's 256-char `MAX_ID_LENGTH`).
+ */
+export function formatRecoveryClaimOwnerV1(identity: RecoveryClaimOwnerIdentityV1): string {
+  const parts = [
+    "v1",
+    `host=${identity.hostId}`,
+    `pid=${Math.trunc(identity.pid)}`,
+    `start=${Math.trunc(identity.processStartTime)}`,
+  ];
+  if (identity.sessionToken) {
+    parts.push(`session=${identity.sessionToken}`);
+  }
+  return parts.join("|");
+}
+
+/**
+ * Parse a structured recovery-claim owner string written by
+ * {@link formatRecoveryClaimOwnerV1}. Returns `undefined` for legacy
+ * `<sessionId>:<random>` strings or any malformed value so callers keep
+ * legacy/unidentifiable records on the existing lease-expiry rule.
+ */
+export function parseRecoveryClaimOwnerV1(
+  rawOwner: string | undefined
+): RecoveryClaimOwnerIdentityV1 | undefined {
+  if (typeof rawOwner !== "string" || !rawOwner.startsWith("v1|")) {
+    return undefined;
+  }
+  let hostId: string | undefined;
+  let pid: number | undefined;
+  let processStartTime: number | undefined;
+  let sessionToken: string | undefined;
+  for (const segment of rawOwner.slice(3).split("|")) {
+    const eq = segment.indexOf("=");
+    if (eq <= 0) continue;
+    const key = segment.slice(0, eq);
+    const val = segment.slice(eq + 1);
+    if (key === "host" && val.length > 0) {
+      hostId = val;
+    } else if (key === "pid") {
+      const parsed = Number(val);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        pid = parsed;
+      }
+    } else if (key === "start") {
+      const parsed = Number(val);
+      if (Number.isFinite(parsed) && parsed > 0) {
+        processStartTime = Math.trunc(parsed);
+      }
+    } else if (key === "session" && val.length > 0) {
+      sessionToken = val;
+    }
+  }
+  if (!hostId || pid === undefined || processStartTime === undefined) {
+    return undefined;
+  }
+  return {
+    hostId,
+    pid,
+    processStartTime,
+    ...(sessionToken !== undefined ? { sessionToken } : {}),
+  };
+}
+
 let recoveryOwnerToken: string | undefined;
 
-/** Stable per-window owner id for recovery leases (parity with the scheduler's). */
+/** Stable per-window session token for recovery leases. */
 function ownerToken(): string {
   if (recoveryOwnerToken === undefined) {
     const sessionId =
@@ -124,6 +206,22 @@ function ownerToken(): string {
     recoveryOwnerToken = `${sessionId}:${Math.random().toString(36).slice(2)}`;
   }
   return recoveryOwnerToken;
+}
+
+/**
+ * Resolve the structured recovery-claim owner string for THIS extension-host
+ * process (`v1|host=...|pid=...|start=...|session=...`).
+ */
+export async function resolveCurrentRecoveryClaimOwnerV1(
+  sessionToken: string = ownerToken()
+): Promise<string> {
+  const hostId = await resolveHostIdentityV1();
+  return formatRecoveryClaimOwnerV1({
+    hostId,
+    pid: process.pid,
+    processStartTime: SELF_PROCESS_START_TIME_MS_V1,
+    sessionToken,
+  });
 }
 
 function freshToken(prefix: string): string {
@@ -454,6 +552,7 @@ export async function beginImplementationRecoveryV1(
   const highReviewDescribesPreRoundTree =
     input.postRunReviewStage === "impl-high-review" &&
     (await isHighReviewArtifactUsableV1(folderUri));
+  const currentOwner = await resolveCurrentRecoveryClaimOwnerV1();
   // Mode selection (Part 2) runs INSIDE the patch callback, against the same
   // `current` the transition persists over, so the evidence (score history,
   // pre-round quarantine/marker state) and the recorded mode can never come
@@ -570,7 +669,7 @@ export async function beginImplementationRecoveryV1(
         ...(capReachedNow
           ? {}
           : {
-              leaseOwner: ownerToken(),
+              leaseOwner: currentOwner,
               leaseUntil: new Date(Date.now() + RECOVERY_TRANSITION_LEASE_MS).toISOString(),
             }),
       };
@@ -870,6 +969,7 @@ export interface ClaimedImplRecoveryV1 {
 export async function claimImplRecoveryDispatchV1(
   folderUri: vscode.Uri
 ): Promise<ClaimedImplRecoveryV1> {
+  const currentOwner = await resolveCurrentRecoveryClaimOwnerV1();
   let record: ImplRecoveryV1 | undefined;
   let priorImplReviewFiles: readonly string[] = [];
   let priorPendingFiles: readonly string[] = [];
@@ -886,6 +986,7 @@ export async function claimImplRecoveryDispatchV1(
         ...current.implRecovery,
         dispatch: "dispatched",
         attemptId: freshToken("impl-continuation"),
+        leaseOwner: currentOwner,
       };
       record = claimed;
       let next: TaskProgress = {

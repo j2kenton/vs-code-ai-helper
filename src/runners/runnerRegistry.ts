@@ -21,6 +21,7 @@ import {
   CliAgentRunner,
   cliCommandExists,
   cliProviderSupportsV1StdoutCapture,
+  ConfiguredCheckCommandV1,
   createCliTextTransportV1,
   isCliTextModeSummaryOnlyCapableV1,
   runImplementationWithCli,
@@ -46,6 +47,7 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { candidateHasRecentZeroFileFailuresV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   describeStageSubstitutesV1,
+  getStageDisabledPrimaryV1,
   listStageDisabledBackupsV1,
   resolveEffectiveStageChainV1,
 } from "../utils/modelSelection";
@@ -561,7 +563,7 @@ async function reserveFallback(
     ) {
       return current;
     }
-    if (current.fallbackActive?.[stage]) {
+    if (current.fallbackActive?.[stage] && !current.fallbackModelId?.[stage]) {
       return current;
     }
     activated = true;
@@ -977,6 +979,10 @@ export async function runImplementationForModel(options: {
    * explicitly given a value that differs from `modelId`.
    */
   configuredPrimaryModelId?: string;
+  /** Configured failing check commands for check execution feedback (Step 27 / Defect 13). */
+  configuredFailingCommands?: readonly (string | ConfiguredCheckCommandV1)[];
+  /** Host check runner for fallback execution (Step 27 / Defect 13). */
+  hostCheckRunner?: (cwd: string, command: string) => Promise<{ code: number; output: string }>;
 }): Promise<
   ImplementationRunResult & {
     runnerId: string;
@@ -999,7 +1005,7 @@ export async function runImplementationForModel(options: {
   assertAiExecutionAllowedInThisHostV1();
   assertNoUnauthorizedV1CorrelationV0(options);
   const effective = resolveEffectiveProvider(options.modelId);
-  const primaryProviderLabel = toResolvedRunner(effective).providerLabel;
+  let primaryProviderLabel = toResolvedRunner(effective).providerLabel;
   // Shared identity for this attempt's model/provider/account — used both to
   // gate quotaParkRecord clearing (below) and to stamp a new park record
   // (further below), so the two always agree on what "this run" means.
@@ -1036,6 +1042,8 @@ export async function runImplementationForModel(options: {
         taskFolderUri: options.taskFolderUri,
         stage: options.stage,
         roundProcessClaimId: options.roundProcessClaimId,
+        configuredFailingCommands: options.configuredFailingCommands,
+        hostCheckRunner: options.hostCheckRunner,
       });
       return { ...result, runnerId: selected.def.id };
     }
@@ -1053,7 +1061,7 @@ export async function runImplementationForModel(options: {
     });
     return { ...result, runnerId: "copilot-lm" };
   };
-  const result = await run(effective);
+  let result = await run(effective);
   if (options.stage) {
     await recordQuotaObservation(options.stage, options.modelId, result.failureKind, result.errorMessage, getExtensionContextV1(), undefined, primaryAccountKey);
   }
@@ -1106,8 +1114,28 @@ export async function runImplementationForModel(options: {
   // what governs the quota-fallback cascade below: a blank stage inherits
   // the general chain's backups and strategy.
   const chain = options.stage ? resolveEffectiveStageChainV1(options.stage) : undefined;
+  // Post-1.0 fixes, item 4: when the running model is a backup and it fails,
+  // the stage's enabled primary (the configured one, or the effective primary
+  // when the configured one is off) is also a candidate — it was not tried in
+  // this call, and the cascade used to walk only the backups listed after it.
+  // It goes last: the listed backups keep their order.
+  const retryPrimaryCandidate =
+    chain !== undefined &&
+    chain.strategy === "switch-to-backup" &&
+    chain.primary !== undefined &&
+    options.modelId !== undefined &&
+    options.modelId !== chain.primary &&
+    !chain.backups.includes(chain.primary)
+      ? chain.primary
+      : undefined;
+  const cascadeCandidates: string[] =
+    chain !== undefined && chain.strategy === "switch-to-backup"
+      ? [...chain.backups, ...(retryPrimaryCandidate !== undefined ? [retryPrimaryCandidate] : [])]
+      : [];
   const chainWantsBackup =
-    chain !== undefined && chain.strategy === "switch-to-backup" && chain.backups.length > 0;
+    chain !== undefined &&
+    chain.strategy === "switch-to-backup" &&
+    (chain.backups.length > 0 || retryPrimaryCandidate !== undefined);
   // Prefer the provider's own pre-hint verdict; fall back to the regex over the
   // pre-hint diagnostic text, and only then over errorMessage. The layering is
   // what breaks a self-reinforcing loop: toFriendlyError APPENDS the login hint
@@ -1125,6 +1153,7 @@ export async function runImplementationForModel(options: {
   const authFailure =
     result.authFailure === true ||
     isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
+  let terminalAuthFailure = authFailure;
   // A failed run may already have written partial changes before it failed
   // (a timeout on a provider whose CLI keeps writing right up to the kill,
   // e.g. Cline/Antigravity's unenforced text/edit modes — or, less likely but
@@ -1185,7 +1214,7 @@ export async function runImplementationForModel(options: {
     primaryLeftTreeClean &&
     isCascadeEligibleFailureKind(result.failureKind) &&
     options.stage &&
-    chainWantsBackup
+    cascadeCandidates.length > 0
   ) {
     if (!options.taskFolderUri) {
       return withActualIdentity(result, primaryProviderLabel, options.modelId);
@@ -1216,7 +1245,27 @@ export async function runImplementationForModel(options: {
         roundOutcomesForHealthCheck = undefined;
       }
     }
-    for (const backupModel of chain.backups) {
+    for (const backupModel of cascadeCandidates) {
+      // Item 4: the stage's primary is skipped (and says why) while it is
+      // known to be limited; a limit whose reset time has passed no longer
+      // counts.
+      if (backupModel === retryPrimaryCandidate) {
+        const observation = getQuotaObservation(options.stage, backupModel);
+        const stillLimited =
+          observation !== undefined &&
+          (observation.state === "exhausted" || observation.state === "entitlement-blocked") &&
+          (observation.resetAt === undefined || Date.parse(observation.resetAt) > Date.now());
+        if (stillLimited) {
+          backupRecords.push({
+            label: labelForBackup(backupModel),
+            outcome: "held-back",
+            reason: `the stage's primary is known to be limited${
+              observation.resetAt ? ` until ${observation.resetAt}` : ""
+            }`,
+          });
+          continue;
+        }
+      }
       // RC4 item 1: a configured-but-disabled backup is listed in the
       // diagnostic inventory only; it is never dispatched.
       if (isModelProviderDisabled(backupModel)) {
@@ -1231,7 +1280,7 @@ export async function runImplementationForModel(options: {
         backupRecords.push({
           label: labelForBackup(backupModel),
           outcome: "held-back",
-          reason: "it is the same model as the primary",
+          reason: "it is the model that just failed",
         });
         continue;
       }
@@ -1300,15 +1349,31 @@ export async function runImplementationForModel(options: {
           errorMessage: fallbackAvailability.availability.reason ?? "Backup model is unavailable.",
         };
         await recordQuotaObservation(options.stage, backupModel, fallbackFailure.failureKind, fallbackFailure.errorMessage, getExtensionContextV1(), undefined, backupAccountKey);
-        if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
-          await releaseReservation();
-          return withActualIdentity(fallbackFailure, fallbackAvailability.providerLabel, backupModel);
-        }
         backupRecords.push({
           label: labelForBackup(backupModel),
           outcome: "held-back",
           reason: `unavailable: ${fallbackFailure.errorMessage}`,
         });
+        if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
+          const currentIndex = cascadeCandidates.indexOf(backupModel);
+          if (currentIndex !== -1) {
+            for (let j = currentIndex + 1; j < cascadeCandidates.length; j++) {
+              const untriedModel = cascadeCandidates[j];
+              if (untriedModel !== undefined) {
+                backupRecords.push({
+                  label: labelForBackup(untriedModel),
+                  outcome: "held-back",
+                  reason: "preceding backup failed authentication",
+                });
+              }
+            }
+          }
+          await releaseReservation();
+          result = fallbackFailure;
+          primaryProviderLabel = fallbackAvailability.providerLabel;
+          options.modelId = backupModel;
+          break;
+        }
         continue;
       }
       // RC4 item 1: a cross-kind backup runs through the sealed pipeline
@@ -1324,7 +1389,9 @@ export async function runImplementationForModel(options: {
           backupModel
         );
         const rescueNote =
-          `${primaryProviderLabel} hit a usage limit` +
+          (result.providerCapacity === true
+            ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)`
+            : `${primaryProviderLabel} hit a usage limit`) +
           (result.errorMessage ? ` (${result.errorMessage})` : "") +
           `; this round ran on ${labelForBackup(backupModel)}.`;
         options.onProgress(rescueNote);
@@ -1337,12 +1404,34 @@ export async function runImplementationForModel(options: {
       // A failed/cancelled backup cannot be the stage's sticky fallback.
       // In particular, this prevents an OpenCode 401 from routing every
       // later implementation attempt to the same unauthenticated model.
-      if (
-        fallbackResult.status === "cancelled" ||
-        !isCascadeEligibleFailureKind(fallbackResult.failureKind)
-      ) {
+      if (fallbackResult.status === "cancelled") {
         await releaseReservation();
         return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
+      }
+      if (!isCascadeEligibleFailureKind(fallbackResult.failureKind)) {
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "tried-and-failed",
+          reason: fallbackResult.errorMessage ?? "it failed",
+        });
+        const currentIndex = cascadeCandidates.indexOf(backupModel);
+        if (currentIndex !== -1) {
+          for (let j = currentIndex + 1; j < cascadeCandidates.length; j++) {
+            const untriedModel = cascadeCandidates[j];
+            if (untriedModel !== undefined) {
+              backupRecords.push({
+                label: labelForBackup(untriedModel),
+                outcome: "held-back",
+                reason: "preceding backup failure is not cascade-eligible",
+              });
+            }
+          }
+        }
+        await releaseReservation();
+        result = fallbackResult;
+        primaryProviderLabel = fallbackAvailability.providerLabel;
+        options.modelId = backupModel;
+        break;
       }
       // Codex review finding (P1): this backup's own failure is cascadable
       // by failureKind alone, but the SAME dirty-tree gate applied to the
@@ -1353,8 +1442,29 @@ export async function runImplementationForModel(options: {
       // attempt — primary or backup — may have mutated the workspace,
       // exactly as the primary's own gate does.
       if (!leftTreeCleanV1(fallbackResult)) {
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "tried-and-failed",
+          reason: fallbackResult.errorMessage ?? "it failed",
+        });
+        const currentIndex = cascadeCandidates.indexOf(backupModel);
+        if (currentIndex !== -1) {
+          for (let j = currentIndex + 1; j < cascadeCandidates.length; j++) {
+            const untriedModel = cascadeCandidates[j];
+            if (untriedModel !== undefined) {
+              backupRecords.push({
+                label: labelForBackup(untriedModel),
+                outcome: "held-back",
+                reason: "preceding backup left uncommitted changes",
+              });
+            }
+          }
+        }
         await releaseReservation();
-        return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
+        result = fallbackResult;
+        primaryProviderLabel = fallbackAvailability.providerLabel;
+        options.modelId = backupModel;
+        break;
       }
       backupRecords.push({
         label: labelForBackup(backupModel),
@@ -1393,7 +1503,9 @@ export async function runImplementationForModel(options: {
   ) {
     const dirtyTreeStage = options.stage;
     const limitLabel =
-      result.failureKind === "quota"
+      result.providerCapacity === true
+        ? "the model being at capacity (a temporary overload at OpenAI)"
+        : result.failureKind === "quota"
         ? "a quota/rate limit"
         : result.failureKind === "model-entitlement"
           ? "a model-entitlement block"
@@ -1414,20 +1526,28 @@ export async function runImplementationForModel(options: {
     if (options.taskFolderUri) {
       const breakerRounds = getResilienceSettings().fallbackProviderBreakerRounds;
       let roundOutcomesForHandoffHealthCheck: RoundOutcomeEntryV1[] | undefined;
-      if (breakerRounds > 0) {
-        try {
-          const progressRead = await readTaskProgressStrictV1(options.taskFolderUri);
-          roundOutcomesForHandoffHealthCheck = progressRead.ok
-            ? progressRead.decoded.progress.roundOutcomes
-            : undefined;
-        } catch {
-          roundOutcomesForHandoffHealthCheck = undefined;
+      try {
+        const progressRead = await readTaskProgressStrictV1(options.taskFolderUri);
+        if (progressRead.ok) {
+          roundOutcomesForHandoffHealthCheck = progressRead.decoded.progress.roundOutcomes;
         }
+      } catch {
+        roundOutcomesForHandoffHealthCheck = undefined;
       }
       let handoffCandidate: { modelId: string; providerLabel: string } | undefined;
-      for (const backupModel of filterEnabledBackupModels(chain.backups)) {
+      for (const backupModel of filterEnabledBackupModels(cascadeCandidates)) {
         if (backupModel === options.modelId) {
           continue;
+        }
+        if (backupModel === retryPrimaryCandidate) {
+          const observation = getQuotaObservation(dirtyTreeStage, backupModel);
+          const stillLimited =
+            observation !== undefined &&
+            (observation.state === "exhausted" || observation.state === "entitlement-blocked") &&
+            (observation.resetAt === undefined || Date.parse(observation.resetAt) > Date.now());
+          if (stillLimited) {
+            continue;
+          }
         }
         let backupKind: "cli" | "copilot" | undefined;
         let backupProviderId: string | undefined;
@@ -1564,6 +1684,53 @@ export async function runImplementationForModel(options: {
       affectedStageDescriptions.length > 0
         ? ` This also affects: ${affectedStageDescriptions.join("; ")}.`
         : "";
+    const dirtyTreeBackupRecords: BackupAttemptRecordV1[] = [];
+    if (chain !== undefined && chain.strategy === "switch-to-backup") {
+      const disabledPrimary = getStageDisabledPrimaryV1(chain.originStage);
+      if (disabledPrimary !== undefined) {
+        dirtyTreeBackupRecords.push({
+          label: labelForBackup(disabledPrimary),
+          outcome: "disabled",
+          isPrimary: true,
+          reason: "the stage's primary is disabled in the stage's chain",
+        });
+      }
+      for (const disabledModel of listStageDisabledBackupsV1(chain.originStage)) {
+        dirtyTreeBackupRecords.push({
+          label: labelForBackup(disabledModel),
+          outcome: "disabled",
+          reason: "disabled in the stage's chain",
+        });
+      }
+      for (const model of cascadeCandidates) {
+        if (model === options.modelId) {
+          continue;
+        }
+        const isPrimary = model === retryPrimaryCandidate || model === chain.primary;
+        if (model === retryPrimaryCandidate) {
+          const observation = getQuotaObservation(dirtyTreeStage, model);
+          const stillLimited =
+            observation !== undefined &&
+            (observation.state === "exhausted" || observation.state === "entitlement-blocked") &&
+            (observation.resetAt === undefined || Date.parse(observation.resetAt) > Date.now());
+          if (stillLimited) {
+            dirtyTreeBackupRecords.push({
+              label: labelForBackup(model),
+              outcome: "held-back",
+              isPrimary,
+              reason: "it is currently limited",
+            });
+            continue;
+          }
+        }
+        dirtyTreeBackupRecords.push({
+          label: labelForBackup(model),
+          outcome: "held-back",
+          isPrimary,
+          reason: `this round already changed ${result.filesChanged.length} file(s)`,
+        });
+      }
+    }
     const withheldMessage = describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
       kind: "cascadeWithheldDirtyTree",
       limitLabel,
@@ -1571,10 +1738,26 @@ export async function runImplementationForModel(options: {
       remedyText,
       affectedStagesClause,
       rerunActionLabel: rerunActionLabelForActionKeyV1(options.correlation.actionKey),
+      backups: dirtyTreeBackupRecords,
       ...(chain
         ? (() => {
-            const firstBackup = filterEnabledBackupModels(chain.backups).find(
-              (backupModel) => backupModel !== options.modelId
+            const firstBackup = filterEnabledBackupModels(cascadeCandidates).find(
+              (backupModel) => {
+                if (backupModel === options.modelId) {
+                  return false;
+                }
+                if (backupModel === retryPrimaryCandidate) {
+                  const observation = getQuotaObservation(dirtyTreeStage, backupModel);
+                  const stillLimited =
+                    observation !== undefined &&
+                    (observation.state === "exhausted" || observation.state === "entitlement-blocked") &&
+                    (observation.resetAt === undefined || Date.parse(observation.resetAt) > Date.now());
+                  if (stillLimited) {
+                    return false;
+                  }
+                }
+                return true;
+              }
             );
             return firstBackup ? { heldBackBackupLabel: labelForBackup(firstBackup) } : {};
           })()
@@ -1750,7 +1933,11 @@ export async function runImplementationForModel(options: {
     // to explicit `undefined`) rather than reparsed, since no branch below
     // reads a "park-and-schedule"-vs-"park" distinction; only the
     // auth-vs-everything-else split selects which explanation to build.
-    const stopBehaviour = chooseStopBehaviourV1({ failureKind: result.failureKind, authFailure });
+    terminalAuthFailure =
+      authFailure ||
+      result.authFailure === true ||
+      isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
+    const stopBehaviour = chooseStopBehaviourV1({ failureKind: result.failureKind, authFailure: terminalAuthFailure });
     // Review completion blocker (2026-09-01): `chainWantsBackup` is false
     // both when the stage has no usable backup chain at all AND when the
     // stage is deliberately configured `never-switch` — these are different
@@ -1759,9 +1946,26 @@ export async function runImplementationForModel(options: {
     // which is simply false for a `never-switch` stage that DOES have a
     // configured chain. Distinguish them from the resolved chain directly.
     const neverSwitchConfigured = chain !== undefined && chain.strategy === "never-switch";
+    const stagePrimaryModelV1 =
+      retryPrimaryCandidate ?? (chain ? getStageDisabledPrimaryV1(chain.originStage) : undefined);
+    const stagePrimaryLabelV1 =
+      stagePrimaryModelV1 !== undefined ? labelForBackup(stagePrimaryModelV1) : undefined;
     // RC4 item 1: backups switched off on the stage's own chain never reach
     // the effective chain, so list them here as disabled (never dispatched).
     if (chain !== undefined && chain.strategy === "switch-to-backup") {
+      // Item 4: a configured primary that is switched off is a model in the
+      // chain too; the failure message names it with its outcome.
+      const disabledPrimary = getStageDisabledPrimaryV1(chain.originStage);
+      if (disabledPrimary !== undefined) {
+        const label = labelForBackup(disabledPrimary);
+        if (!backupRecords.some((record) => record.label === label)) {
+          backupRecords.push({
+            label,
+            outcome: "disabled",
+            reason: "the stage's primary is disabled in the stage's chain",
+          });
+        }
+      }
       for (const disabledModel of listStageDisabledBackupsV1(chain.originStage)) {
         const label = labelForBackup(disabledModel);
         if (!backupRecords.some((record) => record.label === label)) {
@@ -1783,7 +1987,59 @@ export async function runImplementationForModel(options: {
             kind: "authFailureBackupWithheld",
             dirtyTree: result.filesChangedUnknown !== true && result.filesChanged.length > 0,
             filesChangedCount: result.filesChangedUnknown === true ? undefined : result.filesChanged.length,
+            backups: (() => {
+              if (chain === undefined || chain.strategy !== "switch-to-backup") {
+                return undefined;
+              }
+              const records: BackupAttemptRecordV1[] = [];
+              for (const record of backupRecords) {
+                if (record.outcome === "tried-and-failed") {
+                  records.push(record);
+                }
+              }
+              const disabledPrimary = getStageDisabledPrimaryV1(chain.originStage);
+              if (disabledPrimary !== undefined) {
+                records.push({
+                  label: labelForBackup(disabledPrimary),
+                  outcome: "disabled",
+                  isPrimary: true,
+                  reason: "the stage's primary is disabled in the stage's chain",
+                });
+              }
+              for (const disabledModel of listStageDisabledBackupsV1(chain.originStage)) {
+                records.push({
+                  label: labelForBackup(disabledModel),
+                  outcome: "disabled",
+                  reason: "disabled in the stage's chain",
+                });
+              }
+              for (const model of cascadeCandidates) {
+                if (model === options.modelId) {
+                  continue;
+                }
+                const label = labelForBackup(model);
+                if (records.some((r) => r.label === label)) {
+                  continue;
+                }
+                records.push({
+                  label,
+                  outcome: "held-back",
+                  isPrimary: model === retryPrimaryCandidate || model === chain.primary,
+                  reason: "an authentication failure is not auto-retried against a different model",
+                });
+              }
+              return records.length > 0 ? records : undefined;
+            })(),
           })
+        : backupRecords.length > 0
+          ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
+              kind: "backupsExhausted",
+              ...(result.providerCapacity === true ? { capacity: true } : {}),
+              backups: backupRecords.map((record) =>
+                record.label === stagePrimaryLabelV1 ? { ...record, isPrimary: true } : record
+              ),
+              remedyText: resolveFailureRemedyTextV1(),
+            })
         : !isCascadeEligibleFailureKind(result.failureKind)
           ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
               kind: "notCascadeEligible",
@@ -1796,34 +2052,35 @@ export async function runImplementationForModel(options: {
           ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
               kind: "neverSwitchConfigured",
               failureKind: result.failureKind,
+              ...(result.providerCapacity === true ? { capacity: true } : {}),
             })
           : !chainWantsBackup && !(backupRecords.length > 0 && isCascadeEligibleFailureKind(result.failureKind))
             ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
                 kind: "noBackupConfigured",
                 failureKind: result.failureKind,
+                ...(result.providerCapacity === true ? { capacity: true } : {}),
               })
             : result.filesChangedUnknown === true
               ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
                   kind: "treeStateUnknown",
                   failureKind: result.failureKind,
+                  ...(result.providerCapacity === true ? { capacity: true } : {}),
                 })
-              : backupRecords.length > 0
-                ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
-                    kind: "backupsExhausted",
-                    backups: backupRecords,
-                    remedyText: resolveFailureRemedyTextV1(),
-                  })
-                : undefined;
+              : undefined;
     if (explanation !== undefined) {
       options.onProgress(explanation);
       return withActualIdentity(
-        { ...result, errorMessage: explanation },
+        { ...result, errorMessage: explanation, ...(terminalAuthFailure ? { authFailure: true } : {}) },
         primaryProviderLabel,
         options.modelId
       );
     }
   }
-  return withActualIdentity(result, primaryProviderLabel, options.modelId);
+  return withActualIdentity(
+    { ...result, ...(terminalAuthFailure ? { authFailure: true } : {}) },
+    primaryProviderLabel,
+    options.modelId
+  );
 }
 
 /* ------------------------------------------------------------------------ *

@@ -163,7 +163,8 @@ function decodeEvidence(value: unknown): boolean {
       return false;
     }
     const entry = item as Record<string, unknown>;
-    return typeof entry.label === "string" && typeof entry.detail === "string";
+    return typeof entry.label === "string" && typeof entry.detail === "string" &&
+      (entry.openFilePath === undefined || typeof entry.openFilePath === "string");
   });
 }
 

@@ -195,6 +195,7 @@ export type PostWorkflowDecisionInputV1 = Omit<CreateWorkflowDecisionInputV1, "d
    * the identifier travels.
    */
   readonly decisionId?: string;
+  readonly suppressNotification?: boolean;
 };
 
 /**
@@ -266,7 +267,9 @@ export async function postWorkflowDecisionV1(
     // The decision store is authoritative for the card; leave timestamp
     // ordering as the compatibility fallback when the projection cannot run.
   }
-  notifyPendingWorkflowDecision(result.decision, target);
+  if (!input.suppressNotification) {
+    notifyPendingWorkflowDecision(result.decision, target);
+  }
   return result.decision;
 }
 

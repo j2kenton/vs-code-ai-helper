@@ -177,7 +177,7 @@ void describe("nextStage — defaults to CurrentTaskStore's task instead of alwa
     }
   });
 
-  void it("falls back to the picker, listing the display name as the label and the folder id as detail, when there is no current task", async () => {
+  void it("asks in global chat (never showQuickPick), listing the display name as the label and the folder id in the description, when there is no current task", async () => {
     const container = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-next-stage-ambiguous-"));
     const metaRoot = path.join(container, ".ensemble");
     const taskA = path.join(metaRoot, "task-a");
@@ -194,19 +194,39 @@ void describe("nextStage — defaults to CurrentTaskStore's task instead of alwa
     const quickPick = installQuickPickCapture();
     const context = makeContext();
 
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+    const chatChoiceMod = require("../utils/chatChoiceV1") as {
+      askChatChoiceV1: (req: {
+        decisionKey: string;
+        options: ReadonlyArray<{ optionId: string; label: string; description?: string }>;
+      }) => Promise<string | undefined>;
+    };
+    const origAskChatChoice = chatChoiceMod.askChatChoiceV1;
+    const chatCalls: Array<{
+      decisionKey: string;
+      options: ReadonlyArray<{ optionId: string; label: string; description?: string }>;
+    }> = [];
+    chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+      chatCalls.push(req);
+      return Promise.resolve(undefined);
+    };
+
     try {
       // No current task set — genuinely ambiguous between task-a and task-b.
       await nextStage(vscode.Uri.file(container), context, undefined);
 
-      assert.equal(quickPick.calls.length, 1, "with no current task and two eligible tasks, the picker must be shown");
-      const items = quickPick.calls[0]![0] as Array<{ label: string; detail?: string }>;
-      const taskAItem = items.find((item) => item.detail === "task-a");
-      assert.ok(taskAItem, "task-a's item must carry its folder id as the detail");
+      assert.equal(quickPick.calls.length, 0, "showQuickPick must never be called");
+      assert.equal(chatCalls.length, 1, "with no current task and two eligible tasks, global chat choice must be asked");
+      assert.equal(chatCalls[0]!.decisionKey, "resolveReviewActionTask");
+      const options = chatCalls[0]!.options;
+      const taskAItem = options.find((item) => item.description?.includes("task-a"));
+      assert.ok(taskAItem, "task-a's option must carry its folder id in the description");
       assert.equal(taskAItem.label, "Friendly Task Name", "the label must be the display name, not the folder id");
-      const taskBItem = items.find((item) => item.detail === "task-b");
-      assert.ok(taskBItem, "task-b's item must carry its folder id as the detail");
+      const taskBItem = options.find((item) => item.description?.includes("task-b"));
+      assert.ok(taskBItem, "task-b's option must carry its folder id in the description");
       assert.equal(taskBItem.label, "task-b", "with no display name, the label falls back to the folder id");
     } finally {
+      chatChoiceMod.askChatChoiceV1 = origAskChatChoice;
       quickPick.restore();
       wsBridge.restore();
       fsBridge.restore();

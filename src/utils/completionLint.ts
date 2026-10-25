@@ -24,6 +24,10 @@ import {
   withPublishChecksReportLockV1,
   writeFileAtomicV1,
 } from "./publishChecksFreshness";
+import {
+  composeCheckFailureOutputV1,
+  truncateKeepingFailingTestIndexV1,
+} from "./failingTestsV1";
 
 /**
  * Resolve a package manager executable to an absolute path, preferring a
@@ -263,6 +267,8 @@ export interface CompletionLintResult {
    * forced to populate it. Treat absent as `"full"`.
    */
   checkSet?: "fast" | "full";
+  /** Task-folder-relative path to the saved complete raw check output (e.g. "runs/raw-check-output.log"). */
+  rawReportLocation?: string;
 }
 
 /** True when the path exists on disk and is a directory. */
@@ -1137,7 +1143,7 @@ function safeCwdForDisclosure(cwd: string): string {
 }
 
 /** Run one user-authored verification command line through the shell. */
-function runExplicitCheck(
+export function runExplicitCheck(
   cwd: string,
   command: string,
   guard?: RunGuardOptions,
@@ -1267,6 +1273,10 @@ export interface CollectCompletionLintOptions {
      */
     batchBoundary?(): void;
   };
+  /** The task folder URI where checks run for (used to persist raw check logs under runs/). */
+  taskFolderUri?: vscode.Uri;
+  /** Relative location for raw report, defaults to "runs/raw-check-output.log". */
+  rawReportLocation?: string;
 }
 
 /** Collect diagnostics after fresh lint/type/test checks have completed. */
@@ -1518,6 +1528,23 @@ export async function collectCompletionLint(
     .filter((entry) => entry.match !== undefined)
     .map(({ failure, match }) => ({ command: failure.command, exitCode: failure.code, reason: match!.reason }));
   const unquarantinedFailureCount = commandFailures.length - knownFlakeFailures.length;
+  const rawReportRelPath = options?.rawReportLocation ?? "runs/raw-check-output.log";
+  if (commandFailures.length > 0 && options?.taskFolderUri) {
+    try {
+      const runsDir = path.join(options.taskFolderUri.fsPath, "runs");
+      await fs.promises.mkdir(runsDir, { recursive: true });
+      const fullRawOutput = commandFailures
+        .map((f) => `=== ${f.command} (exit code ${f.code}) ===\n${f.output}`)
+        .join("\n\n");
+      await fs.promises.writeFile(
+        path.join(options.taskFolderUri.fsPath, rawReportRelPath),
+        fullRawOutput,
+        "utf8"
+      );
+    } catch {
+      // Best-effort write of raw report
+    }
+  }
   return {
     runAt: new Date().toISOString(),
     // An undetected toolchain is never a pass: with a required check
@@ -1542,7 +1569,12 @@ export async function collectCompletionLint(
         // VERIFIED_CHECKS_PROMPT_MAX_OUTPUT_CHARS) but never where it feeds
         // storage. Head+tail is kept, so the fail-fast opening and the
         // summarizing end both survive for runLintingFixes.
-        output: truncateCheckOutput(output, PERSISTED_CHECK_OUTPUT_MAX_CHARS),
+        output: composeCheckFailureOutputV1(
+          output,
+          PERSISTED_CHECK_OUTPUT_MAX_CHARS,
+          truncateCheckOutput,
+          { rawReportLocation: rawReportRelPath }
+        ),
         ...(retryCount > 0 ? { retryCount } : {}),
         ...(flake ? { quarantine: { reason: flake.reason, ruleMatch: flake.match } } : {}),
       };
@@ -1565,6 +1597,7 @@ export async function collectCompletionLint(
     monorepoDetected,
     ...(monorepoDetected ? { monorepoChecks } : {}),
     checkSet,
+    rawReportLocation: rawReportRelPath,
   };
 }
 
@@ -1898,9 +1931,11 @@ function renderCompletionChecksSection(
   if (result.failedChecks.length > 0) {
     const knownFlakesForMismatch = getKnownFlakyChecks();
     lines.push("", "#### Failed checks");
+    const rawReportPath = result.rawReportLocation ?? "runs/raw-check-output.log";
+    lines.push(`_Complete raw check output is preserved in [\`${rawReportPath}\`](${rawReportPath})._`);
     for (const check of result.failedChecks) {
       const flakeReason = resolveQuarantineReasonV1(result, check);
-      const output = truncateCheckOutput(check.output, PUBLISH_CHECKS_MAX_OUTPUT_CHARS);
+      const output = truncateKeepingFailingTestIndexV1(check.output, PUBLISH_CHECKS_MAX_OUTPUT_CHARS, truncateCheckOutput);
       // Omitted once the failure is a known, quarantined flake: for those the
       // retry count is not diagnostic evidence, it is noise that can actively
       // contradict the recorded flake reason (e.g. "reproduces only in the
@@ -2196,6 +2231,165 @@ export function extractCompletionChecksSectionV1(content: string): string | unde
 }
 
 /**
+ * Parse the recorded Completion Checks evidence block from `publish-review.md`.
+ * Returns undefined if the section is missing, malformed, or unreadable.
+ *
+ * @internal exported for testing and reuse by reviewActions.ts
+ */
+export function parseRecordedCompletionChecksEvidenceV1(content: string): CompletionLintResult | undefined {
+  const section = extractCompletionChecksSectionV1(content);
+  if (!section) {
+    return undefined;
+  }
+
+  // Parse Status
+  const statusMatch = section.match(/^- Status:\s*(.*)$/m);
+  if (!statusMatch || !statusMatch[1]) {
+    return undefined;
+  }
+  const statusText = statusMatch[1].trim();
+  const passed = statusText.startsWith("Passed");
+  const passedModuloKnownFlakes = passed;
+
+  // Parse Last run
+  const runAtMatch = section.match(/^- Last run:\s*(.*)$/m);
+  const runAt = runAtMatch?.[1]?.trim() ?? new Date().toISOString();
+
+  // Parse Verified against
+  const verifiedFolderMatch = section.match(/^- Verified against:\s*(.*)$/m);
+  const verifiedFolder = verifiedFolderMatch?.[1]?.trim();
+
+  // Parse Summary
+  const summaryMatch = section.match(/^- Summary:\s*(.*)$/m);
+  const summary = summaryMatch?.[1]?.trim() ?? "";
+
+  // Parse Environment
+  let verificationEnvironment: CompletionLintResult["verificationEnvironment"] = undefined;
+  const cwdMatch = section.match(/^- Resolved cwd:\s*(.*)$/m);
+  const pmMatch = section.match(/^- Package manager:\s*(.*)$/m);
+  if (cwdMatch && cwdMatch[1] && pmMatch && pmMatch[1]) {
+    const envVarsMatch = section.match(/^- Environment variable names present.*?:\s*(.*)$/m);
+    const envVarNames: string[] = [];
+    if (envVarsMatch && envVarsMatch[1]) {
+      const varMatches = envVarsMatch[1].matchAll(/`([^`]+)`/g);
+      for (const m of varMatches) {
+        if (m[1]) {
+          envVarNames.push(m[1]);
+        }
+      }
+    }
+    verificationEnvironment = {
+      cwd: cwdMatch[1].trim(),
+      packageManager: pmMatch[1].trim(),
+      envVarNames,
+    };
+  }
+
+  // Parse Commands that ran
+  const commandsRun: string[] = [];
+  const commandsSectionMatch = section.match(/### Commands that ran\n([\s\S]*?)(?=\n###|\n####|<!-- completion-checks:end -->|$)/);
+  if (commandsSectionMatch && commandsSectionMatch[1]) {
+    const lines = commandsSectionMatch[1].split("\n");
+    for (const line of lines) {
+      const cmdMatch = line.match(/^-\s*`([^`]+)`/);
+      if (cmdMatch && cmdMatch[1]) {
+        commandsRun.push(cmdMatch[1].trim());
+      }
+    }
+  }
+
+  // Parse Inconclusive checks (missing scripts)
+  const missingScripts: string[] = [];
+  const inconclusiveSectionMatch = section.match(/#### Inconclusive checks\n([\s\S]*?)(?=\n###|\n####|<!-- completion-checks:end -->|$)/);
+  if (inconclusiveSectionMatch && inconclusiveSectionMatch[1]) {
+    const lines = inconclusiveSectionMatch[1].split("\n");
+    for (const line of lines) {
+      const scriptMatch = line.match(/^-\s*`([^`]+)`:\s*\*\*inconclusive\*\*/);
+      if (scriptMatch && scriptMatch[1]) {
+        missingScripts.push(scriptMatch[1].trim());
+      }
+    }
+  }
+
+  // Parse Checks that required a retry to pass
+  const retriedPasses: Array<{ command: string; retryCount: number }> = [];
+  const retriesSectionMatch = section.match(/#### Checks that required a retry to pass\n([\s\S]*?)(?=\n###|\n####|<!-- completion-checks:end -->|$)/);
+  if (retriesSectionMatch && retriesSectionMatch[1]) {
+    const lines = retriesSectionMatch[1].split("\n");
+    for (const line of lines) {
+      const retryMatch = line.match(/^-\s*`([^`]+)`:.*?passed on retry\s+(\d+)/);
+      if (retryMatch && retryMatch[1] && retryMatch[2]) {
+        retriedPasses.push({
+          command: retryMatch[1].trim(),
+          retryCount: parseInt(retryMatch[2], 10),
+        });
+      }
+    }
+  }
+
+  // Parse Failed checks
+  const failedChecks: Array<{ command: string; exitCode: number; output: string; retryCount?: number }> = [];
+  const failedSectionMatch = section.match(/#### Failed checks\n([\s\S]*?)(?=\n###|\n#### Checks that required|\n#### Plan items|<!-- completion-checks:end -->|$)/);
+  if (failedSectionMatch && failedSectionMatch[1]) {
+    const failBlocks = failedSectionMatch[1].split(/\n(?=\*\*[^*]+\*\*\s*\(exit\s+\d+\))/);
+    for (const block of failBlocks) {
+      const headerMatch = block.match(/^\*\*([^*]+)\*\*\s*\(exit\s+(\d+)\)(.*?)(?:\n```(?:[\s\S]*?)```|$)/s);
+      if (headerMatch && headerMatch[1] && headerMatch[2]) {
+        const command = headerMatch[1].trim();
+        const exitCode = parseInt(headerMatch[2], 10);
+        const codeBlockMatch = block.match(/```\n?([\s\S]*?)\n?```/);
+        const output = (codeBlockMatch && codeBlockMatch[1] !== undefined) ? codeBlockMatch[1] : "";
+        failedChecks.push({
+          command,
+          exitCode,
+          output,
+        });
+      }
+    }
+  }
+
+  // Parse Monorepo packages checked
+  const monorepoChecks: Array<{ packageDir: string; command: string; exitCode: number; passed: boolean; retryCount?: number }> = [];
+  const monorepoSectionMatch = section.match(/### Monorepo packages checked\n([\s\S]*?)(?=\n###|\n####|<!-- completion-checks:end -->|$)/);
+  if (monorepoSectionMatch && monorepoSectionMatch[1]) {
+    const lines = monorepoSectionMatch[1].split("\n");
+    for (const line of lines) {
+      const monoMatch = line.match(/^-\s*\*\*([^*]+)\*\*\s*—\s*`([^`]+)`:\s*(passed|\*\*FAILED\*\*)(?:\s*\(passed on retry\s+(\d+)\))?/);
+      if (monoMatch && monoMatch[1] && monoMatch[2] && monoMatch[3]) {
+        const passedCheck = monoMatch[3] === "passed";
+        const retryCount = monoMatch[4] ? parseInt(monoMatch[4], 10) : undefined;
+        monorepoChecks.push({
+          packageDir: monoMatch[1].trim(),
+          command: monoMatch[2].trim(),
+          exitCode: passedCheck ? 0 : 1,
+          passed: passedCheck,
+          ...(retryCount !== undefined ? { retryCount } : {}),
+        });
+      }
+    }
+  }
+  const monorepoDetected = monorepoChecks.length > 0 || section.includes("Monorepo workspace detected");
+
+  return {
+    passed,
+    passedModuloKnownFlakes,
+    issueCount: failedChecks.length + missingScripts.length,
+    summary,
+    failedChecks,
+    knownFlakeFailures: [],
+    retriedPasses,
+    missingScripts,
+    verificationEnvironment,
+    commandsRun,
+    monorepoDetected: monorepoDetected ? true : undefined,
+    monorepoChecks: monorepoChecks.length > 0 ? monorepoChecks : undefined,
+    checkSet: "full",
+    runAt,
+    verifiedFolder,
+  };
+}
+
+/**
  * Upsert a "Completion Checks" section into `publish-review.md` — the single
  * Publish-stage artifact (plan item 17, step 20; see the module doc comment
  * on `publishChecksFreshness.ts`'s `publishChecksPath` for why this used to
@@ -2300,6 +2494,8 @@ export async function collectCompletionLintPreview(
     onCheckEvent?: CollectCompletionLintOptions["onCheckEvent"];
     /** See CollectCompletionLintOptions.checkSet. Defaults to `"full"`. */
     checkSet?: CollectCompletionLintOptions["checkSet"];
+    /** Relative location for raw report, defaults to "runs/raw-check-output.log". */
+    rawReportLocation?: string;
   }
 ): Promise<CompletionLintResult> {
   const allowScopePrompt = options?.allowScopePrompt ?? true;
@@ -2337,6 +2533,7 @@ export async function collectCompletionLintPreview(
         ? "The task's project-root binding no longer exists — choose a Publish verification scope"
         : "The saved Publish verification scope no longer exists — choose a new one",
       currentRelPath: progress?.publishScopePath,
+      resumeChecksOnSelection: true,
     });
     if (!repicked) {
       throw new Error(staleReason);
@@ -2349,6 +2546,8 @@ export async function collectCompletionLintPreview(
     timeoutMs: options?.timeoutMs,
     onCheckEvent: options?.onCheckEvent,
     checkSet: options?.checkSet,
+    taskFolderUri: folderUri,
+    rawReportLocation: options?.rawReportLocation,
   });
   result.verifiedFolder = scopeFolder;
   if (includeAiPlanVerification) {

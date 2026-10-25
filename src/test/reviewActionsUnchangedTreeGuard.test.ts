@@ -24,6 +24,8 @@ import * as vscode from "vscode";
 
 import { fastForwardReviewWithAI, runReviewForFolder } from "../commands/reviewActions";
 import { rerunReviewAfterUnchangedTreeCardV1 } from "../commands/rerunReviewAfterUnchangedTreeCardV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { computeWorkingTreeFingerprintV1 } from "../utils/gitRepoInfo";
 import {
   NotificationRouter,
@@ -775,6 +777,9 @@ void describe("runReviewForFolder — offers Restore Last Usable Summary on its 
       }),
     ];
 
+    const context = makeFastForwardExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+
     try {
       await runReviewForFolder(
         vscode.Uri.file(REAL_ROOT),
@@ -793,17 +798,35 @@ void describe("runReviewForFolder — offers Restore Last Usable Summary on its 
       const warning = recorder.notifications.find((n) => n.message.includes("did not produce usable"));
       assert.ok(warning, `expected an unusable-summary warning; got: ${JSON.stringify(recorder.notifications)}`);
       assert.match(warning.message, /Restore the last usable summary/);
-      // Run Implementation takes priority as the toast's one action button
-      // when both it and Restore apply (2026-09-24 review, narrowed
-      // completion blocker) — Restore stays reachable via the tree row and
-      // the "Restore Last Usable Summary" command; the message text above
-      // still names it.
-      assert.deepEqual(warning.actionCommand, {
+      assert.equal(warning.actionCommand?.command, "vs-code-ai-helper.openWorkflowDecision");
+      assert.equal(warning.actionCommand?.title, "Open in Chat");
+
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store.listPending().find((d) => d.decisionKey.startsWith("chatActionOffer:"));
+      assert.ok(decision, "workflow decision for the unusable summary action must be posted in chat");
+      assert.equal(decision.options.find((o) => o.optionId === "runAction")?.label, "Run Implementation");
+      assert.deepEqual(decision.options.find((o) => o.optionId === "runAction")?.effect, {
+        kind: "command",
         command: "vs-code-ai-helper.resumeAndDispatchImplementation",
-        title: "Run Implementation",
         args: [{ taskFolderPath: folderPath }],
       });
+
+      // Unavailable-chat behavior: no direct action button attached to the toast
+      __extensionContextV1TestOnly.reset();
+      recorder.notifications.length = 0;
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        workspaceRoot,
+        "impl" as TaskStage,
+        true,
+        { automationDispatch: true }
+      );
+      const unavail = recorder.notifications.find((n) => n.message.includes("did not produce usable"));
+      assert.ok(unavail);
+      assert.equal(unavail.actionCommand, undefined, "when chat is unavailable, notification carries no direct work-starting button");
     } finally {
+      __extensionContextV1TestOnly.reset();
       for (const p of patches.reverse()) { p.restore(); }
       recorder.restore();
       wsStub.restore();
@@ -830,6 +853,9 @@ void describe("runReviewForFolder — offers Restore Last Usable Summary on its 
           Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
       ];
 
+      const context = makeFastForwardExtensionContext();
+      __extensionContextV1TestOnly.set(context);
+
       try {
         await runReviewForFolder(
           vscode.Uri.file(REAL_ROOT),
@@ -845,16 +871,35 @@ void describe("runReviewForFolder — offers Restore Last Usable Summary on its 
         assert.match(warning.message, /Restore the last usable summary/);
         assert.match(warning.message, /fully settled/);
         assert.doesNotMatch(warning.message, /run the implementation step again/i);
-        // Run Implementation still takes priority as the toast's one action
-        // button here: a fully-settled checklist is not a reason to withhold
-        // it (`shouldOfferRunImplementationForUnusableSummaryV1`'s doc
-        // comment) — only the message TEXT above changes for this case.
-        assert.deepEqual(warning.actionCommand, {
+        assert.equal(warning.actionCommand?.command, "vs-code-ai-helper.openWorkflowDecision");
+        assert.equal(warning.actionCommand?.title, "Open in Chat");
+
+        const store = new WorkflowDecisionStoreV1(context.workspaceState);
+        const decision = store.listPending().find((d) => d.decisionKey.startsWith("chatActionOffer:"));
+        assert.ok(decision, "workflow decision for the unusable summary action must be posted in chat");
+        assert.equal(decision.options.find((o) => o.optionId === "runAction")?.label, "Run Implementation");
+        assert.deepEqual(decision.options.find((o) => o.optionId === "runAction")?.effect, {
+          kind: "command",
           command: "vs-code-ai-helper.resumeAndDispatchImplementation",
-          title: "Run Implementation",
           args: [{ taskFolderPath: folderPath }],
         });
+
+        // Unavailable-chat behavior: no direct action button attached to the toast
+        __extensionContextV1TestOnly.reset();
+        recorder.notifications.length = 0;
+        await runReviewForFolder(
+          vscode.Uri.file(REAL_ROOT),
+          vscode.Uri.file(folderPath),
+          workspaceRoot,
+          "impl" as TaskStage,
+          true,
+          { automationDispatch: true }
+        );
+        const unavail = recorder.notifications.find((n) => n.message.includes("did not produce usable"));
+        assert.ok(unavail);
+        assert.equal(unavail.actionCommand, undefined, "when chat is unavailable, notification carries no direct work-starting button");
       } finally {
+        __extensionContextV1TestOnly.reset();
         for (const p of patches.reverse()) { p.restore(); }
         recorder.restore();
         wsStub.restore();
@@ -884,6 +929,7 @@ void describe("fastForwardReviewWithAI — offers Restore Last Usable Summary wh
     const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
     const gatePatches = installEditActionGatesAlwaysOkV1();
     const context = makeFastForwardExtensionContext();
+    __extensionContextV1TestOnly.set(context);
 
     // Unlike `runReviewForFolder`'s own direct-dispatch refusal (the sibling
     // describe block above), Fast Forward's "no initial review yet" branch
@@ -924,21 +970,39 @@ void describe("fastForwardReviewWithAI — offers Restore Last Usable Summary wh
         `expected Fast Forward's own unusable-summary warning; got: ${JSON.stringify(recorder.notifications)}`
       );
       assert.match(warning.message, /Restore the last usable summary/);
-      // Run Implementation takes priority as the toast's one action button
-      // when both it and Restore apply (2026-09-24 review, narrowed
-      // completion blocker) — Restore stays reachable via the tree row and
-      // the "Restore Last Usable Summary" command.
-      assert.deepEqual(warning.actionCommand, {
+      assert.equal(warning.actionCommand?.command, "vs-code-ai-helper.openWorkflowDecision");
+      assert.equal(warning.actionCommand?.title, "Open in Chat");
+
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store.listPending().find((d) => d.decisionKey.startsWith("chatActionOffer:"));
+      assert.ok(decision, "workflow decision for Fast Forward unusable summary action must be posted in chat");
+      assert.equal(decision.options.find((o) => o.optionId === "runAction")?.label, "Run Implementation");
+      assert.deepEqual(decision.options.find((o) => o.optionId === "runAction")?.effect, {
+        kind: "command",
         command: "vs-code-ai-helper.resumeAndDispatchImplementation",
-        title: "Run Implementation",
         args: [{ taskFolderPath: folderPath }],
       });
+
       assert.equal(
         fs.existsSync(path.join(folderPath, "impl-high-review.md")),
         false,
         "no review artifact must be written when both refusals fire before any provider work"
       );
+
+      // Unavailable-chat behavior: no direct action button attached to the toast
+      __extensionContextV1TestOnly.reset();
+      recorder.notifications.length = 0;
+      await fastForwardReviewWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        context,
+        { taskFolderPath: folderPath },
+        undefined
+      );
+      const unavail = recorder.notifications.find((n) => n.message.includes("nothing to fast-forward from"));
+      assert.ok(unavail);
+      assert.equal(unavail.actionCommand, undefined, "when chat is unavailable, notification carries no direct work-starting button");
     } finally {
+      __extensionContextV1TestOnly.reset();
       for (const p of patches.reverse()) { p.restore(); }
       for (const p of gatePatches.reverse()) { p.restore(); }
       admissionPatch.restore();

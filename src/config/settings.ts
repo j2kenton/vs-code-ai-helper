@@ -6,6 +6,8 @@ import {
   normalizeQualifiedModelId,
   providerAccountIdForModelId,
 } from "../runners/providers";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 
 /** Settings displayed to users. Command and extension identifiers deliberately
  * retain their historical `vs-code-ai-helper` prefix for compatibility. */
@@ -325,14 +327,30 @@ export async function migrateSettingsScope(): Promise<void> {
     return;
   }
 
-  const choice = await vscode.window.showWarningMessage(
-    `This workspace has ${conflicts.length} Ensemble setting(s) that differ from your user settings. ` +
+  const target = await resolveGlobalChatTargetOrDefaultV1();
+  const choice = await askChatChoiceV1({
+    decisionKey: "reconcileWorkspaceSettings",
+    target,
+    whatHappened:
+      `This workspace has ${conflicts.length} Ensemble setting(s) that differ from your user settings. ` +
       "Workspace values still take effect here, but won't follow you to other workspaces unless you " +
       "make them the default.",
-    "Use This Workspace's Settings Everywhere",
-    "Keep Workspace Overrides"
-  );
-  if (choice === "Use This Workspace's Settings Everywhere") {
+    whyUserNeeded: "Choose whether to copy this workspace's Ensemble settings to your user settings or keep them as workspace overrides.",
+    options: [
+      {
+        optionId: "useEverywhere",
+        label: "Use This Workspace's Settings Everywhere",
+        consequence: "Copies these workspace settings to your user settings and clears the workspace overrides.",
+      },
+      {
+        optionId: "keepOverrides",
+        label: "Keep Workspace Overrides",
+        consequence: "Leaves your user settings and workspace overrides as they are.",
+      },
+    ],
+    detail: "Answering reconciles or preserves your workspace settings overrides.",
+  });
+  if (choice === "useEverywhere" || choice === "Use This Workspace's Settings Everywhere") {
     for (const key of conflicts) {
       const inspected = config.inspect(key);
       await config.update(key, inspected?.workspaceValue, vscode.ConfigurationTarget.Global);
@@ -931,12 +949,28 @@ export class AutoImplementConfirmationController implements vscode.Disposable {
       : current.transitionsToAuto(previous);
     if (enabledScopes.length === 0) return;
 
-    const choice = await vscode.window.showWarningMessage(
-      "Automatically implement will make real code and file changes after an approved review. Use it only with continuous human supervision.",
-      { modal: true },
-      "Enable"
-    );
-    if (choice === "Enable") {
+    const target = await resolveGlobalChatTargetOrDefaultV1();
+    const choice = await askChatChoiceV1({
+      decisionKey: "confirmAutoImplementAfterReview",
+      target,
+      whatHappened:
+        "Automatically implement will make real code and file changes after an approved review. Use it only with continuous human supervision.",
+      whyUserNeeded: "Enabling automatic implementation after review requires your confirmation.",
+      options: [
+        {
+          optionId: "enable",
+          label: "Enable",
+          consequence: "Confirms and keeps automatic implementation enabled.",
+        },
+        {
+          optionId: "cancel",
+          label: "Cancel",
+          consequence: "Reverts the automatic-implementation setting change.",
+        },
+      ],
+      detail: "Answering confirms or reverts the automatic-implementation setting.",
+    });
+    if (choice === "enable" || choice === "Enable") {
       await this.context.globalState.update(AUTO_IMPLEMENT_CONFIRMED_KEY, true);
       autoImplementConfirmed = true;
       return;

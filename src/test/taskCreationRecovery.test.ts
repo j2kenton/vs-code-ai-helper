@@ -186,12 +186,16 @@ function installHarness(): Harness {
   const windowTarget = vscode.window as unknown as Record<string, unknown>;
   const originalShowWarningMessage = windowTarget.showWarningMessage;
   const originalExecuteCommand = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
-  // Simulates the user clicking the modal's one action button: every
-  // recovery command passes exactly one button label as its last argument
-  // (e.g. "Retry", "Adopt and Retry", "Delete"), so echoing it back approves
-  // whichever confirmation is currently showing without hardcoding a label.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const chatChoiceModule = require("../utils/chatChoiceV1") as Record<string, unknown>;
+  const originalAskChatChoiceV1 = chatChoiceModule.askChatChoiceV1;
+  // Simulates the user clicking the confirmation's primary action option
+  // (e.g. "Retry", "Adopt and Retry", "Delete"), echoing it back without
+  // hardcoding a label.
   windowTarget.showWarningMessage = (...args: unknown[]): Promise<string | undefined> =>
     Promise.resolve(typeof args[args.length - 1] === "string" ? (args[args.length - 1] as string) : undefined);
+  chatChoiceModule.askChatChoiceV1 = (input: { options: ReadonlyArray<{ optionId?: string; value?: unknown }> }): Promise<unknown> =>
+    Promise.resolve(input.options[0]?.value ?? input.options[0]?.optionId);
   (vscode.commands as unknown as Record<string, unknown>).executeCommand = (): Promise<void> => Promise.resolve();
   TaskCreationStartupReconcilerV1.resetForTests();
   resetWorkflowRuntimeServicesForTestV1();
@@ -215,6 +219,7 @@ function installHarness(): Harness {
       wsStub.restore();
       fsBridge.restore();
       windowTarget.showWarningMessage = originalShowWarningMessage;
+      chatChoiceModule.askChatChoiceV1 = originalAskChatChoiceV1;
       (vscode.commands as unknown as Record<string, unknown>).executeCommand = originalExecuteCommand;
       deactivateNotificationRouter();
       TaskCreationStartupReconcilerV1.resetForTests();

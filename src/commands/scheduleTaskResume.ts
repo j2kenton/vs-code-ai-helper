@@ -10,6 +10,8 @@ import {
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { clearStageActionRefusalReasonV1, takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
 import {
   formatNotificationTaskLabelV1,
@@ -24,8 +26,13 @@ import {
 import {
   IMPL_CONTINUATION_CHAIN_ID_V1,
   owedContinuationSourceV1,
+  parseRecoveryClaimOwnerV1,
+  resolveCurrentRecoveryClaimOwnerV1,
   retireSatisfiedSummaryRejectedRecoveryV1,
 } from "./implementationRecoveryV1";
+import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
+import { classifyRecordedProcessV1 } from "../state/processLivenessClassifierV1";
+import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 import {
   hasLiveSchedulingIntentBestEffortV1,
   liveSchedulingIntentIdsBestEffortV1,
@@ -33,7 +40,7 @@ import {
 } from "../state/schedulingIntentV1";
 import { taskOperations } from "../utils/taskOperations";
 import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
-import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
+import { clearRoundLiveV1, listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
 import { recoverStageEntryJournalIfPresentV1 } from "../utils/stageEntryJournalV1";
 import { pauseTaskWithReasonForClaimV1, setNextActorV1 } from "../utils/taskProgressTransforms";
@@ -498,6 +505,15 @@ export class TaskActionScheduler implements vscode.Disposable {
   /** Display name per armed task, for attributing `fire()`'s notifications. */
   private readonly taskNames = new Map<string, string>();
   private readonly owner: string;
+  private readonly explicitOwner: boolean;
+  /**
+   * Test-visible log of interrupted-and-resuming chat lines appended when a
+   * provably dead local recovery-claim owner is reclaimed on activation.
+   */
+  public readonly deadOwnerReclaimChatLinesForTestV1: Array<{
+    readonly taskFolderPath: string;
+    readonly content: string;
+  }> = [];
   /**
    * `fire()` is deliberately fire-and-forget from its `setTimeout` callback
    * (production code cannot await a timer callback), but it now does real,
@@ -514,9 +530,21 @@ export class TaskActionScheduler implements vscode.Disposable {
     private readonly inventory: TaskInventory,
     private readonly clock: SchedulerClock = systemSchedulerClock,
     private readonly store: SchedulerProgressStore = progressStore,
-    owner = `${vscode.env.sessionId}:${Math.random().toString(36).slice(2)}`
+    owner?: string
   ) {
-    this.owner = owner;
+    this.explicitOwner = owner !== undefined;
+    this.owner = owner ?? `${vscode.env.sessionId}:${Math.random().toString(36).slice(2)}`;
+  }
+
+  private async resolveRecoveryClaimOwnerV1(): Promise<string> {
+    if (this.explicitOwner) {
+      return this.owner;
+    }
+    return resolveCurrentRecoveryClaimOwnerV1(this.owner);
+  }
+
+  private isOwnRecoveryClaimOwnerV1(leaseOwner: string | undefined, resolvedOwner: string): boolean {
+    return leaseOwner !== undefined && (leaseOwner === this.owner || leaseOwner === resolvedOwner);
   }
 
   async arm(taskFolderPath: string, canonicalId?: string): Promise<void> {
@@ -985,10 +1013,10 @@ export class TaskActionScheduler implements vscode.Disposable {
     }
   }
 
-  private surfaceStaleWorkAdmissionTakeoverNoticeV1(
+  private async surfaceStaleWorkAdmissionTakeoverNoticeV1(
     task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
     outcome: Extract<WorkAdmissionAutomaticReclamationOutcomeV1, { outcome: "notDead" }>
-  ): void {
+  ): Promise<void> {
     const kind = outcome.liveness.kind;
     if (kind !== "foreignHost" && kind !== "sameHostAlive" && kind !== "corrupt") {
       // `indeterminate` (or any future kind): never notice-worthy — clear any
@@ -1008,11 +1036,17 @@ export class TaskActionScheduler implements vscode.Disposable {
     const displayName = notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath);
     const message = describeStaleWorkAdmissionTakeoverNoticeV1(displayName, outcome.liveness, outcome.owner, outcome.ageMs);
     try {
-      NotificationRouter.showWarning(message, undefined, undefined, undefined, {
+      const chatPointer = await offerActionInChatV1({
+        taskFolderPath: task.taskFolderPath,
+        progress: task.progress,
+        actionLabel: "Take over this task on this machine",
         command: "vs-code-ai-helper.takeOverStaleWorkAdmission",
-        title: "Take over this task on this machine",
         args: [{ taskFolderPath: task.taskFolderPath, expectedMarkerPath: outcome.markerPath, expectedClaimId: outcome.owner?.claimId }],
+        noticeText: message,
+        optional: true,
+        taskLabel: task.progress.displayName,
       });
+      NotificationRouter.showWarning(message /* displayName */, undefined, undefined, undefined, chatPointer);
     } catch (error) {
       // Best-effort, like every other notification in this sweep (e.g.
       // `reclaimStaleWorkAdmissionMarkersV1`'s own logging-only failures) —
@@ -1084,7 +1118,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         // observations of a stuck, unreclaimable owner — may surface a
         // one-click takeover notice once it has persisted. See that method's
         // own doc comment for the full identity/threshold/reset contract.
-        this.surfaceStaleWorkAdmissionTakeoverNoticeV1(task, outcome);
+        await this.surfaceStaleWorkAdmissionTakeoverNoticeV1(task, outcome);
       } else {
         // Any other outcome ("reclaimed", "nothingToReclaim", "notStale",
         // "raced", "writeFailed") means the marker this task's tracking (if
@@ -1187,9 +1221,76 @@ export class TaskActionScheduler implements vscode.Disposable {
   }
 
   /**
-   * Tasks whose stale `dispatched` recovery record this window has already
-   * surfaced — once per window, not once per 5-minute sweep.
+   * Step 16 (Defect 3): determine whether a recovery claim's `leaseOwner`
+   * encodes a local process that is provably gone on THIS host, using the
+   * existing process-liveness (`classifyRecordedProcessV1`) and work-admission
+   * (`attemptAutomaticWorkAdmissionReclamationV1`) paths.
+   *
+   * Returns `false` for legacy/unidentifiable owner strings, foreign-host
+   * claims, live local processes (including PID-matched start time), and
+   * inconclusive probes so all of those remain governed by the lease rule.
    */
+  private async isRecoveryClaimOwnerProvablyDeadLocalV1(
+    leaseOwner: string | undefined,
+    taskFolderPath: string,
+    now: number
+  ): Promise<boolean> {
+    const parsed = parseRecoveryClaimOwnerV1(leaseOwner);
+    if (!parsed) {
+      return false;
+    }
+    const myHostId = await resolveHostIdentityV1();
+    if (parsed.hostId !== myHostId) {
+      return false;
+    }
+    const classification = await classifyRecordedProcessV1(
+      { pid: parsed.pid, processStartTime: parsed.processStartTime },
+      now
+    );
+    if (classification !== "gone") {
+      return false;
+    }
+    try {
+      const admissionOutcome = await attemptAutomaticWorkAdmissionReclamationV1(
+        taskFolderPath,
+        now,
+        deadOwnerGateForTaskV1(taskFolderPath)
+      );
+      if (
+        admissionOutcome.outcome === "notDead" ||
+        admissionOutcome.outcome === "cliSurvivors" ||
+        admissionOutcome.outcome === "writeFailed"
+      ) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  private async appendDeadLocalRecoveryInterruptedChatLineV1(task: {
+    readonly taskFolderPath: string;
+    readonly canonicalId?: string;
+    readonly progress: TaskProgress;
+  }): Promise<void> {
+    const content =
+      "_Round interrupted (the window running it closed or restarted) — resuming recovery continuation automatically._";
+    this.deadOwnerReclaimChatLinesForTestV1.push({
+      taskFolderPath: task.taskFolderPath,
+      content,
+    });
+    await appendChatMessageV1(
+      task.taskFolderPath,
+      {
+        role: "assistant",
+        text: content,
+        stage: task.progress.currentStage,
+        at: new Date(this.clock.now()).toISOString(),
+      },
+      task.canonicalId ?? task.taskFolderPath
+    ).catch(() => undefined);
+  }
   private readonly staleRecoveryNotified = new Set<string>();
 
   /**
@@ -1262,6 +1363,17 @@ export class TaskActionScheduler implements vscode.Disposable {
         vscode.Uri.file(task.taskFolderPath),
         { nextActorOnRetire: "human" }
       )) {
+        const noticeText =
+          "The Implementation recovery was cleared because its summary is usable again. Choose the next stage action in Chat when you're ready.";
+        await offerActionInChatV1({
+          taskFolderPath: task.taskFolderPath,
+          taskLabel: task.progress.displayName,
+          actionLabel: "Complete Stage & Move On",
+          command: "vs-code-ai-helper.nextStage",
+          args: [{ taskFolderPath: task.taskFolderPath }],
+          noticeText,
+          optional: true,
+        });
         continue;
       }
       // Part 1b step 13 ("automation gates"): this sweep automatically
@@ -1282,7 +1394,13 @@ export class TaskActionScheduler implements vscode.Disposable {
         if (this.owedRetryAnnounced.has(task.taskFolderPath)) {
           await this.withdrawOwedContinuationCardV1(task.taskFolderPath, task.canonicalId, "the owed continuation has started");
         }
-        if (!isStaleDispatchedImplRecoveryV1(recovery, this.clock.now())) {
+        const deadLocalDispatchedOwner = await this.isRecoveryClaimOwnerProvablyDeadLocalV1(
+          recovery.leaseOwner,
+          task.taskFolderPath,
+          this.clock.now()
+        );
+        const staleDispatched = isStaleDispatchedImplRecoveryV1(recovery, this.clock.now());
+        if (!deadLocalDispatchedOwner && !staleDispatched) {
           continue;
         }
         if (!isReconstructableImplRecoveryV1(recovery, task.progress)) {
@@ -1294,20 +1412,55 @@ export class TaskActionScheduler implements vscode.Disposable {
           // through the ledger's own terminalization path instead.
           continue;
         }
-        // Reclaim: return the stale `dispatched` record to `pending` (CAS —
-        // re-checks staleness AND reconstructability inside the patch so a
-        // concurrent reclaim from another window, or a round that finalizes
-        // at the last instant, cannot double-reclaim a record that is no
-        // longer stale, no longer reconstructable, or no longer present) so
-        // the ordinary pending-claim logic below re-arms it in this same
-        // pass.
+        const observedDispatchedLeaseOwner = recovery.leaseOwner;
+        let closedRoundIds: string[] = [];
+        // Reclaim: return the stale or dead-local-owner `dispatched` record to
+        // `pending` (CAS — re-checks staleness/owner AND reconstructability
+        // inside the patch so a concurrent reclaim from another window, or a
+        // round that finalizes at the last instant, cannot double-reclaim a
+        // record that is no longer eligible) so the ordinary pending-claim
+        // logic below re-arms it in this same pass.
         const reclaimed = await this.store.patch(vscode.Uri.file(task.taskFolderPath), (progress) => {
+          closedRoundIds = [];
           const record = progress.implRecovery;
           if (!record || record.dispatch !== "dispatched") return progress;
-          if (!isStaleDispatchedImplRecoveryV1(record, this.clock.now())) return progress;
+          const eligibleByDeadLocal =
+            deadLocalDispatchedOwner &&
+            observedDispatchedLeaseOwner !== undefined &&
+            record.leaseOwner === observedDispatchedLeaseOwner;
+          if (!eligibleByDeadLocal && !isStaleDispatchedImplRecoveryV1(record, this.clock.now())) {
+            return progress;
+          }
           if (!isReconstructableImplRecoveryV1(record, progress)) return progress;
+          const nowIso = new Date(this.clock.now()).toISOString();
+          const updatedRoundLedger = progress.roundLedger?.map((row) => {
+            if (row.state !== "open" && row.state !== "scheduled") {
+              return row;
+            }
+            const matchesAttempt =
+              record.attemptId !== undefined &&
+              (row.roundId === record.attemptId || (row.attemptIds ?? []).includes(record.attemptId));
+            const matchesContinuation =
+              record.sourceRoundId !== undefined && row.continuationOf === record.sourceRoundId;
+            if (!matchesAttempt && !matchesContinuation) {
+              return row;
+            }
+            closedRoundIds.push(row.roundId);
+            return {
+              ...row,
+              state: "interrupted" as const,
+              endedAt: nowIso,
+              outcome: {
+                ...row.outcome,
+                rejectionReason:
+                  "The window running the round closed or restarted — resuming recovery continuation automatically.",
+                continuationOwed: true,
+              },
+            };
+          });
           return {
             ...progress,
+            ...(updatedRoundLedger !== undefined ? { roundLedger: updatedRoundLedger } : {}),
             implRecovery: {
               ...record,
               dispatch: "pending",
@@ -1322,6 +1475,12 @@ export class TaskActionScheduler implements vscode.Disposable {
           // meantime, or it was no longer stale/reconstructable under the
           // fresh read — no action needed from this pass.
           continue;
+        }
+        for (const closedId of closedRoundIds) {
+          await clearRoundLiveV1(closedId);
+        }
+        if (deadLocalDispatchedOwner) {
+          await this.appendDeadLocalRecoveryInterruptedChatLineV1(task);
         }
         if (!this.staleRecoveryNotified.has(task.taskFolderPath)) {
           this.staleRecoveryNotified.add(task.taskFolderPath);
@@ -1343,14 +1502,50 @@ export class TaskActionScheduler implements vscode.Disposable {
       if ((task.progress.incompleteRoundContinuations ?? 0) >= MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1) {
         continue;
       }
-      // ANY live lease blocks a re-arm — including this window's own. The
-      // sweep runs on every progress change and every 5 minutes; a claim it
-      // could immediately re-take would turn one cancelled continuation into
-      // a dispatch loop. A pending record is retried only once its previous
-      // claim's lease has fully expired.
-      const leaseLive =
+      // ANY live lease blocks a re-arm — including this window's own, UNLESS
+      // the lease owner encodes a local process on THIS host that is provably
+      // dead (Step 16 / Defect 3).
+      let leaseLive =
         recovery.leaseUntil !== undefined &&
         new Date(recovery.leaseUntil).getTime() > this.clock.now();
+      if (leaseLive) {
+        const deadLocalPendingOwner = await this.isRecoveryClaimOwnerProvablyDeadLocalV1(
+          recovery.leaseOwner,
+          task.taskFolderPath,
+          this.clock.now()
+        );
+        if (deadLocalPendingOwner) {
+          const observedPendingOwner = recovery.leaseOwner;
+          const observedPendingUntil = recovery.leaseUntil;
+          let clearedDeadPendingLease = false;
+          const afterClear = await this.store.patch(vscode.Uri.file(task.taskFolderPath), (progress) => {
+            clearedDeadPendingLease = false;
+            const record = progress.implRecovery;
+            if (
+              !record ||
+              record.dispatch !== "pending" ||
+              record.leaseOwner !== observedPendingOwner ||
+              record.leaseUntil !== observedPendingUntil
+            ) {
+              return progress;
+            }
+            clearedDeadPendingLease = true;
+            return {
+              ...progress,
+              implRecovery: {
+                ...record,
+                leaseOwner: undefined,
+                leaseUntil: undefined,
+              },
+            };
+          });
+          if (clearedDeadPendingLease && afterClear?.implRecovery?.dispatch === "pending") {
+            await this.appendDeadLocalRecoveryInterruptedChatLineV1(task);
+            recovery = afterClear.implRecovery;
+            leaseLive = false;
+          }
+        }
+      }
       if (leaseLive) {
         // A lease normally flips to `dispatched` within seconds of the claim.
         // One that is still `pending` a couple of minutes on is a genuine
@@ -1420,6 +1615,7 @@ export class TaskActionScheduler implements vscode.Disposable {
 
   /** The claim-and-dispatch body; the caller holds this task's `owedClaimsInFlight` entry. */
   private async claimAndDispatchOwedContinuationLockedV1(taskFolderPath: string): Promise<OwedDispatchResultV1> {
+    const claimOwner = await this.resolveRecoveryClaimOwnerV1();
     // Identity of THIS attempt's claim: the exact lease expiry it wrote, and
     // whether its own write (not someone's earlier one) is what landed.
     let wroteClaim = false;
@@ -1438,14 +1634,14 @@ export class TaskActionScheduler implements vscode.Disposable {
         ...progress,
         implRecovery: {
           ...record,
-          leaseOwner: this.owner,
+          leaseOwner: claimOwner,
           leaseUntil: claimLeaseUntil,
         },
       };
     });
     if (
       !wroteClaim ||
-      claimed?.implRecovery?.leaseOwner !== this.owner ||
+      claimed?.implRecovery?.leaseOwner !== claimOwner ||
       claimed.implRecovery.dispatch !== "pending"
     ) {
       return { kind: "notClaimed", heldBy: claimed?.implRecovery?.leaseOwner };
@@ -1494,7 +1690,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         if (
           !record ||
           record.dispatch !== "pending" ||
-          record.leaseOwner !== this.owner ||
+          record.leaseOwner !== claimOwner ||
           record.leaseUntil !== claimLeaseUntil
         ) {
           return progress;
@@ -1589,9 +1785,10 @@ export class TaskActionScheduler implements vscode.Disposable {
     taskFolderPath: string,
     recovery: NonNullable<TaskProgress["implRecovery"]>
   ): Promise<OwedContinuationRunNowResultV1> {
+    const resolvedOwner = await this.resolveRecoveryClaimOwnerV1();
     const leaseLive =
       recovery.leaseUntil !== undefined && new Date(recovery.leaseUntil).getTime() > this.clock.now();
-    if (leaseLive && recovery.leaseOwner !== this.owner) {
+    if (leaseLive && !this.isOwnRecoveryClaimOwnerV1(recovery.leaseOwner, resolvedOwner)) {
       const availableAt = new Date(recovery.leaseUntil ?? 0);
       return this.refuseOwedContinuationNowV1(
         `another VS Code window (${recovery.leaseOwner ?? "unknown owner"}) holds its claim until ` +
@@ -1613,7 +1810,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         if (
           !record ||
           record.dispatch !== "pending" ||
-          record.leaseOwner !== this.owner ||
+          !this.isOwnRecoveryClaimOwnerV1(record.leaseOwner, resolvedOwner) ||
           record.leaseUntil !== recovery.leaseUntil
         ) {
           return progress;
@@ -2080,8 +2277,18 @@ export async function scheduleTaskResume(
   const resolverArg = arg?.task ? { taskFolderPath: arg.task.folderUri.fsPath } : arg && (arg.canonicalId || arg.taskFolderPath) ? { canonicalId: arg.canonicalId, taskFolderPath: arg.taskFolderPath } : undefined;
   const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: false });
   if (!task) return;
-  const value = await vscode.window.showInputBox({ prompt: "Schedule current-stage action (ISO date/time)", value: new Date(clock.now() + LEASE_DURATION_MS).toISOString() });
-  const runAt = value ? new Date(value) : undefined;
+  const defaultIso = new Date(clock.now() + LEASE_DURATION_MS).toISOString();
+  const value = await askChatFreeTextV1({
+    target: {
+      canonicalId: task.canonicalId,
+      taskFolderPath: task.taskFolderPath,
+      stage: task.progress.currentStage,
+      taskName: task.progress.displayName ?? task.folderName,
+    },
+    prompt: `Schedule current-stage action (enter an ISO date/time, e.g. ${defaultIso}).`,
+    placeHolder: defaultIso,
+  });
+  const runAt = value ? new Date(value.trim()) : undefined;
   if (!runAt || Number.isNaN(runAt.getTime()) || runAt.getTime() <= clock.now()) {
     if (value) {
       const taskName = task.progress.displayName;

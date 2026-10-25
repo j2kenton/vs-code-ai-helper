@@ -45,6 +45,17 @@ import { ChatViewProvider, ChatInteractionRefV1 } from "../views/chatView";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 
+// Monkey-patchable so the test can answer the chat confirmations the
+// Commit & Push flow now asks (owner rule: every question is asked in chat).
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const workflowDecisionModule = require("../utils/workflowDecisionDispatchV1") as {
+  awaitWorkflowDecisionAnswerV1: (input: {
+    decisionKey: string;
+    whatHappened: string;
+    options: { optionId: string; label: string }[];
+  }) => Promise<string | undefined>;
+};
+
 // buildCommitMessage's AI path runs through the real production coordinator
 // (createProductionTaskActionCoordinatorV1), which requires the Chat
 // interaction transaction store to be wired exactly as extension.ts does at
@@ -333,6 +344,7 @@ function installHarness(
     showWarningMessage: vscode.window.showWarningMessage,
     showInformationMessage: vscode.window.showInformationMessage,
     showErrorMessage: vscode.window.showErrorMessage,
+    awaitWorkflowDecisionAnswerV1: workflowDecisionModule.awaitWorkflowDecisionAnswerV1,
     fsWriteFile: workspaceFs.writeFile,
     fsRename: workspaceFs.rename,
     fsReadFile: workspaceFs.readFile,
@@ -362,18 +374,38 @@ function installHarness(
     modelStageCalls.push(String(args[1]));
     return Promise.resolve({ modelId: "copilot:auto" });
   };
-  // The file-scope confirmation modal (unrelated to this file's coverage).
-  vscode.window.showWarningMessage =
-    (() => Promise.resolve("Commit & Push")) as unknown as typeof vscode.window.showWarningMessage;
+  // Commit & Push now asks every confirmation in the task chat. Answer the
+  // scope/fallback decisions the way the old modal stub did, and route the
+  // commit-message review through this file's own callback.
   const infoCalls: { message: string; options: unknown; items: string[] }[] = [];
-  vscode.window.showInformationMessage = ((...args: unknown[]): Promise<string | undefined> => {
-    const message = String(args[0]);
-    const options = args[1];
-    const items = args.slice(2).filter((a): a is string => typeof a === "string");
-    const call = { message, options, items };
-    infoCalls.push(call);
-    return Promise.resolve(answerReviewModal(call));
-  }) as unknown as typeof vscode.window.showInformationMessage;
+  workflowDecisionModule.awaitWorkflowDecisionAnswerV1 = (
+    input
+  ): Promise<string | undefined> => {
+    if (input.decisionKey === "commitPushReviewMessage") {
+      const call = {
+        message: input.whatHappened,
+        options: undefined,
+        items: input.options.map((option) => option.label),
+      };
+      infoCalls.push(call);
+      const answer = answerReviewModal(call);
+      return Promise.resolve(
+        answer === "Commit & Push"
+          ? "commitAndPush"
+          : answer === "Regenerate"
+            ? "regenerate"
+            : undefined
+      );
+    }
+    if (input.decisionKey === "commitPushFinalScopeConfirmation") {
+      return Promise.resolve("commitAndPush");
+    }
+    return Promise.resolve(undefined);
+  };
+  vscode.window.showWarningMessage =
+    (() => Promise.resolve(undefined)) as unknown as typeof vscode.window.showWarningMessage;
+  vscode.window.showInformationMessage =
+    (() => Promise.resolve(undefined)) as unknown as typeof vscode.window.showInformationMessage;
   vscode.window.showErrorMessage = (() => Promise.resolve(undefined)) as unknown as typeof vscode.window.showErrorMessage;
   workspaceFs.writeFile = () => Promise.resolve();
   workspaceFs.rename = () => Promise.resolve();
@@ -391,6 +423,7 @@ function installHarness(
       vscode.window.showWarningMessage = originals.showWarningMessage;
       vscode.window.showInformationMessage = originals.showInformationMessage;
       vscode.window.showErrorMessage = originals.showErrorMessage;
+      workflowDecisionModule.awaitWorkflowDecisionAnswerV1 = originals.awaitWorkflowDecisionAnswerV1;
       workspaceFs.writeFile = originals.fsWriteFile;
       workspaceFs.rename = originals.fsRename;
       workspaceFs.readFile = originals.fsReadFile;
@@ -446,8 +479,7 @@ void describe("commit-message review (in-UI modal, no editor session)", () => {
       assert.match(call.message, /Files \(\d+ total\):/);
       assert.match(call.message, /foo\.ts/, "the file preview lists changed files");
       assert.match(call.message, /Destination: /);
-      assert.deepEqual(call.items, ["Commit & Push", "Regenerate"]);
-      assert.deepEqual(call.options, { modal: true });
+      assert.deepEqual(call.items, ["Commit & Push", "Regenerate", "Cancel"]);
 
       assert.equal(
         git(harness.repoRoot, ["rev-list", "--count", "HEAD"]).trim(),

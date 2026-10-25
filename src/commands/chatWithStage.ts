@@ -22,6 +22,7 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { runTrackedOperation, resolveWorkflowRootTaskName, linkCancellationTokens, runResumedRoundOperationV1 } from "../utils/taskOperations";
@@ -621,7 +622,7 @@ export async function chatWithStage(
       });
       return;
     }
-    if (!(await ensureAiConsent(context))) {
+    if (!(await ensureAiConsent(context, task.taskFolderPath))) {
       await endTargetResolutionOnceV1();
       return;
     }
@@ -1098,13 +1099,35 @@ export async function dispatchProposedBlockerSupersessionEditV1(
     return;
   }
   const folderName = path.basename(taskFolderPath);
-  const choice = await vscode.window.showWarningMessage(
-    `${folderName}: apply the drafted update to "${proposedEdit.relPath}"?\n\nThis would resolve the blocker:\n"${proposedEdit.blockerDescription}"\n\n` +
-      "A fresh review is the stronger confirmation, but is not required for this write to land.",
-    { modal: true },
-    "Apply Update"
-  );
-  if (choice !== "Apply Update") {
+  const confirmedOptionId = await askChatChoiceV1({
+    decisionKey: "confirmBlockerSupersessionEdit",
+    target: {
+      canonicalId,
+      taskFolderPath,
+      stage: targetStage,
+    },
+    whatHappened:
+      `${folderName}: apply the drafted update to "${proposedEdit.relPath}"?\n\n` +
+      `This would resolve the blocker:\n"${proposedEdit.blockerDescription}"`,
+    whyUserNeeded:
+      "Writing the drafted update changes a stage artifact. A fresh review is the stronger confirmation, but is not required for this write to land.",
+    options: [
+      {
+        optionId: "apply",
+        label: "Apply Update",
+        consequence: `Writes the drafted content into ${proposedEdit.relPath}.`,
+      },
+      {
+        optionId: "cancel",
+        label: "Cancel",
+        consequence: "Leaves the file unchanged.",
+      },
+    ],
+    recommendedOptionId: "apply",
+    recommendationReasoning: "The draft already names the blocker it resolves.",
+    detail: "Answering continues this command; cancel leaves the draft unapplied.",
+  });
+  if (confirmedOptionId !== "apply") {
     await chatViewProvider.append(
       "assistant",
       `_The drafted update to \`${proposedEdit.relPath}\` was not confirmed; nothing was written._`,

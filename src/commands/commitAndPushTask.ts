@@ -3,7 +3,7 @@ import * as path from "path";
 import { formatNotificationTaskLabelV1, notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
-import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress } from "../types/taskProgress";
+import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
 import {
   getImplementationSummaryUri,
   isUnusableImplementationSummaryV1,
@@ -34,6 +34,7 @@ import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/c
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { isLegacyAiRouteDisabledV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
+import { awaitWorkflowDecisionAnswerV1 } from "../utils/workflowDecisionDispatchV1";
 import {
   ensureTaskRunsDirectoryV1,
   ensureWorkflowTaskFolderRootV1,
@@ -233,13 +234,62 @@ function isFileInFolder(filePath: string, folderPath: string): boolean {
 }
 
 /**
- * Review the AI-suggested commit message via a modal confirmation dialog —
- * no editor document, no file to save, and no re-triggering the whole
- * command to see it again. "Regenerate" asks for a different message without
- * restarting staging, PR-description generation, or the earlier file-scope
+ * Ask one Commit & Push confirmation in the task chat instead of a pop-up
+ * (owner rule 2026-09-29: everything Ensemble asks is asked in chat, with
+ * its own controls). The caller is already awaiting the answer in-process,
+ * so `awaitWorkflowDecisionAnswerV1` keeps the existing control flow —
+ * every branch below still runs in this same command invocation. A
+ * dismissal (or a run with no chat available) is the same "declined"
+ * outcome the old dismissed modal produced, so nothing is ever staged,
+ * committed, or pushed on a missing answer.
+ */
+async function askCommitPushInChatV1(args: {
+  taskFolderUri: vscode.Uri;
+  decisionKey: string;
+  whatHappened: string;
+  whyUserNeeded: string;
+  options: readonly { optionId: string; label: string; consequence: string }[];
+  recommendation?: { optionId: string; reasoning: string };
+  detail: string;
+  token?: vscode.CancellationToken;
+}): Promise<string | undefined> {
+  const stage: TaskStage = "publish";
+  return awaitWorkflowDecisionAnswerV1(
+    {
+      decisionKey: args.decisionKey,
+      taskCanonicalId: args.taskFolderUri.fsPath,
+      stage,
+      whatHappened: args.whatHappened,
+      whyUserNeeded: args.whyUserNeeded,
+      options: args.options.map((option) => ({
+        optionId: option.optionId,
+        label: option.label,
+        resumeKind: "continue" as const,
+        consequence: option.consequence,
+        effect: { kind: "doNothing" as const },
+      })),
+      recommendation: args.recommendation
+        ? { kind: "option", optionId: args.recommendation.optionId, reasoning: args.recommendation.reasoning }
+        : { kind: "none", reasoning: "The choice is yours." },
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: false,
+        detail: args.detail,
+      },
+    },
+    { canonicalId: args.taskFolderUri.fsPath, taskFolderPath: args.taskFolderUri.fsPath, stage },
+    args.token
+  );
+}
+
+/**
+ * Review the AI-suggested commit message in the task chat — no editor
+ * document, no file to save, and no re-triggering the whole command to see
+ * it again. "Regenerate" asks for a different message without restarting
+ * staging, PR-description generation, or the earlier file-scope
  * confirmation. Nothing is staged, committed, or pushed until the user picks
- * "Commit & Push" here — cancelling (or dismissing the dialog) leaves the
- * working tree and index exactly as they were.
+ * "Commit & Push" here — cancelling (or dismissing the chat decision) leaves
+ * the working tree and index exactly as they were.
  *
  * Returns a discriminated result rather than a bare `string | undefined` so
  * the caller can settle `reviewCommitPushMessageV1`'s result correctly: metadata
@@ -346,13 +396,37 @@ async function reviewCommitMessage(
       `Commit message:\n\n${message}\n\n` +
       `Files (${scopedFiles.length} total):\n${fileList}${moreNote}\n\n` +
       `Destination: ${pushDestination}`;
-    const choice = await vscode.window.showInformationMessage(
-      confirmText,
-      { modal: true },
-      "Commit & Push",
-      "Regenerate"
-    );
-    if (choice === "Regenerate") {
+    const choice = await askCommitPushInChatV1({
+      taskFolderUri,
+      decisionKey: "commitPushReviewMessage",
+      whatHappened: confirmText,
+      whyUserNeeded:
+        "Nothing is staged, committed, or pushed until you confirm this message and file list.",
+      options: [
+        {
+          optionId: "commitAndPush",
+          label: "Commit & Push",
+          consequence: "Commits these files with this message and pushes the branch.",
+        },
+        {
+          optionId: "regenerate",
+          label: "Regenerate",
+          consequence: "Asks the configured model for a different commit message; nothing is committed.",
+        },
+        {
+          optionId: "cancel",
+          label: "Cancel",
+          consequence: "Stops here. The working tree and index stay exactly as they are.",
+        },
+      ],
+      recommendation: {
+        optionId: "commitAndPush",
+        reasoning: "Use this message if it describes the change accurately.",
+      },
+      detail: "Choosing an option continues or cancels this Commit and Push run.",
+      token: cancellationToken,
+    });
+    if (choice === "regenerate") {
       const regenerated = await generate();
       if (regenerated.kind === "questionsPosted") {
         return { kind: "questionsPosted", interactionId: regenerated.interactionId, correlation: regenerated.correlation };
@@ -360,7 +434,7 @@ async function reviewCommitMessage(
       message = regenerated.text;
       continue;
     }
-    if (choice === "Commit & Push") {
+    if (choice === "commitAndPush") {
       return { kind: "confirmed", message };
     }
     return { kind: "declined" };
@@ -1863,15 +1937,40 @@ export async function runCommitPushCompletionChecksV1(
   // a fix pass that didn't resolve everything re-surfaces this decision.
   while (!lintPayload.passed) {
     const summary = lintPayload.summary ? ` (${lintPayload.summary})` : "";
-    const choice = await vscode.window.showWarningMessage(
-      `${commitPushTaskLabel(resolvedTask)}: completion checks failed${summary}.\n\n` +
+    const choice = await askCommitPushInChatV1({
+      taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+      decisionKey: "commitPushCompletionChecksFailed",
+      whatHappened:
+        `${commitPushTaskLabel(resolvedTask)}: completion checks failed${summary}.\n\n` +
         "Publish Anyway records the failing checks in the Publish review. " +
         "Fix with AI applies automatic and AI fixes using the failing check output, then re-runs the checks.",
-      { modal: true },
-      "Publish Anyway",
-      "Fix with AI"
-    );
-    if (choice === "Publish Anyway") {
+      whyUserNeeded:
+        "Publishing over failing checks is a real override with an audit trail, and fixing them runs AI edits.",
+      options: [
+        {
+          optionId: "publishAnyway",
+          label: "Publish Anyway",
+          consequence: "Records the failing checks in the Publish review and continues publishing.",
+        },
+        {
+          optionId: "fixWithAi",
+          label: "Fix with AI",
+          consequence: "Runs automatic and AI fixes from the failing output, then re-runs the checks.",
+        },
+        {
+          optionId: "cancel",
+          label: "Cancel",
+          consequence: "Stops here. Nothing is committed or pushed.",
+        },
+      ],
+      recommendation: {
+        optionId: "fixWithAi",
+        reasoning: "Fixing the checks first keeps the published result verified.",
+      },
+      detail: "Choosing an option continues or cancels this Commit and Push run.",
+      token: op.token,
+    });
+    if (choice === "publishAnyway") {
       // The override lives here, in the publish flow (C3): task completion
       // is ungated and never records overrides — publishing over failing
       // checks is the decision worth an audit trail in publish-review.md.
@@ -1882,7 +1981,7 @@ export async function runCommitPushCompletionChecksV1(
       );
       break;
     }
-    if (choice !== "Fix with AI") {
+    if (choice !== "fixWithAi") {
       return { ok: false, reason: "checksDeclined" };
     }
     if (!extensionContext) {
@@ -2041,14 +2140,34 @@ export async function resolveCommitPushStagingScopeV1(
           const hasUnstagedChanges =
             unstagedOutput.trim().length > 0 || untrackedOutput.trim().length > 0;
           if (hasUnstagedChanges) {
-            const choice = await vscode.window.showWarningMessage(
-              `${commitPushTaskLabel(resolvedTask)} — this repository already has ${preStagedFiles.length} staged change(s) alongside unstaged changes.\n\n` +
+            const choice = await askCommitPushInChatV1({
+              taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+              decisionKey: "commitPushExistingStagedChanges",
+              whatHappened:
+                `${commitPushTaskLabel(resolvedTask)} — this repository already has ${preStagedFiles.length} staged change(s) alongside unstaged changes.\n\n` +
                 "Commit everything together (staged and unstaged changes in one commit), " +
                 "or cancel to handle the existing staged changes manually first.",
-              { modal: true },
-              "Commit Everything Together"
-            );
-            if (choice !== "Commit Everything Together") {
+              whyUserNeeded:
+                "Committing pre-staged changes together with this task's changes is a choice only you can make.",
+              options: [
+                {
+                  optionId: "commitEverything",
+                  label: "Commit Everything Together",
+                  consequence: "Stages and commits both the pre-staged and unstaged changes in one commit.",
+                },
+                {
+                  optionId: "cancel",
+                  label: "Cancel",
+                  consequence: "Stops here so you can handle the staged changes manually.",
+                },
+              ],
+              recommendation: {
+                optionId: "commitEverything",
+                reasoning: "Continue when the pre-staged changes belong with this commit.",
+              },
+              detail: "Choosing an option continues or cancels this Commit and Push run.",
+            });
+            if (choice !== "commitEverything") {
               return {
                 kind: "notCompleted",
                 reason: "userCancelled",
@@ -2075,14 +2194,34 @@ export async function resolveCommitPushStagingScopeV1(
             return { kind: "noChanges" };
           }
 
-          const choice = await vscode.window.showInformationMessage(
-            `${commitPushTaskLabel(resolvedTask)} — no source code changes found outside the task folder.\n\n` +
+          const choice = await askCommitPushInChatV1({
+            taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+            decisionKey: "commitPushIncludeTaskFolder",
+            whatHappened:
+              `${commitPushTaskLabel(resolvedTask)} — no source code changes found outside the task folder.\n\n` +
               "Only the task's planning files (in the task folder) have changed. " +
               "Include the task folder in this commit instead?",
-            { modal: true },
-            "Include Task Folder Changes",
-          );
-          if (choice !== "Include Task Folder Changes") {
+            whyUserNeeded:
+              "The task folder holds planning metadata, not source changes, so including it is your choice.",
+            options: [
+              {
+                optionId: "includeTaskFolder",
+                label: "Include Task Folder Changes",
+                consequence: "Stages the task folder's planning files in this commit.",
+              },
+              {
+                optionId: "cancel",
+                label: "Cancel",
+                consequence: "Stops here with nothing staged.",
+              },
+            ],
+            recommendation: {
+              optionId: "includeTaskFolder",
+              reasoning: "Include them when the planning records belong with this commit.",
+            },
+            detail: "Choosing an option continues or cancels this Commit and Push run.",
+          });
+          if (choice !== "includeTaskFolder") {
             return { kind: "notCompleted", reason: "taskFolderChangesDeclined" };
           }
           includeTaskFolder = true;
@@ -2091,16 +2230,36 @@ export async function resolveCommitPushStagingScopeV1(
 
           if (scopedFiles.length === 0) {
             // All task-folder changes were run artifacts
-            const artifactChoice = await vscode.window.showWarningMessage(
-              `${commitPushTaskLabel(resolvedTask)} — the only changes in the task folder are run artifacts ` +
+            const artifactChoice = await askCommitPushInChatV1({
+              taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+              decisionKey: "commitPushIncludeRunArtifacts",
+              whatHappened:
+                `${commitPushTaskLabel(resolvedTask)} — the only changes in the task folder are run artifacts ` +
                 "(runs/, context-pack.md). " +
                 "These are excluded from the default staged set because they " +
                 "contain AI prompts and file contents.\n\n" +
                 "Include run artifacts in this commit?",
-              { modal: true },
-              "Include Run Artifacts",
-            );
-            if (artifactChoice === "Include Run Artifacts") {
+              whyUserNeeded:
+                "Run artifacts contain AI prompts and file contents, so publishing them is your call.",
+              options: [
+                {
+                  optionId: "includeRunArtifacts",
+                  label: "Include Run Artifacts",
+                  consequence: "Stages the task's run artifacts in this commit.",
+                },
+                {
+                  optionId: "cancel",
+                  label: "Cancel",
+                  consequence: "Stops here with nothing staged.",
+                },
+              ],
+              recommendation: {
+                optionId: "cancel",
+                reasoning: "Leave run artifacts out unless they are needed in the repository.",
+              },
+              detail: "Choosing an option continues or cancels this Commit and Push run.",
+            });
+            if (artifactChoice === "includeRunArtifacts") {
               const taskRelative = path
                 .relative(repoRoot, resolvedTask.taskFolderPath)
                 .replace(/\\/g, "/");
@@ -2257,14 +2416,37 @@ export async function confirmCommitPushScopeV1(
           `See DISCLAIMER.md §4-5 for full risk details.\n\n` +
           `Proceed?`;
 
-        const confirmed = await vscode.window.showWarningMessage(
-          confirmMessage,
-          { modal: true },
-          "Commit & Push",
-          "View Full List"
-        );
+        const confirmed = await askCommitPushInChatV1({
+          taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+          decisionKey: "commitPushFinalScopeConfirmation",
+          whatHappened: confirmMessage,
+          whyUserNeeded:
+            "Pushing is outward-facing and largely irreversible; nothing is staged or pushed until you confirm.",
+          options: [
+            {
+              optionId: "commitAndPush",
+              label: "Commit & Push",
+              consequence: "Stages these files, commits them, and pushes the branch.",
+            },
+            {
+              optionId: "viewFullList",
+              label: "View Full List",
+              consequence: "Writes the complete file list to the Commit Preview output channel; nothing is committed.",
+            },
+            {
+              optionId: "cancel",
+              label: "Cancel",
+              consequence: "Stops here. The working tree and index stay exactly as they are.",
+            },
+          ],
+          recommendation: {
+            optionId: "commitAndPush",
+            reasoning: "Proceed once the scope, branch, destination, and files look right.",
+          },
+          detail: "Choosing an option continues, shows the full list, or cancels this Commit and Push run.",
+        });
 
-        if (confirmed === "View Full List") {
+        if (confirmed === "viewFullList") {
           // Show the full file list in the output channel and return —
           // the user can re-invoke the command after reviewing.
           const channel = getCommitPreviewChannel();
@@ -2316,7 +2498,7 @@ export async function confirmCommitPushScopeV1(
           return { kind: "notCompleted", reason: "viewedFullFileList" };
         }
 
-        if (confirmed !== "Commit & Push") {
+        if (confirmed !== "commitAndPush") {
           return { kind: "notCompleted", reason: "userCancelled" };
         }
 

@@ -46,6 +46,7 @@ import {
   HOST_NOTIFICATION_MIRROR_FILENAME_V1,
 } from "./services/hostNotificationMirrorV1";
 import { notifyChatHistoryChangedExternallyV1, settleChatInteraction } from "./utils/chatHistoryStore";
+import { askChatFreeTextV1 } from "./utils/chatFreeTextV1";
 import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
@@ -128,6 +129,8 @@ import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHigh
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
 import { recoverRevertJournals } from "./utils/artifactRevertJournal";
+import { askChatChoiceV1 } from "./utils/chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "./utils/globalChatTargetV1";
 import { registerConditionalWriteSaveGuardV1 } from "./utils/fileUtils";
 import {
   ensureAutomaticMetaGitIgnore,
@@ -981,14 +984,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         NotificationRouter.showWarning("Select a task first — the action runs on the runner for the current task.");
         return;
       }
-      const picked = await vscode.window.showQuickPick(
-        RUN_ON_RUNNER_ACTIONS_V1.map((action) => ({ label: action.label, command: action.command })),
-        { placeHolder: "Run on the runner for the current task" }
-      );
-      if (picked === undefined) {
+      const currentTask = inventory
+        .getTasks()
+        .find((t) => t.canonicalId === currentTaskCanonicalId || t.taskFolderPath === currentTaskCanonicalId);
+      const chatTarget = currentTask
+        ? {
+            canonicalId: currentTask.canonicalId,
+            taskFolderPath: currentTask.taskFolderPath,
+            stage: currentTask.progress.currentStage,
+            taskName: currentTask.progress.displayName ?? currentTask.folderName,
+          }
+        : await resolveGlobalChatTargetOrDefaultV1();
+      const pickedCommand = await askChatChoiceV1({
+        target: chatTarget,
+        decisionKey: "runOnRunnerAction",
+        whatHappened: "Choose an action to run on the runner for the current task.",
+        whyUserNeeded: "This viewer window forwards workflow actions to the runner host.",
+        options: RUN_ON_RUNNER_ACTIONS_V1.map((action) => ({
+          optionId: action.command,
+          label: action.label,
+        })),
+        recommendedOptionId: RUN_ON_RUNNER_ACTIONS_V1[0]?.command,
+      });
+      if (pickedCommand === undefined) {
         return;
       }
-      await forwardCommandToRunner(picked.command, currentTaskCanonicalId);
+      await forwardCommandToRunner(pickedCommand, currentTaskCanonicalId);
     })
   );
 
@@ -1460,10 +1481,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     taskTreeProvider.onDidLoadTasks(refreshTasksSearchBanner),
     statusTreeProvider.onDidChangeTreeData(refreshNotificationsSearchBanner),
     vscode.commands.registerCommand("vs-code-ai-helper.searchTasks", async () => {
-      const query = await vscode.window.showInputBox({
-        title: "Search tasks",
-        prompt: "Show only tasks matching every word (name, folder or stage). Leave empty to clear.",
-        value: taskTreeProvider.getSearchQuery(),
+      const globalTarget = await resolveGlobalChatTargetOrDefaultV1();
+      const currentQuery = taskTreeProvider.getSearchQuery();
+      const query = await askChatFreeTextV1({
+        target: globalTarget,
+        prompt:
+          "Search tasks: enter words to filter by name, folder, or stage (submit empty text to clear the filter).",
+        placeHolder: currentQuery || "Search tasks...",
       });
       // Esc leaves the current query untouched; an empty submit clears it.
       if (query === undefined) return;
@@ -1471,10 +1495,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("vs-code-ai-helper.clearTasksSearch", () => applyTasksSearch("")),
     vscode.commands.registerCommand("vs-code-ai-helper.searchNotifications", async () => {
-      const query = await vscode.window.showInputBox({
-        title: "Search notifications",
-        prompt: "Show only notifications containing every word. Leave empty to clear.",
-        value: statusTreeProvider.getSearchQuery(),
+      const globalTarget = await resolveGlobalChatTargetOrDefaultV1();
+      const currentQuery = statusTreeProvider.getSearchQuery();
+      const query = await askChatFreeTextV1({
+        target: globalTarget,
+        prompt:
+          "Search notifications: enter words to show only matching notifications (submit empty text to clear the filter).",
+        placeHolder: currentQuery || "Search notifications...",
       });
       if (query === undefined) return;
       await applyNotificationsSearch(query);
@@ -2216,8 +2243,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   void recoverRevertJournals(async (prompt) => {
     const name = prompt.artifactPath.split(/[\\/]/).pop() ?? prompt.artifactPath;
     const artifactTaskFolder = path.dirname(prompt.artifactPath);
+    const boundTask = inventory.getTaskByPath(artifactTaskFolder);
     const artifactTaskLabel = formatNotificationTaskLabelV1(
-      inventory.getTaskByPath(artifactTaskFolder)?.progress.displayName,
+      boundTask?.progress.displayName,
       artifactTaskFolder
     );
     const detail = prompt.artifactDiverged
@@ -2225,15 +2253,27 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       : prompt.backupDiverged
         ? `The previous-version backup of ${name} was changed after the revert was interrupted; completing the revert would overwrite that backup.`
         : `An interrupted revert of ${name} was found from a previous session.`;
-    const choice = await vscode.window.showWarningMessage(
-      `${artifactTaskLabel} — ${detail} Complete the revert, or keep the file as it is now?`,
-      { modal: true },
-      "Complete Revert",
-      "Keep Current File"
-    );
-    if (choice === "Complete Revert") return "restore";
-    if (choice === "Keep Current File") return "keep";
-    return "defer"; // Dismissed — ask again on a later activation.
+    const target = boundTask
+      ? {
+          canonicalId: boundTask.canonicalId,
+          taskFolderPath: boundTask.taskFolderPath,
+          stage: boundTask.progress.currentStage,
+        }
+      : await resolveGlobalChatTargetOrDefaultV1(artifactTaskFolder);
+    const choice = await askChatChoiceV1({
+      target,
+      decisionKey: "recoverInterruptedRevertJournal",
+      whatHappened: `${artifactTaskLabel} — ${detail} Complete the revert, or keep the file as it is now?`,
+      whyUserNeeded: "An interrupted revert from a previous session cannot be finalized without choosing which version to keep.",
+      options: [
+        { optionId: "restore", label: "Complete Revert" },
+        { optionId: "keep", label: "Keep Current File" },
+        { optionId: "defer", label: "Ask Later" },
+      ],
+    });
+    if (choice === "restore") return "restore";
+    if (choice === "keep") return "keep";
+    return "defer";
   }).then((recovered) => {
     if (recovered > 0) {
       NotificationRouter.showInformation(

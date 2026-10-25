@@ -41,12 +41,14 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { resolvePublishScopeFolder, runCompletionLint } from "../utils/completionLint";
-import { choosePublishScope } from "../commands/choosePublishScope";
+import { choosePublishScope, promptAndPersistPublishScope } from "../commands/choosePublishScope";
 import { readTaskProgressForTest as readTaskProgress } from "./taskFolderFixture";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { initNotificationRouter } from "../utils/notificationRouter";
 import { safeRemoveDir } from "./testFsUtils";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 // Route NotificationRouter to the vscode stub's window methods, mirroring
 // completedTaskResume.test.ts, so command-level flows can complete.
@@ -66,6 +68,33 @@ const TEST_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-scope-
 after(() => {
   safeRemoveDir(TEST_ROOT);
 });
+
+/** Let the poster's async reads/post finish, then return the pending card. */
+async function waitForDecision(
+  store: WorkflowDecisionStoreV1,
+  decisionKey: string
+): Promise<ReturnType<WorkflowDecisionStoreV1["listPending"]>[number] | undefined> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    const found = store.listPending().find((item) => item.decisionKey === decisionKey);
+    if (found) {
+      return found;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return undefined;
+}
+
+function makeMemento(): vscode.Memento {
+  const backing = new Map<string, unknown>();
+  return {
+    keys: (): readonly string[] => [...backing.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined => backing.has(key) ? backing.get(key) as T : defaultValue,
+    update: (key: string, value: unknown): Thenable<void> => {
+      if (value === undefined) backing.delete(key); else backing.set(key, value);
+      return Promise.resolve();
+    },
+  } as vscode.Memento;
+}
 
 function makeDirs(...segments: string[][]): void {
   for (const parts of segments) {
@@ -482,6 +511,59 @@ function installInfoMessageCapture(): { messages: string[]; restore: () => void 
 }
 
 void describe("choosePublishScope command", () => {
+  void it("asks for Publish scope in task chat and persists the selected option", async () => {
+    const root = path.join(TEST_ROOT, "scope-chat-root");
+    const app = path.join(root, "packages", "app");
+    const taskFolder = path.join(root, ".ensemble", "2026-01-01_task_chat");
+    makeDirs([app], [taskFolder]);
+    fs.writeFileSync(path.join(app, "package.json"), JSON.stringify({ name: "app" }), "utf8");
+    await writeProgress(taskFolder, makeProgress(path.basename(taskFolder)));
+    const ws = installWorkspaceFoldersStub([root]);
+    const rf = installReadFileBridge();
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [], extensionUri: vscode.Uri.file(TEST_ROOT), workspaceState: memento, globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    const wsTarget = vscode.workspace as unknown as Record<string, unknown>;
+    const originalFindFiles = wsTarget.findFiles;
+    wsTarget.findFiles = (): Promise<vscode.Uri[]> => Promise.resolve([vscode.Uri.file(path.join(app, "package.json"))]);
+    const originalQuickPick = (vscode.window as unknown as Record<string, unknown>).showQuickPick;
+    (vscode.window as unknown as Record<string, unknown>).showQuickPick = (): never => { throw new Error("popup used"); };
+    initNotificationRouter({ addEntry(): void {} } as unknown as Parameters<typeof initNotificationRouter>[0]);
+    try {
+      // The card is awaited in-process: the choice both persists the scope
+      // and returns the absolute folder so the caller's own checks continue
+      // (rather than a separate Publish Checks run being dispatched).
+      const pending = promptAndPersistPublishScope(vscode.Uri.file(taskFolder));
+      const store = new WorkflowDecisionStoreV1(memento);
+      const decision = await waitForDecision(store, "choosePublishVerificationScope");
+      assert.ok(decision);
+      assert.equal(decision.taskCanonicalId, taskFolder);
+      const packageOption = decision.options.find((option) => option.label === "packages/app");
+      assert.ok(packageOption);
+      assert.deepEqual(packageOption.effect, { kind: "doNothing" });
+      const resolved = await store.resolve(decision.decisionId, packageOption.optionId);
+      assert.equal(resolved.kind, "resolved");
+      assert.equal(await pending, app);
+      assert.equal((await readTaskProgress(vscode.Uri.file(taskFolder)))?.publishScopePath, "packages/app");
+
+      const inv = makeInventory([{ canonicalId: taskFolder, taskFolderPath: taskFolder, progress: makeProgress(path.basename(taskFolder)) }]);
+      await choosePublishScope(inv, { taskFolderPath: taskFolder, publishScopeRelPath: "packages/app" });
+      assert.equal((await readTaskProgress(vscode.Uri.file(taskFolder)))?.publishScopePath, "packages/app");
+    } finally {
+      (vscode.window as unknown as Record<string, unknown>).showQuickPick = originalQuickPick;
+      wsTarget.findFiles = originalFindFiles;
+      __extensionContextV1TestOnly.reset();
+      initNotificationRouter({ addEntry(message, level) {
+        if (level === "warning") void vscode.window.showWarningMessage(message);
+        else if (level === "error") void vscode.window.showErrorMessage(message);
+        else void vscode.window.showInformationMessage(message);
+      } });
+      rf.restore();
+      ws.restore();
+    }
+  });
+
   void it("persists per-task scopes for two tasks in one workspace folder, without touching the release target", async () => {
     const root = path.join(TEST_ROOT, "choose-root");
     const app = path.join(root, "packages", "app");
@@ -517,17 +599,9 @@ void describe("choosePublishScope command", () => {
         vscode.Uri.file(path.join(lib, "package.json")),
       ]);
 
-    const pickEndingWith = (suffix: string) =>
-      installQuickPickByRelPath((items) =>
-        items.find((item) => item.relPath.replace(/\\/g, "/").endsWith(suffix))
-      );
-
-    let qp = pickEndingWith("packages/app");
     try {
-      await choosePublishScope(inv, { canonicalId: taskA });
-      qp.restore();
-      qp = pickEndingWith("packages/lib");
-      await choosePublishScope(inv, { canonicalId: taskB });
+      await choosePublishScope(inv, { canonicalId: taskA, taskFolderPath: taskA, publishScopeRelPath: "packages/app" });
+      await choosePublishScope(inv, { canonicalId: taskB, taskFolderPath: taskB, publishScopeRelPath: "packages/lib" });
 
       const storedA = await readTaskProgress(vscode.Uri.file(taskA));
       const storedB = await readTaskProgress(vscode.Uri.file(taskB));
@@ -559,7 +633,6 @@ void describe("choosePublishScope command", () => {
       );
       assert.equal(storedA && "releaseTarget" in storedA, false, "no release-target field may leak onto the task record");
     } finally {
-      qp.restore();
       wsTarget.findFiles = origFindFiles;
       msgs.restore();
       rf.restore();
@@ -567,7 +640,7 @@ void describe("choosePublishScope command", () => {
     }
   });
 
-  void it("external metadata root: the picker offers the ownership projectRoot and the pick round-trips", async () => {
+  void it("external metadata root: a chat-selected scope resolves against the ownership projectRoot", async () => {
     const project = path.join(TEST_ROOT, "ext-choose-project");
     const app = path.join(project, "packages", "app");
     const metaRoot = path.join(TEST_ROOT, "ext-choose-meta", ".ensemble");
@@ -589,31 +662,8 @@ void describe("choosePublishScope command", () => {
     const ws = installWorkspaceFoldersStub([project]);
     const rf = installReadFileBridge();
     const msgs = installInfoMessageCapture();
-    const wsTarget = vscode.workspace as unknown as Record<string, unknown>;
-    const origFindFiles = wsTarget.findFiles;
-    let findFilesBase: string | undefined;
-    wsTarget.findFiles = (pattern: { base?: string }): Promise<vscode.Uri[]> => {
-      findFilesBase = pattern?.base;
-      return Promise.resolve([vscode.Uri.file(path.join(app, "package.json"))]);
-    };
-    const offered: string[][] = [];
-    const qp = installQuickPickByRelPath((items) => {
-      offered.push(items.map((item) => item.relPath.replace(/\\/g, "/")));
-      return items.find((item) => item.relPath.replace(/\\/g, "/").endsWith("packages/app"));
-    });
-
     try {
-      await choosePublishScope(inv, { canonicalId: taskFolder });
-
-      // The picker was rooted at the bound project (ownership.projectRoot),
-      // not refused for the task folder being outside every workspace root.
-      assert.equal(
-        path.resolve(findFilesBase ?? ""),
-        path.resolve(project),
-        "nested-package detection must search the ownership projectRoot"
-      );
-      assert.ok(offered[0]?.includes(""), "the projectRoot root item must be offered");
-
+      await choosePublishScope(inv, { canonicalId: taskFolder, taskFolderPath: taskFolder, publishScopeRelPath: "packages/app" });
       const stored = await readTaskProgress(vscode.Uri.file(taskFolder));
       assert.equal(stored?.publishScopePath?.replace(/\\/g, "/"), "packages/app");
 
@@ -624,8 +674,6 @@ void describe("choosePublishScope command", () => {
       assert.equal(path.resolve(resolved.folder), path.resolve(app));
       assert.equal(resolved.stale, false);
     } finally {
-      qp.restore();
-      wsTarget.findFiles = origFindFiles;
       msgs.restore();
       rf.restore();
       ws.restore();
@@ -704,6 +752,68 @@ void describe("choosePublishScope command", () => {
       assert.equal(stored?.lintPayload?.passed, true);
     } finally {
       wsTarget.getConfiguration = origGetConfiguration;
+      rf.restore();
+      ws.restore();
+    }
+  });
+
+  void it("runCompletionLint continues its own checks after the stale-scope chat choice instead of aborting", async () => {
+    const project = path.join(TEST_ROOT, "run-lint-repick-project");
+    const taskFolder = path.join(project, ".ensemble", "2026-01-01_task_repick");
+    makeDirs([project], [taskFolder]);
+    fs.writeFileSync(path.join(project, "package.json"), JSON.stringify({ name: "repick" }), "utf8");
+    await writeProgress(
+      taskFolder,
+      makeProgress(path.basename(taskFolder), {
+        publishScopePath: path.join("packages", "gone"),
+      })
+    );
+    const markerName = "repick-check-cwd.txt";
+    const explicitCommand =
+      `node -e "require('fs').writeFileSync('${markerName}', process.cwd())"`;
+    const wsTarget = vscode.workspace as unknown as Record<string, unknown>;
+    const origGetConfiguration = wsTarget.getConfiguration;
+    wsTarget.getConfiguration = (): unknown => ({
+      get: (key: string, defaultValue: unknown): unknown =>
+        key === "publishVerificationCommands" ? [explicitCommand] : defaultValue,
+      inspect: (): undefined => undefined,
+    });
+    const origFindFiles = wsTarget.findFiles;
+    wsTarget.findFiles = (): Promise<vscode.Uri[]> => Promise.resolve([]);
+
+    const ws = installWorkspaceFoldersStub([project]);
+    const rf = installReadFileBridge();
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [], extensionUri: vscode.Uri.file(TEST_ROOT), workspaceState: memento, globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    initNotificationRouter({ addEntry(): void {} } as unknown as Parameters<typeof initNotificationRouter>[0]);
+    try {
+      const pending = runCompletionLint(vscode.Uri.file(taskFolder));
+      const store = new WorkflowDecisionStoreV1(memento);
+      const decision = await waitForDecision(store, "choosePublishVerificationScope");
+      assert.ok(decision, "a stale scope must ask in chat");
+      const rootOption = decision.options.find((option) => option.optionId === "scope-0");
+      assert.ok(rootOption);
+      assert.deepEqual(rootOption.effect, { kind: "doNothing" });
+      await store.resolve(decision.decisionId, rootOption.optionId);
+
+      const result = await pending;
+      // The caller's own check run continued against the chosen folder; a
+      // separate Publish Checks command was not needed.
+      assert.equal(path.resolve(result.verifiedFolder ?? ""), path.resolve(project));
+      assert.equal(result.passed, true);
+      assert.ok(fs.existsSync(path.join(project, markerName)));
+      assert.equal((await readTaskProgress(vscode.Uri.file(taskFolder)))?.publishScopePath, undefined);
+    } finally {
+      wsTarget.getConfiguration = origGetConfiguration;
+      wsTarget.findFiles = origFindFiles;
+      __extensionContextV1TestOnly.reset();
+      initNotificationRouter({ addEntry(message, level) {
+        if (level === "warning") void vscode.window.showWarningMessage(message);
+        else if (level === "error") void vscode.window.showErrorMessage(message);
+        else void vscode.window.showInformationMessage(message);
+      } });
       rf.restore();
       ws.restore();
     }
@@ -859,11 +969,7 @@ void describe("choosePublishScope command", () => {
     const ws = installWorkspaceFoldersStub([parentRoot]);
     const rf = installReadFileBridge();
     const msgs = installInfoMessageCapture();
-    let quickPickShown = false;
-    const qp = installQuickPickByRelPath((items) => {
-      quickPickShown = true;
-      return items[0];
-    });
+    const quickPickShown = false;
     try {
       await choosePublishScope(inv, { canonicalId: taskFolder });
 
@@ -879,7 +985,6 @@ void describe("choosePublishScope command", () => {
       const stored = await readTaskProgress(vscode.Uri.file(taskFolder));
       assert.equal(stored?.publishScopePath, undefined, "no scope may be persisted by a refused pick");
     } finally {
-      qp.restore();
       msgs.restore();
       rf.restore();
       ws.restore();
@@ -907,17 +1012,14 @@ void describe("choosePublishScope command", () => {
     const ws = installWorkspaceFoldersStub([root]);
     const rf = installReadFileBridge();
     const msgs = installInfoMessageCapture();
-    const qp = installQuickPickByRelPath((items) => items.find((item) => item.relPath === ""));
-
     try {
-      await choosePublishScope(inv, { canonicalId: taskFolder });
+      await choosePublishScope(inv, { canonicalId: taskFolder, taskFolderPath: taskFolder, publishScopeRelPath: "" });
 
       const stored = await readTaskProgress(vscode.Uri.file(taskFolder));
       assert.equal(stored?.publishScopePath, undefined);
       const resolved = resolvePublishScopeFolder(vscode.Uri.file(taskFolder), stored);
       assert.equal(path.resolve(resolved.folder), path.resolve(root));
     } finally {
-      qp.restore();
       msgs.restore();
       rf.restore();
       ws.restore();

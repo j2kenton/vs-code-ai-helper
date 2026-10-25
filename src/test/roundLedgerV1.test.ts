@@ -1406,6 +1406,44 @@ void describe("handleReviewRoutingOutcome — terminalizes the round-start row (
 });
 
 void describe("formatRoundOutcomeMessageV1", () => {
+  void it("labels an implementation round whose recorded type-check failure occurred during that round", () => {
+    const entry = makeBaseEntry({
+      mode: "implementation",
+      state: "completed",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:05:00.000Z",
+    });
+    const text = formatRoundOutcomeMessageV1(entry, undefined, {
+      implementationTypeCheckFailure: {
+        at: "2026-01-01T00:04:00.000Z",
+        output: "src/a.ts(1,1): error TS2322",
+      },
+      status: "active",
+      currentStage: "impl",
+      nextActor: "human",
+      roundLedger: [entry],
+    });
+    assert.match(text, /Ended: Implementation — completed — type-check failed/);
+    assert.match(text, /fix the type-check errors before review can continue/);
+  });
+
+  void it("explains the next action when a completed Implementation round hands back without follow-up", () => {
+    const entry = makeBaseEntry({
+      mode: "implementation",
+      stage: "impl",
+      state: "completed",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:05:00.000Z",
+    });
+    const text = formatRoundOutcomeMessageV1(entry, undefined, {
+      status: "active",
+      currentStage: "impl",
+      nextActor: "human",
+      roundLedger: [entry],
+    });
+    assert.match(text, /Review the changes or run another Implementation round if automatic review does not start/);
+  });
+
   void it("renders a score/blocker split for a review round", () => {
     const entry = makeBaseEntry({
       state: "completed",

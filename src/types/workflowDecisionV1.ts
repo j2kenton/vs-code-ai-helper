@@ -107,6 +107,8 @@ export type WorkflowDecisionRecommendationV1 =
 export interface WorkflowDecisionEvidenceItemV1 {
   readonly label: string;
   readonly detail: string;
+  /** Optional task-local artifact that the chat card can open on request. */
+  readonly openFilePath?: string;
 }
 
 export type WorkflowDecisionStateV1 = "pending" | "resolved" | "dismissed" | "superseded" | "withdrawn";

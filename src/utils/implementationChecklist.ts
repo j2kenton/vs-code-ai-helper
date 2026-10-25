@@ -463,6 +463,20 @@ export function normalizeChecklistItemTextV1(text: string): string {
 }
 
 /**
+ * A leading step label a round may omit when echoing an item: `Step 4:`,
+ * `Step 4 —`, `4.`, or `**Step 4**`. Applied only after exact matching fails
+ * (see {@link mergeChecklistProgressV1}), so an item whose own text really
+ * starts with one of these forms still matches itself first.
+ */
+const LEADING_STEP_LABEL_RE =
+  /^(?:\*\*step[ \t]+\d+\*\*(?:[ \t]*[:—–-])?|step[ \t]+\d+[ \t]*(?::|—|–|-)|[0-9]+\.[ \t]+)[ \t]*/i;
+
+/** Remove one leading step label from an already-normalized item key. */
+function stripLeadingStepLabelV1(normalizedText: string): string {
+  return normalizedText.replace(LEADING_STEP_LABEL_RE, "").trim();
+}
+
+/**
  * A round's `## Plan Item Checklist` section may report an item as `done`
  * with this marker to claim it was completed in an EARLIER round and only
  * verified (not built) this round — see `apply-impl-review-code.md` and
@@ -2850,6 +2864,84 @@ export function mergeChecklistProgressV1(
       if (!reportedRawText.has(key)) {
         reportedRawText.set(key, itemText);
       }
+    }
+  }
+
+  // A round sometimes omits an item's leading step label ("Step 4: …") when
+  // echoing it. Exact matching ran above; for a reported key that names no
+  // plan item, compare again with the label removed from both sides. Resolve
+  // only a UNIQUE open item — two items that differ only by their label stay
+  // ambiguous (and so unmatched) rather than risking a tick on the wrong one.
+  if (reported.size > 0) {
+    const openItemsByLabelFreeKey = new Map<string, { key: string; count: number }>();
+    for (const item of itemsInLatestRendering(planOfRecord)) {
+      if (item.checked || item.excluded) {
+        continue;
+      }
+      const key = normalizeChecklistItemTextV1(item.text);
+      const labelFreeKey = stripLeadingStepLabelV1(key);
+      if (labelFreeKey.length === 0) {
+        continue;
+      }
+      const existing = openItemsByLabelFreeKey.get(labelFreeKey);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        openItemsByLabelFreeKey.set(labelFreeKey, { key, count: 1 });
+      }
+    }
+
+    const resolvedKeyByOriginal = new Map<string, string>();
+    for (const key of reported.keys()) {
+      if (planItemKeys.has(key)) {
+        resolvedKeyByOriginal.set(key, key);
+        continue;
+      }
+      const match = openItemsByLabelFreeKey.get(stripLeadingStepLabelV1(key));
+      resolvedKeyByOriginal.set(key, match?.count === 1 ? match.key : key);
+    }
+
+    const resolvedReported = new Map<string, number>();
+    for (const [key, count] of reported) {
+      const resolved = resolvedKeyByOriginal.get(key) ?? key;
+      resolvedReported.set(resolved, (resolvedReported.get(resolved) ?? 0) + count);
+    }
+    reported.clear();
+    for (const [key, count] of resolvedReported) {
+      reported.set(key, count);
+    }
+
+    const resolvedRawText = new Map<string, string>();
+    for (const [key, raw] of reportedRawText) {
+      const resolved = resolvedKeyByOriginal.get(key) ?? key;
+      if (!resolvedRawText.has(resolved)) {
+        resolvedRawText.set(resolved, raw);
+      }
+    }
+    reportedRawText.clear();
+    for (const [key, raw] of resolvedRawText) {
+      reportedRawText.set(key, raw);
+    }
+
+    const resolvedRetroactiveKeys = new Set<string>();
+    for (const key of retroactiveKeys) {
+      resolvedRetroactiveKeys.add(resolvedKeyByOriginal.get(key) ?? key);
+    }
+    retroactiveKeys.clear();
+    for (const key of resolvedRetroactiveKeys) {
+      retroactiveKeys.add(key);
+    }
+
+    const resolvedEvidenceByKey = new Map<string, string>();
+    for (const [key, evidence] of retroactiveEvidenceByKey) {
+      const resolved = resolvedKeyByOriginal.get(key) ?? key;
+      if (!resolvedEvidenceByKey.has(resolved)) {
+        resolvedEvidenceByKey.set(resolved, evidence);
+      }
+    }
+    retroactiveEvidenceByKey.clear();
+    for (const [key, evidence] of resolvedEvidenceByKey) {
+      retroactiveEvidenceByKey.set(key, evidence);
     }
   }
 

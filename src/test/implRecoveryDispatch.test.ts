@@ -46,13 +46,23 @@ import { flushScheduledRevokedWatchdogPauseCleanupsV1 } from "../state/effective
 import {
   describeOwedImplRecoveryRefusalV1,
   discardOwedImplRecoveryV1,
+  formatRecoveryClaimOwnerV1,
   isImplRecoveryDiscardOfferableV1,
+  parseRecoveryClaimOwnerV1,
   retireSatisfiedSummaryRejectedRecoveryV1,
   shouldLogNoOpContinuationRoundV1,
 } from "../commands/implementationRecoveryV1";
+import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
+import { setProcessLivenessTestHooksForTestV1 } from "../state/processStartTimeProbeV1";
 import { IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1 } from "../utils/implementationArtifactResolver";
 import { registerReviewActionCommands } from "../commands/reviewActions";
 import { safeRemoveDir } from "./testFsUtils";
+
+// Monkey-patchable so a test can answer the chat confirmation a command asks.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const workflowDecisionModuleV1 = require("../utils/workflowDecisionDispatchV1") as {
+  awaitWorkflowDecisionAnswerV1: (input: unknown) => Promise<string | undefined>;
+};
 
 /**
  * `armAll()` (exercised throughout this file) may reach the watchdog sweep's
@@ -68,8 +78,33 @@ setWorkAdmissionRootOverrideForTestV1((taskFolderPath) =>
 );
 after(() => {
   setWorkAdmissionRootOverrideForTestV1(undefined);
+  taskStateStoreModule.withTaskLock = originalWithTaskLock;
   safeRemoveDir(admissionTestRootV1);
 });
+
+/**
+ * The same placeholders also reach `withTaskLock`'s on-disk session, meta-root
+ * and task lock files (the revoked-watchdog-pause repair writes progress under
+ * it), which created an empty `C:/tasks/2026-08-14_task_1/` in the working
+ * directory and failed the unit-test run's repository leak check. Map each
+ * placeholder to a folder under the same temp root, keeping a task's siblings
+ * under one shared parent so the meta-root lock is shared between them exactly
+ * as in production.
+ */
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const taskStateStoreModule = require("../state/taskStateStore") as {
+  withTaskLock: <T>(taskFolderPath: string, operation: () => Promise<T>) => Promise<T>;
+};
+const originalWithTaskLock = taskStateStoreModule.withTaskLock;
+taskStateStoreModule.withTaskLock = <T>(taskFolderPath: string, operation: () => Promise<T>): Promise<T> =>
+  originalWithTaskLock(
+    path.join(
+      admissionTestRootV1,
+      Buffer.from(path.dirname(taskFolderPath)).toString("hex"),
+      path.basename(taskFolderPath)
+    ),
+    operation
+  );
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const automationChainModule = require("../utils/automationChain") as Record<string, unknown>;
@@ -945,10 +980,10 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
 
       const restoreFs = installFsStub();
       initNotificationRouter(new StatusTreeProvider());
-      const originalShowWarningMessage = vscode.window.showWarningMessage;
-      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (
-        (): Promise<string> => Promise.resolve("Discard Continuation")
-      ) as unknown as typeof vscode.window.showWarningMessage;
+      // The confirmation is a chat decision now (owner rule: no modals).
+      const originalAwait = workflowDecisionModuleV1.awaitWorkflowDecisionAnswerV1;
+      workflowDecisionModuleV1.awaitWorkflowDecisionAnswerV1 = (): Promise<string | undefined> =>
+        Promise.resolve("discard");
       const fakeContext = {
         subscriptions: [],
         extensionUri: vscode.Uri.file("/fake-extension"),
@@ -975,7 +1010,7 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
           "discard still clears implRecovery even though it no longer advances the stage"
         );
       } finally {
-        vscode.window.showWarningMessage = originalShowWarningMessage;
+        workflowDecisionModuleV1.awaitWorkflowDecisionAnswerV1 = originalAwait;
         deactivateNotificationRouter();
         restoreFs();
       }
@@ -989,10 +1024,9 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
 
       const restoreFs = installFsStub();
       initNotificationRouter(new StatusTreeProvider());
-      const originalShowWarningMessage = vscode.window.showWarningMessage;
-      (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (
-        (): Promise<string | undefined> => Promise.resolve(undefined)
-      ) as unknown as typeof vscode.window.showWarningMessage;
+      const originalAwait = workflowDecisionModuleV1.awaitWorkflowDecisionAnswerV1;
+      workflowDecisionModuleV1.awaitWorkflowDecisionAnswerV1 = (): Promise<string | undefined> =>
+        Promise.resolve(undefined);
       const fakeContext = {
         subscriptions: [],
         extensionUri: vscode.Uri.file("/fake-extension"),
@@ -1011,7 +1045,7 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
         assert.deepEqual(nextStageCalls, []);
         assert.notEqual(readProgress(folderPath).implRecovery, undefined);
       } finally {
-        vscode.window.showWarningMessage = originalShowWarningMessage;
+        workflowDecisionModuleV1.awaitWorkflowDecisionAnswerV1 = originalAwait;
         deactivateNotificationRouter();
         restoreFs();
       }
@@ -1154,4 +1188,175 @@ void describe("shouldLogNoOpContinuationRoundV1 (Part 4 Step 10 / item 16)", () 
       assert.equal(shouldLogNoOpContinuationRoundV1(true, "interrupted", true), false);
     }
   );
+});
+
+void describe("Step 16 (Defect 3): immediate reclamation of dead local recovery claims on activation", () => {
+  afterEach(() => {
+    setProcessLivenessTestHooksForTestV1(undefined);
+  });
+
+  void it("encodes and parses host, pid, and processStartTime in leaseOwner while returning undefined for legacy strings", () => {
+    const encoded = formatRecoveryClaimOwnerV1({
+      hostId: "host-abc-123",
+      pid: 42424,
+      processStartTime: 1700000000000,
+      sessionToken: "sess:xyz",
+    });
+    assert.deepEqual(parseRecoveryClaimOwnerV1(encoded), {
+      hostId: "host-abc-123",
+      pid: 42424,
+      processStartTime: 1700000000000,
+      sessionToken: "sess:xyz",
+    });
+    assert.equal(parseRecoveryClaimOwnerV1("legacy-window:abc123"), undefined);
+    assert.equal(parseRecoveryClaimOwnerV1(undefined), undefined);
+  });
+
+  void it("immediately reclaims a dispatched recovery claim from a dead local process (ESRCH), appends one interrupted-and-resuming chat line, and closes its open roundLedger row", async () => {
+    const myHostId = await resolveHostIdentityV1();
+    setProcessLivenessTestHooksForTestV1({
+      checkPidLiveness: (pid) => (pid === 99991 ? "dead" : "alive"),
+    });
+    const deadOwner = formatRecoveryClaimOwnerV1({
+      hostId: myHostId,
+      pid: 99991,
+      processStartTime: BASE_NOW - 30_000,
+      sessionToken: "crashed-window:1",
+    });
+    const harness = makeHarness(
+      makeProgress(
+        pendingRecord({
+          dispatch: "dispatched",
+          attemptId: "impl-continuation-crashed-1",
+          leaseOwner: deadOwner,
+          leaseUntil: new Date(BASE_NOW + 5 * 60 * 1000).toISOString(),
+          sourceRoundId: "round-source-dead-local",
+          filesChangedUnknown: true,
+        }),
+        {
+          roundLedger: [
+            {
+              roundId: "impl-continuation-crashed-1",
+              attemptIds: ["impl-continuation-crashed-1"],
+              stage: "impl-high-review",
+              mode: "implementation",
+              startedAt: new Date(BASE_NOW - 10_000).toISOString(),
+              state: "open",
+              continuationOf: "round-source-dead-local",
+            },
+          ],
+        }
+      )
+    );
+    active = harness;
+
+    // Without advancing the clock past the 90-minute grace window or 10-minute lease:
+    await harness.armAll();
+
+    assert.equal(harness.dispatches.length, 1, "dead local owner must be reclaimed and re-armed immediately on activation");
+    assert.equal(harness.progress.implRecovery?.dispatch, "pending");
+    assert.equal(harness.progress.implRecovery?.leaseOwner, OWNER);
+    assert.equal(harness.scheduler.deadOwnerReclaimChatLinesForTestV1.length, 1, "must append exactly one interrupted-and-resuming chat line");
+    assert.match(
+      harness.scheduler.deadOwnerReclaimChatLinesForTestV1[0]!.content,
+      /interrupted.*closed or restarted.*resuming/i
+    );
+    const ledgerRow = harness.progress.roundLedger?.find((r) => r.roundId === "impl-continuation-crashed-1");
+    assert.equal(ledgerRow?.state, "interrupted", "open roundLedger row for the dead attempt must not be left dangling");
+  });
+
+  void it("immediately reclaims a pending recovery claim with a live lease when the local owner PID was reused (start-time mismatch)", async () => {
+    const myHostId = await resolveHostIdentityV1();
+    setProcessLivenessTestHooksForTestV1({
+      checkPidLiveness: () => "alive",
+      readOtherProcessStartEpochMs: () => Promise.resolve(BASE_NOW - 5_000),
+    });
+    const reusedPidOwner = formatRecoveryClaimOwnerV1({
+      hostId: myHostId,
+      pid: 88881,
+      // Recorded start time is 60 seconds earlier than the current process at PID 88881:
+      processStartTime: BASE_NOW - 65_000,
+      sessionToken: "reused-pid-window:1",
+    });
+    const harness = makeHarness(
+      makeProgress(
+        pendingRecord({
+          dispatch: "pending",
+          leaseOwner: reusedPidOwner,
+          leaseUntil: new Date(BASE_NOW + 9 * 60 * 1000).toISOString(),
+        })
+      )
+    );
+    active = harness;
+
+    await harness.armAll();
+
+    assert.equal(harness.dispatches.length, 1, "PID reuse must be detected via processStartTime mismatch and reclaimed immediately");
+    assert.equal(harness.progress.implRecovery?.leaseOwner, OWNER);
+    assert.equal(harness.scheduler.deadOwnerReclaimChatLinesForTestV1.length, 1);
+  });
+
+  void it("keeps a live local process claim on the lease rule (does not reclaim early)", async () => {
+    const myHostId = await resolveHostIdentityV1();
+    const startTime = BASE_NOW - 60_000;
+    setProcessLivenessTestHooksForTestV1({
+      checkPidLiveness: () => "alive",
+      readOtherProcessStartEpochMs: () => Promise.resolve(startTime),
+    });
+    const liveLocalOwner = formatRecoveryClaimOwnerV1({
+      hostId: myHostId,
+      pid: 77771,
+      processStartTime: startTime,
+      sessionToken: "live-window:1",
+    });
+    const harness = makeHarness(
+      makeProgress(
+        pendingRecord({
+          dispatch: "pending",
+          leaseOwner: liveLocalOwner,
+          leaseUntil: new Date(BASE_NOW + 9 * 60 * 1000).toISOString(),
+        })
+      )
+    );
+    active = harness;
+
+    await harness.armAll();
+
+    assert.equal(harness.dispatches.length, 0, "live local owner must not be reclaimed before lease expiry");
+    assert.equal(harness.progress.implRecovery?.leaseOwner, liveLocalOwner);
+    assert.equal(harness.scheduler.deadOwnerReclaimChatLinesForTestV1.length, 0);
+  });
+
+  void it("keeps a foreign-host claim on the lease rule even if its PID does not exist locally", async () => {
+    setProcessLivenessTestHooksForTestV1({
+      checkPidLiveness: () => "dead",
+    });
+    const foreignOwner = formatRecoveryClaimOwnerV1({
+      hostId: "foreign-host-uuid-9999",
+      pid: 66661,
+      processStartTime: BASE_NOW - 60_000,
+      sessionToken: "foreign-window:1",
+    });
+    const harness = makeHarness(
+      makeProgress(
+        pendingRecord({
+          dispatch: "pending",
+          leaseOwner: foreignOwner,
+          leaseUntil: new Date(BASE_NOW + 9 * 60 * 1000).toISOString(),
+        })
+      )
+    );
+    active = harness;
+
+    await harness.armAll();
+
+    assert.equal(harness.dispatches.length, 0, "foreign-host claim must stay on the lease rule");
+    assert.equal(harness.progress.implRecovery?.leaseOwner, foreignOwner);
+    assert.equal(harness.scheduler.deadOwnerReclaimChatLinesForTestV1.length, 0);
+
+    // Once the lease expires, normal lease rule re-arms it:
+    harness.advance(10 * 60 * 1000);
+    await harness.armAll();
+    assert.equal(harness.dispatches.length, 1);
+  });
 });

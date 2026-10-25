@@ -256,8 +256,13 @@ function makeTaskFolder(
   return { folderPath, folderUri: vscode.Uri.file(folderPath), progress };
 }
 
-function makeButtonPressArg(folderPath: string, progress: TaskProgress): { task: IncompleteTask } {
+function makeButtonPressArg(
+  folderPath: string,
+  progress: TaskProgress,
+  implementationTypeCheckErrorsV1?: string
+): { task: IncompleteTask; implementationTypeCheckErrorsV1?: string } {
   return {
+    ...(implementationTypeCheckErrorsV1 ? { implementationTypeCheckErrorsV1 } : {}),
     task: {
       folderUri: vscode.Uri.file(folderPath),
       folderName: path.basename(folderPath),
@@ -545,6 +550,7 @@ interface HarnessRun {
 }
 
 interface HarnessOptions {
+  implementationTypeCheckErrorsV1?: string;
   /**
    * Result the fake text-mode dispatch returns when a summary-only
    * continuation routes there. When absent, a text dispatch is unexpected
@@ -723,7 +729,7 @@ async function runHarnessed(
     await runImplementationWithAI(
       vscode.Uri.file(REAL_ROOT),
       context,
-      makeButtonPressArg(folderPath, progress)
+      makeButtonPressArg(folderPath, progress, harnessOptions.implementationTypeCheckErrorsV1)
     );
   } finally {
     for (const p of patches.reverse()) { p.restore(); }
@@ -4434,6 +4440,8 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
       runnerId: "test-cli",
       providerLabel: "Test CLI",
       storedModelId: "cli:test-model",
+      typeCheckFailed: true,
+      typeCheckOutput: "src/rejected.ts(1,1): error TS2304: Cannot find name 'x'.",
     });
 
     const persisted = readProgress(folderPath);
@@ -4441,10 +4449,23 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
     assert.equal(persisted?.status, "paused");
     assert.equal(persisted?.escalation?.kind, "plateau");
     assert.equal(persisted?.implRecovery?.trigger, "summaryRejected");
+    const typeCheckDecision = run.pendingDecisions?.find((decision) => decision.decisionKey === "implementationTypeCheckFailed");
+    assert.ok(typeCheckDecision, "exhausted recovery leaves the owner a type-check decision");
+    assert.match(
+      typeCheckDecision.evidence?.find((evidence) => evidence.label === "First type-check errors")?.detail ?? "",
+      /src\/rejected\.ts\(1,1\).*TS2304/
+    );
     assert.equal(
       run.dispatches.some((d) => d.chainId === "impl-continuation"),
       false
     );
+    const fixOption = typeCheckDecision.options.find((option) => option.optionId === "runImplementationFix");
+    assert.equal(fixOption?.effect.kind, "command");
+    if (fixOption?.effect.kind === "command") {
+      assert.equal(fixOption.effect.command, "vs-code-ai-helper.resumeAndDispatchImplementation");
+      const args = fixOption.effect.args?.[0] as { implementationTypeCheckErrorsV1?: string } | undefined;
+      assert.match(args?.implementationTypeCheckErrorsV1 ?? "", /src\/rejected\.ts\(1,1\).*TS2304/);
+    }
     const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
     assert.match(summary, /continuation budget is exhausted/);
   });
@@ -4556,9 +4577,99 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
       true,
       "the stamp's promise must be true: the continuation is dispatched even when the type-check gate returns first"
     );
+    assert.equal(
+      run.pendingDecisions?.some((decision) => decision.decisionKey === "implementationTypeCheckFailed"),
+      false,
+      "a recovery continuation already owns the next implementation round, so no competing manual-round card is posted"
+    );
     const logs = readRunLogs(folderPath);
     assert.match(logs[0]!, /## Type-check failure/);
     assert.match(logs[0]!, /## Unusable summary — recovery scheduled/);
+  });
+
+  void it("posts one actionable type-check card with errors and a clickable run log when no continuation is scheduled", async () => {
+    const { folderPath, progress } = makeTaskFolder("typecheck_chat_handoff");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/broken.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+      typeCheckFailed: true,
+      typeCheckOutput: "src/broken.ts(7,3): error TS2322: Type 'string' is not assignable to type 'number'.",
+    });
+
+    const decisions = run.pendingDecisions?.filter((decision) => decision.decisionKey === "implementationTypeCheckFailed") ?? [];
+    assert.equal(decisions.length, 1);
+    const decision = decisions[0]!;
+    assert.equal(decision.recommendation.kind, "option");
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : "", "runImplementationFix");
+    assert.match(decision.evidence?.find((item) => item.label === "First type-check errors")?.detail ?? "", /src\/broken\.ts\(7,3\).*TS2322/);
+    assert.ok(decision.evidence?.find((item) => item.label === "Implementation run log")?.openFilePath?.includes(`${path.sep}runs${path.sep}`));
+    const dispatchOptions = decision.options.filter((option) => option.effect.kind === "command");
+    assert.equal(dispatchOptions.length, 1, "the card offers exactly one dispatching option");
+    const effect = dispatchOptions[0]!.effect;
+    assert.equal(effect.kind, "command");
+    if (effect.kind === "command") {
+      const args = effect.args?.[0] as { implementationTypeCheckErrorsV1?: string } | undefined;
+      assert.match(args?.implementationTypeCheckErrorsV1 ?? "", /src\/broken\.ts\(7,3\).*TS2322/);
+    }
+    assert.equal(decision.options.find((option) => option.optionId === "fixBuildManually")?.effect.kind, "doNothing");
+    assert.equal(readProgress(folderPath).implementationTypeCheckFailure !== undefined, true);
+    const transcript = fs.readFileSync(path.join(folderPath, "chat-v1.json"), "utf8");
+    assert.match(transcript, /type-check failed/);
+
+    // Resolve the card's recommended command using its actual arguments. The
+    // following Implementation prompt must contain the exact errors attached
+    // to the card, not merely mention that a type-check failed.
+    const fixArgs = dispatchOptions[0]!.effect.kind === "command"
+      ? dispatchOptions[0]!.effect.args?.[0] as { implementationTypeCheckErrorsV1?: string }
+      : undefined;
+    assert.ok(fixArgs?.implementationTypeCheckErrorsV1);
+    const { folderPath: followUpFolder, progress: followUpProgress } = makeTaskFolder("typecheck_prompt_receives_errors");
+    const followUp = await runHarnessed(
+      followUpFolder,
+      followUpProgress,
+      {
+        status: "completed",
+        filesChanged: ["src/fixed.ts"],
+        filesChangedUnknown: false,
+        summary: GOOD_SUMMARY,
+        runnerId: "test-cli",
+        providerLabel: "Test CLI",
+        storedModelId: "cli:test-model",
+      },
+      { implementationTypeCheckErrorsV1: fixArgs.implementationTypeCheckErrorsV1 }
+    );
+    assert.match(followUp.prompts[0] ?? "", /Type-check errors from the previous Implementation round/);
+    assert.match(followUp.prompts[0] ?? "", /src\/broken\.ts\(7,3\).*TS2322/);
+  });
+
+  void it("records and posts the type-check hand-off when a zero-file gate returns early", async () => {
+    const { folderPath, progress } = makeTaskFolder("typecheck_zero_file_gate", {
+      implReviewFiles: [],
+    });
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: [],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+      typeCheckFailed: true,
+      typeCheckOutput: "src/unchanged.ts(4,2): error TS2322: Type 'string' is not assignable to type 'number'.",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.match(persisted.implementationTypeCheckFailure?.output ?? "", /src\/unchanged\.ts\(4,2\).*TS2322/);
+    const decisions = run.pendingDecisions?.filter((decision) => decision.decisionKey === "implementationTypeCheckFailed") ?? [];
+    assert.equal(decisions.length, 1);
+    assert.match(decisions[0]?.evidence?.find((evidence) => evidence.label === "First type-check errors")?.detail ?? "", /src\/unchanged\.ts\(4,2\).*TS2322/);
+    assert.match(fs.readFileSync(path.join(folderPath, "chat-v1.json"), "utf8"), /type-check failed/);
+    assert.equal(run.dispatches.some((dispatch) => dispatch.command === "vs-code-ai-helper.runReviewWithAI"), false);
   });
 
   void it("a later usable round claims the pending dispatch and clears the record in the finalizing transaction", async () => {

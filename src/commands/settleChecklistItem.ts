@@ -13,6 +13,8 @@ import {
   settleChecklistItemV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
+import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
 
 /**
  * "Settle a checklist item by hand" (RC1 item 8): tick or exclude ONE item of
@@ -99,43 +101,69 @@ export async function settleChecklistItem(
     return false;
   }
 
+  const target = {
+    canonicalId: resolved.canonicalId,
+    taskFolderPath: resolved.taskFolderPath,
+    stage: resolved.progress.currentStage,
+    taskName: resolved.progress.displayName ?? resolved.folderName,
+  };
+
   let itemText = explicit?.itemText;
   if (!itemText) {
-    const picked = await vscode.window.showQuickPick(
-      unchecked.map((text) => ({ label: truncateChecklistItemTextV1(text, 120), text })),
-      { title: `Settle a checklist item — ${taskName}`, placeHolder: "Choose the item to settle by hand", ignoreFocusOut: true }
-    );
-    if (!picked) {
+    const chosenItem = await askChatChoiceV1({
+      decisionKey: "settleChecklistPickItem",
+      target,
+      whatHappened: `Settle a checklist item — ${taskName}`,
+      whyUserNeeded: "Choose the item to settle by hand.",
+      options: unchecked.map((text, index) => ({
+        optionId: `item-${index}`,
+        label: truncateChecklistItemTextV1(text, 120),
+        consequence: "Selects this checklist item to tick or exclude.",
+      })),
+      detail: "Answering selects the checklist item to settle.",
+    });
+    const itemIndex = chosenItem === undefined ? -1 : unchecked.findIndex((_t, i) => `item-${i}` === chosenItem);
+    if (itemIndex < 0) {
       return false;
     }
-    itemText = picked.text;
+    itemText = unchecked[itemIndex]!;
   }
 
   let mode = explicit?.mode;
   if (!mode) {
-    const choice = await vscode.window.showQuickPick(
-      [
-        { label: "Tick it", detail: "You did this (or checked it). Ticks the box and records your note beside it.", mode: "tick" as const },
+    const choice = await askChatChoiceV1({
+      decisionKey: "settleChecklistPickMode",
+      target,
+      whatHappened: truncateChecklistItemTextV1(itemText, 100),
+      whyUserNeeded: "Only this one line of plan-final.md changes.",
+      options: [
         {
+          optionId: "tick",
+          label: "Tick it",
+          description: "You did this (or checked it). Ticks the box and records your note beside it.",
+        },
+        {
+          optionId: "exclude",
           label: "Exclude it",
-          detail: "This item no longer applies. Leaves the box open, marks it excluded, and keeps it in the count.",
-          mode: "exclude" as const,
+          description: "This item no longer applies. Leaves the box open, marks it excluded, and keeps it in the count.",
         },
       ],
-      { title: truncateChecklistItemTextV1(itemText, 100), placeHolder: "Only this one line of plan-final.md changes", ignoreFocusOut: true }
-    );
-    if (!choice) {
+      recommendedOptionId: "tick",
+      recommendationReasoning: "Ticking records completed or verified work.",
+      detail: "Answering chooses how to settle the selected item.",
+    });
+    if (choice !== "tick" && choice !== "exclude") {
       return false;
     }
-    mode = choice.mode;
+    mode = choice;
   }
 
   let note = explicit?.note;
   if (note === undefined) {
-    note = await vscode.window.showInputBox({
+    note = await askChatFreeTextV1({
+      target,
       title: mode === "tick" ? "Tick this item" : "Exclude this item",
       prompt: mode === "tick" ? "What did you see? Recorded beside the item." : "Why does it not apply? Recorded beside the item.",
-      ignoreFocusOut: true,
     });
     if (note === undefined) {
       return false;

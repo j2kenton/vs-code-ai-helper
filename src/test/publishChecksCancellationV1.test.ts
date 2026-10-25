@@ -86,7 +86,7 @@ void describe("runPublishChecks wiring", () => {
 
   void it("classifies the cancellation error before the generic failure notification", () => {
     const cancelledIndex = source.indexOf("error instanceof PublishChecksCancelledError");
-    const failedIndex = source.indexOf("Publish checks failed to run:");
+    const failedIndex = source.indexOf("await offerPublishChecksRetryAfterExecutionFailureV1(");
     assert.ok(cancelledIndex > 0 && failedIndex > cancelledIndex);
   });
 

@@ -45,11 +45,23 @@ import {
 import { QuestionOptionV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 } from "./chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "./ownerEvidenceV1";
 
 /** Minimal shape this module needs from ChatViewProvider — avoids importing
  * the view layer from a utils module (chatView.ts pulls in webview/vscode UI
  * machinery reviewActions.ts and its callers don't otherwise depend on). */
 export interface EscalationChatTarget {
+  ask?(
+    question: {
+      canonicalId: string;
+      taskFolderPath: string;
+      stage: TaskStage;
+      taskName?: string;
+      question: string;
+    },
+    forceOpen?: boolean,
+    notify?: { blocking?: boolean; blockedReason?: string }
+  ): Promise<void>;
   /**
    * The no-context fallback's bound-answer channel (Part 10 items 13d/13e,
    * 2026-08-30 review blocker: this previously used a separate, app-only
@@ -1290,6 +1302,179 @@ export async function postEnvironmentalAdvanceNoticeV1(
     stage,
     taskName: target.taskName,
   });
+  if (posted) {
+    const ownerEvidenceBlocker = nonFixable.find(({ description, resolver }) =>
+      (resolver === "environmental" || resolver === "needs-toolchain") &&
+      OWNER_EVIDENCE_PREFIX_RE.test(description)
+    )?.description;
+    if (ownerEvidenceBlocker) {
+      await postOwnerEvidenceQuestionV1(folderUri, stage, ownerEvidenceBlocker, target.taskName);
+    }
+  }
+  return posted !== undefined;
+}
+
+/**
+ * Post-1.0 fixes, item 9: a plan checklist item that only asks for a check to
+ * be run or confirmed (a verification item) rather than for code to be built.
+ * Used to decide which exit a latched-review card recommends: moving on is
+ * reasonable when every open item is of this kind, building is not.
+ */
+const VERIFICATION_ITEM_RE =
+  /^(?:step\s+\d+\s*[:—–-]\s*|\d+\.\s*)?(?:\*\*[^*]+\*\*\s*)?(?:verify|confirm|check\s+(?:that|whether)|manually|run\s+(?:the\s+)?(?:full\s+|unit\s+|targeted\s+)?(?:tests?|suite|lint|type[- ]?check|check-types|verify)|owner\s+check|inspect\s+(?:the\s+)?(?:effective|live))\b|verified by publish checks/i;
+
+export function isVerificationChecklistItemV1(itemText: string): boolean {
+  return VERIFICATION_ITEM_RE.test(itemText.trim());
+}
+
+/**
+ * Post-1.0 fixes, item 9: the card a latched (`checklistProgressUnreliable`),
+ * clean review posts INSTEAD of advancing silently while plan items are still
+ * open after the reviewer-verified ticks were applied.
+ *
+ * `Move on` is the RC8 path unchanged — `resumeAndSetTaskStage` moves to the
+ * next stage and dispatches its next action (the follow-up review), and
+ * continues a Fast Forward run (`resumeFastForward`, captured now). `Back to
+ * Implementation` returns the task there. Move on is recommended only when
+ * every open item is a verification item.
+ */
+export async function postLatchedOpenItemsDecisionV1(
+  stage: TaskStage,
+  nextStage: TaskStage,
+  open: { readonly items: readonly string[]; readonly total: number },
+  target: { canonicalId: string; taskFolderPath: string; taskName?: string }
+): Promise<boolean> {
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  const nextStageName = STAGE_DISPLAY_NAMES[nextStage];
+  const resumeFastForward = isFastForwardRunActiveV1(target.taskFolderPath);
+  const allVerification = open.items.length > 0 && open.items.length === open.total && open.items.every(isVerificationChecklistItemV1);
+  const noun = open.total === 1 ? "plan item is" : "plan items are";
+  const listed = open.items.map((item) => `- ${item}`).join("\n");
+  const more = open.total > open.items.length ? `\n- …and ${open.total - open.items.length} more` : "";
+  const options: WorkflowDecisionOptionV1[] = [
+    {
+      optionId: "moveOn",
+      label: "Move on",
+      resumeKind: "continue",
+      consequence:
+        `Advances to ${nextStageName} and dispatches its next action${resumeFastForward ? ", continuing Fast Forward" : ""}, ` +
+        `exactly as a clean review does. ${open.total} ${noun} still open and will not be built there.`,
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [{ taskFolderPath: target.taskFolderPath, stage: nextStage, resumeFastForward, expectedSourceStage: stage }],
+      },
+    },
+    {
+      optionId: "backToImplementation",
+      label: "Back to Implementation",
+      resumeKind: "continue",
+      consequence: `Moves the task back to Implementation and dispatches its next action there — ${open.total} ${noun} still open.`,
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [{ taskFolderPath: target.taskFolderPath, stage: "impl" as TaskStage, resumeFastForward, expectedSourceStage: stage }],
+      },
+    },
+  ];
+  const posted = await postWorkflowDecisionV1(
+    {
+      decisionKey: "latchedCleanReviewOpenItems",
+      taskCanonicalId: target.canonicalId,
+      stage,
+      whatHappened:
+        `${stageName} is clean, but this task's plan checklist is flagged as behind and ${open.total} ${noun} still open:\n\n` +
+        `${listed}${more}`,
+      whyUserNeeded:
+        "A clean review no longer holds the stage while the checklist is flagged as behind, but moving on with plan items " +
+        "still open should be your decision, not the default.",
+      options,
+      recommendation: allVerification
+        ? {
+            kind: "option",
+            optionId: "moveOn",
+            reasoning: "Every open item is a verification item, which a build round cannot complete.",
+          }
+        : {
+            kind: "option",
+            optionId: "backToImplementation",
+            reasoning: "At least one open item asks for work to be built.",
+          },
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: true,
+        detail: `The task stays on ${stageName} until you choose; a Fast Forward run waits here.`,
+      },
+    },
+    { canonicalId: target.canonicalId, taskFolderPath: target.taskFolderPath, stage, taskName: target.taskName }
+  );
+  return posted !== undefined;
+}
+
+/**
+ * Post-1.0 fixes, item 10: the review's verdict or next-work text names plan
+ * steps still to be built, but it carries no `[completion]` blocker. The stage
+ * is held, and this card says why.
+ */
+export async function postUnbuiltStepsHoldDecisionV1(
+  stage: TaskStage,
+  nextStage: TaskStage | undefined,
+  sentence: string,
+  target: { canonicalId: string; taskFolderPath: string; taskName?: string }
+): Promise<boolean> {
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  const resumeFastForward = isFastForwardRunActiveV1(target.taskFolderPath);
+  const options: WorkflowDecisionOptionV1[] = [
+    {
+      optionId: "backToImplementation",
+      label: "Back to Implementation",
+      resumeKind: "continue",
+      consequence: "Moves the task back to Implementation and dispatches its next action there, to build the steps the review names.",
+      effect: {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [{ taskFolderPath: target.taskFolderPath, stage: "impl" as TaskStage, resumeFastForward, expectedSourceStage: stage }],
+      },
+    },
+    ...(nextStage
+      ? [
+          {
+            optionId: "moveOn",
+            label: `Move on to ${STAGE_DISPLAY_NAMES[nextStage]} anyway`,
+            resumeKind: "continue" as const,
+            consequence: `Advances with the named steps unbuilt and dispatches ${STAGE_DISPLAY_NAMES[nextStage]}'s next action.`,
+            effect: {
+              kind: "command" as const,
+              command: "vs-code-ai-helper.resumeAndSetTaskStage",
+              args: [{ taskFolderPath: target.taskFolderPath, stage: nextStage, resumeFastForward, expectedSourceStage: stage }],
+            },
+          },
+        ]
+      : []),
+  ];
+  const posted = await postWorkflowDecisionV1(
+    {
+      decisionKey: "reviewNamesUnbuiltSteps",
+      taskCanonicalId: target.canonicalId,
+      stage,
+      whatHappened:
+        `${stageName} scored above the threshold and lists no completion blocker, but its own text says plan steps ` +
+        `are still to be built: "${sentence}" A review that says work remains cannot also be ready, so the stage was not advanced.`,
+      whyUserNeeded: "Advancing on unfinished work should be your decision, not the default.",
+      options,
+      recommendation: {
+        kind: "option",
+        optionId: "backToImplementation",
+        reasoning: "The review itself says the named steps are not built yet.",
+      },
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: true,
+        detail: `The task stays on ${stageName} until you choose.`,
+      },
+    },
+    { canonicalId: target.canonicalId, taskFolderPath: target.taskFolderPath, stage, taskName: target.taskName }
+  );
   return posted !== undefined;
 }
 
@@ -1450,8 +1635,8 @@ function describeResolverClearingActionV1(
     return (
       "evidence only you can gather (the concrete check is named above; do it after installing this build when it requires the installed product, or now when it does not; rounds cannot fetch pages or run live provider CLIs) — " +
       (evidenceCommand ? `run \`${evidenceCommand}\` to gather it, then ` : "gather it, then ") +
-      "record the result under an 'Owner evidence' heading in this task's task.md (the task description), " +
-      `then use "Keep iterating" to have ${stageName} re-verify.`
+      "paste it into the Owner evidence answer field in Chat (or edit this task's task.md by hand), " +
+      `and submitting it will save the answer and have ${stageName} re-verify.`
     );
   }
   switch (resolver) {
@@ -1996,6 +2181,13 @@ export async function escalateReviewToHuman(
         }
       );
       if (posted) {
+        const ownerEvidenceBlocker = reviewPlateauEvidence.blockers.find(({ description, resolver }) =>
+          (resolver === "environmental" || resolver === "needs-toolchain") &&
+          OWNER_EVIDENCE_PREFIX_RE.test(description)
+        )?.description;
+        if (ownerEvidenceBlocker) {
+          await postOwnerEvidenceQuestionV1(folderUri, stage, ownerEvidenceBlocker, progressHint?.displayName);
+        }
         return true;
       }
     }
@@ -2036,6 +2228,7 @@ export async function escalateReviewToHuman(
       taskName: progressHint?.displayName,
     });
     if (genericDecision !== undefined) {
+      if (OWNER_EVIDENCE_PREFIX_RE.test(reason)) await postOwnerEvidenceQuestionV1(folderUri, stage, reason.trim(), progressHint?.displayName);
       return true;
     }
 
@@ -2157,4 +2350,26 @@ export async function escalateReviewToHuman(
     // pause would strand the round with no visible outcome at all.
     return false;
   }
+}
+
+async function postOwnerEvidenceQuestionV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  blocker: string,
+  taskName?: string
+): Promise<void> {
+  await chatTarget?.ask?.(
+    {
+      canonicalId: normalizePath(folderUri.fsPath),
+      taskFolderPath: folderUri.fsPath,
+      stage,
+      taskName,
+      question:
+        `Owner evidence needed — ${OWNER_EVIDENCE_ANSWER_MARKER_V1}\n` +
+        "Paste the output, or type what you found. Submitting saves it under `## Owner evidence` in this task's task.md and re-runs this stage's review. You can also edit task.md by hand.\n\n" +
+        `Blocker: ${blocker}`,
+    },
+    true,
+    { blocking: true, blockedReason: `${STAGE_DISPLAY_NAMES[stage]} is waiting for owner evidence.` }
+  );
 }

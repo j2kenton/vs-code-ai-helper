@@ -27,7 +27,7 @@ import {
 import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptureV1";
 import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
-import { ImplementationRunResult } from "./copilotImplementationRunner";
+import { CheckExecutionFeedbackV1, ImplementationRunResult } from "./copilotImplementationRunner";
 import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
 import {
   classifyCliFailure,
@@ -35,6 +35,7 @@ import {
   isModelEntitlementFailure,
   isProviderCapacityError,
   isTransportError,
+  MAX_PROVIDER_CAPACITY_RETRIES_V1,
 } from "../utils/quota";
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
@@ -45,7 +46,8 @@ import {
 } from "../types/taskProgress";
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
 import { killProcessTree, sanitizedCliEnv } from "../utils/cliProcessUtils";
-import { readPackageScripts } from "../utils/completionLint";
+import { readPackageScripts, runExplicitCheck } from "../utils/completionLint";
+import { prioritizeImplementationTypeCheckDiagnosticsV1 } from "../utils/implementationTypeCheckHandOffV1";
 import {
   abandonProcessSpawnAttemptV1,
   beginProcessSpawnAttemptV1,
@@ -339,6 +341,7 @@ async function persistRetryAuditLog(
 export interface CliExecResult {
   status: "completed" | "failed" | "cancelled";
   output: string;
+  rawOutput?: string;
   errorMessage?: string;
   /** Set on failed results; absent for completed/cancelled. */
   failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
@@ -356,6 +359,14 @@ export interface CliExecResult {
    * applyTransportTransience.
    */
   transient?: boolean;
+  /**
+   * True when an edit-mode Codex run ended with the "Selected model is at
+   * capacity" reply — a temporary overload at the provider. Classified
+   * `temporarily-unavailable`; `runImplementationWithCli` retries it on the
+   * same model first (the text path's rule, `providerCapacity` on the
+   * transport exit).
+   */
+  providerCapacity?: boolean;
   /**
    * Event-stream evidence captured for timed-out runs. Deliberately NOT
    * populated for transport drops: a truncated stream would look like a clean
@@ -414,6 +425,161 @@ export interface CliExecResult {
 export function extractOpencodeSessionIdV1(rawStdout: string): string | undefined {
   const match = /"sessionID"\s*:\s*"([A-Za-z0-9_-]{1,128})"/.exec(rawStdout);
   return match?.[1];
+}
+
+/**
+ * First `thread_id` reported by a Codex `--json` event stream (codex-cli).
+ * The initial `{"type":"thread.started","thread_id":"..."}` line carries it.
+ */
+export function extractCodexSessionIdV1(rawStdout: string): string | undefined {
+  const match = /"thread_id"\s*:\s*"([A-Za-z0-9_-]{1,128})"/.exec(rawStdout);
+  return match?.[1];
+}
+
+export interface CodexExecutedCommandRecord {
+  readonly command: string;
+  readonly exitCode: number | null;
+  readonly status: string;
+  readonly output: string;
+}
+
+/**
+ * Extracts command execution records from a Codex `--json` event stream.
+ */
+export function extractCodexExecutedCommands(rawStdout: string): CodexExecutedCommandRecord[] {
+  const parsed = parseJsonLineEvents(rawStdout);
+  const records: CodexExecutedCommandRecord[] = [];
+  for (const rawEvent of parsed.events) {
+    const event = rawEvent;
+    const item = event?.item as Record<string, unknown> | undefined;
+    if (event?.type === "item.completed" && item?.type === "command_execution") {
+      records.push({
+        command: typeof item.command === "string" ? item.command : "",
+        exitCode: typeof item.exit_code === "number" ? item.exit_code : null,
+        status: typeof item.status === "string" ? item.status : "",
+        output: typeof item.aggregated_output === "string"
+          ? item.aggregated_output
+          : typeof item.output === "string"
+            ? item.output
+            : typeof item.text === "string"
+              ? item.text
+              : "",
+      });
+    }
+  }
+  return records;
+}
+
+/**
+ * Identifies whether an executed check command was denied by the sandbox policy
+ * (e.g. status: "denied", or exit code != 0 with sandbox/permission/EPERM failure).
+ */
+export function isDeniedCommandExecution(record: CodexExecutedCommandRecord): boolean {
+  if (record.status === "denied") {
+    return true;
+  }
+  if (record.exitCode !== null && record.exitCode !== 0) {
+    const out = record.output.toLowerCase();
+    return (
+      out.includes("eperm") ||
+      out.includes("permission denied") ||
+      out.includes("operation not permitted") ||
+      out.includes("sandbox restriction") ||
+      out.includes("spawnsync git") ||
+      out.includes("spawnsync")
+    );
+  }
+  return false;
+}
+
+export interface ConfiguredCheckCommandV1 {
+  readonly displayCommand: string;
+  readonly executableCommand: string;
+  readonly cwd?: string;
+}
+
+/**
+ * Matches an executed command line against the configured failing check commands.
+ * Preserves executable command and cwd identity, and rejects substring matches.
+ */
+export function matchConfiguredCheckCommand(
+  executedCommand: string,
+  configuredFailingCommands?: readonly (string | ConfiguredCheckCommandV1)[],
+  defaultCwd?: string
+): ConfiguredCheckCommandV1 | undefined {
+  if (!configuredFailingCommands || configuredFailingCommands.length === 0) {
+    return undefined;
+  }
+  let cleanExec = executedCommand
+    .replace(/^(\/bin\/(bash|sh)\s+-lc?\s+['"]?|cmd\.exe\s+\/c\s+['"]?)/i, "")
+    .replace(/['"]$/, "")
+    .trim();
+
+  let execCwd: string | undefined = undefined;
+  const cdMatch = cleanExec.match(/^cd\s+("[^"]+"|'[^']+'|[^\s;&]+)\s*(?:&&|;)\s*(.*)$/i);
+  if (cdMatch && cdMatch[1] && cdMatch[2]) {
+    execCwd = cdMatch[1].replace(/^['"]|['"]$/g, "");
+    cleanExec = cdMatch[2].trim();
+  }
+
+  const effectiveExecDir = execCwd
+    ? (defaultCwd ? nodePath.resolve(defaultCwd, execCwd) : nodePath.resolve(execCwd))
+    : (defaultCwd ? nodePath.resolve(defaultCwd) : undefined);
+
+  for (const item of configuredFailingCommands) {
+    let candidate: ConfiguredCheckCommandV1;
+    if (typeof item === "string") {
+      const monorepoMatch = item.match(/^\[([^\]]+)\]\s*(.*)$/);
+      if (monorepoMatch && monorepoMatch[1] && monorepoMatch[2]) {
+        const pkgDir = monorepoMatch[1].trim();
+        candidate = {
+          displayCommand: item,
+          executableCommand: monorepoMatch[2].trim(),
+          cwd: defaultCwd ? nodePath.resolve(defaultCwd, pkgDir) : pkgDir,
+        };
+      } else {
+        candidate = {
+          displayCommand: item,
+          executableCommand: item.trim(),
+          cwd: defaultCwd,
+        };
+      }
+    } else {
+      candidate = item;
+    }
+
+    const cleanConfigExec = candidate.executableCommand.trim();
+    const cleanConfigDisplay = candidate.displayCommand.trim();
+
+    // Match exact command or command with args (e.g. "pnpm run test:unit src/foo.test.ts" matching "pnpm run test:unit")
+    const isExactExec = cleanExec === cleanConfigExec || cleanExec === cleanConfigDisplay;
+    const isArgsExec = cleanExec.startsWith(cleanConfigExec + " ");
+
+    if (!isExactExec && !isArgsExec) {
+      continue;
+    }
+
+    const candidateTargetDir = candidate.cwd
+      ? (defaultCwd ? nodePath.resolve(defaultCwd, candidate.cwd) : nodePath.resolve(candidate.cwd))
+      : (defaultCwd ? nodePath.resolve(defaultCwd) : undefined);
+
+    // B1 / Step 27: Preserve the configured command-and-directory pair.
+    // Directory identity must match candidate target directory to prevent host execution outside selected scope.
+    if (effectiveExecDir !== undefined && candidateTargetDir !== undefined) {
+      if (effectiveExecDir !== candidateTargetDir) {
+        continue;
+      }
+    } else if (effectiveExecDir !== candidateTargetDir) {
+      continue;
+    }
+
+    return {
+      displayCommand: candidate.displayCommand,
+      executableCommand: candidate.executableCommand,
+      cwd: candidateTargetDir,
+    };
+  }
+  return undefined;
 }
 
 /**
@@ -565,6 +731,13 @@ function applyTransportTransience(
   // classifications from classifyFailure are left exactly as they are.
   if (result.failureKind !== "generic") {
     return result;
+  }
+  // A Codex "at capacity" reply is a temporary overload, not a generic
+  // failure. The text path flags it on the transport exit; the edit path
+  // flags it here. The edit runner retries the same model first, and the
+  // backup cascade (with its dirty-tree rules) takes it from there.
+  if (mode === "edit" && def.id === "codex-cli" && isProviderCapacityError(friendly.diagnosticText)) {
+    return { ...result, failureKind: "temporarily-unavailable", providerCapacity: true };
   }
   const normalizedDiagnostic = friendly.diagnosticText.toLowerCase();
   const canResumeConversation =
@@ -3761,7 +3934,11 @@ export async function execCliAgent(options: {
     // path the stream is truncated by definition, and the id appears on the
     // very first event, so a partial buffer is enough.
     const sessionIdOfRun = (): string | undefined =>
-      def.structuredEventStream === "opencode" ? extractOpencodeSessionIdV1(stdout) : undefined;
+      def.structuredEventStream === "opencode"
+        ? extractOpencodeSessionIdV1(stdout)
+        : def.structuredEventStream === "codex"
+          ? extractCodexSessionIdV1(stdout)
+          : undefined;
 
     const emitTimeout = (baseMessage: string, timeoutReason: "wall-clock" | "inactivity"): void => {
       // Once post-spawn record-failure recovery, or cancellation, has taken
@@ -3984,7 +4161,7 @@ export async function execCliAgent(options: {
         return;
       }
       if (cancelled) {
-        finishAfterRecordingSettles({ status: "cancelled", output: stdout });
+        finishAfterRecordingSettles({ status: "cancelled", output: stdout, rawOutput: stdout, sessionId: sessionIdOfRun() });
         return;
       }
 
@@ -4010,6 +4187,8 @@ export async function execCliAgent(options: {
           classifyCliFailure({
             status: "failed",
             output,
+            rawOutput: stdout,
+            sessionId: sessionIdOfRun(),
             errorMessage: friendly.message,
             // Captured pre-hint so the backup-cascade gate never re-reads our
             // own login hint as evidence of the auth failure that produced it.
@@ -4055,6 +4234,8 @@ export async function execCliAgent(options: {
           classifyCliFailure({
             status: "failed",
             output,
+            rawOutput: stdout,
+            sessionId: sessionIdOfRun(),
             errorMessage: friendly.message,
             authFailure: friendly.authFailure,
             authDiagnosticText: friendly.diagnosticText,
@@ -4074,7 +4255,7 @@ export async function execCliAgent(options: {
       // admission lock before that write is durable — the exact crash
       // window a review flagged (this close handler was the one settle
       // path that bypassed the wrapper every other exit path already uses).
-      finishAfterRecordingSettles({ status: "completed", output });
+      finishAfterRecordingSettles({ status: "completed", output, rawOutput: stdout, sessionId: sessionIdOfRun() });
     });
 
     if (promptTransport === "stdin") {
@@ -4429,6 +4610,7 @@ function toCliImplementationRunResult(
       // ordinary provider failure without re-parsing errorMessage.
       timedOut: result.timeoutReason !== undefined,
       timeoutReason: result.timeoutReason,
+      ...(result.providerCapacity === true ? { providerCapacity: true } : {}),
     };
   }
   if (noChangeCompletionIsSuccess && !filesChangedUnknown && filesChanged.length === 0) {
@@ -4480,10 +4662,7 @@ const TYPE_CHECK_OUTPUT_MAX_CHARS = 4000;
 const TYPE_CHECK_TIMEOUT_MS = 120_000;
 
 function truncateTypeCheckOutputV1(output: string): string {
-  const trimmed = output.trim();
-  return trimmed.length > TYPE_CHECK_OUTPUT_MAX_CHARS
-    ? `${trimmed.slice(0, TYPE_CHECK_OUTPUT_MAX_CHARS)}\n… (truncated)`
-    : trimmed;
+  return prioritizeImplementationTypeCheckDiagnosticsV1(output, TYPE_CHECK_OUTPUT_MAX_CHARS);
 }
 
 /**
@@ -4617,6 +4796,10 @@ export async function runImplementationWithCli(options: {
   /** See execCliAgent's own doc — forwarded verbatim so this round's edit
    * process is recorded next to its lock exactly like a text/review run's. */
   roundProcessClaimId?: string;
+  /** Configured failing check commands from the task's check report (Step 27 / Defect 13). */
+  configuredFailingCommands?: readonly (string | ConfiguredCheckCommandV1)[];
+  /** Test seam / host runner for falling back when a sandbox blocks a configured check command. */
+  hostCheckRunner?: (cwd: string, command: string) => Promise<{ code: number; output: string }>;
 }): Promise<ImplementationRunResult> {
   const { def, model, prompt, workspaceUri, token, onProgress, requireFileChange, taskFolderUri, roundProcessClaimId } = options;
   const cwd = workspaceUri.fsPath;
@@ -4669,6 +4852,47 @@ export async function runImplementationWithCli(options: {
    */
   let lastKnownSessionId: string | undefined;
   const retryDelayMs = options.retryDelayMs ?? CLI_RETRY_DELAY_MS;
+  // Post-1.0 fixes, item 5: a Codex "at capacity" reply gets the text path's
+  // bounded same-model retry (same delay, same limit). A replay is only safe
+  // while the working tree still matches the snapshot taken before the round,
+  // so a run that already changed files is not replayed and keeps the
+  // dirty-tree rules downstream.
+  for (
+    let capacityRetries = 0;
+    result.status === "failed" &&
+    result.providerCapacity === true &&
+    capacityRetries < MAX_PROVIDER_CAPACITY_RETRIES_V1 &&
+    !token.isCancellationRequested;
+    capacityRetries++
+  ) {
+    const afterCapacityReply = before ? await gitStatusSnapshot(cwd) : undefined;
+    if (
+      !before ||
+      !afterCapacityReply ||
+      sanitizeChangeSetV1(changedPathsSince(before, afterCapacityReply)).length > 0
+    ) {
+      break;
+    }
+    onProgress(
+      `${def.label} reported its model is at capacity; retrying on the same model ` +
+        `(attempt ${capacityRetries + 2} of ${MAX_PROVIDER_CAPACITY_RETRIES_V1 + 1})...`
+    );
+    await retryDelay(token, retryDelayMs);
+    if (token.isCancellationRequested) {
+      break;
+    }
+    result = await execCliAgent({
+      def,
+      mode: "edit",
+      model,
+      prompt,
+      cwd,
+      token,
+      onProgress,
+      taskFolderPath: taskFolderUri?.fsPath,
+      roundProcessClaimId,
+    });
+  }
   let attempt = 1;
   // Part 7: when a timed-out run refuses to retry, the reason is recorded
   // here rather than folded into result.errorMessage immediately — the
@@ -4766,6 +4990,89 @@ export async function runImplementationWithCli(options: {
     options.taskFolderUri, def.id, options.stage, def.label, "edit", retryAudit
   );
 
+  // Step 27 / Defect 13: check command execution inspection and host runner fallback for Codex.
+  const executedChecks: CheckExecutionFeedbackV1[] = [];
+  if (
+    def.structuredEventStream === "codex" &&
+    options.configuredFailingCommands &&
+    options.configuredFailingCommands.length > 0 &&
+    !token.isCancellationRequested
+  ) {
+    const rawOut = result.rawOutput ?? result.output;
+    const executedRecords = extractCodexExecutedCommands(rawOut);
+    let needsResume = false;
+    let feedbackContent = "";
+    for (const record of executedRecords) {
+      const matched = matchConfiguredCheckCommand(record.command, options.configuredFailingCommands, cwd);
+      if (matched !== undefined) {
+        if (isDeniedCommandExecution(record)) {
+          const targetCwd = matched.cwd ?? cwd;
+          const targetCmd = matched.executableCommand;
+          onProgress(`Executing host check fallback for denied command '${targetCmd}' in '${targetCwd}'...`);
+          const hostRunner = options.hostCheckRunner ?? (async (dir, cmd) => {
+            const r = await runExplicitCheck(dir, cmd, { token });
+            return { code: r.code, output: r.output };
+          });
+          try {
+            const hostRes = await hostRunner(targetCwd, targetCmd);
+            executedChecks.push({
+              command: matched.displayCommand,
+              outcome: "host-fallback",
+              exitCode: hostRes.code,
+              hostOutput: hostRes.output,
+            });
+            feedbackContent += `\nHost check runner executed '${targetCmd}' in '${targetCwd}' (exit code ${hostRes.code}):\n${hostRes.output}\n`;
+            needsResume = true;
+          } catch {
+            executedChecks.push({
+              command: matched.displayCommand,
+              outcome: "sandbox-denied",
+              exitCode: record.exitCode,
+            });
+          }
+        } else {
+          executedChecks.push({
+            command: matched.displayCommand,
+            outcome: "sandbox-success",
+            exitCode: record.exitCode,
+            hostOutput: record.output,
+          });
+        }
+      } else if (isDeniedCommandExecution(record)) {
+        // Arbitrary command denied by sandbox — security constraint: do NOT run through host runner!
+        executedChecks.push({
+          command: record.command,
+          outcome: "sandbox-denied",
+          exitCode: record.exitCode,
+        });
+      }
+    }
+
+    if (needsResume && !token.isCancellationRequested) {
+      const sessionId = result.sessionId ?? extractCodexSessionIdV1(rawOut) ?? lastKnownSessionId;
+      if (sessionId) {
+        onProgress(`Resuming ${def.label} session with host check feedback...`);
+        const feedbackPrompt =
+          `The following project check commands were executed on the host system because the sandbox restricted them:\n` +
+          feedbackContent +
+          `\nPlease inspect these check outcomes, make any remaining code edits required to fix the failures, and complete the task.`;
+        result = await execCliAgent({
+          def,
+          mode: "edit",
+          model,
+          prompt: feedbackPrompt,
+          cwd,
+          token,
+          onProgress,
+          resumePreviousConversation: true,
+          resumeSessionId: sessionId,
+          taskFolderPath: taskFolderUri?.fsPath,
+          roundProcessClaimId,
+        });
+      }
+    }
+  }
+
   // Git unavailable or not a repository — we genuinely can't tell what
   // changed, which is different from "nothing changed". Callers must fall
   // back to open-editor review scope in this case, same as manual
@@ -4853,9 +5160,17 @@ export async function runImplementationWithCli(options: {
     const typeCheck = await (options.typeCheckRunner ?? runProjectTypeCheckV1)(cwd, token);
     if (!typeCheck.passed) {
       onProgress(`${def.label}'s changes left the project failing to type-check.`);
-      return { ...implResult, typeCheckFailed: true, typeCheckOutput: typeCheck.output };
+      return {
+        ...implResult,
+        typeCheckFailed: true,
+        typeCheckOutput: typeCheck.output,
+        ...(executedChecks.length > 0 ? { executedChecks } : {}),
+      };
     }
   }
 
-  return implResult;
+  return {
+    ...implResult,
+    ...(executedChecks.length > 0 ? { executedChecks } : {}),
+  };
 }

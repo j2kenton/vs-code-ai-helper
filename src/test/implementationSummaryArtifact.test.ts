@@ -2296,6 +2296,75 @@ void describe("mergeChecklistProgressV1 distinguishes no-op from no-match", () =
   });
 });
 
+void describe("mergeChecklistProgressV1 matches a unique item without its step label", () => {
+  const PLAN = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [ ] Step 4: On the continuation row path, close the row as failed.",
+    "- [ ] Step 5 — Wire the gate.",
+    "- [ ] 6. Update the caller test.",
+    "- [ ] **Step 7** Add the ambiguity regression.",
+    "- [ ] Keep this open.",
+  ].join("\n");
+
+  void it("ticks unique open items when the echo omits the prefix", () => {
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] On the continuation row path, close the row as failed.",
+      "- [x] Wire the gate.",
+      "- [x] Update the caller test.",
+      "- [x] Add the ambiguity regression.",
+    ].join("\n");
+    const merged = mergedContent(mergeChecklistProgressV1(PLAN, echo));
+    assert.ok(merged.includes("- [x] Step 4: On the continuation row path, close the row as failed."));
+    assert.ok(merged.includes("- [x] Step 5 — Wire the gate."));
+    assert.ok(merged.includes("- [x] 6. Update the caller test."));
+    assert.ok(merged.includes("- [x] **Step 7** Add the ambiguity regression."));
+    assert.ok(merged.includes("- [ ] Keep this open."));
+    assert.deepEqual(countChecklistProgressV1(merged), {
+      total: 5,
+      checked: 4,
+      closedWithoutDoing: 0,
+      settled: 4,
+      remaining: 1,
+      excluded: 0,
+    });
+  });
+
+  void it("does not tick when two open items differ only by their step label", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [ ] Step 4: Wire the gate.",
+      "- [ ] Step 5: Wire the gate.",
+    ].join("\n");
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] Wire the gate.",
+    ].join("\n");
+    const result = mergeChecklistProgressV1(plan, echo);
+    assert.equal(result.kind, "no-match");
+    if (result.kind === "no-match") {
+      assert.deepEqual(result.unmatchedSample, ["Wire the gate."]);
+    }
+    assert.equal(countChecklistProgressV1(plan)?.remaining, 2);
+  });
+
+  void it("prefers an exact match over an ambiguous stripped match", () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [ ] Step 4: Wire the gate.",
+      "- [ ] Wire the gate.",
+    ].join("\n");
+    const echo = [
+      "<!-- ensemble:implementation-checklist -->",
+      "- [x] Wire the gate.",
+    ].join("\n");
+    const merged = mergedContent(mergeChecklistProgressV1(plan, echo));
+    assert.ok(merged.includes("- [ ] Step 4: Wire the gate."));
+    assert.ok(merged.includes("- [x] Wire the gate."));
+  });
+});
+
 void describe("parseNumberedChecklistClaimV1 (RC3 item 1, Step 2a)", () => {
   void it("resolves a single 'Step N' claim", () => {
     assert.deepEqual(parseNumberedChecklistClaimV1("Step 34"), { kind: "resolved", indices: [34] });

@@ -33,6 +33,7 @@ import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import {
   computePublishScopeId,
+  computeTreeFingerprintV1,
   invalidatePublishChecksFreshnessStampOnDiskV1,
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
@@ -77,6 +78,38 @@ export function queuePublishChecksRunV1<T>(
   const run = previous.then(fn, fn);
   publishChecksRunQueues.set(key, run.catch(() => undefined));
   return run;
+}
+
+/** Posts the retry action when an automated Publish Checks execution throws. */
+export async function offerPublishChecksRetryAfterExecutionFailureV1(
+  taskFolderUri: vscode.Uri,
+  taskLabel: string | undefined,
+  error: unknown
+): Promise<void> {
+  const detail = error instanceof Error ? error.message : String(error);
+  const noticeText = `Publish checks failed to run: ${detail}. Run Publish Checks again after the problem is fixed.`;
+  let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>>;
+  try {
+    chatPointer = await offerActionInChatV1({
+      taskFolderPath: taskFolderUri.fsPath,
+      taskLabel,
+      actionLabel: "Run Publish Checks",
+      command: "vs-code-ai-helper.runPublishChecks",
+      args: [{ taskFolderPath: taskFolderUri.fsPath }],
+      noticeText,
+      optional: true,
+    });
+  } catch (chatError) {
+    console.warn("Could not post the Publish Checks retry in chat:", chatError);
+    chatPointer = undefined;
+  }
+  NotificationRouter.showError(
+    `${noticeText}${chatPointer ? " Open the decision in Chat to continue." : ""} /* taskLabel */`,
+    undefined,
+    undefined,
+    undefined,
+    chatPointer
+  );
 }
 
 /**
@@ -543,6 +576,7 @@ export async function runPublishChecks(
                 resolvedTask.progress
               ).folder;
               const beforeSha = await resolveHeadCommitSha(scopeGuess);
+              const beforeFingerprint = await computeTreeFingerprintV1(scopeGuess);
               await invalidatePublishChecksFreshnessStampOnDiskV1(taskFolderUri);
 
               throwIfPublishChecksCancelledV1(cancelToken);
@@ -560,14 +594,26 @@ export async function runPublishChecks(
 
               const verifiedFolder = result.verifiedFolder ?? scopeGuess;
               const afterSha = await resolveHeadCommitSha(verifiedFolder);
-              const freshStampWritten = Boolean(beforeSha && afterSha && beforeSha === afterSha);
-              if (freshStampWritten && afterSha) {
+              const afterFingerprint = await computeTreeFingerprintV1(verifiedFolder);
+              const checksPassed = Boolean(result.passedModuloKnownFlakes ?? result.passed);
+              const freshStampWritten = Boolean(
+                checksPassed &&
+                beforeSha &&
+                afterSha &&
+                beforeSha === afterSha &&
+                beforeFingerprint &&
+                afterFingerprint &&
+                beforeFingerprint === afterFingerprint &&
+                computePublishScopeId(scopeGuess) === computePublishScopeId(verifiedFolder)
+              );
+              if (freshStampWritten && afterSha && afterFingerprint) {
                 await writePublishChecksFreshnessStampV1(taskFolderUri, {
                   formatVersion: 1,
                   runId: crypto.randomUUID(),
                   verifiedCommitSha: afterSha,
                   completedAt: new Date().toISOString(),
                   scopeId: computePublishScopeId(verifiedFolder),
+                  treeFingerprint: afterFingerprint,
                 });
               }
               // A mismatch (working tree advanced mid-run, or HEAD could not be
@@ -636,9 +682,22 @@ export async function runPublishChecks(
                   );
                 }
               } else {
-                NotificationRouter.showWarning(
+                const failureNotice =
                   `Publish checks found issues: ${result.summary} ` +
-                    'Use "Fix Linting & Code Errors" to address the report.'
+                  'Use "Fix Linting & Code Errors" to address the report.';
+                NotificationRouter.showWarning(
+                  failureNotice,
+                  undefined,
+                  undefined,
+                  undefined,
+                  await offerActionInChatV1({
+                    taskFolderPath: taskFolderUri.fsPath,
+                    taskLabel: resolvedTask.progress.displayName,
+                    actionLabel: "Fix Linting & Code Errors",
+                    command: "vs-code-ai-helper.runLintingFixes",
+                    args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                    noticeText: failureNotice,
+                  })
                 );
               }
               // RC9 item 2: a "Run Publish Checks" card asks for work that has
@@ -666,15 +725,29 @@ export async function runPublishChecks(
                 // Not a failure: the tracked operation settles as `cancelled`
                 // (its token is cancelled) and the user is told so. No stamp
                 // was written and nothing was persisted for this run.
+                const cancelledNotice =
+                  "Publish checks were cancelled. Nothing was recorded for this run — run the checks again when you're ready.";
                 NotificationRouter.showInformation(
-                  "Publish checks were cancelled. Nothing was recorded for this run — run the checks again when you're ready."
+                  cancelledNotice,
+                  undefined,
+                  undefined,
+                  undefined,
+                  await offerActionInChatV1({
+                    taskFolderPath: taskFolderUri.fsPath,
+                    taskLabel: resolvedTask.progress.displayName,
+                    actionLabel: "Run Publish Checks",
+                    command: "vs-code-ai-helper.runPublishChecks",
+                    args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                    noticeText: cancelledNotice,
+                    optional: true,
+                  })
                 );
                 return;
               }
-              NotificationRouter.showError(
-                `Publish checks failed to run: ${
-                  error instanceof Error ? error.message : String(error)
-                }`
+              await offerPublishChecksRetryAfterExecutionFailureV1(
+                taskFolderUri,
+                resolvedTask.progress.displayName,
+                error
               );
             }
           }

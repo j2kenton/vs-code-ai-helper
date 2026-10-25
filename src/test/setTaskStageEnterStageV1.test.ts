@@ -147,6 +147,48 @@ function makeCurrentTaskStoreStub(): CurrentTaskStore {
 const SIMPLE_PLAN = ["<!-- ensemble:implementation-checklist -->", "", "- [ ] Do the thing", ""].join("\n");
 
 void describe("setTaskStage routed through enterStageV1 (Part 1, item 15 reroute)", () => {
+  void it("refuses a stage choice card after the task has moved from the stage it observed", async () => {
+    const { folderPath } = makeTaskFolder("plan-low-review");
+    fs.writeFileSync(path.join(folderPath, "plan-final.md"), SIMPLE_PLAN, "utf8");
+    const progress = readProgress(folderPath);
+    fs.writeFileSync(
+      path.join(folderPath, "task-progress.json"),
+      JSON.stringify({ ...progress, currentStage: "plan-high-review" }, null, 2),
+      "utf8"
+    );
+
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const inv = makeInventoryStub(folderPath, "plan-low-review");
+    const currentStore = makeCurrentTaskStoreStub();
+    try {
+      const moved = await setTaskStage(
+        inv,
+        currentStore,
+        {
+          taskFolderPath: folderPath,
+          stage: "impl",
+          expectedSourceStage: "plan-low-review",
+        },
+        "jump"
+      );
+
+      assert.equal(moved, false, "a card posted from the old stage must not apply after a later transition");
+      assert.equal(readProgress(folderPath).currentStage, "plan-high-review");
+      assert.ok(
+        provider.getEntries().some((entry) => /has since moved on/.test(entry.message ?? "")),
+        "the stale choice refusal remains visible"
+      );
+    } finally {
+      provider.dispose();
+      deactivateNotificationRouter();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("jumping onto impl promotes plan.md -> plan-final.md instead of only ever refusing", async () => {
     const { folderPath } = makeTaskFolder("plan-low-review");
     fs.writeFileSync(path.join(folderPath, "plan.md"), SIMPLE_PLAN, "utf8");

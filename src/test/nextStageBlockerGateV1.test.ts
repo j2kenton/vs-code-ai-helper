@@ -20,6 +20,8 @@ import * as vscode from "vscode";
 
 import { completeStageAnywayV1, nextStage } from "../commands/reviewActions";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { OWNED_FIXTURE_BOUND_AT } from "./taskFolderFixture";
 import { IncompleteTask } from "../types/incompleteTask";
 import { TaskProgress } from "../types/taskProgress";
@@ -163,22 +165,51 @@ void describe("nextStage — blocker-gate warning on manual advance (wf10 item 1
       return Promise.resolve({ ok: true });
     };
 
+    const context = makeContext();
+    __extensionContextV1TestOnly.set(context);
+
     try {
-      await nextStage(vscode.Uri.file(container), makeContext(), makeNode(taskFolder));
+      await nextStage(vscode.Uri.file(container), context, makeNode(taskFolder));
 
       assert.ok(cancelCalled, "the gate check runs after the existing cancel-running-operations step");
       const gateWarning = surface.entries.find((entry) =>
-        entry.actionCommand?.command === "vs-code-ai-helper.completeStageAnywayV1"
+        entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"
       );
-      assert.ok(gateWarning, "a warning naming the Complete Anyway override must be posted");
+      assert.ok(gateWarning, "a warning opening the Complete Anyway chat decision must be posted");
       assert.match(gateWarning.message, /the owner must approve the tie policy/);
       assert.equal(gateWarning.level, "warning");
-      assert.deepEqual(gateWarning.actionCommand?.args, [{ taskFolderPath: taskFolder }]);
+      assert.equal(gateWarning.actionCommand?.title, "Open in Chat");
+
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store.listPending().find((d) => d.decisionKey === "chatActionOffer:completeStageAnywayV1");
+      assert.ok(decision, "a workflow decision for Complete Anyway must be posted in chat");
+      const action = decision.options.find((o) => o.optionId === "runAction");
+      assert.equal(action?.label, "Complete Anyway");
+      assert.deepEqual(action?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.completeStageAnywayV1",
+        args: [{ taskFolderPath: taskFolder }],
+      });
       assert.ok(
         !surface.entries.some((entry) => /advanced to:/.test(entry.message)),
         "the stage must NOT have actually advanced — the gate returns before the transition runs"
       );
+
+      // Verify unavailable-chat behavior: no direct action fallback attached to the toast
+      __extensionContextV1TestOnly.reset();
+      surface.entries.length = 0;
+      await nextStage(vscode.Uri.file(container), makeContext(), makeNode(taskFolder));
+      const unavailWarning = surface.entries.find((entry) =>
+        entry.level === "warning" && entry.message.includes("the owner must approve the tie policy")
+      );
+      assert.ok(unavailWarning, "warning still posted when chat is unavailable");
+      assert.equal(
+        unavailWarning.actionCommand,
+        undefined,
+        "when chat is unavailable, notification carries no direct work-starting button"
+      );
     } finally {
+      __extensionContextV1TestOnly.reset();
       taskOperationsModule.cancelRunningOperationsForTask = origCancel;
       fsBridge.restore();
       deactivateNotificationRouter();

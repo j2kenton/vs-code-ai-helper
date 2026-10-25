@@ -21,6 +21,7 @@ import { parseReadiness, withVisibleReviewedCommitLineV1 } from "../../utils/rev
 import { attributionModelLabel, withAttribution } from "../../utils/fileUtils";
 import {
   checkPublishChecksFreshnessV1,
+  computeTreeFingerprintV1,
   describePublishChecksFreshnessFailureV1,
   type PublishChecksFreshnessCheckV1,
 } from "../../utils/publishChecksFreshness";
@@ -55,6 +56,7 @@ export interface PublishReviewFreshnessGuardV1 {
   readonly scopeFolderPath: string;
   readonly runId: string;
   readonly verifiedCommitSha: string;
+  readonly treeFingerprint?: string;
 }
 
 export interface ReviewActionInputV1 {
@@ -182,8 +184,10 @@ function validateReviewCompletedContentV1(
  * started and finished against the SAME commit while this review's provider
  * call was in flight — evidence the reviewer never actually consumed — still
  * blocks promotion rather than silently passing a coincidental SHA match.
+ *
+ * @internal exported for testing
  */
-async function revalidatePublishFreshnessOrThrowV1(
+export async function revalidatePublishFreshnessOrThrowV1(
   guard: PublishReviewFreshnessGuardV1
 ): Promise<void> {
   const taskFolderUri = vscode.Uri.file(guard.taskFolderPath);
@@ -199,6 +203,14 @@ async function revalidatePublishFreshnessOrThrowV1(
     check.stamp.verifiedCommitSha === guard.verifiedCommitSha;
   if (!stillValid) {
     throw new ReviewPromotionErrorV1(describePublishPromotionGuardFailureV1(guard, check));
+  }
+  if (guard.treeFingerprint !== undefined) {
+    const currentFingerprint = await computeTreeFingerprintV1(guard.scopeFolderPath);
+    if (!currentFingerprint || currentFingerprint !== guard.treeFingerprint) {
+      throw new ReviewPromotionErrorV1(
+        "The working tree changed while this review was being generated, so the reused Publish Checks results are no longer valid. Run Publish Checks again and retry the review."
+      );
+    }
   }
 }
 

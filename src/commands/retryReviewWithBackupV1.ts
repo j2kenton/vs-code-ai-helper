@@ -21,6 +21,7 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { getAvailableModels } from "../utils/modelSelection";
+import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 
 export async function retryReviewWithBackupV1(
   extensionUri: vscode.Uri,
@@ -79,17 +80,31 @@ export async function chooseReviewRetryV1(
     );
     return;
   }
-  const selected = await vscode.window.showQuickPick(choices, {
-    title: "Choose another model or reasoning level for this review",
-    placeHolder: "Select a discovered model and level",
+  const chosen = await askChatChoiceV1({
+    decisionKey: "chooseReviewRetryModel",
+    target: {
+      canonicalId: input.taskFolderPath,
+      taskFolderPath: input.taskFolderPath,
+      stage: input.stage,
+    },
+    whatHappened: "Choose another model or reasoning level for this review retry.",
+    whyUserNeeded: "The stage's automatic backup advance did not apply, so a model choice is yours.",
+    options: choices.map((choice, index) => ({
+      optionId: `model-${index}`,
+      label: choice.label,
+      description: [choice.description, choice.detail].filter(Boolean).join(" — "),
+    })),
+    detail: "Answering retries the review once with the chosen model.",
   });
-  if (!selected) {
+  const index = chosen === undefined ? -1 : choices.findIndex((_choice, i) => `model-${i}` === chosen);
+  const choice = index >= 0 ? choices[index] : undefined;
+  if (!choice) {
     return;
   }
   await retryReviewWithBackupV1(extensionUri, {
     taskFolderPath: input.taskFolderPath,
     stage: input.stage,
-    modelId: selected.modelId,
+    modelId: choice.modelId,
   });
 }
 

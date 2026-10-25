@@ -820,8 +820,8 @@ export async function draftTaskWithAI(
   let result: DraftResultV1 | undefined;
 
   try {
-    // ── Consent gate ─────────────────────────────────────────────────────────
-    const consented = await ensureAiConsent(context);
+    // ── Consent gate (ensureAiConsent(context)) ──────────────────────────────
+    const consented = await ensureAiConsent(context, earlyFolderPath);
     if (!consented) {
       return;
     }

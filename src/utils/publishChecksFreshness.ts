@@ -9,15 +9,14 @@ import {
   upsertNoteBelowArtifactChangeBannerV1,
 } from "./reviewReadiness";
 import { publishNextStepAfterChecksV1 } from "./stageArtifactRequirementsV1";
+import { runGitCommand } from "./gitRepoInfo";
 
 /**
  * Freshness stamp for `publish-review.md` (plan PART 2, step 6; plan item 17,
  * step 20 for the artifact-unification rename from the legacy
  * `publish-checks.md`): proves the completion lint and Publish Scope Check
  * that produced the rest of the document ran back-to-back against one
- * unchanged commit. The stamp does NOT assert the checks passed — a
- * completed run with red results still gets a valid stamp — only that they
- * ran, together, against `verifiedCommitSha`.
+ * unchanged commit and verification-relevant tree fingerprint.
  *
  * `scopeId` is a hash of the absolute verification-scope folder rather than
  * the raw path itself, so the stamp never embeds a private absolute
@@ -29,12 +28,153 @@ export interface PublishChecksFreshnessStampV1 {
   verifiedCommitSha: string;
   completedAt: string;
   scopeId: string;
+  treeFingerprint?: string;
 }
 
 export const PUBLISH_CHECKS_STAMP_FORMAT_VERSION = 1 as const;
 
 export const PUBLISH_CHECKS_STAMP_START = "<!-- publish-checks-freshness:start -->";
 export const PUBLISH_CHECKS_STAMP_END = "<!-- publish-checks-freshness:end -->";
+
+/** Paths and patterns explicitly excluded from the verification-relevant repository fingerprint. */
+export function isFingerprintExcludedPathV1(relPath: string): boolean {
+  const normalized = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
+  if (
+    normalized === ".ensemble" ||
+    normalized.startsWith(".ensemble/") ||
+    /(^|\/)\.ensemble\//.test(normalized)
+  ) {
+    return true;
+  }
+  // Source files are never generated output or build artifacts.
+  // Protect all source directories (root src/ and member package src/ such as packages/app/src/)
+  // from being excluded by downstream out/ or dist/ patterns.
+  if (normalized.startsWith("src/") || /(^|\/)src\//.test(normalized)) {
+    return false;
+  }
+  if (
+    normalized === "out" ||
+    normalized.startsWith("out/") ||
+    normalized === "dist" ||
+    normalized.startsWith("dist/") ||
+    /(^|\/)(out|dist)\//.test(normalized)
+  ) {
+    return true;
+  }
+  if (
+    normalized === "runs/raw-check-output.log" ||
+    normalized.endsWith("/runs/raw-check-output.log") ||
+    normalized.endsWith("/raw-check-output.log") ||
+    normalized === "raw-check-output.log" ||
+    normalized === "publish-review.md" ||
+    normalized === "publish-checks.md" ||
+    normalized.endsWith("/publish-review.md") ||
+    normalized.endsWith("/publish-checks.md")
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Dispatch-time identity check for a reused Publish Checks run (Step 30): the
+ * run the review prompt cites must still be the run the freshness stamp
+ * records. A newer run at the same commit and tree replaces the stamp's run
+ * id, so the consumed run is no longer the one promotion would validate.
+ */
+export function isReusedPublishChecksRunStillCurrentV1(
+  consumedRunId: string,
+  latestStampRunId: string | undefined
+): boolean {
+  return latestStampRunId !== undefined && latestStampRunId === consumedRunId;
+}
+
+/**
+ * Deterministically computes a SHA-256 fingerprint of verification-relevant
+ * repository state: tracked index entries, tracked working-tree files (modes,
+ * symlink targets, content), and untracked non-ignored files, excluding
+ * explicitly designated build outputs and check logs.
+ */
+export async function computeTreeFingerprintV1(scopeFolder: string): Promise<string | undefined> {
+  try {
+    const { stdout: indexStdout } = await runGitCommand(scopeFolder, "ls-files", ["-s", "-z"]);
+    const { stdout: modifiedStdout } = await runGitCommand(scopeFolder, "ls-files", ["-m", "-z"]);
+    const { stdout: untrackedStdout } = await runGitCommand(scopeFolder, "ls-files", ["-o", "--exclude-standard", "-z"]);
+
+    const records: string[] = [];
+
+    // 1. Tracked index entries (<mode> <sha> <stage>\t<path>\0)
+    const indexEntries = indexStdout.split("\0");
+    for (const entry of indexEntries) {
+      if (!entry.trim()) {
+        continue;
+      }
+      const tabIdx = entry.indexOf("\t");
+      if (tabIdx === -1) {
+        continue;
+      }
+      const meta = entry.slice(0, tabIdx);
+      const relPath = entry.slice(tabIdx + 1);
+      if (isFingerprintExcludedPathV1(relPath)) {
+        continue;
+      }
+      records.push(`index:${meta}:${relPath}`);
+    }
+
+    // 2. Tracked modified files in working tree
+    const modifiedFiles = modifiedStdout.split("\0");
+    for (const relPath of modifiedFiles) {
+      if (!relPath.trim() || isFingerprintExcludedPathV1(relPath)) {
+        continue;
+      }
+      const fullPath = path.join(scopeFolder, relPath);
+      try {
+        const stat = await fs.promises.lstat(fullPath);
+        if (stat.isSymbolicLink()) {
+          const target = await fs.promises.readlink(fullPath);
+          records.push(`worktree:symlink:${stat.mode}:${target}:${relPath}`);
+        } else if (stat.isFile()) {
+          const content = await fs.promises.readFile(fullPath);
+          const hash = crypto.createHash("sha256").update(content).digest("hex");
+          records.push(`worktree:file:${stat.mode}:${hash}:${relPath}`);
+        }
+      } catch {
+        records.push(`worktree:missing:${relPath}`);
+      }
+    }
+
+    // 3. Untracked non-ignored files
+    const untrackedFiles = untrackedStdout.split("\0");
+    for (const relPath of untrackedFiles) {
+      if (!relPath.trim() || isFingerprintExcludedPathV1(relPath)) {
+        continue;
+      }
+      const fullPath = path.join(scopeFolder, relPath);
+      try {
+        const stat = await fs.promises.lstat(fullPath);
+        if (stat.isSymbolicLink()) {
+          const target = await fs.promises.readlink(fullPath);
+          records.push(`untracked:symlink:${stat.mode}:${target}:${relPath}`);
+        } else if (stat.isFile()) {
+          const content = await fs.promises.readFile(fullPath);
+          const hash = crypto.createHash("sha256").update(content).digest("hex");
+          records.push(`untracked:file:${stat.mode}:${hash}:${relPath}`);
+        }
+      } catch {
+        // Ignored if missing
+      }
+    }
+
+    records.sort();
+    const hasher = crypto.createHash("sha256");
+    for (const rec of records) {
+      hasher.update(rec + "\n");
+    }
+    return hasher.digest("hex");
+  } catch {
+    return undefined;
+  }
+}
 
 /** Safe, non-reversible identifier for a verification-scope folder — never the raw path. */
 export function computePublishScopeId(scopeFolderAbsolutePath: string): string {
@@ -57,6 +197,7 @@ export function renderPublishChecksFreshnessStamp(stamp: PublishChecksFreshnessS
     `<!-- verified-commit: ${stamp.verifiedCommitSha} -->`,
     `<!-- completed-at: ${stamp.completedAt} -->`,
     `<!-- scope-id: ${stamp.scopeId} -->`,
+    ...(stamp.treeFingerprint ? [`<!-- tree-fingerprint: ${stamp.treeFingerprint} -->`] : []),
     PUBLISH_CHECKS_STAMP_END,
   ].join("\n");
 }
@@ -269,6 +410,7 @@ export function parsePublishChecksFreshnessStamp(
   const verifiedCommitSha = readStampField(block, "verified-commit");
   const completedAt = readStampField(block, "completed-at");
   const scopeId = readStampField(block, "scope-id");
+  const treeFingerprint = readStampField(block, "tree-fingerprint");
   if (
     formatVersionRaw !== String(PUBLISH_CHECKS_STAMP_FORMAT_VERSION) ||
     !runId ||
@@ -284,6 +426,7 @@ export function parsePublishChecksFreshnessStamp(
     verifiedCommitSha,
     completedAt,
     scopeId,
+    ...(treeFingerprint ? { treeFingerprint } : {}),
   };
 }
 
@@ -374,7 +517,7 @@ function legacyPublishChecksPath(taskFolderUri: vscode.Uri): string {
   return path.join(taskFolderUri.fsPath, PUBLISH_CHECKS_FILENAME);
 }
 
-async function readPublishChecksFile(taskFolderUri: vscode.Uri): Promise<string> {
+export async function readPublishChecksFile(taskFolderUri: vscode.Uri): Promise<string> {
   try {
     return await fs.promises.readFile(publishChecksPath(taskFolderUri), "utf8");
   } catch {
@@ -801,7 +944,8 @@ export type PublishChecksFreshnessCheckV1 =
 export function classifyPublishChecksFreshnessV1(
   stamp: PublishChecksFreshnessStampV1 | undefined,
   currentScopeFolder: string,
-  currentCommitSha: string | undefined
+  currentCommitSha: string | undefined,
+  _currentFingerprint?: string
 ): PublishChecksFreshnessCheckV1 {
   if (!stamp) {
     return { status: "missing" };
@@ -864,4 +1008,46 @@ export function describePublishChecksFreshnessFailureV1(
         "review would use. Run Publish Checks again for the current scope before requesting a Publish review."
       );
   }
+}
+
+export interface PublishChecksReuseEligibilityResultV1 {
+  readonly eligible: boolean;
+  readonly reason?: string;
+  readonly stamp?: PublishChecksFreshnessStampV1;
+  readonly currentFingerprint?: string;
+}
+
+/**
+ * Checks whether recorded Publish Checks results are fresh and eligible for reuse
+ * by Publish review (Steps 29-30).
+ */
+export async function checkPublishChecksReuseEligibilityV1(
+  taskFolderUri: vscode.Uri,
+  scopeFolder: string,
+  headCommitSha: string | undefined,
+  evidenceValidator?: (content: string) => boolean
+): Promise<PublishChecksReuseEligibilityResultV1> {
+  const stamp = await readPublishChecksFreshnessStampV1(taskFolderUri);
+  const currentFingerprint = await computeTreeFingerprintV1(scopeFolder);
+  const freshness = classifyPublishChecksFreshnessV1(stamp, scopeFolder, headCommitSha);
+  if (freshness.status !== "valid") {
+    return { eligible: false, reason: `Freshness check failed: ${freshness.status}` };
+  }
+  if (!stamp?.treeFingerprint) {
+    return { eligible: false, reason: "Stamp does not contain a tree fingerprint (ineligible for reuse)" };
+  }
+  if (!currentFingerprint || currentFingerprint !== stamp.treeFingerprint) {
+    return { eligible: false, reason: "Working tree fingerprint has changed since checks ran" };
+  }
+  if (evidenceValidator) {
+    const reportContent = await readPublishChecksFile(taskFolderUri);
+    if (!evidenceValidator(reportContent)) {
+      return { eligible: false, reason: "Recorded Completion Checks evidence is missing, failed, or unreadable" };
+    }
+  }
+  return {
+    eligible: true,
+    stamp,
+    currentFingerprint,
+  };
 }

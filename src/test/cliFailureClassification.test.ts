@@ -1311,7 +1311,7 @@ void describe("stream-transport failures are cascade-eligible", () => {
     assert.equal(promoted.transient, true);
   });
 
-  void it("does NOT promote the overload reply in edit mode", () => {
+  void it("flags the overload reply in edit mode as a temporary unavailability (capacity), without the text-mode transient flag", () => {
     const codex = getCliProvider("codex-cli");
     assert.ok(codex, "expected codex-cli provider definition");
 
@@ -1322,7 +1322,11 @@ void describe("stream-transport failures are cascade-eligible", () => {
       codex
     );
 
-    assert.equal(promoted.failureKind, "generic");
+    // Post-1.0 fixes, item 5: no longer a generic failure. The edit runner
+    // retries the same model (only on an unchanged tree) via `providerCapacity`
+    // rather than the timeout-retry `transient` flag.
+    assert.equal(promoted.failureKind, "temporarily-unavailable");
+    assert.equal(promoted.providerCapacity, true);
     assert.equal(promoted.transient, undefined);
   });
 

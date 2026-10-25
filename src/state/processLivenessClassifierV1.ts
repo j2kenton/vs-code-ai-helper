@@ -1,4 +1,8 @@
-import { isProcessStartTimeMismatchV1, readOtherProcessStartEpochMsV1 } from "./processStartTimeProbeV1";
+import {
+  getProcessLivenessTestHooksForTestV1,
+  isProcessStartTimeMismatchV1,
+  readOtherProcessStartEpochMsV1,
+} from "./processStartTimeProbeV1";
 
 /**
  * Shared (pid, processStartTime) → gone/alive/inconclusive classifier (1.0
@@ -48,6 +52,10 @@ export function setPidExistsCheckOverrideForTestV1(override: ((pid: number) => "
 function checkPidExistsSyncV1(pid: number): "exists" | "gone" {
   if (pidExistsCheckOverrideForTestV1) {
     return pidExistsCheckOverrideForTestV1(pid);
+  }
+  const livenessHook = getProcessLivenessTestHooksForTestV1()?.checkPidLiveness;
+  if (livenessHook) {
+    return livenessHook(pid) === "dead" ? "gone" : "exists";
   }
   try {
     // Signal 0 sends nothing — on every platform Node supports this only

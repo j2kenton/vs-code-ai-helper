@@ -289,7 +289,10 @@ void describe("review scoring rubric", () => {
       void it(`${templateFile} scores staged plans by executable-order progress, not raw completeness`, () => {
         const raw = fs.readFileSync(path.join(PROMPTS_DIR, templateFile), "utf8");
         assert.match(raw, /executable order/);
-        assert.match(raw, /not completion blockers/);
+        // Item 10: not-yet-reached items are not defects in what landed, but
+        // they are still named in ONE completion blocker.
+        assert.match(raw, /not defects in the code that landed/);
+        assert.match(raw, /exactly ONE `- \[completion\] \[task-fixable\]` blocker/);
       });
     }
   });
@@ -417,6 +420,26 @@ void describe("review scoring rubric", () => {
         assert.strictEqual(parseReadiness(withoutReadiness).score, null);
         assert.strictEqual(parseReadiness(withoutReadiness).label, "—/10");
       });
+    });
+  });
+
+  void describe("unbuilt plan steps are one completion blocker (post-1.0 item 10)", () => {
+    void it("every implementation review template files ONE [completion] [task-fixable] blocker for steps that are not built", async () => {
+      for (const templateFile of IMPLEMENTATION_REVIEW_TEMPLATES) {
+        const source = await fs.promises.readFile(path.join(PROMPTS_DIR, templateFile), "utf8");
+        assert.match(source, /exactly ONE `- \[completion\] \[task-fixable\]` blocker/, templateFile);
+        assert.match(source, /not built/, templateFile);
+        assert.match(source, /built but not ticked/, templateFile);
+        assert.match(source, /Ensemble holds the stage instead of advancing/, templateFile);
+        assert.doesNotMatch(source, /must not hold the score down/, templateFile);
+      }
+    });
+
+    void it("the shared rubric says the unbuilt-steps blocker keeps the score at 7 or below and built-but-unticked is never a blocker", async () => {
+      const rubric = await fs.promises.readFile(path.join(PROMPTS_DIR, "review-scoring-rubric.md"), "utf8");
+      assert.match(rubric, /not built \(as opposed to built but not ticked\) are filed as one `\[completion\]` blocker/);
+      assert.match(rubric, /keeps the score at 7 or below/);
+      assert.match(rubric, /Built-but-unticked items are never a blocker/);
     });
   });
 

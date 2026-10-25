@@ -182,6 +182,15 @@ export function isTransportError(message: string | undefined): boolean {
   return TRANSPORT_MARKERS.some((marker) => value.includes(marker));
 }
 
+/**
+ * Shared by the text path (action coordinator) and the edit path
+ * (`runImplementationWithCli`): a Codex "at capacity" reply is retried on the
+ * same model this many times, after this delay, before the model counts as
+ * temporarily unavailable.
+ */
+export const MAX_PROVIDER_CAPACITY_RETRIES_V1 = 2;
+export const PROVIDER_CAPACITY_RETRY_DELAY_MS_V1 = 5_000;
+
 /** True for the one observed provider-overload phrase that merits a bounded same-model retry. */
 export function isProviderCapacityError(message: string | undefined): boolean {
   return (message ?? "").toLowerCase().includes("at capacity");

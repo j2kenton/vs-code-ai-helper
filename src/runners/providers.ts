@@ -1253,8 +1253,24 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // dispatch (`codex exec`) with no competing interactive-flow behavior —
     // the response is whatever the prompt asked for.
     textModeResponseContractV1: "honours",
+    conversationResume: {
+      errorMarkers: [],
+      requiresPinnedSession: true,
+      continuationPrompt:
+        "Continue the same task from where the previous response stopped. Your earlier " +
+        "context and workspace changes are still in this conversation. Inspect the workspace " +
+        "and continue without reverting completed work.",
+    },
     buildArgs(mode, model, context): string[] {
       const parsedModel = parseCodexModelSelection(model);
+      if (context?.resumePreviousConversation && context?.resumeSessionId) {
+        const args = ["exec", "resume", "--json", "--skip-git-repo-check"];
+        if (parsedModel.model) {
+          args.push("--model", parsedModel.model);
+        }
+        args.push(context.resumeSessionId, "-");
+        return args;
+      }
       // `--json` for the same reason kimi-cli uses `--output-format
       // stream-json`: Codex's human-readable stdout wraps the answer in a
       // banner ("OpenAI Codex v…", workdir/model header, a `user` echo of the

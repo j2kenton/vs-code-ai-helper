@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import * as path from "path";
 import {
   CONTEXT_CONFIRM_THRESHOLD_BYTES,
   PROMPT_TOTAL_MAX_BYTES,
@@ -16,6 +17,9 @@ import {
   isAutomationDispatchContextV1,
 } from "../state/automationDispatchContextV1";
 import { formatNotificationTaskLabelV1 } from "./notificationTaskContextV1";
+import { offerActionInChatV1 } from "./chatActionOfferV1";
+import { askChatChoiceV1 } from "./chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "./globalChatTargetV1";
 
 /**
  * Check whether a prompt is safe to send, applying two enforcement rules:
@@ -67,12 +71,20 @@ export async function checkAndConfirmPromptSize(
   if (bytes > PROMPT_TOTAL_MAX_BYTES) {
     const kb = Math.round(bytes / 1024);
     const ceiling = Math.round(PROMPT_TOTAL_MAX_BYTES / 1024);
-    NotificationRouter.showError(
-      withTaskLabel(
-        `⛔ Prompt is too large to send (${kb} KB). The hard limit is ${ceiling} KB. ` +
-          `Reduce the number of open editors, close large files, or shorten your task description.`
-      )
+    const reason = withTaskLabel(
+      `⛔ Prompt is too large to send (${kb} KB). The hard limit is ${ceiling} KB. ` +
+        `Reduce the number of open editors, close large files, or shorten your task description.`
     );
+    if (task?.folderPath && (isUnattendedExecutionV1() || isAutomationDispatchContextV1())) {
+      await offerActionInChatV1({
+        taskFolderPath: task.folderPath,
+        actionLabel: "Open task.md to shorten the prompt",
+        command: "vscode.open",
+        args: [vscode.Uri.file(path.join(task.folderPath, "task.md"))],
+        noticeText: `${reason} Edit task.md or close large editors, then run the action again.`,
+      });
+    }
+    NotificationRouter.showError(reason /* taskLabel */);
     return "abort";
   }
 
@@ -90,12 +102,19 @@ export async function checkAndConfirmPromptSize(
       // this dialog here. Declining is the safe answer — it is the user's
       // quota — and the relay reports the reason instead of hanging.
       const kb = Math.round(bytes / 1024);
-      NotificationRouter.showWarning(
-        withTaskLabel(
-          unattendedRefusalV1(`Sending a ~${kb} KB prompt to ${providerLabel}`) +
-            " (turn off the large-request warning in Ensemble Settings to send prompts this size without asking.)"
-        )
+      const reason = withTaskLabel(
+        unattendedRefusalV1(`Sending a ~${kb} KB prompt to ${providerLabel}`) +
+          " (turn off the large-request warning in Ensemble Settings to send prompts this size without asking.)"
       );
+      if (task?.folderPath) {
+        await offerActionInChatV1({
+          taskFolderPath: task.folderPath,
+          actionLabel: "Open Ensemble Settings",
+          command: "vs-code-ai-helper.openSettings",
+          noticeText: reason,
+        });
+      }
+      NotificationRouter.showWarning(reason /* taskLabel */);
       return "declined";
     }
     if (isAutomationDispatchContextV1()) {
@@ -104,13 +123,20 @@ export async function checkAndConfirmPromptSize(
       // setting that lets prompts this size through unattended.
       const kbAuto = Math.round(bytes / 1024);
       console.log(describeAutomationDefaultV1(`Sending a ~${kbAuto} KB prompt to ${providerLabel}`, "declined"));
-      NotificationRouter.showWarning(
-        withTaskLabel(
-          `An automated round did not send a ~${kbAuto} KB prompt to ${providerLabel}: large prompts need a confirmation ` +
-            "and no one was attached to give it. Turn off the large-request warning in Ensemble Settings to let " +
-            "automated rounds send prompts this size, then run the action again."
-        )
+      const reason = withTaskLabel(
+        `An automated round did not send a ~${kbAuto} KB prompt to ${providerLabel}: large prompts need a confirmation ` +
+          "and no one was attached to give it. Turn off the large-request warning in Ensemble Settings to let " +
+          "automated rounds send prompts this size, then run the action again."
       );
+      if (task?.folderPath) {
+        await offerActionInChatV1({
+          taskFolderPath: task.folderPath,
+          actionLabel: "Open Ensemble Settings",
+          command: "vs-code-ai-helper.openSettings",
+          noticeText: reason,
+        });
+      }
+      NotificationRouter.showWarning(reason /* taskLabel */);
       return "declined";
     }
     const kb = Math.round(bytes / 1024);
@@ -121,20 +147,32 @@ export async function checkAndConfirmPromptSize(
       ? ` If this run hits quota/availability limits or its response doesn't validate, this same prompt may also be retried against up to ` +
         `${backupProviderCount} configured backup model${backupProviderCount === 1 ? "" : "s"}.`
       : "";
-    const choice = await vscode.window.showWarningMessage(
-      withTaskLabel(
+    const target = task?.folderPath
+      ? { canonicalId: task.folderPath, taskFolderPath: task.folderPath, stage: "impl" as const }
+      : await resolveGlobalChatTargetOrDefaultV1();
+    const choice = await askChatChoiceV1({
+      target,
+      decisionKey: "confirmLargePromptSize",
+      whatHappened: withTaskLabel(
         `⚠️ This will send a prompt of ~${kb} KB (~${tokens.toLocaleString()} tokens) to ${providerLabel}. ` +
           `This may use significant quota.${backupNote} Continue?`
       ),
-      { modal: true },
-      PROCEED,
-      PROCEED_DONT_ASK
-    );
-    if (choice === PROCEED_DONT_ASK) {
+      whyUserNeeded: "Confirming before sending a large prompt prevents unexpected token usage.",
+      options: [
+        { optionId: "proceed", label: PROCEED },
+        {
+          optionId: "proceedDontAsk",
+          label: PROCEED_DONT_ASK,
+          description: "Disables the large-request warning in Ensemble Settings",
+        },
+        { optionId: "cancel", label: "Cancel" },
+      ],
+    });
+    if (choice === "proceedDontAsk") {
       await setLargeTokenRequestWarningEnabled(false);
       return "confirmed";
     }
-    if (choice !== PROCEED) {
+    if (choice !== "proceed") {
       return "declined";
     }
     return "confirmed";

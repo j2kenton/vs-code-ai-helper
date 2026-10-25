@@ -60,11 +60,17 @@ function installConfigStub(
   };
 }
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const chatChoiceModule = require("../utils/chatChoiceV1") as {
+  askChatChoiceV1: (input: { whatHappened: string; options: { optionId: string; label: string }[] }) => Promise<string | undefined>;
+};
+
 function stubWarningMessage(response: string | undefined): {
   calls: unknown[][];
   restore: () => void;
 } {
   const original = vscode.window.showWarningMessage;
+  const originalAskChoice = chatChoiceModule.askChatChoiceV1;
   const calls: unknown[][] = [];
   (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (
     ...args: unknown[]
@@ -72,10 +78,15 @@ function stubWarningMessage(response: string | undefined): {
     calls.push(args);
     return Promise.resolve(response);
   };
+  chatChoiceModule.askChatChoiceV1 = (input): Promise<string | undefined> => {
+    calls.push([input.whatHappened, ...input.options.map((o) => o.label)]);
+    return Promise.resolve(response);
+  };
   return {
     calls,
     restore: (): void => {
       (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = original;
+      chatChoiceModule.askChatChoiceV1 = originalAskChoice;
     },
   };
 }
@@ -297,6 +308,7 @@ void describe("automatic implementation confirmation gate", () => {
     const workspace = vscode.workspace as unknown as Record<string, unknown>;
     const originalConfiguration = workspace.getConfiguration;
     const originalWarning = vscode.window.showWarningMessage;
+    const originalAskChoice = chatChoiceModule.askChatChoiceV1;
     let setting: unknown = "auto";
     let prompts = 0;
     workspace.getConfiguration = () => ({
@@ -311,6 +323,10 @@ void describe("automatic implementation confirmation gate", () => {
       prompts += 1;
       return Promise.resolve(undefined);
     };
+    chatChoiceModule.askChatChoiceV1 = (): Promise<undefined> => {
+      prompts += 1;
+      return Promise.resolve(undefined);
+    };
     const state = new Map<string, unknown>();
     const context = {
       globalState: {
@@ -321,7 +337,7 @@ void describe("automatic implementation confirmation gate", () => {
     const controller = new AutoImplementConfirmationController(context);
     try {
       assert.equal(getAutoImplementAfterReviewMode(), "off", "raw auto must not arm implementation before confirmation");
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await controller.whenIdle();
       assert.equal(prompts, 1);
       assert.equal(setting, undefined, "declining clears only the enabled scope");
       assert.equal(getAutoImplementAfterReviewMode(), "off");
@@ -330,6 +346,7 @@ void describe("automatic implementation confirmation gate", () => {
       resetAutoImplementConfirmationForTests();
       workspace.getConfiguration = originalConfiguration;
       (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = originalWarning;
+      chatChoiceModule.askChatChoiceV1 = originalAskChoice;
     }
   });
 
@@ -410,6 +427,7 @@ void describe("automatic implementation confirmation gate", () => {
     const workspace = vscode.workspace as unknown as Record<string, unknown>;
     const originalConfiguration = workspace.getConfiguration;
     const originalWarning = vscode.window.showWarningMessage;
+    const originalAskChoice = chatChoiceModule.askChatChoiceV1;
     const global: Record<string, unknown> = {};
     const workspaceValues: Record<string, unknown> = {};
     workspace.getConfiguration = () => ({
@@ -427,11 +445,13 @@ void describe("automatic implementation confirmation gate", () => {
     });
     let firstPrompt: (() => void) | undefined;
     let promptCount = 0;
-    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (): Promise<undefined> => {
+    const handlePrompt = (): Promise<undefined> => {
       promptCount += 1;
       if (promptCount > 1) return Promise.resolve(undefined);
       return new Promise((resolve) => { firstPrompt = () => resolve(undefined); });
     };
+    (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = handlePrompt;
+    chatChoiceModule.askChatChoiceV1 = handlePrompt;
     const context = {
       globalState: { get: <T>(_key: string, fallback?: T): T => fallback as T, update: (): Promise<void> => Promise.resolve() },
     } as unknown as vscode.ExtensionContext;
@@ -443,8 +463,10 @@ void describe("automatic implementation confirmation gate", () => {
       await controller.whenIdle();
       global.autoImplementAfterReview = "auto";
       changes.fire({ affectsConfiguration: () => true });
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      assert.ok(firstPrompt, "the global change should open the first modal");
+      for (let i = 0; i < 10 && !firstPrompt; i++) {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      assert.ok(firstPrompt, "the global change should open the first prompt");
 
       // This event occurs while the first modal is open. It must be handled
       // after the global cancellation, not absorbed by that cancellation's
@@ -462,6 +484,7 @@ void describe("automatic implementation confirmation gate", () => {
       resetAutoImplementConfirmationForTests();
       workspace.getConfiguration = originalConfiguration;
       (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = originalWarning;
+      chatChoiceModule.askChatChoiceV1 = originalAskChoice;
     }
   });
 
@@ -470,6 +493,7 @@ void describe("automatic implementation confirmation gate", () => {
     const originalConfiguration = workspace.getConfiguration;
     const originalFolders = workspace.workspaceFolders;
     const originalWarning = vscode.window.showWarningMessage;
+    const originalAskChoice = chatChoiceModule.askChatChoiceV1;
     const folder = vscode.Uri.file("/workspace-folder-scope");
     const global: Record<string, unknown> = { autoImplementAfterReview: "off" };
     const folderValues: Record<string, unknown> = {};
@@ -489,6 +513,7 @@ void describe("automatic implementation confirmation gate", () => {
       },
     });
     (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = (): Promise<undefined> => Promise.resolve(undefined);
+    chatChoiceModule.askChatChoiceV1 = (): Promise<undefined> => Promise.resolve(undefined);
     const context = {
       globalState: { get: <T>(_key: string, fallback?: T): T => fallback as T, update: (): Promise<void> => Promise.resolve() },
     } as unknown as vscode.ExtensionContext;
@@ -509,6 +534,7 @@ void describe("automatic implementation confirmation gate", () => {
       workspace.getConfiguration = originalConfiguration;
       workspace.workspaceFolders = originalFolders;
       (vscode.window as unknown as { showWarningMessage: unknown }).showWarningMessage = originalWarning;
+      chatChoiceModule.askChatChoiceV1 = originalAskChoice;
     }
   });
 });

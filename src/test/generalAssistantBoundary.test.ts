@@ -7,7 +7,10 @@
  * assert that authorization boundary directly.
  */
 import * as assert from "node:assert/strict";
-import { describe, it } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import {
@@ -22,11 +25,21 @@ import { buildGlobalAssistantPrompt } from "../commands/openGeneralAssistant";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import type { TaskProgress } from "../types/taskProgress";
+import { safeRemoveDir } from "./testFsUtils";
+
+const tempDirs: string[] = [];
+afterEach(() => {
+  for (const dir of tempDirs) {
+    safeRemoveDir(dir);
+  }
+  tempDirs.length = 0;
+});
 
 function makeTask(folderName: string, status: TaskProgress["status"]): TaskWithProgress {
+  const folderPath = path.join(os.tmpdir(), folderName);
   return {
-    canonicalId: `c:/tmp/${folderName}`,
-    taskFolderPath: `c:/tmp/${folderName}`,
+    canonicalId: folderPath,
+    taskFolderPath: folderPath,
     folderName,
     sourceScopeKey: "scope",
     progress: {
@@ -46,10 +59,12 @@ function makeContext(tasks: TaskWithProgress[]): GlobalAssistantContext {
   const store = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
   store.get = (): string | undefined => undefined;
   store.clear = async (): Promise<void> => { /* no-op */ };
+  const assistantDir = fs.mkdtempSync(path.join(os.tmpdir(), "global-assistant-"));
+  tempDirs.push(assistantDir);
   return {
     inventory,
     currentTaskStore: store,
-    assistantFolderUri: vscode.Uri.file("c:/tmp/global-assistant"),
+    assistantFolderUri: vscode.Uri.file(assistantDir),
   };
 }
 
@@ -57,15 +72,18 @@ function withWarningStub<T>(
   result: string | undefined,
   body: (calls: string[]) => Promise<T>
 ): Promise<T> {
-  const win = vscode.window as unknown as Record<string, unknown>;
-  const original = win.showWarningMessage;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+  const chatChoiceMod = require("../utils/chatChoiceV1") as {
+    askChatChoiceV1: (req: { whatHappened: string }) => Promise<string | undefined>;
+  };
+  const original = chatChoiceMod.askChatChoiceV1;
   const calls: string[] = [];
-  win.showWarningMessage = (message: string): Promise<string | undefined> => {
-    calls.push(message);
-    return Promise.resolve(result);
+  chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+    calls.push(req.whatHappened);
+    return Promise.resolve(result === "Run Action" ? "runAction" : result);
   };
   return body(calls).finally(() => {
-    win.showWarningMessage = original;
+    chatChoiceMod.askChatChoiceV1 = original;
   });
 }
 

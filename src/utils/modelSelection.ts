@@ -137,6 +137,21 @@ export function listStageDisabledBackupsV1(stage: TaskStage): string[] {
 }
 
 /**
+ * The stage's own configured primary when the owner switched it off
+ * (`primaryEnabled === false`). `skipFilteredChainOf` drops it from the
+ * effective chain, so failure explanations read it from the raw setting to
+ * list it as disabled. Never dispatched.
+ */
+export function getStageDisabledPrimaryV1(stage: TaskStage): string | undefined {
+  const setting = getModelSettings()[stage];
+  return setting?.primaryEnabled === false &&
+    typeof setting.primary === "string" &&
+    setting.primary.trim().length > 0
+    ? setting.primary.trim()
+    : undefined;
+}
+
+/**
  * Whether a stage has any configured candidate at all — a primary or backup
  * model id present in settings, REGARDLESS of its enabled flag. Distinct from
  * `skipFilteredChainOf(...).primary`, which is undefined both when nothing

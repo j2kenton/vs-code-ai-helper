@@ -206,9 +206,12 @@ void describe("globalAssistantSendRowV1", () => {
       const currentTaskStore = Object.create(CurrentTaskStore.prototype) as CurrentTaskStore;
       setGlobalAssistantRuntimeDepsV1({ inventory, currentTaskStore, workspaceState: makeMemento() });
 
-      const win = vscode.window as unknown as Record<string, unknown>;
-      const originalWarning = win.showWarningMessage;
-      win.showWarningMessage = (): Promise<string | undefined> => Promise.resolve("Run Action");
+      // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+      const chatChoiceMod = require("../utils/chatChoiceV1") as {
+        askChatChoiceV1: () => Promise<string | undefined>;
+      };
+      const originalAskChatChoice = chatChoiceMod.askChatChoiceV1;
+      chatChoiceMod.askChatChoiceV1 = (): Promise<string | undefined> => Promise.resolve("runAction");
 
       const folder = makeGlobalFolder("execute");
       try {
@@ -224,7 +227,7 @@ void describe("globalAssistantSendRowV1", () => {
         assert.equal(history[0]?.text, "On it.");
         assert.equal(history[1]?.text, "No completed tasks to archive.");
       } finally {
-        win.showWarningMessage = originalWarning;
+        chatChoiceMod.askChatChoiceV1 = originalAskChatChoice;
         resetGlobalAssistantRuntimeDepsForTestV1();
         safeRemoveDir(folder);
       }

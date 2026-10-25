@@ -1746,6 +1746,22 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     const inv = makeInventoryStub(folderPath, "impl-low-review");
     const currentStore = makeCurrentTaskStoreStub();
     const dispatches: AutomationDispatch[] = [];
+    const backing = new Map<string, unknown>();
+    const memento = {
+      keys: (): readonly string[] => [...backing.keys()],
+      get: <T>(key: string, defaultValue?: T): T | undefined =>
+        backing.has(key) ? (backing.get(key) as T) : defaultValue,
+      update: (key: string, value: unknown): Thenable<void> => {
+        if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+        return Promise.resolve();
+      },
+    };
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
     const patches: Patched[] = [
       patch(automationChainModule, "scheduleAutomationChain", (dispatch: AutomationDispatch): Promise<boolean> => {
         dispatches.push(dispatch);
@@ -1759,13 +1775,23 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
 
       assert.equal(dispatches.length, 0, "a failed preflight must never schedule the publish chain");
       // setTaskStage.ts surfaces the failing-checks warning unconditionally on
-      // landing on Publish, so the user still learns checks are failing and
-      // gets a one-click way to publish anyway.
+      // landing on Publish and offers Publish Anyway in the task's chat.
       const warning = provider
         .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.commitAndPushTask");
+        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(warning, "a Publish Anyway warning should appear for the failing preflight");
+      const offer = new WorkflowDecisionStoreV1(memento)
+        .listPending()
+        .find((d) => d.decisionKey === "chatActionOffer:commitAndPushTask");
+      assert.ok(offer, "the chat offers the Publish Anyway action");
+      assert.equal(offer.options.find((o) => o.optionId === "runAction")?.label, "Publish Anyway");
+      assert.deepEqual(offer.options.find((o) => o.optionId === "runAction")?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.commitAndPushTask",
+        args: [{ taskFolderPath: folderPath }],
+      });
     } finally {
+      __extensionContextV1TestOnly.reset();
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
       fsBridge.restore();
@@ -2168,6 +2194,22 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();
     const dispatches: AutomationDispatch[] = [];
+    const backing = new Map<string, unknown>();
+    const memento = {
+      keys: (): readonly string[] => [...backing.keys()],
+      get: <T>(key: string, defaultValue?: T): T | undefined =>
+        backing.has(key) ? (backing.get(key) as T) : defaultValue,
+      update: (key: string, value: unknown): Thenable<void> => {
+        if (value === undefined) { backing.delete(key); } else { backing.set(key, value); }
+        return Promise.resolve();
+      },
+    };
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
     const patches: Patched[] = [
       patch(settingsModule, "isAutoAdvanceEnabled", () => false),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
@@ -2176,12 +2218,23 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       await runPassingReview(folderPath, dispatches, "Readiness: 9/10\n\n- Ready.\n", "impl-low-review");
       const gate = provider
         .getEntries()
-        .find((entry) => entry.message.endsWith("Code reviews passed — advance to Publish when you're ready."));
+        .find((entry) => entry.message.includes("Review passed — advance to Publish when you're ready."));
       assert.ok(gate, "expected the plain gate message");
       assert.match(gate.message, /\(Low-Level Code Review\)/, "expected the task/stage attribution prefix");
-      assert.equal(gate?.actionCommand?.command, "vs-code-ai-helper.nextStage");
+      assert.equal(gate?.actionCommand?.command, "vs-code-ai-helper.openWorkflowDecision");
+      const decision = new WorkflowDecisionStoreV1(memento)
+        .listPending()
+        .find((d) => d.decisionKey.startsWith("chatActionOffer:"));
+      assert.ok(decision, "the chat offers the manual stage advance");
+      assert.equal(decision.options.find((o) => o.optionId === "runAction")?.label, "Complete Stage & Move On");
+      assert.deepEqual(decision.options.find((o) => o.optionId === "runAction")?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.nextStage",
+        args: [{ taskFolderPath: folderPath }],
+      });
       assert.equal(dispatches.length, 0, "the gate message must not advance anything by itself");
     } finally {
+      __extensionContextV1TestOnly.reset();
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
       fsBridge.restore();
@@ -3157,9 +3210,12 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     assert.notEqual(persisted.updatedAt, "2026-01-01T00:00:00.000Z", "updatedAt must be bumped");
 
     const runsDir = path.join(folderPath, "runs");
-    const logs = fs.readdirSync(runsDir).map((entry) =>
-      fs.readFileSync(path.join(runsDir, entry), "utf8")
-    );
+    const logs = fs
+      .readdirSync(runsDir)
+      .filter((entry) => entry.endsWith(".md"))
+      .map((entry) =>
+        fs.readFileSync(path.join(runsDir, entry), "utf8")
+      );
     assert.equal(logs.length, 1);
     assert.match(logs[0]!, /## Provider chain exhausted/);
     assert.match(logs[0]!, /Cline CLI .*— quota exhausted at invocation/);
