@@ -915,7 +915,8 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
  * opencode/claude-opus-5-5 and opencode/gpt-6-* lines were added 2026-09-27
  * from an opencode 1.18.31 capture, without regenerating the rest),
  * 2026-10-21: added GPT-6.1 Sol and Gemini 4 Argon base IDs from the
- * official Console / Go endpoint tables (see audit-2026-10-additions.md).
+ * official Console / Go endpoint tables; 2026-10-26: added the Kimi K3.1 Pro
+ * OpenCode Go base ID from the local CLI listing (see audit-2026-10-additions.md).
  * Their variant ladders await a live capture; empty variants here mean
  * provider defaults, not disabled thinking.
  * Compacted to one minified JSON object per line (only the fields
@@ -1073,6 +1074,8 @@ opencode-go/kimi-k2.7-code
 {"id":"kimi-k2.7-code","providerID":"opencode-go","name":"Kimi K2.7 Code","variants":{}}
 opencode-go/kimi-k3
 {"id":"kimi-k3","providerID":"opencode-go","name":"Kimi K3 (2x usage)","variants":{"max":{}}}
+opencode-go/kimi-k3.1-pro
+{"id":"kimi-k3.1-pro","providerID":"opencode-go","name":"Kimi K3.1 Pro","variants":{}}
 opencode-go/mimo-v2.5
 {"id":"mimo-v2.5","providerID":"opencode-go","name":"MiMo V2.5","variants":{}}
 opencode-go/mimo-v2.5-pro
@@ -1683,11 +1686,13 @@ const SEEDED_CLI_MODELS: Readonly<
   "cline-cli": createSeededClineModels(),
   // Snapshot of `kimi provider list --json`'s "models" map (kimi-code
   // 0.29.2, re-captured 2026-08-03 against the managed `kimi-code` OAuth
-  // provider), run through the real parseKimiModelsOutput (cliModelDiscovery.ts)
+  // provider, with K3.1 additions from the official Kimi Code model docs on
+  // 2026-10-26), run through the real parseKimiModelsOutput (cliModelDiscovery.ts)
   // so the seeded catalog and live discovery share one code path and can't
   // drift in shape. K2.7 Coding / K2.7 Coding Highspeed have no
   // `supportEfforts` (always-on thinking), so they get one entry each; K3 /
-  // K3-256k each expand into a bare entry plus @low/@high/@max variants —
+  // K3-256k and K3.1 Pro / K3.1 Pro Highspeed each expand into a bare entry
+  // plus @low/@high/@max variants —
   // reasoning effort is applied via KIMI_MODEL_THINKING_EFFORT, an
   // operational environment-variable override, not a CLI flag — see
   // parseKimiModelSelection's doc comment in providers.ts.
@@ -1696,7 +1701,9 @@ const SEEDED_CLI_MODELS: Readonly<
     "kimi-code/kimi-for-coding": { "displayName": "K2.7 Coding" },
     "kimi-code/kimi-for-coding-highspeed": { "displayName": "K2.7 Coding Highspeed" },
     "kimi-code/k3-256k": { "displayName": "K3-256k", "supportEfforts": ["low", "high", "max"], "defaultEffort": "high" },
-    "kimi-code/k3": { "displayName": "K3", "supportEfforts": ["low", "high", "max"], "defaultEffort": "high" }
+    "kimi-code/k3": { "displayName": "K3", "supportEfforts": ["low", "high", "max"], "defaultEffort": "high" },
+    "kimi-code/k3.1-pro": { "displayName": "K3.1 Pro", "supportEfforts": ["low", "high", "max"], "defaultEffort": "high" },
+    "kimi-code/k3.1-pro-highspeed": { "displayName": "K3.1 Pro Highspeed", "supportEfforts": ["low", "high", "max"], "defaultEffort": "high" }
   }
 }`),
 };

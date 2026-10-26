@@ -40,3 +40,20 @@ default selections are preserved.
   Sources: https://www.antigravity.google/docs/models/ ;
   https://opencode.ai/v2/docs/console/models/ ;
   https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash .
+
+- Kimi Code CLI: added `kimi-code/k3.1-pro` and
+  `kimi-code/k3.1-pro-highspeed`. The official Kimi Code model table lists
+  both IDs, Low/High/Max effort, High as the default, and thinking as always
+  enabled; Highspeed is a separate, faster model ID. The CLI picker therefore
+  offers each model at its default plus the three supported efforts, without
+  an off-thinking option.
+  Source: https://www.kimi.com/code/docs/en/kimi-code/models .
+- OpenCode Go: added `opencode-go/kimi-k3.1-pro` after the owner confirmed it
+  appears in the local CLI model list. It is seeded as a base selection only;
+  the local CLI wrapper could not be queried under WSL to capture its variant
+  metadata, so live `model.list` discovery supplies variants when available.
+  The current public Go model list still names Kimi K3 but not K3.1 Pro.
+  Source: https://opencode.ai/v2/docs/console/go/ .
+- Copilot remains host-discovered through VS Code's Language Model API, so a
+  Copilot listing appears automatically when GitHub exposes it to the signed-in
+  VS Code account.
