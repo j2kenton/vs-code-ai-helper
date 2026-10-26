@@ -35,8 +35,18 @@ RUN apt-get update \
 # The provider CLIs enabled in the local setup, installed signed-out. Each is
 # signed in once, interactively, on the user's own subscription; the logins
 # persist in /home/dev (a volume).
-RUN npm install -g @anthropic-ai/claude-code @openai/codex opencode-ai \
-  && claude --version && codex --version && opencode --version
+RUN npm install -g --allow-scripts=cline,protobufjs @anthropic-ai/claude-code @openai/codex opencode-ai cline @google/gemini-cli \
+  && claude --version && codex --version && opencode --version && cline --version && gemini --version
+
+# Kimi Code CLI: Moonshot's official installer (a checksum-verified binary),
+# NOT the npm package — that one installs a Windows .cmd shim Ensemble cannot
+# run (see the kimi-cli entry in src/runners/providers.ts). System-wide, so
+# the runner window's PATH finds it. Downloaded to a file first, so a failed
+# or partial download fails the build instead of running half a script.
+RUN curl -fsSL -o /tmp/kimi-install.sh https://code.kimi.com/kimi-code/install.sh \
+  && KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash /tmp/kimi-install.sh \
+  && rm -f /tmp/kimi-install.sh \
+  && kimi --version
 
 # pnpm on the SYSTEM path: the workflow's rounds run `pnpm run …` from the
 # runner's and viewer's VS Code processes, which never read a login profile —

@@ -7,6 +7,8 @@
 #   box viewer        browser-viewer tunnel, opens the viewer in the browser
 #   box tunnel        both tunnels over one connection
 #   box status        one-screen status of every task on the box
+#   box models        each stage's AI models as the runner sees them (on/off,
+#                     which runs first) - checks a settings change has synced
 #   box update [ver]  update every copy of Ensemble on the box (update-ensemble.sh)
 #   box drop-viewers  end every browser-viewer session on the box (frees memory;
 #                     any open viewer tab just reloads)
@@ -78,11 +80,12 @@ switch ($Command) {
       @($VncUrl, (Get-ViewerUrl))
   }
   'status'       { & ssh $BoxHost 'sh ~/status.sh' }
+  'models'       { & ssh $BoxHost 'python3 ~/box-models.py' }
   'update'       { & ssh $BoxHost "~/update-ensemble.sh $($Rest -join ' ')" }
   'drop-viewers' { & ssh $BoxHost 'sh ~/reap-viewers.sh --restart-all' }
   default {
     Get-Content -LiteralPath $PSCommandPath |
-      Select-Object -Skip 2 -First 10 |
+      Select-Object -Skip 2 -First 12 |
       ForEach-Object { $_ -replace '^# ?', '' }
   }
 }
