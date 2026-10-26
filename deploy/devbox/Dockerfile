@@ -35,7 +35,7 @@ RUN apt-get update \
 # The provider CLIs enabled in the local setup, installed signed-out. Each is
 # signed in once, interactively, on the user's own subscription; the logins
 # persist in /home/dev (a volume).
-RUN npm install -g --allow-scripts=cline,protobufjs @anthropic-ai/claude-code @openai/codex opencode-ai cline @google/gemini-cli \
+RUN npm install -g --allow-scripts=cline,protobufjs,@opencode/cli @anthropic-ai/claude-code @openai/codex @opencode/cli cline @google/gemini-cli \
   && claude --version && codex --version && opencode --version && cline --version && gemini --version
 
 # Kimi Code CLI: Moonshot's official installer (a checksum-verified binary),
