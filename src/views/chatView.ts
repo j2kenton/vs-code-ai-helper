@@ -42,7 +42,6 @@ import {
   OwnerEvidenceSubmissionErrorV1,
 } from "../utils/ownerEvidenceV1";
 import { settleChatFreeTextQuestionV1 } from "../utils/chatFreeTextV1";
-import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
 import {
   decodeStructuredAnswersArrayV1,
@@ -1255,28 +1254,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     const identity = this.target;
     const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
-    const confirmed = await askChatChoiceV1({
-      target: identity,
-      decisionKey: "confirmResetChatHistory",
-      whatHappened:
-        `${taskLabel} — Reset Chat History clears this conversation's unresolved questions, after saving a private recovery ` +
-        "snapshot. This cannot be undone from Chat With AI.",
-      whyUserNeeded: "Resetting chat history requires explicit confirmation before clearing unresolved interactions.",
-      options: [
-        {
-          optionId: "reset",
-          label: "Reset Chat History",
-          description: "Save a private recovery snapshot and clear unresolved questions",
-        },
-        {
-          optionId: "cancel",
-          label: "Cancel",
-          description: "Keep the conversation's unresolved questions unchanged",
-        },
-      ],
-      recommendedOptionId: "reset",
-    });
-    if (confirmed !== "reset") {
+    const confirmed = await vscode.window.showWarningMessage(
+      `${taskLabel} — Reset Chat History clears this conversation's unresolved questions, after saving a private recovery ` +
+        "snapshot. This cannot be undone from Chat With AI. Continue?",
+      { modal: true },
+      "Reset Chat History"
+    );
+    if (confirmed !== "Reset Chat History") {
       return;
     }
     const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;

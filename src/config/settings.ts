@@ -949,28 +949,12 @@ export class AutoImplementConfirmationController implements vscode.Disposable {
       : current.transitionsToAuto(previous);
     if (enabledScopes.length === 0) return;
 
-    const target = await resolveGlobalChatTargetOrDefaultV1();
-    const choice = await askChatChoiceV1({
-      decisionKey: "confirmAutoImplementAfterReview",
-      target,
-      whatHappened:
-        "Automatically implement will make real code and file changes after an approved review. Use it only with continuous human supervision.",
-      whyUserNeeded: "Enabling automatic implementation after review requires your confirmation.",
-      options: [
-        {
-          optionId: "enable",
-          label: "Enable",
-          consequence: "Confirms and keeps automatic implementation enabled.",
-        },
-        {
-          optionId: "cancel",
-          label: "Cancel",
-          consequence: "Reverts the automatic-implementation setting change.",
-        },
-      ],
-      detail: "Answering confirms or reverts the automatic-implementation setting.",
-    });
-    if (choice === "enable" || choice === "Enable") {
+    const choice = await vscode.window.showWarningMessage(
+      "Automatically implement will make real code and file changes after an approved review. Use it only with continuous human supervision.",
+      { modal: true },
+      "Enable"
+    );
+    if (choice === "Enable") {
       await this.context.globalState.update(AUTO_IMPLEMENT_CONFIRMED_KEY, true);
       autoImplementConfirmed = true;
       return;

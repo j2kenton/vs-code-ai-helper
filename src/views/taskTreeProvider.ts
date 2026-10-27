@@ -49,8 +49,6 @@ import { buildQuotaRemedyTextV1 } from "../utils/quota";
 import { describeModelWithProviderV1 } from "../runners/providers";
 import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } from "./tooltipInfoTextV1";
 import { getConfiguredTaskRoot, normalizePath } from "../utils/taskRoot";
-import { askChatChoiceV1 } from "../utils/chatChoiceV1";
-import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 import { isEffectivelyPausedSyncV1 } from "../state/effectivePauseStatusV1";
 import {
   formatChecklistItemGlyphV1,
@@ -1643,52 +1641,18 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   };
 
   async chooseStatusFilter(): Promise<void> {
-    const all = this.allStatuses();
-    const globalTarget = await resolveGlobalChatTargetOrDefaultV1();
-    const chosenId = await askChatChoiceV1({
-      target: globalTarget,
-      decisionKey: "chooseTaskStatusFilter",
-      whatHappened: "Filter tasks by status in the Tasks view.",
-      whyUserNeeded: "Select which task statuses to display or toggle an individual status filter.",
-      options: [
-        {
-          optionId: "default",
-          label: "Default (hide archived)",
-          description: "Show all statuses except archived",
-        },
-        {
-          optionId: "all",
-          label: "All statuses (include archived)",
-          description: "Show every task status including archived",
-        },
-        ...all.map(status => ({
-          optionId: status,
-          label: (status[0] ?? "").toUpperCase() + status.slice(1),
-          description:
-            `${this.selectedStatuses.has(status) ? "[Shown] " : "[Hidden] "}` +
-            (TaskTreeProvider.STATUS_DESCRIPTIONS[status] ?? `Toggle ${status} tasks`),
-        })),
-      ],
-      recommendedOptionId: "default",
-    });
-    if (!chosenId) return;
-    if (chosenId === "default") {
-      this.selectedStatuses = new Set(this.defaultStatuses());
-    } else if (chosenId === "all") {
-      this.selectedStatuses = new Set(all);
-    } else if (all.includes(chosenId)) {
-      const next = new Set(this.selectedStatuses);
-      if (next.has(chosenId)) {
-        next.delete(chosenId);
-      } else {
-        next.add(chosenId);
-      }
-      this.selectedStatuses = next;
-    } else {
-      return;
-    }
+    const picked = await vscode.window.showQuickPick(
+      this.allStatuses().map(status => ({
+        label: (status[0] ?? "").toUpperCase() + status.slice(1),
+        description: TaskTreeProvider.STATUS_DESCRIPTIONS[status],
+        picked: this.selectedStatuses.has(status),
+      })),
+      { canPickMany: true, title: "Filter tasks by status", placeHolder: "Select the task statuses to show" }
+    );
+    if (!picked) return;
+    this.selectedStatuses = new Set(picked.map(item => item.label.toLowerCase()));
     await this.state?.update(this.filterKey, [...this.selectedStatuses]);
-    await this.state?.update(this.filterKnownStatusesKey, all);
+    await this.state?.update(this.filterKnownStatusesKey, this.allStatuses());
     this.scheduleTreeRefreshV1();
   }
 

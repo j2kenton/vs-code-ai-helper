@@ -655,12 +655,9 @@ void describe("pin/unpin bump updatedAt (wf10 item 8 completion blocker)", () =>
     const ws = installWorkspaceFoldersStub();
     const rf = installReadFileBridge();
     const msgs = installMessageCapture();
-    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-    const chatFreeTextMod = require("../utils/chatFreeTextV1") as {
-      askChatFreeTextV1: () => Promise<string | undefined>;
-    };
-    const origAskFreeText = chatFreeTextMod.askChatFreeTextV1;
-    chatFreeTextMod.askChatFreeTextV1 = (): Promise<string> => Promise.resolve("renamed name");
+    const win = vscode.window as unknown as { showInputBox: (...args: unknown[]) => unknown };
+    const origInputBox = win.showInputBox;
+    win.showInputBox = (): Promise<string> => Promise.resolve("renamed name");
 
     try {
       await renameTask(inv, { taskFolderPath: folder });
@@ -672,7 +669,7 @@ void describe("pin/unpin bump updatedAt (wf10 item 8 completion blocker)", () =>
         "renaming is a user-visible change and must bump updatedAt"
       );
     } finally {
-      chatFreeTextMod.askChatFreeTextV1 = origAskFreeText;
+      win.showInputBox = origInputBox;
       msgs.restore();
       rf.restore();
       ws.restore();

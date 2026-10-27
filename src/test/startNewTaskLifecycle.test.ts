@@ -24,7 +24,6 @@ import {
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
-import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../commands/openGeneralAssistant";
 import { safeRemoveDir } from "./testFsUtils";
 
 function installConfigStub(configuredTaskRoot: string): { restore: () => void } {
@@ -141,8 +140,10 @@ function installHarness(extraWorkspaceRoots: readonly string[] = []): Harness {
   };
   (vscode.window as unknown as Record<string, unknown>).showInformationMessage = () =>
     Promise.resolve(undefined);
-  // Keep a defensive popup stub so these lifecycle tests fail if a future
-  // change reintroduces a hidden workspace question.
+  // With more than one workspace folder, startNewTask prompts a QuickPick for
+  // which folder the new task belongs to. Always pick the first (primary)
+  // folder deterministically so multi-root tests exercise "creating in one
+  // folder while another folder's meta root already has an active task".
   (vscode.window as unknown as Record<string, unknown>).showQuickPick = (
     items: ReadonlyArray<{ folder: vscode.WorkspaceFolder }>
   ): Promise<{ folder: vscode.WorkspaceFolder } | undefined> => Promise.resolve(items[0]);
@@ -168,51 +169,6 @@ function installHarness(extraWorkspaceRoots: readonly string[] = []): Harness {
 }
 
 void describe("startNewTask — active/paused lifecycle", () => {
-  void it("asks in Global Assistant chat which workspace should own a new task", async () => {
-    const extraRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-start-new-task-extra-"));
-    const harness = installHarness([extraRoot]);
-    const memento = makeMemento();
-    __extensionContextV1TestOnly.set({
-      subscriptions: [], extensionUri: vscode.Uri.file(harness.workspaceRoot),
-      workspaceState: memento, globalState: memento,
-    } as unknown as vscode.ExtensionContext);
-    const win = vscode.window as unknown as Record<string, unknown>;
-    const originalQuickPick = win.showQuickPick;
-    win.showQuickPick = (): never => { throw new Error("workspace questions must not use a popup"); };
-    try {
-      assert.equal(await startNewTask(
-        harness.inventory,
-        vscode.Uri.file(harness.workspaceRoot),
-        harness.currentTaskStore
-      ), undefined);
-      const decision = new WorkflowDecisionStoreV1(memento).listPending()
-        .find((item) => item.decisionKey === "chooseWorkspaceForNewTask");
-      assert.ok(decision);
-      assert.equal(decision.taskCanonicalId, GLOBAL_ASSISTANT_CANONICAL_ID);
-      const option = decision.options.find((item) => item.consequence.includes(extraRoot));
-      assert.ok(option);
-      assert.deepEqual(option.effect, {
-        kind: "command",
-        command: "vs-code-ai-helper.startNewTask",
-        args: [{ workspaceFolderPath: extraRoot }],
-      });
-
-      const created = await startNewTask(
-        harness.inventory,
-        vscode.Uri.file(harness.workspaceRoot),
-        harness.currentTaskStore,
-        undefined,
-        { workspaceFolderPath: extraRoot }
-      );
-      assert.ok(created);
-      assert.ok(fs.existsSync(path.join(extraRoot, ".ensemble", created, "task.md")));
-    } finally {
-      win.showQuickPick = originalQuickPick;
-      __extensionContextV1TestOnly.reset();
-      harness.restore();
-    }
-  });
-
   void it("does not create a task when the extension folder disappeared before loading its template", async () => {
     const harness = installHarness();
     const fsApi = vscode.workspace.fs as unknown as Record<string, unknown>;
@@ -317,9 +273,7 @@ void describe("startNewTask — active/paused lifecycle", () => {
         folderName = await startNewTask(
           harness.inventory,
           vscode.Uri.file(harness.workspaceRoot),
-          harness.currentTaskStore,
-          undefined,
-          { workspaceFolderPath: harness.workspaceRoot }
+          harness.currentTaskStore
         );
       } finally {
         __extensionContextV1TestOnly.reset();
@@ -383,9 +337,7 @@ void describe("startNewTask — active/paused lifecycle", () => {
       const folderName = await startNewTask(
         harness.inventory,
         vscode.Uri.file(harness.workspaceRoot),
-        harness.currentTaskStore,
-        undefined,
-        { workspaceFolderPath: harness.workspaceRoot }
+        harness.currentTaskStore
       );
       assert.ok(folderName);
 

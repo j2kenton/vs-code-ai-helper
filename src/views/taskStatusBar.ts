@@ -21,8 +21,6 @@ import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } fr
 import { normalizePath } from "../utils/taskRoot";
 import { isEffectivelyPausedSyncV1, isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
-import { askChatChoiceV1 } from "../utils/chatChoiceV1";
-import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 
 /**
  * Status bar item that shows the persisted current task from CurrentTaskStore.
@@ -440,33 +438,10 @@ export class TaskStatusBar implements vscode.Disposable {
       command: "vs-code-ai-helper.startNewTask",
     });
 
-    const target = taskToShow
-      ? {
-          canonicalId: taskToShow.canonicalId ?? normalizePath(taskToShow.folderUri.fsPath),
-          taskFolderPath: taskToShow.folderUri.fsPath,
-          stage: taskToShow.progress.currentStage,
-          taskName: taskToShow.progress.displayName ?? taskToShow.folderName,
-        }
-      : await resolveGlobalChatTargetOrDefaultV1();
-
-    const chosenId = await askChatChoiceV1({
-      target,
-      decisionKey: "taskStatusBarMenu",
-      whatHappened: "Ensemble Actions: select an action to perform.",
-      whyUserNeeded: "Choose a status bar action for the current task or create a new task.",
-      options: items.map((item, index) => ({
-        optionId: `action_${index}`,
-        label: item.label,
-        description: [item.description, item.detail].filter(Boolean).join(" — ") || undefined,
-      })),
-      recommendedOptionId: "action_0",
+    const selected = await vscode.window.showQuickPick(items, {
+      title: "Ensemble Actions",
+      placeHolder: "Select an action to perform",
     });
-
-    const chosenIndex =
-      chosenId !== undefined && chosenId.startsWith("action_")
-        ? Number.parseInt(chosenId.slice("action_".length), 10)
-        : Number.NaN;
-    const selected = Number.isInteger(chosenIndex) ? items[chosenIndex] : undefined;
 
     if (selected) {
       void vscode.commands.executeCommand(selected.command, selected.arg);

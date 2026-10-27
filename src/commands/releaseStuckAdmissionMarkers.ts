@@ -19,8 +19,6 @@ import {
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
-import { askChatChoiceV1 } from "../utils/chatChoiceV1";
-import { resolveGlobalChatTargetV1 } from "../utils/globalChatTargetV1";
 import type { ChatTarget } from "../views/chatView";
 
 export const RELEASE_STUCK_ADMISSION_STALE_MS_V1 = 20 * 60 * 1000;
@@ -505,32 +503,13 @@ export async function releaseStuckAdmissionMarkers(): Promise<void> {
     .map((m) => `  - ${m.workspaceRelativePath} (${Math.round((now - m.mtimeMs) / 60000)} min old)`)
     .join("\n");
 
-  const target = await resolveGlobalChatTargetV1();
-  const choice = target
-    ? await askChatChoiceV1({
-        decisionKey: "releaseStuckAdmissionMarkers",
-        target,
-        whatHappened: `Found ${staleMarkers.length} stale admission marker(s) (last renewed >20 min ago).\n\n${markerList}`,
-        whyUserNeeded: "Deleting marker files can let another operation take over; only stale markers are offered.",
-        options: [
-          {
-            optionId: "deleteAll",
-            label: "Delete All",
-            consequence: "Deletes only the validated, stale marker files listed above.",
-          },
-          {
-            optionId: "cancel",
-            label: "Cancel",
-            consequence: "Leaves every marker file in place.",
-          },
-        ],
-        recommendedOptionId: "cancel",
-        recommendationReasoning: "Delete only when no task operation is still running.",
-        detail: "Answering continues this command; cancel changes nothing.",
-      })
-    : undefined;
+  const choice = await vscode.window.showWarningMessage(
+    `Found ${staleMarkers.length} stale admission marker(s) (last renewed >20 min ago).\n\n${markerList}\n\nDelete them to unblock stuck task operations?`,
+    "Delete All",
+    "Cancel"
+  );
 
-  if (choice !== "deleteAll") {
+  if (choice !== "Delete All") {
     return;
   }
 
