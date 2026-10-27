@@ -67,9 +67,9 @@ void describe("AI consent under automation", () => {
       assert.ok(notices.some((n) => /AI consent has not been given/.test(n)), "the refusal is visible");
 
       const attended = await ensureAiConsent(emptyContext);
-      assert.equal(attended, false, "dismissing the chat decision still declines");
-      assert.equal(modalCalls, 0, "first-use consent asks in global chat, never a modal");
-      assert.equal(chatChoiceCalls, 1, "a human-driven call asks in global chat");
+      assert.equal(attended, false, "dismissing the consent dialog still declines");
+      assert.equal(modalCalls, 1, "a human-driven call shows the first-use consent modal");
+      assert.equal(chatChoiceCalls, 0, "first-use consent is a modal, never a chat card");
     } finally {
       chatChoiceModule.askChatChoiceV1 = originalAskChoice;
       vscode.window.showWarningMessage = original;

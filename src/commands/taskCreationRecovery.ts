@@ -15,7 +15,6 @@ import { runTrackedOperation } from "../utils/taskOperations";
 import { ensureAutomaticMetaGitIgnore } from "./toggleMetaResourcesGitIgnore";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
-import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import {
   commitCreationSentinelV1,
   loadTaskCreationJournalV1,
@@ -152,29 +151,12 @@ export async function retryTaskCreation(
   const taskFolderUri = task.folderUri;
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
 
-  const readForConfirm = await readTaskProgressStrictV1(taskFolderUri, {
-    expectedTaskFolder: taskFolderName,
-  });
-  const confirmTarget = {
-    canonicalId: normalizePath(taskFolderPath),
-    taskFolderPath,
-    stage: readForConfirm.ok ? readForConfirm.decoded.progress.currentStage : "desc",
-    taskName: readForConfirm.ok ? readForConfirm.decoded.progress.displayName ?? folderName : folderName,
-  };
-  const confirmation = await askChatChoiceV1({
-    decisionKey: "confirmRetryTaskCreation",
-    target: confirmTarget,
-    whatHappened: `Retry creating "${folderName}"? This writes task.md and marks the task ready to use.`,
-    whyUserNeeded: "The task creation was interrupted; retrying finishes it.",
-    options: [
-      { optionId: "retry", label: "Retry", consequence: "Writes task.md and marks the task ready to use." },
-      { optionId: "cancel", label: "Cancel", consequence: "Leaves the incomplete task folder unchanged." },
-    ],
-    recommendedOptionId: "retry",
-    recommendationReasoning: "The folder already passed a verified-creation check.",
-    detail: "Answering continues this command; cancel leaves the task as-is.",
-  });
-  if (confirmation !== "retry") {
+  const confirmation = await vscode.window.showWarningMessage(
+    `Retry creating "${folderName}"? This writes task.md and marks the task ready to use.`,
+    { modal: true },
+    "Retry"
+  );
+  if (confirmation !== "Retry") {
     return false;
   }
 
@@ -464,29 +446,12 @@ export async function adoptAndRetryTaskCreation(
   const taskFolderUri = task.folderUri;
   const taskFileUri = vscode.Uri.joinPath(taskFolderUri, TASK_FILENAME);
 
-  const readForConfirm = await readTaskProgressStrictV1(taskFolderUri, {
-    expectedTaskFolder: taskFolderName,
-  });
-  const confirmTarget = {
-    canonicalId: normalizePath(taskFolderPath),
-    taskFolderPath,
-    stage: readForConfirm.ok ? readForConfirm.decoded.progress.currentStage : "desc",
-    taskName: readForConfirm.ok ? readForConfirm.decoded.progress.displayName ?? folderName : folderName,
-  };
-  const confirmation = await askChatChoiceV1({
-    decisionKey: "confirmAdoptAndRetryTaskCreation",
-    target: confirmTarget,
-    whatHappened: `Adopt and retry creating "${folderName}"? Your existing task.md will be preserved exactly as-is and the task marked ready to use.`,
-    whyUserNeeded: "The folder looks like a task but was not created by Ensemble; adoption preserves your task.md.",
-    options: [
-      { optionId: "adopt", label: "Adopt and Retry", consequence: "Preserves task.md and marks the task ready to use." },
-      { optionId: "cancel", label: "Cancel", consequence: "Leaves the folder unchanged." },
-    ],
-    recommendedOptionId: "adopt",
-    recommendationReasoning: "Your existing task.md is preserved exactly as-is.",
-    detail: "Answering continues this command; cancel leaves the task as-is.",
-  });
-  if (confirmation !== "adopt") {
+  const confirmation = await vscode.window.showWarningMessage(
+    `Adopt and retry creating "${folderName}"? Your existing task.md will be preserved exactly as-is and the task marked ready to use.`,
+    { modal: true },
+    "Adopt and Retry"
+  );
+  if (confirmation !== "Adopt and Retry") {
     return false;
   }
   const confirmationReceiptId = allocateHex128IdV1();
@@ -793,29 +758,12 @@ export async function safeDeleteFailedTaskCreation(
     return false;
   }
 
-  const readForConfirm = await readTaskProgressStrictV1(taskFolderUri, {
-    expectedTaskFolder: taskFolderName,
-  });
-  const confirmTarget = {
-    canonicalId: normalizePath(taskFolderPath),
-    taskFolderPath,
-    stage: readForConfirm.ok ? readForConfirm.decoded.progress.currentStage : "desc",
-    taskName: readForConfirm.ok ? readForConfirm.decoded.progress.displayName ?? folderName : folderName,
-  };
-  const confirmation = await askChatChoiceV1({
-    decisionKey: "confirmSafeDeleteFailedTaskCreation",
-    target: confirmTarget,
-    whatHappened: `Permanently delete the incomplete task folder for "${folderName}"? This cannot be undone.`,
-    whyUserNeeded: "Deleting the folder removes the incomplete task and its files.",
-    options: [
-      { optionId: "delete", label: "Delete", consequence: "Permanently deletes the incomplete task folder.", destructive: true },
-      { optionId: "cancel", label: "Cancel", consequence: "Leaves the folder unchanged." },
-    ],
-    recommendedOptionId: "cancel",
-    recommendationReasoning: "Deletion is permanent; confirm only if the folder is no longer needed.",
-    detail: "Answering continues this command; cancel leaves the task as-is.",
-  });
-  if (confirmation !== "delete") {
+  const confirmation = await vscode.window.showWarningMessage(
+    `Permanently delete the incomplete task folder for "${folderName}"? This cannot be undone.`,
+    { modal: true },
+    "Delete"
+  );
+  if (confirmation !== "Delete") {
     return false;
   }
   const confirmationReceiptId = allocateHex128IdV1();

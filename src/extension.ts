@@ -46,7 +46,6 @@ import {
   HOST_NOTIFICATION_MIRROR_FILENAME_V1,
 } from "./services/hostNotificationMirrorV1";
 import { notifyChatHistoryChangedExternallyV1, settleChatInteraction } from "./utils/chatHistoryStore";
-import { askChatFreeTextV1 } from "./utils/chatFreeTextV1";
 import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
@@ -127,11 +126,11 @@ import { registerApplyReviewerVerifiedTicksCommands } from "./commands/applyRevi
 import { registerPlanRevisionCommandsV1 } from "./commands/planRevisionV1";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
+import { askChatChoiceV1 } from "./utils/chatChoiceV1";
+import { resolveGlobalChatTargetOrDefaultV1 } from "./utils/globalChatTargetV1";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
 import { recoverRevertJournals } from "./utils/artifactRevertJournal";
-import { askChatChoiceV1 } from "./utils/chatChoiceV1";
-import { resolveGlobalChatTargetOrDefaultV1 } from "./utils/globalChatTargetV1";
 import { registerConditionalWriteSaveGuardV1 } from "./utils/fileUtils";
 import {
   ensureAutomaticMetaGitIgnore,
@@ -986,32 +985,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         NotificationRouter.showWarning("Select a task first — the action runs on the runner for the current task.");
         return;
       }
-      const currentTask = inventory
-        .getTasks()
-        .find((t) => t.canonicalId === currentTaskCanonicalId || t.taskFolderPath === currentTaskCanonicalId);
-      const chatTarget = currentTask
-        ? {
-            canonicalId: currentTask.canonicalId,
-            taskFolderPath: currentTask.taskFolderPath,
-            stage: currentTask.progress.currentStage,
-            taskName: currentTask.progress.displayName ?? currentTask.folderName,
-          }
-        : await resolveGlobalChatTargetOrDefaultV1();
-      const pickedCommand = await askChatChoiceV1({
-        target: chatTarget,
-        decisionKey: "runOnRunnerAction",
-        whatHappened: "Choose an action to run on the runner for the current task.",
-        whyUserNeeded: "This viewer window forwards workflow actions to the runner host.",
-        options: RUN_ON_RUNNER_ACTIONS_V1.map((action) => ({
-          optionId: action.command,
-          label: action.label,
-        })),
-        recommendedOptionId: RUN_ON_RUNNER_ACTIONS_V1[0]?.command,
-      });
-      if (pickedCommand === undefined) {
+      const picked = await vscode.window.showQuickPick(
+        RUN_ON_RUNNER_ACTIONS_V1.map((action) => ({ label: action.label, command: action.command })),
+        { placeHolder: "Run on the runner for the current task" }
+      );
+      if (picked === undefined) {
         return;
       }
-      await forwardCommandToRunner(pickedCommand, currentTaskCanonicalId);
+      await forwardCommandToRunner(picked.command, currentTaskCanonicalId);
     })
   );
 
@@ -1532,13 +1513,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     taskTreeProvider.onDidLoadTasks(refreshTasksSearchBanner),
     statusTreeProvider.onDidChangeTreeData(refreshNotificationsSearchBanner),
     vscode.commands.registerCommand("vs-code-ai-helper.searchTasks", async () => {
-      const globalTarget = await resolveGlobalChatTargetOrDefaultV1();
-      const currentQuery = taskTreeProvider.getSearchQuery();
-      const query = await askChatFreeTextV1({
-        target: globalTarget,
-        prompt:
-          "Search tasks: enter words to filter by name, folder, or stage (submit empty text to clear the filter).",
-        placeHolder: currentQuery || "Search tasks...",
+      const query = await vscode.window.showInputBox({
+        title: "Search tasks",
+        prompt: "Show only tasks matching every word (name, folder or stage). Leave empty to clear.",
+        value: taskTreeProvider.getSearchQuery(),
       });
       // Esc leaves the current query untouched; an empty submit clears it.
       if (query === undefined) return;
@@ -1546,13 +1524,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("vs-code-ai-helper.clearTasksSearch", () => applyTasksSearch("")),
     vscode.commands.registerCommand("vs-code-ai-helper.searchNotifications", async () => {
-      const globalTarget = await resolveGlobalChatTargetOrDefaultV1();
-      const currentQuery = statusTreeProvider.getSearchQuery();
-      const query = await askChatFreeTextV1({
-        target: globalTarget,
-        prompt:
-          "Search notifications: enter words to show only matching notifications (submit empty text to clear the filter).",
-        placeHolder: currentQuery || "Search notifications...",
+      const query = await vscode.window.showInputBox({
+        title: "Search notifications",
+        prompt: "Show only notifications containing every word. Leave empty to clear.",
+        value: statusTreeProvider.getSearchQuery(),
       });
       if (query === undefined) return;
       await applyNotificationsSearch(query);

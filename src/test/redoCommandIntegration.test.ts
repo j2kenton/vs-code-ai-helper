@@ -34,47 +34,7 @@ import {
   deactivateNotificationRouter,
   initNotificationRouter,
 } from "../utils/notificationRouter";
-import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
-import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { safeRemoveDir } from "./testFsUtils";
-
-function installAutoConfirmDecisions(): { restore: () => void } {
-  const backing = new Map<string, unknown>();
-  const memento: vscode.Memento = {
-    keys: () => [...backing.keys()],
-    get: <T>(key: string, defaultValue?: T): T | undefined => backing.has(key) ? (backing.get(key) as T) : defaultValue,
-    update: (key: string, value: unknown): Thenable<void> => {
-      if (value === undefined) backing.delete(key);
-      else backing.set(key, value);
-      return Promise.resolve();
-    },
-  };
-  __extensionContextV1TestOnly.set({
-    subscriptions: [],
-    extensionUri: vscode.Uri.file(os.tmpdir()),
-    workspaceState: memento,
-    globalState: memento,
-  } as unknown as vscode.ExtensionContext);
-  const store = new WorkflowDecisionStoreV1(memento);
-  const sub = store.onDidChange(() => {
-    setImmediate(() => {
-      for (const pending of store.listPending()) {
-        if (
-          pending.decisionKey === "confirmRevertStageChanges" ||
-          pending.decisionKey === "confirmRedoStageChanges"
-        ) {
-          void store.resolve(pending.decisionId, "confirm");
-        }
-      }
-    });
-  });
-  return {
-    restore: (): void => {
-      sub.dispose();
-      __extensionContextV1TestOnly.reset();
-    },
-  };
-}
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
@@ -255,7 +215,8 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
 
       const surface = new RecordingSurface();
       initNotificationRouter(surface);
-      const autoConfirm = installAutoConfirmDecisions();
+      const originalShowWarningMessage = vscode.window.showWarningMessage;
+      vscode.window.showWarningMessage = ((): Promise<string> => Promise.resolve("Revert Changes")) as unknown as typeof vscode.window.showWarningMessage;
       const node = fakeNode(folderUri, "task_1");
       try {
         await vscode.commands.executeCommand("vs-code-ai-helper.revertStageChanges", node);
@@ -270,7 +231,7 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
         // refusal forever.
         assert.equal(fs.existsSync(redoSidecarUri(artifact).fsPath), false);
       } finally {
-        autoConfirm.restore();
+        vscode.window.showWarningMessage = originalShowWarningMessage;
         deactivateNotificationRouter();
         safeRemoveDir(folderPath);
       }
@@ -288,7 +249,9 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
 
       const surface = new RecordingSurface();
       initNotificationRouter(surface);
-      const autoConfirm = installAutoConfirmDecisions();
+      const originalShowWarningMessage = vscode.window.showWarningMessage;
+      vscode.window.showWarningMessage = ((_msg: string, _opts: unknown, label: string): Promise<string> =>
+        Promise.resolve(label)) as unknown as typeof vscode.window.showWarningMessage;
       const node = fakeNode(folderUri, "task_1");
       try {
         await vscode.commands.executeCommand("vs-code-ai-helper.revertStageChanges", node);
@@ -311,7 +274,7 @@ void describe("revertStageChanges / redoStageChanges — registered-command safe
         });
         assert.equal(afterRedo?.direction, "applied");
       } finally {
-        autoConfirm.restore();
+        vscode.window.showWarningMessage = originalShowWarningMessage;
         deactivateNotificationRouter();
         safeRemoveDir(folderPath);
       }

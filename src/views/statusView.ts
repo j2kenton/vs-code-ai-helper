@@ -9,8 +9,6 @@ import { formatTimestampForDisplay } from "../utils/timeFormat";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { REVIEW_TARGETS } from "../utils/reviewReadiness";
 import { describeModelWithProviderV1 } from "../runners/providers";
-import { askChatChoiceV1 } from "../utils/chatChoiceV1";
-import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 import { recordStageActionTerminalOutcomeV1 } from "../utils/stageActionRefusalV1";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
@@ -312,45 +310,20 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
   }
 
   /**
-   * Chat choice for filtering notifications by type (info / warning / error).
+   * QuickPick for filtering notifications by type (info / warning / error).
    * Running-operation rows are never filtered out.
    */
   async chooseLevelFilter(): Promise<void> {
-    const globalTarget = await resolveGlobalChatTargetOrDefaultV1();
-    const chosenId = await askChatChoiceV1({
-      target: globalTarget,
-      decisionKey: "chooseNotificationLevelFilter",
-      whatHappened: "Filter notifications by type in the Notifications view.",
-      whyUserNeeded: "Select which notification types to display or toggle an individual type.",
-      options: [
-        {
-          optionId: "all",
-          label: "All notification types",
-          description: "Show info, warning, and error notifications",
-        },
-        ...ALL_LEVELS.map((level) => ({
-          optionId: level,
-          label: level[0]!.toUpperCase() + level.slice(1),
-          description: `${this.levelFilter.has(level) ? "[Shown]" : "[Hidden]"} Toggle ${level} notifications`,
-        })),
-      ],
-      recommendedOptionId: "all",
-    });
-    if (!chosenId) return;
-    if (chosenId === "all") {
-      this.levelFilter = new Set(ALL_LEVELS);
-    } else if ((ALL_LEVELS as readonly string[]).includes(chosenId)) {
-      const level = chosenId as StatusEntry["level"];
-      const next = new Set(this.levelFilter);
-      if (next.has(level)) {
-        next.delete(level);
-      } else {
-        next.add(level);
-      }
-      this.levelFilter = next.size === 0 ? new Set(ALL_LEVELS) : next;
-    } else {
-      return;
-    }
+    const picked = await vscode.window.showQuickPick(
+      ALL_LEVELS.map((level) => ({
+        label: level[0]!.toUpperCase() + level.slice(1),
+        picked: this.levelFilter.has(level),
+        level,
+      })),
+      { canPickMany: true, title: "Filter notifications by type", placeHolder: "Select the notification types to show" }
+    );
+    if (!picked) return;
+    this.levelFilter = picked.length === 0 ? new Set(ALL_LEVELS) : new Set(picked.map((item) => item.level));
     await this.state?.update(LEVEL_FILTER_STATE_KEY, [...this.levelFilter]);
     this.refresh();
   }

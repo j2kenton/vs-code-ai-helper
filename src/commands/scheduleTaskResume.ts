@@ -10,7 +10,6 @@ import {
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import {
   clearStageActionRefusalReasonV1,
@@ -2710,16 +2709,9 @@ export async function scheduleTaskResume(
   const resolverArg = arg?.task ? { taskFolderPath: arg.task.folderUri.fsPath } : arg && (arg.canonicalId || arg.taskFolderPath) ? { canonicalId: arg.canonicalId, taskFolderPath: arg.taskFolderPath } : undefined;
   const task = await resolveTaskContext(inventory, resolverArg, { allowPaused: false });
   if (!task) return;
-  const defaultIso = new Date(clock.now() + LEASE_DURATION_MS).toISOString();
-  const value = await askChatFreeTextV1({
-    target: {
-      canonicalId: task.canonicalId,
-      taskFolderPath: task.taskFolderPath,
-      stage: task.progress.currentStage,
-      taskName: task.progress.displayName ?? task.folderName,
-    },
-    prompt: `Schedule current-stage action (enter an ISO date/time, e.g. ${defaultIso}).`,
-    placeHolder: defaultIso,
+  const value = await vscode.window.showInputBox({
+    prompt: "Schedule current-stage action (ISO date/time)",
+    value: new Date(clock.now() + LEASE_DURATION_MS).toISOString(),
   });
   const runAt = value ? new Date(value.trim()) : undefined;
   if (!runAt || Number.isNaN(runAt.getTime()) || runAt.getTime() <= clock.now()) {

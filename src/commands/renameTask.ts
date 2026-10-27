@@ -12,7 +12,6 @@ import { parseTaskDocument } from "../utils/taskDescriptionDocument";
 import { TaskNode } from "../views/taskTreeProvider";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
 import { formatNotificationTaskLabelV1, notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { ensureAiConsent } from "../utils/aiConsent";
@@ -159,25 +158,13 @@ export async function renameTask(
   if (!task) return;
   if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;
 
-  const currentDisplayName = suggestedName ?? task.progress.displayName ?? task.folderName;
-  const rawName = await askChatFreeTextV1({
-    target: {
-      canonicalId: task.canonicalId,
-      taskFolderPath: task.taskFolderPath,
-      stage: task.progress.currentStage,
-      taskName: task.progress.displayName ?? task.folderName,
-    },
-    prompt: `Enter a new name for task "${currentDisplayName}".`,
-    placeHolder: currentDisplayName,
+  const name = await vscode.window.showInputBox({
+    prompt: "Task name",
+    value: suggestedName ?? task.progress.displayName ?? task.folderName,
+    validateInput: (value) =>
+      value.trim() ? undefined : "Task name cannot be blank.",
   });
-  if (rawName === undefined) return;
-  const name = rawName.trim();
-  if (!name) {
-    NotificationRouter.showWarning(
-      `${formatNotificationTaskLabelV1(task.progress.displayName, task.taskFolderPath)} — Task name cannot be blank.`
-    );
-    return;
-  }
+  if (name === undefined) return;
 
   // The input box can sit open for as long as the user likes, so a Task
   // Description run may have started meanwhile — re-check for the

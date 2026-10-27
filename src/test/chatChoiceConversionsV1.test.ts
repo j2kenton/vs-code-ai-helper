@@ -1,9 +1,15 @@
 /**
- * Owner rule (2026-09-29): every question Ensemble asks is asked in the chat
- * panel, never a QuickPick/input box/modal. This pins Part 2 Step 12's
- * conversion of review, recovery, retained-prompt and artifact choices:
- * each command awaits a chat decision and then continues its own operation
- * with the answer (the effect is `doNothing`, so no second command runs).
+ * Where Ensemble asks the user something (owner rule, 2026-10-26, which
+ * narrows the 2026-09-29 "everything in the chat" rule):
+ *
+ *  - A question the workflow itself raises (a round, a review, automation)
+ *    is asked in the chat panel and awaited there.
+ *  - A picker, search box, filter, rename, or "are you sure?" for something
+ *    the user just clicked in this window stays a pop-up (QuickPick, input
+ *    box, modal). Moving those into the chat made every search and filter a
+ *    round trip through a chat card.
+ *
+ * This pins both halves for the call sites the 2026-10-25 conversion touched.
  */
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
@@ -16,44 +22,29 @@ function read(relativePath: string): string {
   return fs.readFileSync(path.join(SRC, relativePath), "utf8");
 }
 
-void describe("Step 12 choices are asked in chat", () => {
-  const converted: Array<{ file: string; decisionKeys: readonly string[] }> = [
-    { file: "commands/viewArtifacts.ts", decisionKeys: ["viewTaskArtifact", "viewPlanArtifact"] },
-    { file: "commands/openRetainedPromptV1.ts", decisionKeys: ["openRetainedPromptTask", "openRetainedPromptRound"] },
-    { file: "commands/retryReviewWithBackupV1.ts", decisionKeys: ["chooseReviewRetryModel"] },
-    { file: "commands/viewStageChanges.ts", decisionKeys: ["confirmRevertStageChanges", "confirmRedoStageChanges"] },
-    { file: "commands/releaseStuckAdmissionMarkers.ts", decisionKeys: ["releaseStuckAdmissionMarkers"] },
+void describe("workflow questions are asked in chat", () => {
+  const inChat: Array<{ file: string; decisionKeys: readonly string[] }> = [
     { file: "commands/chatWithStage.ts", decisionKeys: ["confirmBlockerSupersessionEdit"] },
     { file: "commands/settleChecklistItem.ts", decisionKeys: ["settleChecklistPickItem", "settleChecklistPickMode"] },
-    {
-      file: "commands/taskCreationRecovery.ts",
-      decisionKeys: [
-        "confirmRetryTaskCreation",
-        "confirmAdoptAndRetryTaskCreation",
-        "confirmSafeDeleteFailedTaskCreation",
-      ],
-    },
-    { file: "utils/aiConsent.ts", decisionKeys: ["firstUseAiConsent"] },
-    { file: "config/settings.ts", decisionKeys: ["reconcileWorkspaceSettings", "confirmAutoImplementAfterReview"] },
-    { file: "views/settingsView.ts", decisionKeys: ["clearLeftoverTaskModelOverrides"] },
-    { file: "utils/metaResourcesMigration.ts", decisionKeys: ["offerMetaResourcesMigration"] },
     { file: "utils/promptSizeGuard.ts", decisionKeys: ["confirmLargePromptSize"] },
-    { file: "utils/resolveTaskContext.ts", decisionKeys: ["resolveTaskWorkspaceOwnership", "bindTaskWorkspaceFolder"] },
-    { file: "utils/pickTaskFolder.ts", decisionKeys: ["pickTaskFolder"] },
     { file: "commands/runLintingFixes.ts", decisionKeys: ["confirmNonGitLintingFixes", "confirmDirtyWorkspaceLintingFixes"] },
-    { file: "utils/reopenTask.ts", decisionKeys: ["pickReopenStage"] },
+    // Answering a review-failure card leads here, and on the cloud box that
+    // answer runs on the runner, where a picker would open unseen.
+    { file: "commands/retryReviewWithBackupV1.ts", decisionKeys: ["chooseReviewRetryModel"] },
+    // The assistant proposed the action in the chat (relayed to the runner on
+    // the cloud box), so its confirmation is answered there too.
     { file: "utils/globalAssistantActions.ts", decisionKeys: ["confirmGlobalAssistantAction"] },
-    { file: "views/taskTreeProvider.ts", decisionKeys: ["chooseTaskStatusFilter"] },
-    { file: "views/statusView.ts", decisionKeys: ["chooseNotificationLevelFilter"] },
-    { file: "views/taskStatusBar.ts", decisionKeys: ["taskStatusBarMenu"] },
+    // Raised at activation or by automation (on the cloud box, on the
+    // unattended runner), not by a click in this window.
+    { file: "utils/resolveTaskContext.ts", decisionKeys: ["resolveTaskWorkspaceOwnership", "bindTaskWorkspaceFolder"] },
+    { file: "utils/metaResourcesMigration.ts", decisionKeys: ["offerMetaResourcesMigration"] },
   ];
 
-  for (const { file, decisionKeys } of converted) {
-    void it(`${file} has no pop-up picker and posts its choices in chat`, () => {
+  for (const { file, decisionKeys } of inChat) {
+    void it(`${file} asks its workflow question in chat`, () => {
       const source = read(file);
       assert.doesNotMatch(source, /vscode\.window\.showQuickPick/);
       assert.doesNotMatch(source, /vscode\.window\.showInputBox/);
-      assert.doesNotMatch(source, /vscode\.window\.showWarningMessage/);
       assert.match(source, /askChatChoiceV1/);
       for (const decisionKey of decisionKeys) {
         assert.ok(source.includes(decisionKey), `${decisionKey} must be asked in the chat`);
@@ -61,37 +52,27 @@ void describe("Step 12 choices are asked in chat", () => {
     });
   }
 
-  void it("handoffChecksV1.ts, renameTask.ts, and scheduleTaskResume.ts ask for free-text input in chat instead of an input box", () => {
-    for (const file of ["commands/handoffChecksV1.ts", "commands/renameTask.ts", "commands/scheduleTaskResume.ts"]) {
-      const source = read(file);
-      assert.doesNotMatch(source, /vscode\.window\.showInputBox/);
-      assert.match(source, /askChatFreeTextV1/);
-    }
+  void it("handoffChecksV1.ts asks for the owner's evidence as free text in chat", () => {
+    const source = read("commands/handoffChecksV1.ts");
+    assert.doesNotMatch(source, /vscode\.window\.showInputBox/);
+    assert.match(source, /askChatFreeTextV1/);
   });
 
-  void it("reviewActions.ts asks resolveReviewActionTask, viewReviewMissingArtifact, confirmDiscardOwedImplRecovery, release target, and git safety choices in chat", () => {
+  void it("Publish Checks ask for a replacement scope in chat; the command itself uses a picker", () => {
+    const source = read("commands/choosePublishScope.ts");
+    assert.ok(source.includes('"choosePublishVerificationScope"'));
+    assert.match(source, /vscode\.window\.showQuickPick/);
+  });
+
+  void it("reviewActions.ts asks its workflow choices in chat", () => {
     const source = read("commands/reviewActions.ts");
     assert.doesNotMatch(source, /vscode\.window\.showQuickPick/);
-    assert.ok(source.includes('"resolveReviewActionTask"'));
     assert.ok(source.includes('"viewReviewMissingArtifact"'));
-    assert.ok(source.includes('"confirmDiscardOwedImplRecovery"'));
-    assert.ok(source.includes('"chooseReleaseTargetWorkspaceFolder"'));
-    assert.ok(source.includes('"chooseReleaseTargetPackage"'));
     assert.ok(source.includes('"confirmNonGitImplementation"'));
     assert.ok(source.includes('"confirmDirtyWorkspaceImplementation"'));
   });
 
-  void it("extension.ts, chatView.ts, and copilotImplementationRunner.ts route all remaining questions, filters, and confirmations to chat", () => {
-    const extensionSource = read("extension.ts");
-    assert.doesNotMatch(extensionSource, /vscode\.window\.showWarningMessage/);
-    assert.doesNotMatch(extensionSource, /vscode\.window\.showQuickPick/);
-    assert.doesNotMatch(extensionSource, /vscode\.window\.showInputBox/);
-    assert.ok(extensionSource.includes('"recoverInterruptedRevertJournal"'));
-    assert.ok(extensionSource.includes('"runOnRunnerAction"'));
-    assert.match(extensionSource, /askChatFreeTextV1/);
-    const chatViewSource = read("views/chatView.ts");
-    assert.doesNotMatch(chatViewSource, /vscode\.window\.showWarningMessage/);
-    assert.ok(chatViewSource.includes('"confirmResetChatHistory"'));
+  void it("copilotImplementationRunner.ts asks to continue past its round limit in chat", () => {
     const runnerSource = read("runners/copilotImplementationRunner.ts");
     assert.doesNotMatch(runnerSource, /vscode\.window\.showWarningMessage\(/);
     assert.ok(runnerSource.includes("resolveGlobalChatTargetOrDefaultV1"));
@@ -105,5 +86,59 @@ void describe("Step 12 choices are asked in chat", () => {
     const lintFixes = read("commands/runLintingFixes.ts");
     assert.equal((lintFixes.match(/token: cancelToken/g) ?? []).length >= 2, true);
     assert.equal((lintFixes.match(/throwIfPublishChecksCancelledV1\(cancelToken\);/g) ?? []).length >= 2, true);
+  });
+});
+
+void describe("pickers, search, filters and confirmations stay pop-ups", () => {
+  const popUps: Array<{ file: string; call: RegExp }> = [
+    { file: "commands/viewArtifacts.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "commands/openRetainedPromptV1.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "commands/setTaskStage.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "utils/reopenTask.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "utils/pickTaskFolder.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "commands/startNewTask.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "views/taskTreeProvider.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "views/statusView.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "views/taskStatusBar.ts", call: /vscode\.window\.showQuickPick/ },
+    { file: "commands/renameTask.ts", call: /vscode\.window\.showInputBox/ },
+    { file: "commands/scheduleTaskResume.ts", call: /vscode\.window\.showInputBox/ },
+    { file: "commands/viewStageChanges.ts", call: /vscode\.window\.showWarningMessage/ },
+    { file: "commands/releaseStuckAdmissionMarkers.ts", call: /vscode\.window\.showWarningMessage/ },
+    { file: "commands/taskCreationRecovery.ts", call: /vscode\.window\.showWarningMessage/ },
+    { file: "utils/aiConsent.ts", call: /vscode\.window\.showWarningMessage/ },
+    { file: "views/settingsView.ts", call: /vscode\.window\.showWarningMessage/ },
+    { file: "views/chatView.ts", call: /vscode\.window\.showWarningMessage/ },
+  ];
+
+  for (const { file, call } of popUps) {
+    void it(`${file} uses a pop-up, not a chat card`, () => {
+      const source = read(file);
+      assert.match(source, call);
+      assert.doesNotMatch(source, /askChatChoiceV1/);
+      assert.doesNotMatch(source, /askChatFreeTextV1/);
+    });
+  }
+
+  void it("settings.ts: the workspace-settings question at activation is in chat; turning on auto-implement is a modal", () => {
+    const source = read("config/settings.ts");
+    assert.ok(source.includes('"reconcileWorkspaceSettings"'));
+    assert.match(source, /Automatically implement will make real code and file changes after an approved review\. Use it only with continuous human supervision\.",\s*\{ modal: true \}/);
+  });
+
+  void it("extension.ts searches with input boxes and picks runner actions with a QuickPick", () => {
+    const source = read("extension.ts");
+    assert.match(source, /vscode\.window\.showInputBox\(\{\s*title: "Search tasks"/);
+    assert.match(source, /vscode\.window\.showInputBox\(\{\s*title: "Search notifications"/);
+    assert.match(source, /placeHolder: "Run on the runner for the current task"/);
+    assert.doesNotMatch(source, /askChatFreeTextV1/);
+    assert.doesNotMatch(source, /"runOnRunnerAction"/);
+  });
+
+  void it("extension.ts asks about an interrupted revert found at startup in chat, not a modal", () => {
+    // Raised by activation, not a click, and on the cloud box it runs on the
+    // runner, where a modal would sit unseen.
+    const source = read("extension.ts");
+    assert.ok(source.includes('"recoverInterruptedRevertJournal"'));
+    assert.doesNotMatch(source, /"Complete Revert",\s*"Keep Current File"\s*\)/);
   });
 });

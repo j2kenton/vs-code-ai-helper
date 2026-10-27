@@ -8,8 +8,6 @@ import {
 import { NotificationRouter } from "./notificationRouter";
 import { CurrentTaskStore } from "./currentTaskStore";
 import { offerActionInChatV1 } from "./chatActionOfferV1";
-import { askChatChoiceV1 } from "./chatChoiceV1";
-import { resolveGlobalChatTargetOrDefaultV1 } from "./globalChatTargetV1";
 
 /**
  * Workspace-state key for the current disclaimer version's consent record.
@@ -90,11 +88,9 @@ export async function ensureAiConsent(
   // silently declining.
   let promptAgain = true;
   while (promptAgain) {
-    const target = await resolveGlobalChatTargetOrDefaultV1();
-    const choice = await askChatChoiceV1({
-      decisionKey: "firstUseAiConsent",
-      target,
-      whatHappened: [
+    if (token?.isCancellationRequested) return false;
+    const choice = await vscode.window.showWarningMessage(
+      [
         "⚠️  Ensemble — Before you continue",
         "",
         "AI commands consume real quota/money from your AI subscription.",
@@ -107,29 +103,13 @@ export async function ensureAiConsent(
         "Use is at your own risk. Read DISCLAIMER.md before proceeding.",
         "Never use this extension unsupervised.",
       ].join("\n"),
-      whyUserNeeded: "First-use AI consent is required before any AI provider command runs in this workspace.",
-      options: [
-        {
-          optionId: "accept",
-          label: ACCEPT,
-          consequence: "Records your consent for this workspace and continues the AI action.",
-        },
-        {
-          optionId: "view",
-          label: VIEW,
-          consequence: "Opens DISCLAIMER.md and asks again.",
-        },
-        {
-          optionId: "decline",
-          label: "Cancel",
-          consequence: "Leaves AI consent unset and cancels the current AI action.",
-        },
-      ],
-      detail: "Answering enables or declines AI features for this workspace.",
-      token,
-    });
+      { modal: true },
+      ACCEPT,
+      VIEW
+    );
+    if (token?.isCancellationRequested) return false;
 
-    if (choice === "accept" || choice === ACCEPT) {
+    if (choice === ACCEPT) {
       const record: ConsentRecord = {
         acceptedAt: new Date().toISOString(),
         version: DISCLAIMER_VERSION,
@@ -138,7 +118,7 @@ export async function ensureAiConsent(
       return true;
     }
 
-    if (choice === "view" || choice === VIEW) {
+    if (choice === VIEW) {
       await vscode.commands.executeCommand(
         "vs-code-ai-helper.viewDisclaimer"
       );

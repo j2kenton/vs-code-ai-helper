@@ -105,11 +105,12 @@ async function resolvePickerRoot(taskFolderUri: vscode.Uri): Promise<PickerRootR
 }
 
 /**
- * Ask in task chat for a Publish verification scope and persist the
- * choice on the task record. Options are the project root (workspace folder
+ * Ask for a Publish verification scope and persist the choice on the task
+ * record: a picker when the user runs the command, a chat question when
+ * Publish Checks need a new scope to carry on. Options are the project root (workspace folder
  * or ownership binding — see resolvePickerRoot) plus detected nested
  * package.json directories. Returns the absolute path of the chosen
- * folder, or undefined when the chat card was dismissed (or no project root
+ * folder, or undefined when the picker or chat card was dismissed (or no project root
  * could be resolved for the task). Shared by the choosePublishScope
  * command and by runCompletionLint's stale-scope re-prompt
  * (completionLint.ts), so both persist through the same write and continue
@@ -157,6 +158,54 @@ export async function promptAndPersistPublishScope(
   }
 
   const current = options?.currentRelPath;
+  const chosenRelPath = options?.resumeChecksOnSelection
+    ? await askPublishScopeInChatV1(taskFolderUri, folderName, items, current, options.title)
+    : await pickPublishScopeV1(items, current, options?.title);
+  if (chosenRelPath === undefined) {
+    return undefined;
+  }
+  await patchTaskProgressStrictV1(taskFolderUri, (progress) => ({
+    ...progress,
+    publishScopePath: chosenRelPath || undefined,
+    updatedAt: new Date().toISOString(),
+  }));
+  return chosenRelPath ? path.resolve(workspaceRoot, chosenRelPath) : workspaceRoot;
+}
+
+/**
+ * The choosePublishScope command: the user asked to change the scope, so it
+ * is a picker, not a chat question (owner rule, 2026-10-26). Returns the
+ * chosen folder relative to the project root ("" for the root itself), or
+ * undefined when the picker is dismissed.
+ */
+async function pickPublishScopeV1(
+  items: ReadonlyArray<vscode.QuickPickItem & { relPath: string }>,
+  current: string | undefined,
+  title: string | undefined
+): Promise<string | undefined> {
+  const picked = await vscode.window.showQuickPick(items, {
+    title: title ?? "Publish verification scope",
+    placeHolder: current
+      ? `Current scope: ${current || "(workspace root)"} — lint/tests/plan verification run here`
+      : "Folder that Publish-stage lint/tests/plan verification run against",
+  });
+  return picked?.relPath;
+}
+
+/**
+ * Publish Checks found the saved scope gone and need a new one to carry on:
+ * the workflow is asking, so the question goes to the task's chat and the
+ * checks continue with the answer. Awaited in-process, like the Commit &
+ * Push confirmations; nothing is persisted when the card is dismissed or
+ * times out, so the caller keeps its refusal path.
+ */
+async function askPublishScopeInChatV1(
+  taskFolderUri: vscode.Uri,
+  folderName: string,
+  items: ReadonlyArray<vscode.QuickPickItem & { relPath: string }>,
+  current: string | undefined,
+  title: string | undefined
+): Promise<string | undefined> {
   const taskProgress = await readTaskProgressStrictV1(taskFolderUri);
   if (!taskProgress.ok) {
     return undefined;
@@ -168,24 +217,17 @@ export async function promptAndPersistPublishScope(
     stage,
     taskName: taskProgress.decoded.progress.displayName ?? folderName,
   };
-  // Awaited in-process, like the Commit & Push confirmations: the caller
-  // (runCompletionLint's stale-scope re-prompt, or the choosePublishScope
-  // command) continues its own operation with the chosen folder instead of
-  // starting a separate Publish Checks run. Nothing is persisted when the
-  // card is dismissed or times out, so the caller keeps its refusal path.
   const chosenOptionId = await awaitWorkflowDecisionAnswerV1({
     decisionKey: "choosePublishVerificationScope",
     taskCanonicalId: taskFolderUri.fsPath,
     stage,
-    whatHappened: options?.title ?? `${folderName}: choose the folder for Publish verification.`,
+    whatHappened: title ?? `${folderName}: choose the folder for Publish verification.`,
     whyUserNeeded: "The Publish checks must run against the project root or one of its package folders.",
     options: items.map((item, index) => ({
       optionId: `scope-${index}`,
       label: item.relPath || `${item.label} (project root)`,
       resumeKind: "continue" as const,
-      consequence: `Saves this Publish scope${
-        options?.resumeChecksOnSelection ? " and continues the checks that asked for it" : ""
-      }.`,
+      consequence: "Saves this Publish scope and continues the checks that asked for it.",
       effect: { kind: "doNothing" as const },
     })),
     recommendation: current !== undefined && items.some(item => item.relPath === current)
@@ -194,32 +236,17 @@ export async function promptAndPersistPublishScope(
     gating: {
       holdsTaskPaused: false,
       unblocksProgress: true,
-      detail: options?.resumeChecksOnSelection
-        ? "Choosing a scope saves it and continues the current Publish checks."
-        : "Choosing a scope saves it for this task.",
+      detail: "Choosing a scope saves it and continues the current Publish checks.",
     },
   }, target);
   const chosenIndex = chosenOptionId === undefined
     ? -1
     : items.findIndex((_item, index) => `scope-${index}` === chosenOptionId);
-  if (chosenIndex < 0) {
-    return undefined;
-  }
-  const chosenItem = items[chosenIndex];
-  if (!chosenItem) {
-    return undefined;
-  }
-  const chosenRelPath = chosenItem.relPath;
-  await patchTaskProgressStrictV1(taskFolderUri, (progress) => ({
-    ...progress,
-    publishScopePath: chosenRelPath || undefined,
-    updatedAt: new Date().toISOString(),
-  }));
-  return chosenRelPath ? path.resolve(workspaceRoot, chosenRelPath) : workspaceRoot;
+  return chosenIndex >= 0 ? items[chosenIndex]?.relPath : undefined;
 }
 
 /**
- * Ask in task chat for the Publish verification scope for a task: workspace-folder
+ * Pick the Publish verification scope for a task: workspace-folder
  * roots plus detected nested package.json directories. Deliberately a
  * separate persisted value from the release target — neither ever silently
  * reuses the other's value.

@@ -25,8 +25,6 @@ import {
   ProviderSignInAction,
 } from "../runners/providers";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { askChatChoiceV1 } from "../utils/chatChoiceV1";
-import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 
 type IncomingMessage =
   | { type: "ready" }
@@ -568,30 +566,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     }
 
     const taskWord = conflicts.length === 1 ? "task has" : "tasks have";
-    const target = await resolveGlobalChatTargetOrDefaultV1();
-    const choice = await askChatChoiceV1({
-      decisionKey: "clearLeftoverTaskModelOverrides",
-      target,
-      whatHappened:
-        `${conflicts.length} ${taskWord} leftover per-task model overrides from before model ` +
+    const choice = await vscode.window.showWarningMessage(
+      `${conflicts.length} ${taskWord} leftover per-task model overrides from before model ` +
         "configuration moved to the AI Models panel. They are no longer used — the settings " +
         "above always apply now.",
-      whyUserNeeded: "Choose whether to clear the unused per-task model override files or leave them on disk.",
-      options: [
-        {
-          optionId: "resetToDefault",
-          label: "Reset to Default",
-          consequence: "Clears the leftover per-task model overrides.",
-        },
-        {
-          optionId: "keepExisting",
-          label: "Keep Existing",
-          consequence: "Leaves the files unchanged on disk.",
-        },
-      ],
-      detail: "Answering clears or keeps the leftover per-task model override files.",
-    });
-    if (choice === "resetToDefault" || choice === "Reset to Default") {
+      "Reset to Default",
+      "Keep Existing"
+    );
+    if (choice === "Reset to Default") {
       for (const conflict of conflicts) {
         await clearTaskStageModels(conflict.taskFolderUri, conflict.stages);
       }

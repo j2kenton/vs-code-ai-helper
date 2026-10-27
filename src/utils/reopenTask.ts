@@ -15,8 +15,6 @@ import { RESUME_TASK_ACTION_KEY_V1 } from "../actions/rows/resumeTaskRowV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { runStageEntryPostCommitV1, type StageEntryResultV1 } from "./stageTransition";
 import { recoverStageEntryJournalIfPresentV1 } from "./stageEntryJournalV1";
-import { askChatChoiceV1 } from "./chatChoiceV1";
-import { resolveGlobalChatTargetOrDefaultV1 } from "./globalChatTargetV1";
 import type { ChatTarget } from "../views/chatView";
 import * as path from "path";
 
@@ -29,29 +27,24 @@ function reopenStageItems(): Array<{ label: string; stage: TaskStage }> {
 }
 
 /**
- * Show the reopen stage choice for a completed task in Chat With AI. Publish
- * is listed first and marked as the recommended option so "stay at Publish"
- * (the common case: fixing lint/commit/push) is pre-selected. Returns undefined
- * if the user cancels, which callers must treat as a no-op (no state changes).
+ * Show the reopen stage picker for a completed task. Publish is listed
+ * first — VS Code's QuickPick focuses the first item by default — so
+ * "stay at Publish" (the common case: fixing lint/commit/push) is the
+ * preselected choice without an extra keypress. Returns undefined if the
+ * user cancels, which callers must treat as a no-op (no state changes).
+ *
+ * `_target` is accepted for callers that still pass a chat target; a stage
+ * pick is a pop-up, never a chat question (owner rule, 2026-10-26).
  */
 export async function pickReopenStage(
   folderName: string,
-  target?: ChatTarget
+  _target?: ChatTarget
 ): Promise<TaskStage | undefined> {
-  const items = reopenStageItems();
-  const chatTarget = target ?? (await resolveGlobalChatTargetOrDefaultV1());
-  const chosenId = await askChatChoiceV1({
-    target: chatTarget,
-    decisionKey: "pickReopenStage",
-    whatHappened: `Reopen "${folderName}" at stage.`,
-    whyUserNeeded: "Select the stage to reopen this completed task at.",
-    options: items.map((item) => ({
-      optionId: item.stage,
-      label: item.label,
-    })),
-    recommendedOptionId: "publish",
+  const picked = await vscode.window.showQuickPick(reopenStageItems(), {
+    title: `Reopen "${folderName}" at stage`,
+    placeHolder: "Select the stage to reopen this completed task at",
   });
-  return items.find((item) => item.stage === chosenId)?.stage;
+  return picked?.stage;
 }
 
 export interface ReopenCompletedTaskResult {

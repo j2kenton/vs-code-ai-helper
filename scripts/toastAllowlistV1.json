@@ -2,7 +2,23 @@
   "$schema": "n/a — read by scripts/verifyToastAllowlistV1.mjs",
   "mode": "enforcing",
   "note": "Every vscode.window.showInformationMessage/showWarningMessage call under src/ that offers MORE THAN ONE button must either be converted to a WorkflowDecisionV1/StructuredQuestionV1 posted in the chat, or be listed here with a reason it genuinely is NOT a workflow decision (task 'stage chat as a record of work', item 13 / Part 12 step 35e). A single-button call never needs an entry — the lint only flags calls that ask the user to choose between options. Entries are keyed by file plus a `snippet` — a normalized (whitespace-collapsed) prefix of the call's own source text (from `vscode.window.show...Message(` through its closing paren) — NOT by line number (1.0 plan item 14): an unrelated edit elsewhere in the file no longer requires updating every entry below it. An entry only goes stale when the call's own text changes or is removed.",
-  "entries": [],
+  "entries": [
+    {
+      "file": "src/commands/releaseStuckAdmissionMarkers.ts",
+      "reason": "Manual escape-hatch confirmation for deleting only validated, stale admission marker files after the user explicitly invokes Release Stuck Admission Markers. This is not a workflow decision or background-round outcome; it is a destructive filesystem confirmation for a deterministic cleanup command.",
+      "snippet": "vscode.window.showWarningMessage( `Found ${staleMarkers.length} stale admission marker(s) (last renewed >20 min ago).\\n\\n${markerList}"
+    },
+    {
+      "file": "src/utils/aiConsent.ts",
+      "reason": "The one-time legal/usage disclaimer gate shown before the very first AI command of a session — modal by design, and 'View Disclaimer' loops back rather than branching workflow state. Not a task decision.",
+      "snippet": "vscode.window.showWarningMessage( [ \"⚠️ Ensemble — Before you continue\", \"\", \"AI commands consume real quota/money from your AI subscription.\", \"AI implementati"
+    },
+    {
+      "file": "src/views/settingsView.ts",
+      "reason": "Settings-view notice about leftover per-task model overrides from a superseded configuration shape, offering to clear them — settings hygiene, not a task workflow decision.",
+      "snippet": "vscode.window.showWarningMessage( `${conflicts.length} ${taskWord} leftover per-task model overrides from before model ` + \"configuration moved to the AI Models"
+    }
+  ],
   "directActionEntriesNote": "Every NotificationRouter.show(Information/Warning/Error) call under src/ whose actionCommand dispatches a workflow command directly (rather than the chat-pointer vs-code-ai-helper.openWorkflowDecision) must either be converted to point at a WorkflowDecisionV1 in the chat, or be listed here with a reason it is NOT a hidden workflow decision (task 'stage chat as a record of work', item 13 / Part 12 step 35e, review round 2). Two shapes qualify: (1) a synchronous gate/nudge inline in the user-invoked command it belongs to, pointing at a command already reachable another way (Command Palette, another button) and never the only record of a background round's outcome; (2) a best-effort fallback for when a WorkflowDecisionV1 could not be posted to chat (no activating extension context), degrading to a single pointer at the same option the decision would have recommended. Entries are keyed by file plus a `snippet` — a normalized prefix of the call's own source text — not by line number (1.0 plan item 14), same convention as `entries` above.",
   "directActionEntries": [
     {
