@@ -38,6 +38,12 @@ RUN apt-get update \
 RUN npm install -g --allow-scripts=cline,protobufjs,@opencode/cli @anthropic-ai/claude-code @openai/codex @opencode/cli cline @google/gemini-cli \
   && claude --version && codex --version && opencode --version && cline --version && gemini --version
 
+# devpass-code pinned to 1.x: Ensemble's devpass-cli provider speaks the 1.x
+# CLI (`run --variant`, `models --verbose`). 2.x is an OpenCode 2 fork that
+# dropped both and whose background service takes OpenCode 2's port 49374.
+RUN npm install -g --allow-scripts=devpass-code devpass-code@1.18.11 \
+  && devpass-code --version
+
 # Kimi Code CLI: Moonshot's official installer (a checksum-verified binary),
 # NOT the npm package — that one installs a Windows .cmd shim Ensemble cannot
 # run (see the kimi-cli entry in src/runners/providers.ts). System-wide, so
