@@ -20,6 +20,21 @@ export interface ChatActionOfferInputV1 {
   readonly actionLabel: string;
   readonly command: string;
   readonly args?: readonly unknown[];
+  /** Explicit alternatives shown on the same card, after the recommended action. */
+  readonly alternatives?: readonly {
+    readonly label: string;
+    readonly command: string;
+    readonly args?: readonly unknown[];
+    readonly consequence?: string;
+    /**
+     * How choosing this alternative relates to the task's pause. Defaults to
+     * `"continue"` (the dispatched command resumes the task) to preserve the
+     * pre-existing behavior; an inspect-only alternative whose effect does not
+     * resume work (e.g. `vscode.open` for a run log) must set `"unpause"` so
+     * the acknowledgement does not claim a resume it never performs.
+     */
+    readonly resumeKind?: "unpause" | "continue";
+  }[];
   /** The notification's own text; it becomes the decision's account of what happened and the recommendation's reason. */
   readonly noticeText: string;
   /** True only for a "Resume" offer: the task stays paused until the action is chosen. */
@@ -78,6 +93,17 @@ export async function offerActionInChatV1(
           consequence: `Runs "${input.actionLabel}" for this task now.`,
           effect: { kind: "command", command: input.command, args: input.args ?? [] },
         },
+        ...(input.alternatives ?? []).map((alternative, index) => ({
+          optionId: `alternative${index + 1}`,
+          label: alternative.label,
+          resumeKind: (alternative.resumeKind ?? "continue") as "unpause" | "continue",
+          consequence: alternative.consequence ?? `Runs "${alternative.label}" for this task now.`,
+          effect: {
+            kind: "command" as const,
+            command: alternative.command,
+            args: alternative.args ?? [],
+          },
+        })),
         {
           optionId: "notNow",
           label: "Not now",

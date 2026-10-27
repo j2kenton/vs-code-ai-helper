@@ -148,6 +148,20 @@ export const IMPL_REVIEW_MIN_CHANGED_REGION_EXCERPT_CHARS = 3000;
 export const IMPL_REVIEW_MAX_PAGING_WINDOWS_LISTED = 25;
 
 /**
+ * A resumed implementation review is auto-advance eligible only when the
+ * refreshed context was built from established task-owned scope. This keeps
+ * the original open-editor fallback question from poisoning the resumed run.
+ */
+export function applyResumedReviewScopeRoutingV1(variables: Record<string, string>, input: {
+  readonly isPlanReview: boolean;
+  readonly trackedScopeApplied: boolean;
+}): boolean {
+  const usesTrackedScope = !input.isPlanReview && input.trackedScopeApplied;
+  if (usesTrackedScope) delete variables["reviewScopeFallback"];
+  return usesTrackedScope;
+}
+
+/**
  * Machine-maintained artifacts whose CONTENTS are never embedded in a review
  * context pack (they stay listed by name, explicitly labeled as omitted).
  *
@@ -729,7 +743,10 @@ export type ImplReviewLedgerRebuildResultV1 =
  *    `outcome.filesChanged` present as an array and `filesChangedUnknown`
  *    not true (an empty array is a known "no changes" result).
  *
- * `review` rows are ignored entirely, whatever their state. The union is
+ * `review` rows are ignored entirely, whatever their state. Only `completed`
+ * implementation rows contribute paths: terminal failure, cancellation,
+ * interruption and rejected-summary rows are quarantined evidence, not
+ * accepted review scope. The union is
  * order-preserving-deduplicated (first occurrence wins), most-recent round
  * first, matching `updateImplReviewFiles`'s own ordering convention.
  */
@@ -770,6 +787,7 @@ export function resolveLedgerImplReviewFilesV1(
   // Most-recent round first, mirroring updateImplReviewFiles's convention —
   // `implRows` is in ledger (chronological, oldest-first) order, so reverse.
   for (const row of [...implRows].reverse()) {
+    if (row.state !== "completed") continue;
     for (const file of row.outcome!.filesChanged!) {
       if (!seen.has(file)) {
         seen.add(file);
@@ -778,6 +796,41 @@ export function resolveLedgerImplReviewFilesV1(
     }
   }
   return { established: true, files };
+}
+
+/** Resolve review scope without consulting open editors. A complete ledger is
+ * authoritative and supplements any previously tracked paths; otherwise an
+ * existing tracked set remains usable, while missing/empty scope is
+ * explicitly unavailable. */
+export function resolveImplementationReviewScopeV1(
+  currentFiles: readonly string[] | undefined,
+  ledger: readonly ImplReviewLedgerRowV1[] | undefined,
+  maxEntries: number
+):
+  | { kind: "established"; files: string[]; ledgerFiles: string[]; source: "ledger" | "tracked"; reason?: string; omittedPaths?: number }
+  | { kind: "unavailable"; reason: string } {
+  const tracked = [...(currentFiles ?? [])];
+  const ledgerResult = resolveLedgerImplReviewFilesV1(ledger, maxEntries);
+  if (!ledgerResult.established) {
+    return tracked.length > 0
+      ? { kind: "established", files: tracked, ledgerFiles: [], source: "tracked", reason: ledgerResult.reason }
+      : { kind: "unavailable", reason: ledgerResult.reason };
+  }
+  const safeLedgerFiles = ledgerResult.files.filter((file) => {
+    const normalized = file.replace(/\\/g, "/");
+    return normalized.length > 0 && !normalized.startsWith("/") && !/^[A-Za-z]:\//.test(normalized) &&
+      normalized.split("/").every((part) => part !== ".." && part !== ".");
+  });
+  const files = [...new Set([...safeLedgerFiles, ...tracked])];
+  return {
+    kind: "established",
+    files,
+    ledgerFiles: safeLedgerFiles,
+    source: "ledger",
+    ...(ledgerResult.files.length !== safeLedgerFiles.length
+      ? { omittedPaths: ledgerResult.files.length - safeLedgerFiles.length }
+      : {}),
+  };
 }
 
 /**

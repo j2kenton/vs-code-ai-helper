@@ -44,7 +44,8 @@ interface ConsentRecord {
  */
 export async function ensureAiConsent(
   context: vscode.ExtensionContext,
-  taskFolderPath?: string
+  taskFolderPath?: string,
+  token?: vscode.CancellationToken
 ): Promise<boolean> {
   const existing = context.workspaceState.get<ConsentRecord>(CONSENT_KEY);
   if (existing && existing.version === DISCLAIMER_VERSION) {
@@ -71,6 +72,10 @@ export async function ensureAiConsent(
         actionLabel: "Apply Current Stage Action",
         command: "vs-code-ai-helper.applyCurrentStageAction",
         args: [{ taskFolderPath: targetTaskFolder }],
+        alternatives: [{
+          label: "View Disclaimer",
+          command: "vs-code-ai-helper.viewDisclaimer",
+        }],
         noticeText: reason,
       });
     }
@@ -121,6 +126,7 @@ export async function ensureAiConsent(
         },
       ],
       detail: "Answering enables or declines AI features for this workspace.",
+      token,
     });
 
     if (choice === "accept" || choice === ACCEPT) {

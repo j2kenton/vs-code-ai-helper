@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import { RUNS_DIRNAME } from "../types/taskProgress";
 import { AgentWorkflowStage } from "../types/agentRunner";
 import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
+import { appendLatestDispatchModelChainToRunLogV1 } from "./dispatchModelChainV1";
 
 /**
  * Ensure the runs/ directory exists under the task folder.
@@ -65,7 +66,8 @@ export async function writeRunLog(
   taskFolderUri: vscode.Uri,
   runnerId: string,
   stage: AgentWorkflowStage,
-  content: string
+  content: string,
+  dispatchCorrelation?: { readonly operationId: string; readonly attemptIds?: readonly string[] }
 ): Promise<vscode.Uri> {
   const runsUri = await ensureRunsDirectory(taskFolderUri);
   const runNumber = await getNextRunNumber(runsUri);
@@ -74,9 +76,10 @@ export async function writeRunLog(
   assertRunLogPathArtifactSafe(fileName);
 
   const logUri = vscode.Uri.joinPath(runsUri, fileName);
+  const contentWithDispatchChain = await appendLatestDispatchModelChainToRunLogV1(taskFolderUri, stage, content, dispatchCorrelation);
   await vscode.workspace.fs.writeFile(
     logUri,
-    new TextEncoder().encode(content)
+    new TextEncoder().encode(contentWithDispatchChain)
   );
 
   return logUri;

@@ -20,7 +20,8 @@ import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } from "./tooltipInfoTextV1";
 import { normalizePath } from "../utils/taskRoot";
 import { isEffectivelyPausedSyncV1, isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
-import { withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
+import { PendingUserInputEvidenceV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
+import { readPendingUserInputEvidenceV1 } from "../utils/pendingUserInputV1";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 
@@ -43,6 +44,7 @@ export class TaskStatusBar implements vscode.Disposable {
   private readonly item: vscode.StatusBarItem;
   private lastTasks: IncompleteTask[] = [];
   private lastCurrentTaskId: string | undefined = undefined;
+  private readonly pendingUserInputCache = new Map<string, PendingUserInputEvidenceV1>();
   private readonly onDidChangeSub: vscode.Disposable;
   /**
    * Bumped on every `update()` call and captured by the async implementation-
@@ -201,7 +203,8 @@ export class TaskStatusBar implements vscode.Disposable {
     if (generation !== this.renderGeneration || !counted) {
       return;
     }
-    this.renderActiveTask(task, icon, `${formatChecklistPercentV1(counted.settled, counted.total)}%`);
+    this.renderActiveTask(task, icon, `${formatChecklistPercentV1(counted.settled, counted.total)}%` +
+      ` · ${counted.verified} verified · ${counted.provisional} provisional`);
   }
 
   /**
@@ -378,6 +381,21 @@ export class TaskStatusBar implements vscode.Disposable {
     store.recordOwedContinuation(taskId, owedSource).then(undefined, () => {
       // Best-effort self-heal only — never blocks or fails this render.
     });
+    const pendingEvidence = this.pendingUserInputCache.get(taskId);
+    readPendingUserInputEvidenceV1(task.folderUri.fsPath, taskId)
+      .then((evidence) => {
+        const cached = this.pendingUserInputCache.get(taskId);
+        if (
+          !cached ||
+          cached.state !== evidence.state ||
+          cached.unansweredQuestions !== evidence.unansweredQuestions ||
+          cached.submittedAwaitingResume !== evidence.submittedAwaitingResume
+        ) {
+          this.pendingUserInputCache.set(taskId, evidence);
+          this.update(this.lastTasks, this.lastCurrentTaskId);
+        }
+      })
+      .catch(() => {});
     const posture: SchedulingPostureV1 = withWaitingForHumanFallbackV1(
       deriveSchedulingPostureV1({
         entries: store.listForTask(taskId),
@@ -385,7 +403,8 @@ export class TaskStatusBar implements vscode.Disposable {
         hasCoverage: store.hasCoverage(taskId),
         inFlight: taskOperations.hasRootOperationForTask(taskId),
       }),
-      task.progress
+      task.progress,
+      pendingEvidence
     );
     const rendered = renderRequiredHandoffFieldsV1("scheduledWork", describeSchedulingPostureV1(posture));
     return {

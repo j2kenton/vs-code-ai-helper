@@ -127,8 +127,29 @@ export function isWaitingForHumanV1(progress: TaskProgress): boolean {
  */
 export function withWaitingForHumanFallbackV1(
   posture: SchedulingPostureV1,
-  progress: TaskProgress | undefined
+  progress: TaskProgress | undefined,
+  pendingUserInput?: PendingUserInputEvidenceV1
 ): SchedulingPostureV1 {
+  if (posture.kind === "running") {
+    return posture;
+  }
+  if (pendingUserInput !== undefined) {
+    if (pendingUserInput.state === "unreadable") {
+      return { kind: "unknown" };
+    }
+    if (pendingUserInput.unansweredQuestions > 0) {
+      return { kind: "waitingForYou" };
+    }
+    if (pendingUserInput.submittedAwaitingResume > 0) {
+      if (posture.kind === "unknown" || posture.kind === "waitingForYou") {
+        return {
+          kind: "scheduled",
+          trigger: "an answered question is waiting to resume",
+          expectedTiming: "as soon as the runner can dispatch it",
+        };
+      }
+    }
+  }
   if (posture.kind === "unknown" && progress !== undefined && isWaitingForHumanV1(progress)) {
     return { kind: "waitingForYou" };
   }
@@ -174,8 +195,80 @@ export function isReconstructableImplRecoveryV1(
   );
 }
 
+/**
+ * What the task's own chat says is waiting on the person (bugs2 finding 1):
+ * a question a round posted and nobody has answered is the task's next step,
+ * and an answer that was submitted but whose Resume has not run is owed work.
+ * Neither is "quiet". Read from durable, task-bound state by
+ * `pendingUserInputV1.ts`; kept as plain data here so the predicate stays pure.
+ */
+export interface PendingUserInputEvidenceV1 {
+  /** `unreadable` when the durable question state could not be read — never positive evidence of quiet. */
+  readonly state: "read" | "unreadable";
+  /** Questions posted for this task that no answer has been submitted for. */
+  readonly unansweredQuestions: number;
+  /** Interactions whose answer is stored but whose Resume has not settled. */
+  readonly submittedAwaitingResume: number;
+}
+
+/**
+ * True when pending-input evidence says the task is waiting for the user (or
+ * owes a stored answer a Resume), or could not be read. Absent evidence is
+ * not an exemption: callers that have not read the chat keep the existing
+ * evidence-based checks.
+ */
+export function hasPendingUserInputV1(evidence: PendingUserInputEvidenceV1 | undefined): boolean {
+  if (evidence === undefined) {
+    return false;
+  }
+  return (
+    evidence.state === "unreadable" ||
+    evidence.unansweredQuestions > 0 ||
+    evidence.submittedAwaitingResume > 0
+  );
+}
+
+/** The minimal interaction shape the classifier needs (a `ChatDocumentInteractionV1` satisfies it). */
+export interface PendingUserInputInteractionV1 {
+  readonly state: string;
+  readonly answers?: readonly unknown[];
+}
+
+/**
+ * Classifies a task's mirrored chat interactions. `unresolved` with no stored
+ * answer is an open question; `unresolved` with answers is a stored answer
+ * awaiting its Resume (owed work, not an unanswered question); an
+ * `orphanedTransaction` is an unsettled durable question whose mirror record
+ * is missing and counts the same way. Settled, cancelled, expired, reset and
+ * `missingTransaction` records are not pending.
+ */
+export function classifyPendingUserInputV1(
+  interactions: readonly PendingUserInputInteractionV1[]
+): PendingUserInputEvidenceV1 {
+  let unansweredQuestions = 0;
+  let submittedAwaitingResume = 0;
+  for (const interaction of interactions) {
+    if (interaction.state !== "unresolved" && interaction.state !== "orphanedTransaction") {
+      continue;
+    }
+    if ((interaction.answers?.length ?? 0) > 0) {
+      submittedAwaitingResume += 1;
+    } else {
+      unansweredQuestions += 1;
+    }
+  }
+  return { state: "read", unansweredQuestions, submittedAwaitingResume };
+}
+
 export interface StalledActiveTaskCheckInputV1 {
   readonly progress: TaskProgress;
+  /**
+   * Durable question state for this task (bugs2 finding 1). A task with an
+   * unanswered question, a stored answer awaiting Resume, or unreadable
+   * question state is never "impossible": it is waiting for the user, owes a
+   * Resume, or cannot be judged.
+   */
+  readonly pendingUserInput?: PendingUserInputEvidenceV1;
   /** The scheduling-intent store's task key — the same canonical id every
    * other scheduling-intent call in this codebase uses (task folder path). */
   readonly taskCanonicalId: string;
@@ -346,6 +439,11 @@ export function isImpossibleActiveStateV1(input: StalledActiveTaskCheckInputV1):
   if (hasOpenRoundLedgerRowV1(progress)) {
     return false;
   }
+  // bugs2 finding 1: an open question (or a stored answer owed its Resume) is
+  // the task's next step, however long it has waited.
+  if (hasPendingUserInputV1(input.pendingUserInput)) {
+    return false;
+  }
   if (progress.implRecovery !== undefined) {
     // A1's second route (2026-09-04 review follow-up, blocker
     // "isImpossibleActiveStateV1 exempts every recovery record"): a
@@ -490,9 +588,11 @@ export function stalledActivePauseReasonForReadingV1(reading: StalledRoundReadin
 /** True for any of the watchdog's stalled-task pause reasons (generic, finished, lost). */
 export function isStalledActivePauseReasonV1(reason: string | undefined): boolean {
   return (
-    reason === STALLED_ACTIVE_TASK_PAUSE_REASON_V1 ||
-    reason === STALLED_ACTIVE_TASK_FINISHED_PAUSE_REASON_V1 ||
-    reason === STALLED_ACTIVE_TASK_LOST_PAUSE_REASON_V1
+    reason !== undefined &&
+    (reason.startsWith("Watchdog:") ||
+      reason === STALLED_ACTIVE_TASK_PAUSE_REASON_V1 ||
+      reason === STALLED_ACTIVE_TASK_FINISHED_PAUSE_REASON_V1 ||
+      reason === STALLED_ACTIVE_TASK_LOST_PAUSE_REASON_V1)
   );
 }
 

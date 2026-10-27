@@ -24,6 +24,9 @@ import {
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { safeRemoveDir } from "./testFsUtils";
 import { decideHandoffOnlyStopV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 
 const PLAN = [
   "<!-- ensemble:implementation-checklist -->",
@@ -190,6 +193,36 @@ void describe("buildHandoffChecksDecisionInputV1", () => {
     assert.ok(input.whatHappened.startsWith("Waiting for you:"));
     assert.equal(input.recommendation.kind, "none");
     assert.ok(/no basis to recommend/i.test(input.recommendation.reasoning));
+  });
+
+  void it("updates one terminal hand-off card with the reason and explicit alternatives", async () => {
+    const backing = new Map<string, unknown>();
+    const memento = {
+      keys: () => [...backing.keys()],
+      get: <T>(key: string, fallback?: T): T | undefined => backing.has(key) ? backing.get(key) as T : fallback,
+      update: (key: string, value: unknown): Thenable<void> => {
+        if (value === undefined) backing.delete(key); else backing.set(key, value);
+        return Promise.resolve();
+      },
+    } as vscode.Memento;
+    __extensionContextV1TestOnly.set({ subscriptions: [], workspaceState: memento, globalState: memento } as unknown as vscode.ExtensionContext);
+    try {
+      const target = { canonicalId: "/tmp/task", taskFolderPath: "/tmp/task", stage: "impl-high-review" as const };
+      await postWorkflowDecisionV1(input, target);
+      await postWorkflowDecisionV1(input, target);
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending("/tmp/task")
+        .filter((decision) => decision.decisionKey === "handoffChecks");
+      assert.equal(decisions.length, 1, "repeated terminal reporting updates one hand-off card");
+      const decision = decisions[0];
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /Only hand-off checks remain/);
+      assert.deepEqual(decision.options.map((option) => option.optionId), ["tick-0", "tick-1", "acceptRest", "notYet"]);
+      assert.equal(decision.options[2]?.effect.kind, "command");
+      assert.equal(decision.options[3]?.effect.kind, "command");
+      assert.ok(decision.options.every((option) => option.consequence.length > 0));
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
   });
 
   void it("caps the per-check options while accept-the-rest still counts every check", () => {

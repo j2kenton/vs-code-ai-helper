@@ -12,7 +12,14 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
-import { clearStageActionRefusalReasonV1, takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
+import {
+  clearStageActionRefusalReasonV1,
+  clearStageActionTerminalOutcomeV1,
+  describeStageActionTerminalOutcomeV1,
+  StageActionTerminalOutcomeV1,
+  takeStageActionRefusalReasonV1,
+  takeStageActionTerminalOutcomeV1,
+} from "../utils/stageActionRefusalV1";
 import {
   formatNotificationTaskLabelV1,
   notificationTaskDisplayNameV1,
@@ -27,6 +34,7 @@ import {
   IMPL_CONTINUATION_CHAIN_ID_V1,
   owedContinuationSourceV1,
   parseRecoveryClaimOwnerV1,
+  releaseImplRecoveryClaimV1,
   resolveCurrentRecoveryClaimOwnerV1,
   retireSatisfiedSummaryRejectedRecoveryV1,
 } from "./implementationRecoveryV1";
@@ -43,15 +51,24 @@ import { reconcileRoundLedgerV1 } from "../utils/roundLedgerReconciliationV1";
 import { clearRoundLiveV1, listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { retryStuckPlanRevisionAdoptionV1 } from "../utils/implementationArtifactResolver";
 import { recoverStageEntryJournalIfPresentV1 } from "../utils/stageEntryJournalV1";
-import { pauseTaskWithReasonForClaimV1, setNextActorV1 } from "../utils/taskProgressTransforms";
+import {
+  clearStageFallbackReservation,
+  pauseTaskWithReasonForClaimV1,
+  setNextActorV1,
+  updateTaskStatus,
+} from "../utils/taskProgressTransforms";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { isPauseCreatedByQuotaStopV1, judgeScheduledRunPauseV1 } from "../utils/scheduledPauseProvenanceV1";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { terminalizeRoundV1 } from "../utils/roundLedgerV1";
+import { readPendingUserInputEvidenceV1 } from "../utils/pendingUserInputV1";
 import {
   stalledActivePauseReasonForReadingV1,
   UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1,
   describeStalledActiveTaskEscalationV1,
   readStalledRoundReadingV1,
   describeUnrecoverableRecoveryEscalationV1,
+  hasPendingUserInputV1,
   isImpossibleActiveStateV1,
   isReconstructableImplRecoveryV1,
   isStaleDispatchedImplRecoveryV1,
@@ -315,17 +332,92 @@ export function buildDelayedRetryDecisionV1(
   target: ChatTarget,
   kind: DelayedRetryKindV1,
   dueAt: Date,
-  holderNote?: string
+  holderNote?: string,
+  /**
+   * Why the scheduled action could not start (bugs2 finding 13): the card says
+   * what actually happened instead of assuming "something else was working on
+   * this task". Absent only for a legacy caller, which keeps the busy wording.
+   */
+  refusal?: ScheduledRefusalDetailV1
 ): PostWorkflowDecisionInputV1 {
   const displayName = notificationTaskDisplayNameV1(target.taskName, target.taskFolderPath);
   const due = dueAt.toLocaleString();
-  const whatHappened =
-    kind === "refused"
-      ? `The scheduled ${target.stage} action for "${displayName}" could not start` +
-        (holderNote ? ` (${holderNote})` : "") +
-        `. It stays scheduled; the next automatic attempt is due ${due}.`
-      : `The ${target.stage} action for "${displayName}" is waiting for the provider's quota to reset; ` +
-        `the automatic rerun is due ${due}.`;
+  const category = refusal?.category ?? "busy";
+  let whatHappened: string;
+  if (kind === "quotaPark") {
+    whatHappened = `The ${target.stage} action for "${displayName}" is waiting for the provider's quota to reset; the automatic rerun is due ${due}.`;
+  } else if (category === "cancelled") {
+    whatHappened =
+      `The scheduled ${target.stage} action for "${displayName}" was cancelled` +
+      (holderNote ? ` (${holderNote})` : "") +
+      `. It stays scheduled; the next automatic attempt is due ${due}.`;
+  } else if (category === "interrupted") {
+    whatHappened =
+      `The scheduled ${target.stage} action for "${displayName}" was interrupted` +
+      (holderNote ? ` (${holderNote})` : "") +
+      `. It stays scheduled; the next automatic attempt is due ${due}.`;
+  } else if (category === "failed" && refusal?.terminalOutcome) {
+    whatHappened =
+      `The scheduled ${target.stage} action for "${displayName}" started and failed` +
+      (holderNote ? ` (${holderNote})` : "") +
+      `. It stays scheduled; the next automatic attempt is due ${due}.`;
+  } else {
+    whatHappened =
+      `The scheduled ${target.stage} action for "${displayName}" could not start` +
+      (holderNote ? ` (${holderNote})` : "") +
+      `. It stays scheduled; the next automatic attempt is due ${due}.`;
+  }
+  const whyByCategory: Record<ScheduledRefusalDetailV1["category"], string> = {
+    busy:
+      "Another operation holds this task right now (named above). Only you can tell whether it has " +
+      "finished and the action can go now.",
+    paused:
+      "The task is paused, and nothing resumes it by itself for this schedule. Resume it, and the scheduled " +
+      "action runs at its next attempt.",
+    precondition:
+      "The stage's action cannot start until the condition above is cleared; retrying alone will not clear it.",
+    failed: refusal?.terminalOutcome
+      ? "The action started and failed (named above); retrying may help if the cause was temporary."
+      : "The action failed to start (named above); retrying may help if the cause was temporary.",
+    cancelled:
+      "The action started and was cancelled (named above); retrying runs the action again.",
+    interrupted:
+      "The action was interrupted (named above); retrying runs the action again.",
+  };
+  const waitOption: WorkflowDecisionOptionV1 = {
+    optionId: "waitForRetry",
+    resumeKind: "unpause",
+    label: "Wait for the automatic retry",
+    consequence: `Does nothing. The scheduled action retries by itself at ${due}.`,
+    effect: { kind: "doNothing" },
+  };
+  const runNowOption: WorkflowDecisionOptionV1 = {
+    optionId: "runNow",
+    resumeKind: "continue",
+    label: "Run now",
+    consequence:
+      `Runs the scheduled ${target.stage} action immediately, exactly as the timer would. If something ` +
+      "still stops it, this says what.",
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.runScheduledActionNow",
+      args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
+    },
+  };
+  const resumeOption: WorkflowDecisionOptionV1 = {
+    optionId: "resumeTask",
+    resumeKind: "unpause",
+    label: "Resume the task",
+    consequence:
+      "Resumes the paused task (this pauses any other task that is active) and starts nothing by itself; " +
+      "the scheduled action then runs at its next attempt, or choose Run now.",
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.resumeTask",
+      args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
+    },
+  };
+  const offerResume = kind === "refused" && refusal?.offerResume === true;
   return {
     decisionKey: "scheduledActionRunNow",
     taskCanonicalId: target.canonicalId,
@@ -333,44 +425,52 @@ export function buildDelayedRetryDecisionV1(
     whatHappened,
     whyUserNeeded:
       kind === "refused"
-        ? "Something else was working on this task when the schedule fired. Only you can tell whether it has " +
-          "finished and the action can go now."
+        ? whyByCategory[category]
         : "The provider reported a quota window; only you can tell whether it has reopened early.",
-    options: [
-      {
-        optionId: "waitForRetry",
-        resumeKind: "unpause",
-        label: "Wait for the automatic retry",
-        consequence: `Does nothing. The scheduled action runs by itself at ${due}.`,
-        effect: { kind: "doNothing" },
-      },
-      {
-        optionId: "runNow",
-        resumeKind: "continue",
-        label: "Run now",
-        consequence:
-          `Runs the scheduled ${target.stage} action immediately, exactly as the timer would. If something ` +
-          "still holds the task, this says what.",
-        effect: {
-          kind: "command",
-          command: "vs-code-ai-helper.runScheduledActionNow",
-          args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
+    // The recommended (cheapest) action is listed first.
+    options: offerResume ? [resumeOption, runNowOption, waitOption] : [waitOption, runNowOption],
+    recommendation: offerResume
+      ? {
+          kind: "option",
+          optionId: "resumeTask",
+          reasoning: "The task is paused, so the scheduled action cannot run until it is resumed; this is the cheapest fix.",
+        }
+      : {
+          kind: "option",
+          optionId: "waitForRetry",
+          reasoning: "The automatic retry needs nothing from you; waiting costs only time.",
         },
-      },
-    ],
-    recommendation: {
-      kind: "option",
-      optionId: "waitForRetry",
-      reasoning: "The automatic retry needs nothing from you; waiting costs only time.",
-    },
     gating: {
       holdsTaskPaused: false,
       unblocksProgress: false,
-      detail:
-        `The task is not waiting on this answer: the scheduled action runs automatically at ${due} whichever ` +
-        "option you pick. \"Run now\" only brings it forward.",
+      detail: offerResume
+        ? `The task stays paused until you resume it; the schedule is kept and retries by itself (next attempt ${due}).`
+        : `The task is not waiting on this answer: the scheduled action runs automatically at ${due} whichever ` +
+          "option you pick. \"Run now\" only brings it forward.",
     },
   };
+}
+
+/** Why a scheduled stage action could not start, for the card's wording and options. */
+export interface ScheduledRefusalDetailV1 {
+  readonly category: "busy" | "paused" | "precondition" | "failed" | "cancelled" | "interrupted";
+  /** The task is paused and a Resume would let the action run. */
+  readonly offerResume?: boolean;
+  /** When work started and then ended without passing, the terminal outcome. */
+  readonly terminalOutcome?: StageActionTerminalOutcomeV1;
+}
+
+/**
+ * Back-off between automatic attempts of a scheduled action that keeps being
+ * refused (bugs2 finding 13): one minute after the first refusal, doubling to a
+ * ceiling, so a standing refusal costs a few attempts an hour instead of one
+ * every minute. A change in the refusal's reason, or the user's Run now, starts
+ * the sequence over.
+ */
+export const REFUSED_SCHEDULE_MAX_RETRY_DELAY_MS_V1 = 30 * 60 * 1000;
+export function refusedScheduleRetryDelayMsV1(attempts: number): number {
+  const exponent = Math.max(0, Math.min(attempts, 16) - 1);
+  return Math.min(REFUSED_SCHEDULE_RETRY_DELAY_MS_V1 * 2 ** exponent, REFUSED_SCHEDULE_MAX_RETRY_DELAY_MS_V1);
 }
 
 /**
@@ -379,6 +479,12 @@ export function buildDelayedRetryDecisionV1(
  * default; "Run now" takes the sweep's own claim-and-dispatch path at once.
  * `dueAt` is undefined when the wait ends on a guard clearing, not a clock.
  */
+export interface OwedContinuationDecisionOptionsV1 {
+  readonly liveHolder?: string;
+  readonly failedProvider?: string;
+  readonly failedModel?: string;
+}
+
 export function buildOwedContinuationDecisionV1(
   target: ChatTarget,
   dueAt: Date | undefined,
@@ -390,18 +496,22 @@ export function buildOwedContinuationDecisionV1(
    * of being pressable only to hand back the same refusal (and, before item
    * 8's fix, a duplicate card) every time.
    */
-  claimedUntil?: Date
+  claimedUntil?: Date,
+  options?: OwedContinuationDecisionOptionsV1
 ): PostWorkflowDecisionInputV1 {
   const displayName = notificationTaskDisplayNameV1(target.taskName, target.taskFolderPath);
   const nextAttempt = dueAt
     ? `the next automatic attempt is due ${dueAt.toLocaleString()}`
     : "the recovery sweep retries automatically every few minutes";
+  const failureDetail = options?.failedProvider
+    ? ` The previous attempt on ${options.failedProvider}${options.failedModel ? ` (${options.failedModel})` : ""} failed.`
+    : "";
   return {
     decisionKey: "owedContinuationRunNow",
     taskCanonicalId: target.canonicalId,
     stage: target.stage,
     whatHappened:
-      `An owed implementation continuation for "${displayName}" is waiting to be retried: ${waitingOn}. ` +
+      `An owed implementation continuation for "${displayName}" is waiting to be retried: ${waitingOn}.${failureDetail} ` +
       `It stays owed; ${nextAttempt}.`,
     whyUserNeeded:
       "Only you can tell whether whatever is holding the continuation back has finished, so it can go now.",
@@ -413,6 +523,23 @@ export function buildOwedContinuationDecisionV1(
         consequence: `Does nothing. The continuation is retried by itself; ${nextAttempt}.`,
         effect: { kind: "doNothing" },
       },
+      ...(options?.failedProvider || options?.failedModel
+        ? [
+            {
+              optionId: "changeModel",
+              resumeKind: "unpause" as const,
+              label: "Change the model",
+              consequence:
+                "Opens AI Models so you can choose a different model for this stage. " +
+                'After changing the model, use "Run now" to retry.',
+              effect: {
+                kind: "command" as const,
+                command: "vs-code-ai-helper.openAiModels",
+                args: [target.stage],
+              },
+            },
+          ]
+        : []),
       {
         optionId: "runNow",
         resumeKind: "continue",
@@ -425,15 +552,20 @@ export function buildOwedContinuationDecisionV1(
           command: "vs-code-ai-helper.runOwedContinuationNow",
           args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
         },
-        ...(claimedUntil
+        ...(options?.liveHolder
+          ? { disabled: true, disabledReason: `held by ${options.liveHolder}` }
+          : claimedUntil
           ? { disabled: true, disabledReason: `available after ${claimedUntil.toLocaleTimeString()}` }
           : {}),
       },
     ],
     recommendation: {
       kind: "option",
-      optionId: "waitForRetry",
-      reasoning: "The automatic retry needs nothing from you; waiting costs only time.",
+      optionId: options?.failedProvider || options?.failedModel ? "changeModel" : "waitForRetry",
+      reasoning:
+        options?.failedProvider || options?.failedModel
+          ? "The configured model failed; switching models allows the continuation to retry immediately."
+          : "The automatic retry needs nothing from you; waiting costs only time.",
     },
     gating: {
       holdsTaskPaused: false,
@@ -465,6 +597,16 @@ const LEASE_DURATION_MS = 60 * 60 * 1000;
  * same "could not start yet" warning again (seen live, 2026-09-17).
  */
 export const REFUSED_SCHEDULE_RETRY_DELAY_MS_V1 = 60 * 1000;
+/** Review stages: the ones whose scheduled action must be planned from the review's freshness. */
+const REVIEW_STAGES_FOR_SCHEDULED_PLAN_V1: ReadonlySet<string> = new Set([
+  "plan-high-review",
+  "plan-low-review",
+  "impl-high-review",
+  "impl-low-review",
+]);
+/** Used when a refused action stated no reason: says what is unknown instead of "declined". */
+const NO_STATED_REFUSAL_REASON_V1 =
+  "it did not start and recorded no reason (check the task's chat and the Output panel)";
 /** How long a claimed-but-undispatched owed continuation may sit before a Run-now card is posted. */
 export const OWED_CONTINUATION_WAIT_ANNOUNCE_AFTER_MS_V1 = 2 * 60 * 1000;
 
@@ -501,7 +643,29 @@ export class TaskActionScheduler implements vscode.Disposable {
    * the refused run's signature, and the earliest moment it may be retried.
    * The user is warned once per signature, not once per retry.
    */
-  private readonly refusedRuns = new Map<string, { readonly signature: string; readonly retryAt: number }>();
+  private readonly refusedRuns = new Map<
+    string,
+    {
+      readonly signature: string;
+      readonly retryAt: number;
+      /** Consecutive refusals for the same reason; drives the back-off. */
+      readonly attempts: number;
+      /** The reason given for the latest refusal; a different one starts over. */
+      readonly reason: string;
+    }
+  >();
+  /** Test seam: how a review stage's scheduled action is planned. */
+  private scheduledActionPlanLoaderV1: (
+    taskFolderPath: string,
+    progress: TaskProgress
+  ) => Promise<ResumeActionPlanV1> = loadResumeActionPlanV1;
+
+  /** Test-only: replaces the planner `fire()` consults for review stages. */
+  setScheduledActionPlanLoaderForTestV1(
+    loader: ((taskFolderPath: string, progress: TaskProgress) => Promise<ResumeActionPlanV1>) | undefined
+  ): void {
+    this.scheduledActionPlanLoaderV1 = loader ?? loadResumeActionPlanV1;
+  }
   /** Display name per armed task, for attributing `fire()`'s notifications. */
   private readonly taskNames = new Map<string, string>();
   private readonly owner: string;
@@ -626,7 +790,10 @@ export class TaskActionScheduler implements vscode.Disposable {
     stage: TaskProgress["currentStage"],
     kind: DelayedRetryKindV1,
     dueAt: Date,
-    holderNote?: string
+    holderNote?: string,
+    refusal?: ScheduledRefusalDetailV1,
+    /** True for a repeat of a refusal already announced: refresh the one card, announce nothing new. */
+    quietRepost = false
   ): Promise<void> {
     const task = this.inventory.getTasks().find((candidate) => candidate.taskFolderPath === taskFolderPath);
     const target: ChatTarget = {
@@ -637,14 +804,17 @@ export class TaskActionScheduler implements vscode.Disposable {
     };
     let posted: unknown;
     try {
-      posted = await postWorkflowDecisionV1(buildDelayedRetryDecisionV1(target, kind, dueAt, holderNote), target);
+      posted = await postWorkflowDecisionV1(
+        { ...buildDelayedRetryDecisionV1(target, kind, dueAt, holderNote, refusal), ...(quietRepost ? { quietRepost: true } : {}) },
+        target
+      );
     } catch (error) {
       console.error("announceDelayedRetryV1: could not post the Run-now card", error);
     }
-    if (posted === undefined && kind === "refused") {
+    if (posted === undefined && kind === "refused" && !quietRepost) {
       NotificationRouter.showWarning(
         `${formatNotificationTaskLabelV1(target.taskName, taskFolderPath)} — ` +
-          `A scheduled stage action could not start yet (${holderNote ?? "another action holds the task"}); ` +
+          `A scheduled stage action could not start yet (${holderNote ?? "no reason was recorded"}); ` +
           "it remains scheduled and will be retried automatically."
       );
     }
@@ -692,7 +862,13 @@ export class TaskActionScheduler implements vscode.Disposable {
     if (pending) {
       this.clock.clearTimeout(pending);
     }
-    this.refusedRuns.delete(taskFolderPath);
+    // The user chose to try now: the back-off starts over (and the retry is
+    // due immediately), but the card already announced for this schedule is
+    // kept so a repeated refusal refreshes it in place instead of posting again.
+    const priorRefusal = this.refusedRuns.get(taskFolderPath);
+    if (priorRefusal) {
+      this.refusedRuns.set(taskFolderPath, { ...priorRefusal, retryAt: 0, attempts: 0 });
+    }
     const firing = runWithNotificationTaskContextV1(
       this.taskNames.get(taskFolderPath),
       taskFolderPath,
@@ -714,6 +890,123 @@ export class TaskActionScheduler implements vscode.Disposable {
   }
 
   /**
+   * bugs2 finding 13: what a firing scheduled action can actually do right now,
+   * decided from the task's CURRENT durable state before anything is dispatched.
+   *
+   * - A paused task: a pause created by the quota stop this schedule was armed
+   *   for is lifted (when no other task is active); a user pause, another
+   *   cause, or a legacy schedule with no stop id refuses with the cause named
+   *   and Resume offered. The watchdog's own pauses are left to
+   *   `applyCurrentStageAction`'s existing reconcile.
+   * - A review stage: the same planner Resume uses decides between running the
+   *   review (it is stale or missing — Apply Review would only be refused),
+   *   applying it, or refusing with the precondition that is actually unmet.
+   *
+   * Unreadable progress changes nothing: the dispatch proceeds exactly as
+   * before and the stage command validates the task itself.
+   */
+  private async prepareScheduledDispatchV1(
+    taskFolderPath: string,
+    stage: TaskProgress["currentStage"],
+    quotaStopId: string | undefined
+  ): Promise<
+    | {
+        readonly kind: "dispatch";
+        readonly command: "vs-code-ai-helper.applyCurrentStageAction" | "vs-code-ai-helper.runReviewWithAI";
+        readonly liftedPause?: { readonly pausedReason: string };
+      }
+    | { readonly kind: "refuse"; readonly note: string; readonly detail: ScheduledRefusalDetailV1 }
+    | { readonly kind: "nothingToRun"; readonly note: string }
+  > {
+    const apply = { kind: "dispatch", command: "vs-code-ai-helper.applyCurrentStageAction" } as const;
+    const read = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath));
+    if (!read.ok) {
+      return apply;
+    }
+    const progress = read.decoded.progress;
+    const paused = progress.status === "paused";
+    const verdict = paused ? judgeScheduledRunPauseV1(progress, { quotaStopId }) : undefined;
+    // 1. A pause this schedule may not lift stays in force, with its cause named.
+    if (verdict?.kind === "blocked") {
+      return {
+        kind: "refuse",
+        note: `the task is paused (${verdict.cause}), and nothing resumes it for this schedule`,
+        detail: { category: "paused", offerResume: true },
+      };
+    }
+    // 2. What the stage needs NOW, decided before the pause is touched so a
+    // refusal never leaves a lifted pause behind.
+    let command: "vs-code-ai-helper.applyCurrentStageAction" | "vs-code-ai-helper.runReviewWithAI" = apply.command;
+    if (REVIEW_STAGES_FOR_SCHEDULED_PLAN_V1.has(stage)) {
+      let plan: ResumeActionPlanV1 | undefined;
+      try {
+        plan = await this.scheduledActionPlanLoaderV1(taskFolderPath, progress);
+      } catch {
+        plan = undefined;
+      }
+      if (plan?.kind === "blocked") {
+        return { kind: "refuse", note: plan.precondition, detail: { category: "precondition" } };
+      }
+      if (plan?.kind === "resume-only") {
+        return { kind: "nothingToRun", note: plan.reason };
+      }
+      if (plan?.kind === "run-review") {
+        // The review Apply Review would act on is stale or missing: review again.
+        command = "vs-code-ai-helper.runReviewWithAI";
+      }
+    }
+    // 3. Lift the pause this schedule's own quota stop created (single-active-task rule kept).
+    if (verdict?.kind === "liftOwnQuotaPause") {
+      const others = await this.otherActiveTaskLabelsV1(taskFolderPath);
+      if (others.length > 0) {
+        return {
+          kind: "refuse",
+          note:
+            `the task is paused by the quota stop this rerun was scheduled for, but ${others.join(", ")} ` +
+            `${others.length === 1 ? "is" : "are"} the active task — resuming this one would pause ${others.length === 1 ? "it" : "them"}`,
+          detail: { category: "paused", offerResume: true },
+        };
+      }
+      const lifted = await this.store.patch(vscode.Uri.file(taskFolderPath), (current) =>
+        isPauseCreatedByQuotaStopV1(current, quotaStopId) ? updateTaskStatus(current, "active") : current
+      );
+      if (lifted?.status !== "active") {
+        return {
+          kind: "refuse",
+          note: "the task's pause changed while the rerun was starting, so it was left as it is",
+          detail: { category: "paused", offerResume: true },
+        };
+      }
+      return { kind: "dispatch", command, liftedPause: { pausedReason: progress.pausedReason ?? "" } };
+    }
+    return { kind: "dispatch", command };
+  }
+
+  /** Labels of tasks other than `taskFolderPath` that are active right now. */
+  private async otherActiveTaskLabelsV1(taskFolderPath: string): Promise<string[]> {
+    const inventory = this.inventory as { refresh?: () => Promise<unknown> };
+    if (typeof inventory.refresh === "function") {
+      await inventory.refresh();
+    }
+    return this.inventory
+      .getTasks()
+      .filter((other) => other.taskFolderPath !== taskFolderPath && (other.progress.status ?? "active") === "active")
+      .map((other) => notificationTaskDisplayNameV1(other.progress.displayName, other.taskFolderPath));
+  }
+
+  /** Puts a pause this firing lifted back, when the action it lifted it for did not start. */
+  private async restoreLiftedQuotaPauseV1(
+    taskFolderPath: string,
+    lifted: { readonly pausedReason: string }
+  ): Promise<void> {
+    await this.store.patch(vscode.Uri.file(taskFolderPath), (current) =>
+      current.status === "active"
+        ? { ...updateTaskStatus(current, "paused"), pausedReason: lifted.pausedReason || undefined }
+        : current
+    );
+  }
+
+  /**
    * v1 fixes item 1, Part 1a step 6 ("a scheduled stage action must dispatch,
    * or must not consume its schedule"): admission is acquired BEFORE
    * `scheduledRun` is cleared below and held across the dispatch itself
@@ -732,16 +1025,31 @@ export class TaskActionScheduler implements vscode.Disposable {
     this.armedRuns.delete(taskFolderPath);
     let result: "dispatched" | "refused" | "skipped" = "skipped";
 
-    /** Refusal bookkeeping shared by an admission refusal and a declined dispatch. */
-    const recordRefusal = (holderNote: string): void => {
+    /**
+     * Refusal bookkeeping shared by an admission refusal and a declined
+     * dispatch (bugs2 finding 13). The first refusal of a schedule announces
+     * itself; every repeat refreshes THE SAME card in place with the new
+     * next-attempt time and posts nothing new. Repeats back off (1, 2, 4 …
+     * minutes, capped); a change in the reason starts the sequence over.
+     */
+    const recordRefusal = (holderNote: string, detail?: ScheduledRefusalDetailV1): void => {
       result = "refused";
       const signature = `${expectedRunAt}\u0000${expectedStage}`;
-      const alreadyWarned = this.refusedRuns.get(taskFolderPath)?.signature === signature;
-      const retryAt = this.clock.now() + REFUSED_SCHEDULE_RETRY_DELAY_MS_V1;
-      this.refusedRuns.set(taskFolderPath, { signature, retryAt });
-      if (!alreadyWarned) {
-        void this.announceDelayedRetryV1(taskFolderPath, canonicalId, expectedStage, "refused", new Date(retryAt), holderNote);
-      }
+      const prior = this.refusedRuns.get(taskFolderPath);
+      const samePendingSchedule = prior?.signature === signature;
+      const attempts = samePendingSchedule && prior.reason === holderNote ? prior.attempts + 1 : 1;
+      const retryAt = this.clock.now() + refusedScheduleRetryDelayMsV1(attempts);
+      this.refusedRuns.set(taskFolderPath, { signature, retryAt, attempts, reason: holderNote });
+      void this.announceDelayedRetryV1(
+        taskFolderPath,
+        canonicalId,
+        expectedStage,
+        "refused",
+        new Date(retryAt),
+        holderNote,
+        detail ?? { category: "busy" },
+        samePendingSchedule
+      );
       // Retry on this window's own timer once the delay has passed, instead
       // of waiting for (or being re-fired by) the next sweep.
       void this.arm(taskFolderPath, canonicalId);
@@ -763,6 +1071,10 @@ export class TaskActionScheduler implements vscode.Disposable {
       async () => {
         let clearedByThisOwner = false;
         let stageStillCurrent = false;
+        // The quota stop this schedule was armed for, if any: it is cleared
+        // from the task with the schedule, so it is kept here to restore the
+        // schedule intact when the dispatch is refused.
+        let claimedQuotaStopId: string | undefined;
         await this.store.patch(vscode.Uri.file(taskFolderPath), current => {
           const run = current.scheduledRun;
           // A stale callback must not consume a replacement schedule created
@@ -770,7 +1082,7 @@ export class TaskActionScheduler implements vscode.Disposable {
           // selected when the schedule was created.
           if (run?.leaseOwner !== this.owner || run.runAt !== expectedRunAt || run.stage !== expectedStage) return current;
           clearedByThisOwner = true;
-          this.refusedRuns.delete(taskFolderPath);
+          claimedQuotaStopId = run.quotaStopId;
           stageStillCurrent = current.currentStage === run.stage;
           return {
             ...current,
@@ -807,15 +1119,56 @@ export class TaskActionScheduler implements vscode.Disposable {
           // the token lets that downstream acquisition ADOPT this same marker
           // instead (`acquireOrAdoptWorkAdmissionV1`), mirroring
           // `resumeTask.ts`'s `resumeThenDispatchV1`.
+          // bugs2 finding 13: decide what the firing can actually do BEFORE
+          // dispatching — the pause it may lift (only the one its own quota
+          // stop created), and the action the stage needs now (a stale review
+          // is reviewed again, not applied).
+          const restoreSchedule = async (): Promise<void> => {
+            // Restore the schedule with its original stage (and quota-stop
+            // binding) rather than leaving the task unprotected AND with the
+            // action it promised never having run — only when nobody has
+            // since created a different schedule of their own.
+            await this.store.patch(vscode.Uri.file(taskFolderPath), current =>
+              current.scheduledRun === undefined
+                ? {
+                    ...current,
+                    scheduledRun: {
+                      runAt: expectedRunAt,
+                      stage: expectedStage,
+                      ...(claimedQuotaStopId !== undefined ? { quotaStopId: claimedQuotaStopId } : {}),
+                    },
+                  }
+                : current
+            );
+          };
+          const prepared = await this.prepareScheduledDispatchV1(taskFolderPath, expectedStage, claimedQuotaStopId);
+          if (prepared.kind === "refuse") {
+            await restoreSchedule();
+            recordRefusal(prepared.note, prepared.detail);
+            return;
+          }
+          if (prepared.kind === "nothingToRun") {
+            // The stage's next step is the person's: the schedule has nothing
+            // for automation to redo. It is consumed, and the chat says why.
+            result = "skipped";
+            this.refusedRuns.delete(taskFolderPath);
+            await this.withdrawDelayedRetryCardV1(taskFolderPath, canonicalId, "the scheduled action has nothing left to run");
+            const taskLabel = formatNotificationTaskLabelV1(this.taskNames.get(taskFolderPath), taskFolderPath);
+            NotificationRouter.showInformation(
+              `${taskLabel} — The scheduled action had nothing left to run: ${prepared.note}`
+            );
+            return;
+          }
           const handoffToken = authorizeWorkAdmissionHandoffV1(taskFolderPath);
           let dispatched = false;
           let failureMessage: string | undefined;
-          // Drop any reason left by an earlier call so the one read below is
+          // Drop any reason or terminal outcome left by an earlier call so the one read below is
           // this dispatch's own.
           clearStageActionRefusalReasonV1(taskFolderPath);
+          clearStageActionTerminalOutcomeV1(taskFolderPath);
           try {
             dispatched = (await vscode.commands.executeCommand<boolean>(
-              "vs-code-ai-helper.applyCurrentStageAction",
+              prepared.command,
               { canonicalId, taskFolderPath, admissionHandoffTokenV1: handoffToken }
             )) === true;
           } catch (error) {
@@ -823,30 +1176,47 @@ export class TaskActionScheduler implements vscode.Disposable {
           } finally {
             revokeWorkAdmissionHandoffV1(taskFolderPath);
           }
-          if (!dispatched) {
+          const terminalOutcome = takeStageActionTerminalOutcomeV1(taskFolderPath);
+          if (terminalOutcome?.kind === "failed") {
+            // The action ran and ended with its own result (e.g. Publish
+            // Checks that found failures), and its own hand-back offers the
+            // next step. Re-arming the schedule would only repeat the same
+            // run automatically, so the schedule is consumed.
+            result = "dispatched";
+            this.refusedRuns.delete(taskFolderPath);
+            await this.withdrawDelayedRetryCardV1(taskFolderPath, canonicalId, "the scheduled action ran and reported its own result");
+          } else if (terminalOutcome !== undefined) {
+            await restoreSchedule();
+            if (prepared.liftedPause) {
+              await this.restoreLiftedQuotaPauseV1(taskFolderPath, prepared.liftedPause);
+            }
+            const text = describeStageActionTerminalOutcomeV1(terminalOutcome);
+            recordRefusal(text, {
+              category: terminalOutcome.kind,
+              terminalOutcome,
+            });
+          } else if (!dispatched) {
             // Dispatch never happened (or failed before any downstream
             // mechanism — its own round ledger row, its own admission —
-            // could take over protecting the task). Restore the schedule
-            // with its original stage rather than leaving the task silently
-            // unprotected AND with the action it promised never having run —
-            // only when nobody has since created a different schedule of
-            // their own.
-            await this.store.patch(vscode.Uri.file(taskFolderPath), current =>
-              current.scheduledRun === undefined
-                ? { ...current, scheduledRun: { runAt: expectedRunAt, stage: expectedStage } }
-                : current
-            );
+            // could take over protecting the task).
+            await restoreSchedule();
+            if (prepared.liftedPause) {
+              await this.restoreLiftedQuotaPauseV1(taskFolderPath, prepared.liftedPause);
+            }
             // The same Run-now card an admission refusal posts, naming the
             // reason — not a bare toast beside a clicked "Run now".
-            recordRefusal(
-              failureMessage
-                ? `the action failed to start: ${failureMessage}`
-                : `the action was refused: ${
-                    takeStageActionRefusalReasonV1(taskFolderPath) ?? "the stage action declined to start"
-                  }`
-            );
+            const stated = takeStageActionRefusalReasonV1(taskFolderPath);
+            if (failureMessage) {
+              recordRefusal(`the action failed to start: ${failureMessage}`, { category: "failed" });
+            } else {
+              recordRefusal(
+                `the action was refused: ${stated ?? NO_STATED_REFUSAL_REASON_V1}`,
+                { category: stated !== undefined && /\bpaused\b/.test(stated) ? "paused" : "precondition", offerResume: stated !== undefined && /\bpaused\b/.test(stated) }
+              );
+            }
           } else {
             result = "dispatched";
+            this.refusedRuns.delete(taskFolderPath);
             await this.withdrawDelayedRetryCardV1(taskFolderPath, canonicalId, "the scheduled action has started");
           }
         } else if (clearedByThisOwner) {
@@ -1544,6 +1914,18 @@ export class TaskActionScheduler implements vscode.Disposable {
             recovery = afterClear.implRecovery;
             leaseLive = false;
           }
+        } else {
+          const resolvedOwner = await this.resolveRecoveryClaimOwnerV1();
+          if (
+            this.isOwnRecoveryClaimOwnerV1(recovery.leaseOwner, resolvedOwner) &&
+            !taskOperations.hasRootOperationForTask(task.taskFolderPath)
+          ) {
+            const released = await releaseImplRecoveryClaimV1(vscode.Uri.file(task.taskFolderPath));
+            if (released?.implRecovery) {
+              recovery = released.implRecovery;
+            }
+            leaseLive = false;
+          }
         }
       }
       if (leaseLive) {
@@ -1727,8 +2109,26 @@ export class TaskActionScheduler implements vscode.Disposable {
       stage: task.progress.currentStage,
       taskName: task.progress.displayName,
     };
+    const liveHolder = taskOperations.hasRootOperationForTask(task.taskFolderPath)
+      ? (taskOperations.getTaskOperations(task.taskFolderPath)[0]?.label ??
+         taskOperations.getMirroredTaskOperations(task.taskFolderPath)[0]?.label ??
+         "an active operation")
+      : undefined;
     try {
-      await postWorkflowDecisionV1(buildOwedContinuationDecisionV1(target, dueAt, waitingOn, claimedUntil), target);
+      await postWorkflowDecisionV1(
+        {
+          ...buildOwedContinuationDecisionV1(target, dueAt, waitingOn, claimedUntil, {
+            liveHolder,
+            failedProvider: task.progress.implRecovery?.failedProvider,
+            failedModel: task.progress.implRecovery?.failedModel,
+          }),
+          // The decision store updates a standing condition in place. Keep
+          // its transcript projection stable too when the condition changes
+          // (for example, a lease expires or the failed model is refreshed).
+          quietRepost: true,
+        },
+        target
+      );
     } catch (error) {
       console.error("announceOwedContinuationWaitV1: could not post the Run-now card", error);
     }
@@ -1763,7 +2163,7 @@ export class TaskActionScheduler implements vscode.Disposable {
     if (!recovery) {
       return { kind: "nothingOwed" };
     }
-    if (recovery.dispatch !== "pending") {
+    if (taskOperations.hasRootOperationForTask(taskFolderPath)) {
       return { kind: "alreadyRunning" };
     }
     if (this.owedClaimsInFlight.has(taskFolderPath)) {
@@ -1785,6 +2185,13 @@ export class TaskActionScheduler implements vscode.Disposable {
     taskFolderPath: string,
     recovery: NonNullable<TaskProgress["implRecovery"]>
   ): Promise<OwedContinuationRunNowResultV1> {
+    if (taskOperations.hasRootOperationForTask(taskFolderPath)) {
+      const liveHolder =
+        taskOperations.getTaskOperations(taskFolderPath)[0]?.label ??
+        taskOperations.getMirroredTaskOperations(taskFolderPath)[0]?.label ??
+        "an active operation";
+      return this.refuseOwedContinuationNowV1(`held by ${liveHolder}`);
+    }
     const resolvedOwner = await this.resolveRecoveryClaimOwnerV1();
     const leaseLive =
       recovery.leaseUntil !== undefined && new Date(recovery.leaseUntil).getTime() > this.clock.now();
@@ -1801,7 +2208,16 @@ export class TaskActionScheduler implements vscode.Disposable {
         "its automation chain guard is still held, so a continuation chain is genuinely in flight"
       );
     }
-    if (leaseLive) {
+    if (recovery.dispatch !== "pending") {
+      await releaseImplRecoveryClaimV1(vscode.Uri.file(taskFolderPath), {
+        reason: recovery.reason,
+        failedProvider: recovery.failedProvider,
+        failedModel: recovery.failedModel,
+        operationId: recovery.operationId,
+        attemptId: recovery.attemptId,
+        leaseOwner: recovery.leaseOwner,
+      });
+    } else if (leaseLive) {
       // This window's own earlier claim, with no chain in flight: the wait the
       // user is choosing not to sit out. Compare-and-clear so a concurrent
       // change of owner is left alone.
@@ -1818,6 +2234,9 @@ export class TaskActionScheduler implements vscode.Disposable {
         return { ...progress, implRecovery: { ...record, leaseOwner: undefined, leaseUntil: undefined } };
       });
     }
+    await this.store.patch(vscode.Uri.file(taskFolderPath), (progress) =>
+      clearStageFallbackReservation(progress, "impl")
+    );
     const result = await this.claimAndDispatchOwedContinuationLockedV1(taskFolderPath);
     if (result.kind === "dispatched") {
       return { kind: "started" };
@@ -1893,7 +2312,7 @@ export class TaskActionScheduler implements vscode.Disposable {
    * codebase uses, and still injectable for tests) via `whenNoLiveRow.patch`.
    */
   private async closeStalledTaskThroughLedgerV1(
-    task: { readonly taskFolderPath: string; readonly progress: TaskProgress },
+    task: { readonly taskFolderPath: string; readonly canonicalId?: string; readonly progress: TaskProgress },
     attemptId: string | undefined,
     reason: string,
     claimId: string,
@@ -1907,12 +2326,18 @@ export class TaskActionScheduler implements vscode.Disposable {
     // conclude the state is no longer impossible, so the pause below could
     // never actually commit (2026-09-09 fix — see the field's doc comment in
     // `taskWatchdogV1.ts`).
+    // bugs2 finding 1: re-read the task's question state under the claim, so a
+    // question posted (or an answer stored) after the sweep's first look still
+    // exempts the task from the pause.
+    const taskCanonicalId = task.canonicalId ?? task.taskFolderPath;
+    const pendingUserInput = await readPendingUserInputEvidenceV1(task.taskFolderPath, taskCanonicalId);
     const isStillImpossible = (current: TaskProgress): boolean =>
       isImpossibleActiveStateV1({
         progress: current,
-        taskCanonicalId: task.taskFolderPath,
+        taskCanonicalId,
         now: this.clock.now(),
         excludeWorkAdmissionOwnerToken: claimOwnerToken,
+        pendingUserInput,
       });
     const clearImplRecovery = reason === UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1;
 
@@ -2026,8 +2451,16 @@ export class TaskActionScheduler implements vscode.Disposable {
       return;
     }
     for (const task of this.inventory.getTasks()) {
+      // The cheap, synchronous evidence first: reading the chat is only worth
+      // doing for a task that would otherwise be paused.
       if (!isImpossibleActiveStateV1({ progress: task.progress, taskCanonicalId: task.taskFolderPath, now: this.clock.now() })) {
         this.stalledActiveNotified.delete(task.taskFolderPath);
+        continue;
+      }
+      // bugs2 finding 1: a task waiting on an unanswered question (or owing a
+      // stored answer its Resume) is waiting for the user, not quiet.
+      const pendingUserInput = await readPendingUserInputEvidenceV1(task.taskFolderPath, task.canonicalId);
+      if (hasPendingUserInputV1(pendingUserInput)) {
         continue;
       }
       if (this.stalledActiveNotified.has(task.taskFolderPath)) {
@@ -2345,7 +2778,15 @@ export async function scheduleQuotaResumeAtV1(
   scheduler: TaskActionScheduler,
   arg: ScheduleArg,
   resetAt: Date,
-  clock: SchedulerClock = systemSchedulerClock
+  clock: SchedulerClock = systemSchedulerClock,
+  /**
+   * The quota stop this rerun is being scheduled for (bugs2 finding 13). When
+   * it names the stop that created the task's CURRENT pause, the schedule is
+   * bound to that pause and may lift it when it fires; otherwise (no id, or
+   * the pause is not that stop's) the schedule runs the stage action but can
+   * never resume a paused task.
+   */
+  options?: { readonly quotaStopId?: string }
 ): Promise<void> {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
   const resolverArg = arg.task
@@ -2378,7 +2819,22 @@ export async function scheduleQuotaResumeAtV1(
   // v1 fixes 2, Wave I chokepoint (arms a schedule) — same reasoning as
   // scheduleTaskResume above: arming a quota-park rerun means automation
   // acts next.
-  await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), p => setNextActorV1({ ...p, scheduledRun: { runAt: effectiveRunAt.toISOString(), stage: p.currentStage }, scheduledResumeTime: undefined, updatedAt: new Date(clock.now()).toISOString() }, "automation"));
+  await patchTaskProgressStrictV1(vscode.Uri.file(task.taskFolderPath), p => {
+    const bindsToCurrentQuotaPause = isPauseCreatedByQuotaStopV1(p, options?.quotaStopId);
+    return setNextActorV1(
+      {
+        ...p,
+        scheduledRun: {
+          runAt: effectiveRunAt.toISOString(),
+          stage: p.currentStage,
+          ...(bindsToCurrentQuotaPause && options?.quotaStopId !== undefined ? { quotaStopId: options.quotaStopId } : {}),
+        },
+        scheduledResumeTime: undefined,
+        updatedAt: new Date(clock.now()).toISOString(),
+      },
+      "automation"
+    );
+  });
   await scheduler.arm(task.taskFolderPath, task.canonicalId);
   // Item 22: a quota park is a delayed automatic retry the user would
   // otherwise just wait out — offer "Run now" beside it, in the task's chat.
@@ -2533,11 +2989,13 @@ export function registerScheduleTaskResumeCommand(context: vscode.ExtensionConte
   context.subscriptions.push(vscode.commands.registerCommand("vs-code-ai-helper.cancelScheduledTaskAction", unlessViewer((arg?: ScheduleArg) => cancelScheduledTaskAction(inventory, scheduler, arg))));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.scheduleQuotaResumeV1",
-    unlessViewer((arg?: ScheduleArg & { resetAtIso?: string }) => {
+    unlessViewer((arg?: ScheduleArg & { resetAtIso?: string; quotaStopId?: string }) => {
       if (!arg?.resetAtIso) return;
       const resetAt = new Date(arg.resetAtIso);
       if (Number.isNaN(resetAt.getTime())) return;
-      return scheduleQuotaResumeAtV1(inventory, scheduler, arg, resetAt);
+      return scheduleQuotaResumeAtV1(inventory, scheduler, arg, resetAt, systemSchedulerClock, {
+        quotaStopId: typeof arg.quotaStopId === "string" ? arg.quotaStopId : undefined,
+      });
     })
   ));
   context.subscriptions.push(vscode.commands.registerCommand(

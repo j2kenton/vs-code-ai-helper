@@ -35,6 +35,7 @@ import {
   shouldOfferRunImplementationForUnusableSummaryV1,
 } from "../utils/implementationArtifactResolver";
 import { previousVersionUri } from "../utils/artifactBackups";
+import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 
 const FOLDER = vscode.Uri.file("/tasks/2026-08-13_restore-rejected-round");
@@ -59,6 +60,28 @@ const REAL_SUMMARY = "## Files Changed\n\n- `src/a.ts` — did a thing\n\n## Ver
 // implementation once there is provably nothing left for a round to change.
 const IMPLEMENTATION_CHECKLIST_MARKER = "<!-- ensemble:implementation-checklist -->";
 const FULLY_SETTLED_PLAN = `# Implementation Checklist\n\n${IMPLEMENTATION_CHECKLIST_MARKER}\n\n- [x] Step one\n- [x] Step two\n`;
+// Ticks only count as settled once a reviewer has verified them (Part 3);
+// unverified ticks are provisional, so the fully-settled fixtures carry a
+// reviewer verification for each item.
+const FULLY_SETTLED_EVIDENCE = ["Step one", "Step two"].map((itemText) => ({
+  planRevision: getPlanRevisionV1(FULLY_SETTLED_PLAN),
+  itemKey: normalizeChecklistItemTextV1(itemText),
+  itemText,
+  claims: [{ source: "implementation", at: "2026-08-13T00:00:00.000Z" }],
+  verifications: [{ at: "2026-08-13T00:00:00.000Z", evidence: "verified by review" }],
+}));
+function settledProgressJson(extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    taskFolder: "2026-08-13_restore-rejected-round",
+    currentStage: "impl-low-review",
+    status: "active",
+    createdAt: "2026-08-13T00:00:00.000Z",
+    updatedAt: "2026-08-13T00:00:00.000Z",
+    planItemEvidence: FULLY_SETTLED_EVIDENCE,
+    ...extra,
+  });
+}
+const PROGRESS_URI = vscode.Uri.joinPath(FOLDER, "task-progress.json").toString();
 
 // ---------------------------------------------------------------------------
 // In-memory vscode.workspace.fs, so these tests never touch real disk.
@@ -293,6 +316,7 @@ void describe("describeUnusableReviewBlockV1", () => {
           [summaryUri.toString()]: stamped,
           [previousVersionUri(summaryUri).toString()]: REAL_SUMMARY,
           [getCanonicalImplementationUri(FOLDER).toString()]: FULLY_SETTLED_PLAN,
+          [PROGRESS_URI]: settledProgressJson(),
         })
       );
       activeStore = mem;
@@ -318,14 +342,7 @@ void describe("describeUnusableReviewBlockV1", () => {
         "run-log-2026-08-13.md"
       );
       const summaryUri = getImplementationSummaryUri(FOLDER);
-      const latchedProgress = JSON.stringify({
-        taskFolder: "2026-08-13_restore-rejected-round",
-        currentStage: "impl-low-review",
-        status: "active",
-        createdAt: "2026-08-13T00:00:00.000Z",
-        updatedAt: "2026-08-13T00:00:00.000Z",
-        checklistProgressUnreliable: true,
-      });
+      const latchedProgress = settledProgressJson({ checklistProgressUnreliable: true });
       const mem = installMemStore(
         seed({
           [summaryUri.toString()]: stamped,
@@ -362,6 +379,7 @@ void describe("describeUnusableReviewBlockV1", () => {
         seed({
           [getImplementationSummaryUri(FOLDER).toString()]: stamped,
           [getCanonicalImplementationUri(FOLDER).toString()]: FULLY_SETTLED_PLAN,
+          [PROGRESS_URI]: settledProgressJson(),
         })
       );
       activeStore = mem;
@@ -711,6 +729,7 @@ void describe("hasOfferableRunImplementationForUnusableSummaryV1", () => {
         seed({
           [getImplementationSummaryUri(FOLDER).toString()]: stamped,
           [getCanonicalImplementationUri(FOLDER).toString()]: FULLY_SETTLED_PLAN,
+          [PROGRESS_URI]: settledProgressJson(),
         })
       );
       activeStore = mem;

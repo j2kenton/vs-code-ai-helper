@@ -16,7 +16,7 @@ import {
 } from "../utils/chatHistoryStore";
 import {
   applyOpenPlanItemsFormV1,
-  countChecklistProgressV1,
+  countChecklistEvidenceProgressV1,
   listOpenPlanItemRecordsV1,
   normalizeChecklistItemTextV1,
   OpenPlanItemsFormAnswerV1,
@@ -29,6 +29,7 @@ import { computeNextStage } from "../utils/stageTransition";
 import { resolveConfiguredReviewStages } from "../utils/modelSelection";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 const COMMAND = "vs-code-ai-helper.decideOpenPlanItems";
 
@@ -261,7 +262,11 @@ async function continueAfterOpenPlanItemDecisionsInnerV1(
 ): Promise<void> {
   const planUri = getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath));
   const freshPlan = await readTextIfExists(planUri);
-  const remaining = freshPlan === undefined ? undefined : countChecklistProgressV1(freshPlan)?.remaining;
+  const taskFolder = vscode.Uri.file(arg.taskFolderPath);
+  const progressRead = await readTaskProgressStrictV1(taskFolder);
+  const remaining = freshPlan === undefined || !progressRead.ok
+    ? undefined
+    : countChecklistEvidenceProgressV1(freshPlan, progressRead.decoded.progress.planItemEvidence ?? [])?.gate.remaining;
   if (remaining === undefined) {
     return;
   }

@@ -63,6 +63,7 @@ function openSelection(options: {
   mode: AgentExecutionModeV1;
   modelId: string | undefined;
   requireSummaryOnlyCapableText?: boolean;
+  restrictToPrimaryModel?: boolean;
 }): ReturnType<typeof openV1RunnerSelection> {
   return openV1RunnerSelection({
     session: options.session,
@@ -71,6 +72,7 @@ function openSelection(options: {
     stage: "impl-high-review",
     workspaceCwd: "/workspace",
     requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
+    restrictToPrimaryModel: options.restrictToPrimaryModel,
   });
 }
 
@@ -137,6 +139,35 @@ void describe("openV1RunnerSelection", () => {
           assert.match(candidate.reason, /reserved for invocation/);
         }
       }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("does not switch models when a report correction is pinned to its original model", () => {
+    const stub = installModelSettings({
+      impl: {
+        primary: "copilot:gpt-5",
+        backups: ["copilot:gpt-5-mini"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openV1RunnerSelection({
+        session,
+        mode: "text",
+        modelId: "copilot:gpt-5",
+        stage: "impl",
+        workspaceCwd: "/workspace",
+        restrictToPrimaryModel: true,
+      });
+      const first = selection.reserveNext(session.allocateAttempt());
+      assert.equal(first.kind, "reserved");
+      if (first.kind !== "reserved") assert.fail("expected original model to be reserved");
+      assert.equal(first.reserved.storedModelId, "copilot:gpt-5");
+      session.reportAttemptOutcome(first.reserved.handle.correlation.attemptId, "transportFailurePreResponse");
+      assert.equal(selection.reserveNext(session.allocateAttempt()).kind, "noneRemaining");
     } finally {
       stub.restore();
     }

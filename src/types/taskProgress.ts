@@ -314,6 +314,8 @@ export interface TaskProgress {
     stage: TaskStage;
     leaseOwner?: string;
     leaseUntil?: string;
+    /** The quota stop whose pause this rerun may lift (`QuotaParkRecordV1.stopId`). */
+    quotaStopId?: string;
   };
   /** @deprecated Kept readable for schedules created by older releases. */
   scheduledResumeTime?: string;
@@ -439,6 +441,8 @@ export interface TaskProgress {
    * has to choose between an open row and eviction in practice).
    */
   roundLedger?: RoundLedgerEntryV1[];
+  /** Per-item claim and review evidence; legacy checklist ticks stay visible if absent. */
+  planItemEvidence?: PlanItemEvidenceV1[];
   /**
    * Durable record of a round that tried to add, remove, or renumber a
    * checklist item in `plan-final.md` (wf "make the stage chat a record of
@@ -718,6 +722,14 @@ export interface QuotaParkRecordV1 {
   resetAt?: string;
   /** ISO instant the failure was observed. */
   observedAt: string;
+  /**
+   * Identity of this quota stop (bugs2 finding 13). A rerun scheduled for the
+   * stop's reset carries it (`scheduledRun.quotaStopId`) so that, when it
+   * fires, it may lift only the pause THIS stop created — never a later user
+   * pause or a pause with another cause. Absent on records written before the
+   * field existed, which therefore never authorize an automatic resume.
+   */
+  stopId?: string;
 }
 
 /** How the round that triggered an `implRecovery` failed to report. */
@@ -840,6 +852,12 @@ export interface ImplRecoveryV1 {
    * continues. Absent for a record persisted before this field existed.
    */
   sourceRoundId?: string;
+  /** Operation holding the continuation claim, if live. */
+  operationId?: string;
+  /** Provider that failed, triggering or holding the recovery. */
+  failedProvider?: string;
+  /** Model that failed, triggering or holding the recovery. */
+  failedModel?: string;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
@@ -1322,6 +1340,49 @@ export const MAX_ROUND_OUTCOMES = 50;
 
 /** Cap on `TaskProgress.roundLedger` length (oldest TERMINAL rows dropped first). */
 export const MAX_ROUND_LEDGER_ENTRIES = 200;
+export const MAX_PLAN_ITEM_EVIDENCE_ENTRIES = 1000;
+
+/** Durable provenance attached to one canonical checklist item and plan revision. */
+export interface PlanItemEvidenceV1 {
+  readonly planRevision: string;
+  readonly itemKey: string;
+  readonly itemText: string;
+  readonly claims: readonly PlanItemClaimEvidenceV1[];
+  readonly verifications?: readonly PlanItemReviewerVerificationV1[];
+  readonly testReports?: readonly PlanItemTestReportV1[];
+}
+
+export interface PlanItemClaimEvidenceV1 {
+  readonly source: "implementation" | "retroactive" | "reviewer";
+  readonly at: string;
+  readonly roundId?: string;
+  readonly evidence?: string;
+}
+
+export interface PlanItemReviewerVerificationV1 {
+  readonly at: string;
+  readonly roundId?: string;
+  readonly evidence: string;
+  /** Test reports this review explicitly accepted; code-only reviews omit it. */
+  readonly testReportRoundIds?: readonly string[];
+}
+
+export interface PlanItemTestReportV1 {
+  readonly at: string;
+  readonly roundId: string;
+  readonly testIdentity: string;
+  readonly command: string;
+  readonly workingDirectory?: string;
+  readonly passed: number;
+  readonly failed: number;
+  readonly sourceState: string;
+  /** Workspace files whose post-edit state this report exercised. */
+  readonly sourceFiles?: readonly string[];
+  /** SHA-256 snapshot of each existing tested workspace source at report time. */
+  readonly sourceFileStates?: readonly { readonly path: string; readonly sha256: string }[];
+  /** If true, later edits conservatively invalidate this report. */
+  readonly sourceFilesTruncated?: boolean;
+}
 
 /** `TaskProgress.roundLedger`'s lifecycle states — a strict superset of the
  * five-value scheduling-posture vocabulary the task tree already renders

@@ -129,13 +129,24 @@ export async function captureRaisedNoticesV1<T>(fn: () => Promise<T>): Promise<{
   return { result, notices };
 }
 
-/** Reason for a Publish Checks dispatch that left no fresh result: the last notice, or a fixed fallback. */
+/**
+ * Reason for a Publish Checks dispatch that left no fresh result and recorded
+ * no terminal outcome: the last notice the command raised, or — when it raised
+ * none — a diagnostic that says what could not be established. A refusal always
+ * carries a reason; "declined to start without saying why" is never shown
+ * (bugs2 finding 5).
+ */
 export function publishChecksDeclinedReasonV1(notices: readonly string[]): string {
   const lastNotice = notices[notices.length - 1];
   return lastNotice !== undefined
     ? `Publish Checks declined to start: ${lastNotice}`
-    : "Publish Checks declined to start without saying why";
+    : PUBLISH_CHECKS_NO_REASON_V1;
 }
+
+/** Shown when Publish Checks left no result and nothing stated or recorded why. */
+export const PUBLISH_CHECKS_NO_REASON_V1 =
+  "Publish Checks left no fresh result, and neither a notice nor a recorded outcome says why " +
+  "(whether they started could not be established) — open the Publish Checks report or the Output panel to see what ran";
 
 /** Called by the router for every warning/error; a no-op outside a capture. */
 export function recordRaisedNoticeV1(message: string): void {

@@ -92,11 +92,12 @@ void describe("collectCompletionLint — verification environment disclosure (re
 
     assert.ok(result.verificationEnvironment, "verificationEnvironment must be populated");
     assert.equal(result.verificationEnvironment.cwd, dir);
-    assert.match(result.verificationEnvironment.packageManager, /^npm(\s.+)?$/);
+    assert.ok(result.verificationEnvironment.packageManager === null || /^npm\s.+$/.test(result.verificationEnvironment.packageManager),
+      "resolved npm version is shown, or remains explicitly unknown when version discovery fails");
 
     const section = buildVerifiedChecksSection(result);
     assert.match(section, /Resolved cwd:/);
-    assert.match(section, /Package manager: npm/);
+    assert.match(section, /Package manager: (?:npm\s.+|version unavailable)/);
   });
 });
 

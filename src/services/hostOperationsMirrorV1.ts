@@ -25,12 +25,9 @@ export const RUNNER_OPERATIONS_HEARTBEAT_MS_V1 = 30 * 1000;
 export const RUNNER_OPERATIONS_STALE_MS_V1 = 3 * RUNNER_OPERATIONS_HEARTBEAT_MS_V1;
 
 /**
- * Identifies ONE runner activation. Operation ids restart at `op-1` every
- * time the runner's extension host starts, so a Stop pressed on a row the
- * viewer had not refreshed yet would otherwise cancel whatever the RESTARTED
- * runner happens to be calling `op-1` now (review, 2026-09-17). A cancel
- * request carries the activation it was read from and the runner refuses it
- * unless that is still its own.
+ * Identifies ONE runner activation. A cancel request carries the activation
+ * its row was read from, and the runner refuses it unless that is still its
+ * own, so a stale viewer cannot act on a different runner session.
  */
 export const runnerActivationIdV1 = crypto.randomUUID();
 

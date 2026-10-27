@@ -456,6 +456,8 @@ export function createProductionTaskActionCoordinatorV1(options: {
    * and must not narrow their provider chain by it now.
    */
   readonly requireSummaryOnlyCapableText?: boolean;
+  /** Restrict a report correction to the exact model used by the edit round. */
+  readonly restrictToPrimaryModel?: boolean;
   /**
    * The task this coordinator instance's invocations belong to, when the
    * caller has one — every production caller does except the Global
@@ -478,6 +480,7 @@ export function createProductionTaskActionCoordinatorV1(options: {
       workspaceCwd: options.workspaceCwd,
       resolveStagePrimaryModel: options.resolveStagePrimaryModel,
       requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
+      restrictToPrimaryModel: options.restrictToPrimaryModel,
     }),
     // Make a passed-over model visible. Until this existed, a candidate the
     // registry refused was recorded only inside the in-memory selection

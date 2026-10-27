@@ -23,15 +23,21 @@
  */
 import * as assert from "node:assert/strict";
 import * as nodeFs from "node:fs";
+import { createHash } from "node:crypto";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { applyReviewerVerifiedTicks, applyReviewerVerifiedTicksConfirmedV1 } from "../commands/applyReviewerVerifiedTicks";
+import {
+  applyReviewerVerifiedTicks,
+  applyReviewerVerifiedTicksConfirmedV1,
+  recordReviewerVerificationOfTickedItemsV1,
+} from "../commands/applyReviewerVerifiedTicks";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskProgress } from "../types/taskProgress";
+import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import {
   StatusSurface,
   deactivateNotificationRouter,
@@ -113,7 +119,12 @@ function readPlan(folder: string): string {
 
 function makeTask(
   name: string,
-  options: { plan?: string; review?: string; currentStage?: TaskProgress["currentStage"] }
+  options: {
+    plan?: string;
+    review?: string;
+    currentStage?: TaskProgress["currentStage"];
+    planItemEvidence?: TaskProgress["planItemEvidence"];
+  }
 ): { folder: string; progress: TaskProgress } {
   const folder = nodePath.join(ROOT, ".ensemble", name);
   nodeFs.mkdirSync(folder, { recursive: true });
@@ -127,6 +138,7 @@ function makeTask(
     status: "active",
     createdAt: BASE_UPDATED_AT,
     updatedAt: BASE_UPDATED_AT,
+    planItemEvidence: options.planItemEvidence,
   } as TaskProgress;
   writeProgress(folder, progress);
   return { folder, progress };
@@ -283,7 +295,12 @@ function makeExtensionContext(): vscode.ExtensionContext {
  */
 async function run(
   name: string,
-  taskOptions: { plan?: string; review?: string; currentStage?: TaskProgress["currentStage"] },
+  taskOptions: {
+    plan?: string;
+    review?: string;
+    currentStage?: TaskProgress["currentStage"];
+    planItemEvidence?: TaskProgress["planItemEvidence"];
+  },
   confirmOptions: {
     confirm?: boolean;
     interference?: (folder: string) => void;
@@ -842,4 +859,246 @@ void describe("applyReviewerVerifiedTicks — cancellation and races", () => {
       assert.match(finalPlan, /- \[ \] Add the retry button/);
     }
   );
+});
+
+void describe("applyReviewerVerifiedTicks — editing-round test evidence", () => {
+  const item = "Add regression cases in dispatch.test.ts";
+  const plan = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    `- [ ] ${item}`,
+    "- [ ] Wire the completeness gate",
+    "",
+  ].join("\n");
+  const review = [
+    "Readiness: 9/10",
+    "",
+    "<!-- verified-complete:start -->",
+    `- ${item}`,
+    "  evidence: Accepted editing round edit-1 and inspected dispatch.ts.",
+    "<!-- verified-complete:end -->",
+    "",
+  ].join("\n");
+  const revision = getPlanRevisionV1(plan);
+
+  function evidenceWithReport(report?: Partial<{
+    passed: number;
+    failed: number;
+    command: string;
+  }>): TaskProgress["planItemEvidence"] {
+    const sourceRel = "src/commands/dispatch.ts";
+    const sourceAbs = nodePath.join(ROOT, sourceRel);
+    nodeFs.mkdirSync(nodePath.dirname(sourceAbs), { recursive: true });
+    nodeFs.writeFileSync(sourceAbs, "export function dispatch(): void {}\n", "utf8");
+    const sourceSha = createHash("sha256").update(nodeFs.readFileSync(sourceAbs)).digest("hex");
+    return [{
+      planRevision: revision,
+      itemKey: normalizeChecklistItemTextV1(item),
+      itemText: item,
+      claims: [{
+        source: "retroactive",
+        at: "2026-10-26T00:00:00.000Z",
+        roundId: "edit-1",
+      }],
+      testReports: [{
+        at: "2026-10-26T00:01:00.000Z",
+        roundId: "edit-1",
+        testIdentity: "src/test/dispatch.test.ts",
+        command: report?.command ?? "node src/test/dispatch.test.ts",
+        workingDirectory: "/workspace",
+        passed: report?.passed ?? 3,
+        failed: report?.failed ?? 0,
+        sourceState: "post-edit source state",
+        sourceFiles: [sourceRel],
+        sourceFileStates: [{ path: sourceRel, sha256: sourceSha }],
+      }],
+    }];
+  }
+
+  void it("keeps a test-dependent reviewer claim provisional without a passing editing-round report", async () => {
+    const result = await run("test-evidence-missing", { plan, review }, { confirm: true });
+    assert.equal(result.decision, undefined);
+    assert.match(result.captured.find((entry) => entry.method === "warning")?.message ?? "", /without an applicable passing/);
+    assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
+  });
+
+  void it("accepts an applicable passing editing-round report without review-time test execution", async () => {
+    const result = await run(
+      "test-evidence-pass",
+      { plan, review, planItemEvidence: evidenceWithReport() },
+      { confirm: true }
+    );
+    assert.ok(result.decision, result.captured.map((entry) => entry.message).join("\n"));
+    assert.match(readPlan(result.folder), /- \[x\] Add regression cases/, result.captured.map((entry) => entry.message).join("\n"));
+    const persisted = JSON.parse(nodeFs.readFileSync(nodePath.join(result.folder, "task-progress.json"), "utf8")) as TaskProgress;
+    assert.deepEqual(persisted.planItemEvidence?.[0]?.verifications?.[0]?.testReportRoundIds, ["edit-1"]);
+  });
+
+  void it("rejects failing results and commands unrelated to the acceptance test", async () => {
+    for (const [name, report] of [
+      ["failed", { passed: 2, failed: 1, command: "node out/test/dispatch.test.js" }],
+      ["unrelated", { passed: 2, failed: 0, command: "node out/test/other.test.js" }],
+    ] as const) {
+      const result = await run(
+        `test-evidence-${name}`,
+        { plan, review, planItemEvidence: evidenceWithReport(report) },
+        { confirm: true }
+      );
+      assert.equal(result.decision, undefined);
+      assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
+    }
+  });
+
+  function evidenceWithHashedReport(): { sourceRel: string; planItemEvidence: TaskProgress["planItemEvidence"] } {
+    const sourceRel = "src/commands/dispatch.ts";
+    const sourceAbs = nodePath.join(ROOT, sourceRel);
+    nodeFs.mkdirSync(nodePath.dirname(sourceAbs), { recursive: true });
+    nodeFs.writeFileSync(sourceAbs, "export function dispatch(): void {}\n", "utf8");
+    const initialSha = createHash("sha256").update(nodeFs.readFileSync(sourceAbs)).digest("hex");
+    const planItemEvidence: TaskProgress["planItemEvidence"] = [{
+      planRevision: revision,
+      itemKey: normalizeChecklistItemTextV1(item),
+      itemText: item,
+      claims: [{ source: "retroactive", at: "2026-10-26T00:00:00.000Z", roundId: "edit-1" }],
+      testReports: [{
+        at: "2026-10-26T00:01:00.000Z",
+        roundId: "edit-1",
+        testIdentity: "src/test/dispatch.test.ts",
+        command: "node src/test/dispatch.test.ts",
+        workingDirectory: ROOT,
+        passed: 3,
+        failed: 0,
+        sourceState: "post-edit source state",
+        sourceFiles: [sourceRel],
+        sourceFileStates: [{ path: sourceRel, sha256: initialSha }],
+      }],
+    }];
+    return { sourceRel, planItemEvidence };
+  }
+
+  void it("accepts a hashed editing-round report whose captured source is still current", async () => {
+    const { planItemEvidence } = evidenceWithHashedReport();
+    const result = await run(
+      "test-evidence-hashed-current",
+      { plan, review, planItemEvidence },
+      { confirm: true }
+    );
+    assert.ok(result.decision, result.captured.map((entry) => entry.message).join("\n"));
+    assert.match(readPlan(result.folder), /- \[x\] Add regression cases/, result.captured.map((entry) => entry.message).join("\n"));
+    const persisted = JSON.parse(nodeFs.readFileSync(nodePath.join(result.folder, "task-progress.json"), "utf8")) as TaskProgress;
+    assert.deepEqual(persisted.planItemEvidence?.[0]?.verifications?.[0]?.testReportRoundIds, ["edit-1"]);
+  });
+
+  void it("refuses a stale hashed report whose captured source changed after the report", async () => {
+    const { sourceRel, planItemEvidence } = evidenceWithHashedReport();
+    // A relevant out-of-round edit lands after the report was captured, with
+    // no Implementation/Apply Review completion in between.
+    nodeFs.writeFileSync(nodePath.join(ROOT, sourceRel), "export function dispatch(): void { /* changed */ }\n", "utf8");
+    const result = await run(
+      "test-evidence-stale-source",
+      { plan, review, planItemEvidence },
+      { confirm: true }
+    );
+    assert.equal(result.decision, undefined);
+    assert.match(
+      result.captured.find((entry) => entry.method === "warning")?.message ?? "",
+      /without an applicable passing/
+    );
+    assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
+  });
+
+  void it("refuses a truncated report that cannot be confirmed current", async () => {
+    const { planItemEvidence } = evidenceWithHashedReport();
+    const truncated = planItemEvidence?.map((record) => ({
+      ...record,
+      testReports: (record.testReports ?? []).map((report) => ({ ...report, sourceFilesTruncated: true })),
+    }));
+    const result = await run(
+      "test-evidence-truncated",
+      { plan, review, planItemEvidence: truncated },
+      { confirm: true }
+    );
+    assert.equal(result.decision, undefined);
+    assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
+  });
+
+  void it("refuses legacy, empty and incomplete source snapshots", async () => {
+    const complete = evidenceWithReport();
+    const variants = [
+      complete?.map((record) => ({ ...record, testReports: record.testReports?.map(({ sourceFileStates: _states, ...report }) => report) })),
+      complete?.map((record) => ({ ...record, testReports: record.testReports?.map((report) => ({ ...report, sourceFiles: [], sourceFileStates: [] })) })),
+      complete?.map((record) => ({ ...record, testReports: record.testReports?.map((report) => ({ ...report, sourceFiles: [...(report.sourceFiles ?? []), "src/commands/other.ts"] })) })),
+    ];
+    for (const [index, planItemEvidence] of variants.entries()) {
+      const result = await run(`test-evidence-incomplete-${index}`, { plan, review, planItemEvidence }, { confirm: true });
+      assert.equal(result.decision, undefined);
+      assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
+    }
+  });
+
+  void it("applies code-observable verification while withholding only unsupported test claims", async () => {
+    const combinedReview = review.replace(
+      "<!-- verified-complete:end -->",
+      "- Wire the completeness gate\n<!-- verified-complete:end -->"
+    );
+    const result = await run(
+      "test-evidence-mixed",
+      { plan, review: combinedReview },
+      { confirm: true }
+    );
+    assert.match(
+      result.decision?.options.find((option) => option.optionId === "apply")?.consequence ?? "",
+      /Withheld and still provisional.*Add regression cases/s
+    );
+    const finalPlan = readPlan(result.folder);
+    assert.match(finalPlan, /- \[ \] Add regression cases/);
+    assert.match(finalPlan, /- \[x\] Wire the completeness gate/);
+  });
+});
+
+void describe("recordReviewerVerificationOfTickedItemsV1 — verifying items an editing round already ticked", () => {
+  const testItem = "Add regression cases in dispatch.test.ts";
+  const plan = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] Wire the completeness gate",
+    `- [x] ${testItem}`,
+    "- [ ] Add the retry button",
+    "",
+  ].join("\n");
+  const review = [
+    "Readiness: 10/10",
+    "",
+    "<!-- verified-complete:start -->",
+    "- Wire the completeness gate",
+    `- ${testItem}`,
+    "- Add the retry button",
+    "<!-- verified-complete:end -->",
+    "",
+  ].join("\n");
+
+  void it("records verification for ticked items only, withholds test-dependent ones without a test report, and never edits the plan", async () => {
+    const { folder } = makeTask("verify-ticked-items", { plan, review });
+    const folderUri = vscode.Uri.file(folder);
+    const realFs = installRealFs();
+    try {
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(folderUri, "impl-high-review"), 1);
+      const evidence = (JSON.parse(nodeFs.readFileSync(nodePath.join(folder, "task-progress.json"), "utf8")) as TaskProgress)
+        .planItemEvidence ?? [];
+      assert.deepEqual(
+        evidence.filter((record) => (record.verifications?.length ?? 0) > 0).map((record) => record.itemText),
+        ["Wire the completeness gate"],
+        "only the ticked, code-observable item is verified; the unticked one is left to Apply Ticks"
+      );
+      assert.equal(readPlan(folder), plan, "recording verification never changes plan-final.md");
+
+      assert.equal(
+        await recordReviewerVerificationOfTickedItemsV1(folderUri, "impl-high-review"),
+        0,
+        "an item already verified for this plan revision is not verified again"
+      );
+    } finally {
+      realFs.restore();
+    }
+  });
 });

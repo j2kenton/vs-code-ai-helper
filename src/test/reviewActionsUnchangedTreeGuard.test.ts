@@ -14,6 +14,7 @@
  * the exact shape that a prior version of the guard (gated behind
  * `currentStage === targetStage`) would have let through unchecked.
  */
+import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
@@ -52,6 +53,7 @@ import { safeRemoveDir } from "./testFsUtils";
 import { computePublishScopeId, renderPublishChecksFreshnessStamp } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
+import { PUBLISH_CHECKS_NO_REASON_V1 } from "../utils/notificationTaskContextV1";
 import { copyPromptResources } from "./helpers/copyPromptResources";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
@@ -250,11 +252,19 @@ function makeUnusableSummaryTaskFolder(name: string): { folderPath: string } {
  */
 function makeUnusableSummaryFullySettledTaskFolder(name: string): { folderPath: string } {
   const { folderPath } = makeUnusableSummaryTaskFolder(name);
-  fs.writeFileSync(
-    path.join(folderPath, "plan-final.md"),
-    "# Implementation Checklist\n\n<!-- ensemble:implementation-checklist -->\n\n- [x] Step one\n- [x] Step two\n",
-    "utf8"
-  );
+  const plan = "# Implementation Checklist\n\n<!-- ensemble:implementation-checklist -->\n\n- [x] Step one\n- [x] Step two\n";
+  fs.writeFileSync(path.join(folderPath, "plan-final.md"), plan, "utf8");
+  // Ticks only count as settled once a reviewer has verified them (Part 3).
+  const progressPath = path.join(folderPath, "task-progress.json");
+  const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+  progress["planItemEvidence"] = ["Step one", "Step two"].map((itemText) => ({
+    planRevision: getPlanRevisionV1(plan),
+    itemKey: normalizeChecklistItemTextV1(itemText),
+    itemText,
+    claims: [{ source: "implementation", at: "2026-08-13T00:00:00.000Z" }],
+    verifications: [{ at: "2026-08-13T00:00:00.000Z", evidence: "verified by review" }],
+  }));
+  fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), "utf8");
   return { folderPath };
 }
 
@@ -1120,7 +1130,7 @@ function makePublishTaskFolderNoChecksV1(name: string): { folderPath: string } {
  */
 void describe("fastForwardReviewWithAI — Publish Checks gate (RC3 item 6 / Step 8)", () => {
   void it("runs Publish Checks first, never attempts the Publish review, and never reports the refusal as 'did not produce usable output'", async () => {
-    await runPublishRefusalCaseV1(undefined, "Publish Checks declined to start without saying why");
+    await runPublishRefusalCaseV1(undefined, PUBLISH_CHECKS_NO_REASON_V1);
   });
 
   void it("a Publish Checks refusal that raised a warning names that warning in the terminal row (RC7 item 5)", async () => {

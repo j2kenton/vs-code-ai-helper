@@ -21,6 +21,9 @@ import {
   MAX_REVIEW_SCORE_HISTORY,
   MAX_ROUND_LEDGER_ENTRIES,
   MAX_ROUND_OUTCOMES,
+  MAX_PLAN_ITEM_EVIDENCE_ENTRIES,
+  PlanItemReviewerVerificationV1,
+  PlanItemTestReportV1,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
@@ -33,6 +36,188 @@ import {
   TaskStatus,
 } from "../types/taskProgress";
 import { isMachineMaintainedArtifactPathV1 } from "./implReviewFileSelection";
+import { normalizeChecklistItemTextV1 } from "./implementationChecklist";
+import { extractPublishFailurePathsV1, publishFailureMatchesTestIdentityV1 } from "./publishFailurePlanAssociationV1";
+
+export function recordPlanItemClaimEvidenceV1<T extends TaskProgress>(
+  progress: T,
+  input: {
+    readonly planRevision: string;
+    readonly itemText: string;
+    readonly source: "implementation" | "retroactive" | "reviewer";
+    readonly at: string;
+    readonly roundId?: string;
+    readonly evidence?: string;
+  }
+): T {
+  const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const records = [...(progress.planItemEvidence ?? [])];
+  const existingIndex = records.findIndex(
+    (record) => record.planRevision === input.planRevision && record.itemKey === itemKey
+  );
+  const claim = {
+    source: input.source,
+    at: input.at,
+    ...(input.roundId ? { roundId: input.roundId } : {}),
+    ...(input.evidence ? { evidence: input.evidence.slice(0, 4000) } : {}),
+  } as const;
+  if (existingIndex >= 0) {
+    const existing = records[existingIndex];
+    if (!existing) return progress;
+    const duplicate = existing.claims.some(
+      (row) => row.source === claim.source && row.roundId === claim.roundId && row.at === claim.at
+    );
+    if (duplicate) return progress;
+    records[existingIndex] = { ...existing, claims: [...existing.claims, claim].slice(-100) };
+  } else {
+    records.push({
+      planRevision: input.planRevision,
+      itemKey,
+      itemText: input.itemText.slice(0, 4000),
+      claims: [claim],
+    });
+  }
+  return { ...progress, planItemEvidence: records.slice(-MAX_PLAN_ITEM_EVIDENCE_ENTRIES) } as T;
+}
+
+export function recordPlanItemReviewerVerificationV1<T extends TaskProgress>(
+  progress: T,
+  input: { readonly planRevision: string; readonly itemText: string; readonly at: string; readonly roundId?: string; readonly evidence: string; readonly testReportRoundIds?: readonly string[] }
+): T {
+  const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const records = [...(progress.planItemEvidence ?? [])];
+  const index = records.findIndex((record) => record.planRevision === input.planRevision && record.itemKey === itemKey);
+  const verification: PlanItemReviewerVerificationV1 = {
+    at: input.at,
+    ...(input.roundId ? { roundId: input.roundId } : {}),
+    evidence: input.evidence.slice(0, 4000),
+    ...(input.testReportRoundIds?.length ? { testReportRoundIds: [...new Set(input.testReportRoundIds)].slice(0, 100) } : {}),
+  };
+  if (index < 0) {
+    records.push({ planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000), claims: [], verifications: [verification] });
+  } else {
+    const current = records[index];
+    if (!current) return progress;
+    if ((current.verifications ?? []).some((row) => row.at === verification.at && row.roundId === verification.roundId)) return progress;
+    records[index] = { ...current, verifications: [...(current.verifications ?? []), verification].slice(-100) };
+  }
+  return { ...progress, planItemEvidence: records.slice(-MAX_PLAN_ITEM_EVIDENCE_ENTRIES) } as T;
+}
+
+export function recordPlanItemTestReportV1<T extends TaskProgress>(
+  progress: T,
+  input: { readonly planRevision: string; readonly itemText: string; readonly report: PlanItemTestReportV1 }
+): T {
+  const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const records = [...(progress.planItemEvidence ?? [])];
+  const index = records.findIndex((record) => record.planRevision === input.planRevision && record.itemKey === itemKey);
+  if (index < 0) {
+    records.push({ planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000), claims: [], testReports: [input.report] });
+  } else {
+    const current = records[index];
+    if (!current) return progress;
+    if ((current.testReports ?? []).some((row) => row.roundId === input.report.roundId && row.command === input.report.command && row.testIdentity === input.report.testIdentity)) return progress;
+    records[index] = { ...current, testReports: [...(current.testReports ?? []), input.report].slice(-100) };
+  }
+  return { ...progress, planItemEvidence: records.slice(-MAX_PLAN_ITEM_EVIDENCE_ENTRIES) } as T;
+}
+
+/**
+ * Drop only verification records that explicitly depend on files changed by a
+ * later editing round. Claims remain visible: changing code does not undo the
+ * model's claim, but it does make evidence that named that code stale. The
+ * association is intentionally explicit because the report schema does not
+ * contain a complete dependency graph for every checklist item.
+ */
+export function invalidatePlanItemEvidenceForChangedFilesV1<T extends TaskProgress>(
+  progress: T,
+  input: { readonly changedFiles: readonly string[] }
+): T {
+  const changed = new Set(input.changedFiles
+    .map((file) => file.replace(/\\/g, "/").replace(/^\.\//, "").trim().toLowerCase())
+    .filter(Boolean));
+  if (changed.size === 0 || !progress.planItemEvidence?.length) return progress;
+
+  let modified = false;
+  const planItemEvidence = progress.planItemEvidence.map((record) => {
+    const normalizePath = (value: string): string => value.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "").trim().toLowerCase();
+    const commandPaths = (value: string | undefined): string[] => {
+      if (!value) return [];
+      return value.split(/[\s'"`;=,]+/)
+        .map((token) => normalizePath(token.replace(/^[([{]+|[),\]}]+$/g, "")))
+        .filter((token) => /(?:^|\/)[^/]+\.[a-z0-9]{1,12}$/i.test(token) && !token.startsWith("-"));
+    };
+    const reportDependsOnChangedFile = (report: PlanItemTestReportV1): boolean => {
+      if (report.sourceFilesTruncated && changed.size > 0) return true;
+      const explicitFiles = [
+        ...(report.sourceFiles ?? []),
+        ...(report.sourceFileStates ?? []).map((state) => state.path),
+        ...commandPaths(report.testIdentity),
+        ...commandPaths(report.command),
+      ].map(normalizePath);
+      return explicitFiles.some((file) => changed.has(file));
+    };
+    const invalidatedReportIds = new Set((record.testReports ?? []).filter(reportDependsOnChangedFile).map((report) => report.roundId));
+    const testReports = (record.testReports ?? []).filter((report) => !invalidatedReportIds.has(report.roundId));
+    const verifications = (record.verifications ?? []).filter((verification) =>
+      !(verification.testReportRoundIds ?? []).some((roundId) => invalidatedReportIds.has(roundId))
+    );
+    if (testReports.length === (record.testReports ?? []).length &&
+        verifications.length === (record.verifications ?? []).length) return record;
+    modified = true;
+    return {
+      ...record,
+      ...(record.testReports ? { testReports } : {}),
+      ...(record.verifications ? { verifications } : {}),
+    };
+  });
+  return modified ? { ...progress, planItemEvidence } as T : progress;
+}
+
+/** Preserve claims while invalidating evidence tied to an older acceptance revision. */
+export function invalidatePlanItemEvidenceForPlanRevisionV1<T extends TaskProgress>(
+  progress: T,
+  currentPlanRevision: string
+): T {
+  if (!progress.planItemEvidence?.length) return progress;
+  let modified = false;
+  const planItemEvidence = progress.planItemEvidence.map((record) => {
+    if (record.planRevision === currentPlanRevision) return record;
+    if (!(record.testReports?.length || record.verifications?.length)) return record;
+    modified = true;
+    return { ...record, testReports: [], verifications: [] };
+  });
+  return modified ? { ...progress, planItemEvidence } as T : progress;
+}
+
+/** Invalidate test evidence only when a failed check names its acceptance test. */
+export function invalidatePlanItemEvidenceContradictedByFailuresV1<T extends TaskProgress>(
+  progress: T,
+  failures: readonly { readonly command: string; readonly output: string }[]
+): T {
+  const mentionedPaths = new Set<string>();
+  for (const failure of failures) {
+    for (const file of extractPublishFailurePathsV1(failure)) mentionedPaths.add(file);
+  }
+  if (mentionedPaths.size === 0 || !progress.planItemEvidence?.length) return progress;
+  let modified = false;
+  const planItemEvidence = progress.planItemEvidence.map((record) => {
+    const invalidatedReports = (record.testReports ?? []).filter((report) =>
+      publishFailureMatchesTestIdentityV1(report.testIdentity, mentionedPaths)
+    );
+    if (invalidatedReports.length === 0) return record;
+    const invalidatedIds = new Set(invalidatedReports.map((report) => report.roundId));
+    modified = true;
+    return {
+      ...record,
+      testReports: (record.testReports ?? []).filter((report) => !invalidatedIds.has(report.roundId)),
+      verifications: (record.verifications ?? []).filter((verification) =>
+        !(verification.testReportRoundIds ?? []).some((roundId) => invalidatedIds.has(roundId))
+      ),
+    };
+  });
+  return modified ? { ...progress, planItemEvidence } as T : progress;
+}
 
 /**
  * Update the task progress stage
@@ -68,7 +253,7 @@ export function updateTaskProgressStage(
 
   // Moving BACKWARDS (Set Stage as Current, or any correction after a stage
   // advanced too early) must retract the stages being re-entered. Without
-  // this the task claims currentStage: "impl-high-review" while
+  // this the task claims the current stage is "impl-high-review" while
   // completedStages still lists "impl-high-review" AND "impl-low-review" —
   // a state that says a stage is simultaneously in progress and finished.
   // taskTreeProvider's getStageStatus now renders from the current stage's

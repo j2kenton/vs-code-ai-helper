@@ -112,6 +112,7 @@ const MODEL_ENTITLEMENT_MARKERS = [
   "does not have access to model",
   "does not have access to the model",
   "not entitled to model",
+  "configured model may not be available for this account or cli version",
 ];
 
 export function isModelEntitlementFailure(message: string | undefined): boolean {

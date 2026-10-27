@@ -11,16 +11,19 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { runLintingFixes } from "../commands/runLintingFixes";
+import { offerLintFixRecoveryInChatV1, runLintingFixes } from "../commands/runLintingFixes";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
-import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
+import { runTrackedOperation, taskOperations, TaskOperationSnapshot } from "../utils/taskOperations";
+import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { resetAutomationChainGuards, scheduleAutomationChain } from "../utils/automationChain";
 import { checkAndReviewPublishV1 } from "../commands/checkAndReviewPublish";
 import { ExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import {
   classifyPublishChecksFreshnessV1,
   computePublishScopeId,
@@ -32,6 +35,7 @@ import {
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
 const publishScopeCheckModule = require("../utils/publishScopeCheck") as Record<string, unknown>;
+const completionLintModule = require("../utils/completionLint") as Record<string, unknown>;
 const contextPackModule = require("../utils/contextPack") as Record<string, unknown>;
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
 const promptSizeGuardModule = require("../utils/promptSizeGuard") as Record<string, unknown>;
@@ -43,6 +47,11 @@ const reviewActionsModule = require("../commands/reviewActions") as Record<strin
 // its own and never collides with the other lint-fix test files run in parallel.
 const REAL_ROOT = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-lint-fixes-exec-")), "workspace");
 fs.mkdirSync(REAL_ROOT, { recursive: true });
+// Model the extension's durable workspace state across separate command
+// invocations for the same task. A fresh Map per run would make a repeated
+// hand-back test inspect the first invocation's store while the second write
+// silently lands in an unrelated store.
+const taskMementos = new Map<string, vscode.Memento>();
 
 class RecordingSurface {
   entries: { message: string; level: "info" | "warning" | "error" }[] = [];
@@ -82,9 +91,12 @@ async function runFix(
   name: string,
   testScript: string,
   options: {
+    /** Exercise the real preflight recovery card when no Publish report exists. */
+    missingReport?: boolean;
     scopeCheckThrows?: boolean;
+    staleScope?: boolean;
     /** Drive the AI pass: `fixes` makes the stubbed edit action repair the checks. */
-    ai?: { fixes: boolean };
+    ai?: { fixes: boolean; cancels?: boolean; invokeCandidate?: boolean; cancelAt?: "prompt-size" | "consent" };
     /** Run as the commit-and-push flow's child under a live parent operation. */
     nested?: boolean;
     /**
@@ -96,6 +108,8 @@ async function runFix(
     realChain?: { parentFails: boolean; headMoved: boolean };
     /** Simulate the shared resource reader detecting a removed extension root. */
     extensionFolderRemoved?: boolean;
+    diagnostics?: "eslint" | "none";
+    eslintUnavailable?: boolean;
   } = {}
 ): Promise<{
   scheduled: ScheduledCall[];
@@ -104,6 +118,8 @@ async function runFix(
   taskFolderPath: string;
   parentOpId?: string;
   aiCalls: number;
+  decisions: ReturnType<WorkflowDecisionStoreV1["listPending"]>;
+  memento: vscode.Memento;
   progressBefore: string;
   chain?: { dispatchedWhileParentLive: number; commands: string[]; reviewStampCommit?: string; newHead: string };
 }> {
@@ -116,13 +132,13 @@ async function runFix(
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     ownership: fixtureOwnershipFor(taskFolderPath),
-    lintPayload: {
+    ...(options.missingReport ? {} : { lintPayload: {
       runAt: "2026-01-01T00:00:00.000Z",
       passed: false,
       summary: "1 check failed",
       issueCount: 1,
       failedChecks: [],
-    },
+    } }),
   };
   fs.writeFileSync(path.join(taskFolderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
   const progressBefore = fs.readFileSync(path.join(taskFolderPath, "task-progress.json"), "utf8");
@@ -144,6 +160,23 @@ async function runFix(
   );
 
   const surface = new RecordingSurface();
+  let memento = taskMementos.get(taskFolderPath);
+  if (!memento) {
+    const state = new Map<string, unknown>();
+    memento = {
+      keys: () => [...state.keys()],
+      get: <T>(key: string, defaultValue?: T): T | undefined => state.has(key) ? state.get(key) as T : defaultValue,
+      update: (key: string, value: unknown): Thenable<void> => {
+        if (value === undefined) state.delete(key);
+        else state.set(key, value);
+        return Promise.resolve();
+      },
+    } as vscode.Memento;
+    taskMementos.set(taskFolderPath, memento);
+  }
+  __extensionContextV1TestOnly.set({
+    subscriptions: [], extensionUri: vscode.Uri.file(REAL_ROOT), workspaceState: memento, globalState: memento,
+  } as unknown as vscode.ExtensionContext);
   initNotificationRouter(surface);
   const wsTarget = vscode.workspace as unknown as Record<string, unknown>;
   const originalFolders = wsTarget.workspaceFolders;
@@ -161,6 +194,10 @@ async function runFix(
   runEditActionModule.checkEditActionAvailabilityV1 = () =>
     Promise.resolve({ ok: false, code: "providerModeUnavailable", reason: "no model" });
   const originalScope = publishScopeCheckModule.runPublishScopeCheck;
+  const originalResolveScope = completionLintModule.resolvePublishScopeFolder;
+  if (options.staleScope) {
+    completionLintModule.resolvePublishScopeFolder = () => ({ folder: REAL_ROOT, stale: true });
+  }
   if (options.scopeCheckThrows) {
     publishScopeCheckModule.runPublishScopeCheck = () => Promise.reject(new Error("scope check exploded"));
   }
@@ -171,9 +208,12 @@ async function runFix(
     _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
   };
   const originalCommandOverride = commandsStub._executeCommandOverride;
-  commandsStub._executeCommandOverride = (): Promise<unknown> => Promise.resolve(undefined);
+  commandsStub._executeCommandOverride = (id: string): Promise<unknown> =>
+    options.eslintUnavailable && id === "eslint.executeAutofix"
+      ? Promise.reject(new Error("ESLint command unavailable"))
+      : Promise.resolve(undefined);
   const originalGetDiagnostics = vscode.languages.getDiagnostics;
-  (vscode.languages as unknown as Record<string, unknown>).getDiagnostics = () => [
+  (vscode.languages as unknown as Record<string, unknown>).getDiagnostics = () => options.diagnostics === "none" ? [] : [
     [
       vscode.Uri.file(path.join(REAL_ROOT, "src", "example.ts")),
       [{ source: "eslint", message: "no-unused-vars", severity: 0, range: undefined }],
@@ -198,17 +238,52 @@ async function runFix(
   if (options.ai) {
     const ai = options.ai;
     patch(runEditActionModule, "checkEditActionAvailabilityV1", () => Promise.resolve({ ok: true }));
-    patch(runEditActionModule, "runImplementationOrSealedV1", () => {
+    patch(runEditActionModule, "runImplementationOrSealedV1", async (input: {
+      onCandidateInvokedV1?: (info: { storedModelId: string; providerLabel: string; runnerId: string; operationId: string; attemptId: string; backup: boolean }) => Promise<void>;
+    }) => {
       aiCalls += 1;
+      if (ai.invokeCandidate) {
+        await input.onCandidateInvokedV1?.({
+          storedModelId: "stub-publish-model",
+          providerLabel: "Test Provider",
+          runnerId: "test-runner",
+          operationId: "lint-fix-operation",
+          attemptId: "lint-fix-attempt",
+          backup: false,
+        });
+      }
       if (ai.fixes) {
         fs.writeFileSync(flagFile, "fixed", "utf8");
+      }
+      if (ai.cancels) {
+        const operation = taskOperations.getLocalTaskOperations(taskFolderPath).find((item) => item.label === "Linting Fixes");
+        if (operation) taskOperations.cancelOperation(operation.id, "viewer");
+        return Promise.resolve({ status: "cancelled", filesChanged: ["src/example.ts"] });
       }
       return Promise.resolve({ status: "completed" });
     });
     patch(contextPackModule, "generateContextPack", () => Promise.resolve("context"));
     patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("prompt"));
-    patch(promptSizeGuardModule, "checkAndConfirmPromptSize", () => Promise.resolve("ok"));
-    patch(aiConsentModule, "ensureAiConsent", () => Promise.resolve(true));
+    patch(promptSizeGuardModule, "checkAndConfirmPromptSize", (_prompt: string, _label: string, _count: number, task: { token?: vscode.CancellationToken }) => {
+      if (ai.cancelAt !== "prompt-size") return Promise.resolve("ok");
+      return new Promise((resolve) => {
+        task.token?.onCancellationRequested(() => resolve("declined"));
+        setTimeout(() => {
+          const operation = taskOperations.getLocalTaskOperations(taskFolderPath).find((item) => item.label === "Linting Fixes");
+          if (operation) taskOperations.cancelOperation(operation.id, "viewer");
+        }, 0);
+      });
+    });
+    patch(aiConsentModule, "ensureAiConsent", (_context: vscode.ExtensionContext, _folder: string, token: vscode.CancellationToken) => {
+      if (ai.cancelAt !== "consent") return Promise.resolve(true);
+      return new Promise((resolve) => {
+        token.onCancellationRequested(() => resolve(false));
+        setTimeout(() => {
+          const operation = taskOperations.getLocalTaskOperations(taskFolderPath).find((item) => item.label === "Linting Fixes");
+          if (operation) taskOperations.cancelOperation(operation.id, "viewer");
+        }, 0);
+      });
+    });
     patch(reviewActionsModule, "isGitWorkspace", () => Promise.resolve(true));
     patch(reviewActionsModule, "getUnrelatedWorkspaceChanges", () => Promise.resolve([]));
     (vscode.workspace as unknown as Record<string, unknown>).getWorkspaceFolder = () => ({
@@ -336,6 +411,8 @@ async function runFix(
       taskFolderPath,
       parentOpId,
       aiCalls,
+      decisions: new WorkflowDecisionStoreV1(memento).listPending(taskFolderPath),
+      memento,
       progressBefore,
       chain: options.realChain ? chainLog : undefined,
     };
@@ -348,6 +425,7 @@ async function runFix(
     modelSelectionModule.resolveFreshModelForStage = originalFresh;
     runEditActionModule.checkEditActionAvailabilityV1 = originalAvailability;
     publishScopeCheckModule.runPublishScopeCheck = originalScope;
+    completionLintModule.resolvePublishScopeFolder = originalResolveScope;
     (vscode.languages as unknown as Record<string, unknown>).getDiagnostics = originalGetDiagnostics;
     commandsStub._executeCommandOverride = originalCommandOverride;
     fs.rmSync(packageJsonPath, { force: true });
@@ -355,10 +433,64 @@ async function runFix(
     wsTarget.workspaceFolders = originalFolders;
     deactivateNotificationRouter();
     resetAutomationChainGuards();
+    __extensionContextV1TestOnly.reset();
   }
 }
 
 void describe("runLintingFixes — RC6 item 5 execution paths", () => {
+  void it("cancels during the AI phase, names its edits, and skips post-cancel checks and follow-up", async () => {
+    const ended: TaskOperationSnapshot[] = [];
+    const sub = taskOperations.onDidEnd((snapshot) => {
+      if (snapshot.label === "Linting Fixes") ended.push(snapshot);
+    });
+    try {
+      const result = await runFix("rc6-ai-cancel", 'node -e "process.exit(1)"', {
+        ai: { fixes: true, cancels: true },
+      });
+      assert.equal(result.aiCalls, 1);
+      assert.deepEqual(result.scheduled, []);
+      assert.equal(ended.length, 1);
+      assert.equal(ended[0]?.state, "cancelled");
+      assert.match(ended[0]?.cancelReasonV1 ?? "", /src\/example\.ts/);
+      assert.match(terminalEntryFor(ended[0])?.message ?? "", /cancelled.*src\/example\.ts/i);
+      const recovery = result.decisions.find((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks");
+      assert.ok(recovery, "cancellation leaves an explicit task-chat recovery choice");
+      assert.match(recovery.whatHappened, /was cancelled[\s\S]*src\/example\.ts[\s\S]*Review any retained edits/);
+      assert.deepEqual(recovery.options.map((option) => option.label), [
+        "Run Publish Checks", "Back to Implementation", "Not now",
+      ]);
+      assert.equal(recovery.recommendation.kind === "option" ? recovery.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(recovery.options[0]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.runPublishChecks",
+        args: [{ taskFolderPath: result.taskFolderPath }],
+      });
+      assert.equal(await readPublishChecksFreshnessStampV1(vscode.Uri.file(result.taskFolderPath)), undefined);
+    } finally {
+      sub.dispose();
+    }
+  });
+
+  for (const cancelAt of ["prompt-size", "consent"] as const) {
+    void it(`cancels and settles while the ${cancelAt} confirmation is waiting`, async () => {
+      const ended: TaskOperationSnapshot[] = [];
+      const sub = taskOperations.onDidEnd((snapshot) => {
+        if (snapshot.label === "Linting Fixes") ended.push(snapshot);
+      });
+      try {
+        const result = await runFix(`rc6-cancel-${cancelAt}`, failUntilFlag(`rc6-cancel-${cancelAt}`), {
+          ai: { fixes: true, cancelAt },
+        });
+        assert.equal(result.aiCalls, 0, "cancellation in a confirmation must happen before provider invocation");
+        assert.deepEqual(result.scheduled, []);
+        assert.equal(ended.at(-1)?.state, "cancelled");
+        assert.equal(await readPublishChecksFreshnessStampV1(vscode.Uri.file(result.taskFolderPath)), undefined);
+      } finally {
+        sub.dispose();
+      }
+    });
+  }
+
   void it("does not run AI or modify task progress when the extension folder disappeared before linting prompt setup", async () => {
     const result = await runFix("rc6-removed-extension", 'node -e "process.exit(0)"', {
       extensionFolderRemoved: true,
@@ -372,7 +504,61 @@ void describe("runLintingFixes — RC6 item 5 execution paths", () => {
       result.surface.entries.some((entry) => /Linting fixes were not started/.test(entry.message)),
       "the user-facing notice should say linting fixes did not start"
     );
+    const decision = result.decisions.find((item) => item.decisionKey === "chatActionOffer:workbench.view.extensions");
+    assert.ok(decision, "the removed-extension hand-back must remain actionable in task chat");
+    assert.match(decision.whatHappened, /extension resources are unavailable, so Publish Checks cannot run/);
+    assert.deepEqual(decision.options.map((option) => option.label), ["Open Extensions", "Not now"]);
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+    assert.deepEqual(decision.options[0]?.effect, {
+      kind: "command", command: "workbench.view.extensions", args: [],
+    });
+    await runFix("rc6-removed-extension", 'node -e "process.exit(0)"', { extensionFolderRemoved: true });
+    const repeated = new WorkflowDecisionStoreV1(result.memento).listPending(result.taskFolderPath)
+      .filter((item) => item.decisionKey === "chatActionOffer:workbench.view.extensions");
+    assert.equal(repeated.length, 1, "repeated removed-extension reporting updates the existing decision");
     assert.deepEqual(result.scheduled, []);
+  });
+
+  void it("missing Publish report offers the actual Run Checks recovery and updates one card", async () => {
+    const result = await runFix("rc6-missing-report-handback", 'node -e "process.exit(0)"', {
+      missingReport: true,
+    });
+    assert.equal(result.aiCalls, 0, "the preflight hand-back must not start an editing round");
+    assert.deepEqual(result.scheduled, []);
+    assert.match(result.surface.entries[0]?.message ?? "", /Publish Checks have not run yet\. Run them first\./);
+    const decision = result.decisions.find((item) => item.decisionKey === "chatActionOffer:runPublishChecks");
+    assert.ok(decision, "the real missing-report path must offer its recovery in chat");
+    assert.match(decision.whatHappened, /Publish Checks have not run yet/);
+    assert.deepEqual(decision.options.map((option) => option.label), ["Run Publish Checks", "Back to Implementation", "Not now"]);
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+    assert.deepEqual(decision.options[0]?.effect, {
+      kind: "command", command: "vs-code-ai-helper.runPublishChecks", args: [{ taskFolderPath: result.taskFolderPath }],
+    });
+
+    await offerLintFixRecoveryInChatV1(result.taskFolderPath, "Task", "Publish Checks have not run yet. Run them first.");
+    const duplicates = new WorkflowDecisionStoreV1(result.memento).listPending(result.taskFolderPath)
+      .filter((item) => item.decisionKey === "chatActionOffer:runPublishChecks");
+    assert.equal(duplicates.length, 1, "repeated terminal reporting updates the same recovery card");
+  });
+
+  void it("stale Publish scope offers the actual checks-first recovery and updates one card", async () => {
+    const result = await runFix("rc6-stale-scope-handback", 'node -e "process.exit(0)"', { staleScope: true });
+    assert.equal(result.aiCalls, 0, "a stale scope must stop before fixes are applied");
+    assert.deepEqual(result.scheduled, []);
+    assert.match(result.surface.entries[0]?.message ?? "", /no valid Publish verification scope could be resolved/);
+    const decision = result.decisions.find((item) => item.decisionKey === "chatActionOffer:runPublishChecks");
+    assert.ok(decision, "the stale-scope branch must offer its recovery in task chat");
+    assert.match(decision.whatHappened, /saved scope or the task's project-root binding no longer exists/);
+    assert.deepEqual(decision.options.map((option) => option.label), ["Run Publish Checks", "Back to Implementation", "Not now"]);
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+    assert.deepEqual(decision.options[0]?.effect, {
+      kind: "command", command: "vs-code-ai-helper.runPublishChecks", args: [{ taskFolderPath: result.taskFolderPath }],
+    });
+
+    await runFix("rc6-stale-scope-handback", 'node -e "process.exit(0)"', { staleScope: true });
+    const repeated = new WorkflowDecisionStoreV1(result.memento).listPending(result.taskFolderPath)
+      .filter((item) => item.decisionKey === "chatActionOffer:runPublishChecks");
+    assert.equal(repeated.length, 1, "a repeated stale-scope hand-back updates one card");
   });
 
   void it("deterministic success marks the review stale and schedules the Publish review once, after the marker is gone", async () => {
@@ -391,6 +577,29 @@ void describe("runLintingFixes — RC6 item 5 execution paths", () => {
     assert.match(result.review, /> Publish Checks still fail after the fix: /);
   });
 
+  void it("still-failing deterministic checks with unavailable AI offer the checks-first recovery once", async () => {
+    const result = await runFix("rc6-still-failing-handback", 'node -e "process.exit(1)"', { diagnostics: "none" });
+    const decisions = result.decisions.filter((item) => item.decisionKey === "chatActionOffer:runPublishChecks");
+    assert.equal(decisions.length, 1);
+    const decision = decisions[0];
+    assert.ok(decision);
+    assert.match(decision.whatHappened, /AI final fixes are unavailable: no model/);
+    assert.match(decision.whatHappened, /Checks summary: unrun\/untested: npm run test/);
+    assert.deepEqual(decision.options.map((option) => option.label), ["Run Publish Checks", "Back to Implementation", "Not now"]);
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+    assert.deepEqual(decision.options[0]?.effect, {
+      kind: "command", command: "vs-code-ai-helper.runPublishChecks", args: [{ taskFolderPath: result.taskFolderPath }],
+    });
+    assert.deepEqual(decision.options[1]?.effect, {
+      kind: "command", command: "vs-code-ai-helper.setTaskStage", args: [{ taskFolderPath: result.taskFolderPath, stage: "implementation" }],
+    });
+
+    await runFix("rc6-still-failing-handback", 'node -e "process.exit(1)"', { diagnostics: "none" });
+    const repeated = new WorkflowDecisionStoreV1(result.memento).listPending(result.taskFolderPath)
+      .filter((item) => item.decisionKey === "chatActionOffer:runPublishChecks");
+    assert.equal(repeated.length, 1, "repeated unavailable-AI hand-backs update rather than duplicate the decision");
+  });
+
   void it("an error after a passing lint result schedules nothing and writes no note", async () => {
     const result = await runFix("rc6-error-after-pass", 'node -e "process.exit(0)"', { scopeCheckThrows: true });
     assert.equal(result.scheduled.length, 0);
@@ -398,6 +607,60 @@ void describe("runLintingFixes — RC6 item 5 execution paths", () => {
     assert.doesNotMatch(result.review, /Publish Checks (still fail|pass) after the fix/);
     assert.ok(result.surface.entries.some((e) => e.level === "error" && /scope check exploded/.test(e.message)));
   });
+
+  for (const scenario of [
+    {
+      name: "AI edits were applied but their checks still fail",
+      options: { ai: { fixes: true } } as const,
+      testScript: 'node -e "process.exit(1)"',
+      expected: /AI final fixes were applied, but checks still fail/,
+    },
+    {
+      name: "final check outcome is unconfirmed",
+      options: { scopeCheckThrows: true } as const,
+      testScript: 'node -e "process.exit(0)"',
+      expected: /Linting fixes failed: scope check exploded\..*final checks could not be confirmed/,
+    },
+    {
+      name: "ESLint autofix is unavailable",
+      options: { eslintUnavailable: true } as const,
+      testScript: 'node -e "process.exit(0)"',
+      expected: /Could not apply automatic fixes because the ESLint extension is unavailable/,
+    },
+    {
+      name: "no automatic fixes were available",
+      options: { diagnostics: "none" as const },
+      testScript: 'node -e "process.exit(0)"',
+      expected: /No automatic fixes were available/,
+    },
+  ]) {
+    void it(`renders a reasoned recovery card when ${scenario.name}`, async () => {
+      const result = await runFix(
+        `rc6-handback-${scenario.name.replace(/\W+/g, "-").toLowerCase()}`,
+        scenario.testScript,
+        scenario.options
+      );
+      const decisions = result.decisions.filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks");
+      assert.equal(decisions.length, 1, "the terminal branch posts one actionable card");
+      const decision = decisions[0];
+      assert.ok(decision);
+      assert.match(decision.whatHappened, scenario.expected);
+      assert.deepEqual(decision.options.map((option) => option.label), [
+        "Run Publish Checks", "Back to Implementation", "Not now",
+      ]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(decision.options[0]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.runPublishChecks",
+        args: [{ taskFolderPath: result.taskFolderPath }],
+      });
+      assert.deepEqual(decision.options[1]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.setTaskStage",
+        args: [{ taskFolderPath: result.taskFolderPath, stage: "implementation" }],
+      });
+    });
+  }
 
   const failUntilFlag = (name: string): string =>
     "node -e \"process.exit(require('fs').existsSync(process.argv[1]) ? 0 : 1)\" \"" +
@@ -413,6 +676,18 @@ void describe("runLintingFixes — RC6 item 5 execution paths", () => {
     assert.equal(result.scheduled[0]?.root, undefined);
     assert.equal(result.scheduled[0]?.markerLiveAtSchedule, false);
     assert.match(result.review, /> ⚠ Stale: superseded by an update to workspace files/);
+  });
+
+  void it("writes a correlated run log with the dispatch chain before invocation and the terminal result", async () => {
+    const result = await runFix("rc6-ai-run-log", failUntilFlag("rc6-ai-run-log"), {
+      ai: { fixes: true, invokeCandidate: true },
+    });
+    const runLogPath = path.join(result.taskFolderPath, "runs", "001-test-runner-publish.md");
+    const runLog = fs.readFileSync(runLogPath, "utf8");
+    assert.match(runLog, /Test Provider — stub-publish-model/);
+    assert.match(runLog, /Operation: lint-fix-operation/);
+    assert.match(runLog, /Terminal outcome/);
+    assert.match(runLog, /completed: lint fixes and required follow-up checks passed/);
   });
 
   void it("AI pass completed but checks still fail writes the failing-checks note and schedules nothing", async () => {

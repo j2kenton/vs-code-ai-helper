@@ -5,6 +5,7 @@ import { policyForKind } from "./operationTaxonomy";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { notificationTaskDisplayNameV1 } from "./notificationTaskContextV1";
 import { describeModelWithProviderV1 } from "../runners/providers";
+import { offerActionInChatV1 } from "./chatActionOfferV1";
 
 /**
  * The centralized operation → Notifications-section terminal-entry policy
@@ -66,7 +67,13 @@ export function terminalEntryFor(
   // cancellation whose detail must survive: "cancelled" on its own would say
   // the work stopped, and a row removed after Stop was ignored has not
   // necessarily stopped (verification review, 2026-09-18).
-  const detail = snap.state === "cancelled" && snap.forcedEndV1 !== true ? undefined : snap.detail;
+  // A cancelled row whose owner stated what was cancelled and by whom (Fast
+  // Forward's "Publish Checks were cancelled from the Notifications row…",
+  // bugs2 finding 5) keeps that statement.
+  const detail =
+    snap.state === "cancelled" && snap.forcedEndV1 !== true
+      ? snap.cancelReasonV1
+      : snap.detail;
   const suffix = detail ? ` (${detail})` : "";
   const modelSuffix = snap.modelId ? ` — model: ${describeModelWithProviderV1(snap.modelId)}` : "";
   // Name the stage where the snapshot has one, unless the label already says it.
@@ -84,6 +91,45 @@ export function terminalEntryFor(
     // where no result target was recorded.
     ...(snap.resultTargetUri !== undefined ? { resultTargetUri: snap.resultTargetUri } : {}),
   };
+}
+
+/**
+ * Re-open a user-reachable recovery choice when activation restores an
+ * interrupted operation. Its result is unknown, so the safest supported
+ * action is the normal stage-action path, which re-reads task state and
+ * admission before dispatch. The stable chat-action key updates this card in place
+ * if activation recovery reports the same interruption more than once.
+ */
+export async function offerInterruptedOperationRecoveryV1(
+  snapshot: TaskOperationSnapshot
+): Promise<void> {
+  if (snapshot.state !== "interrupted" || !snapshot.key) {
+    return;
+  }
+  const reason = `${snapshot.label} was interrupted when the runner stopped reporting; its outcome is unknown.`;
+  const isPublishChecks = snapshot.label === "Run Publish Checks";
+  await offerActionInChatV1({
+    taskFolderPath: snapshot.key,
+    taskLabel: snapshot.taskName,
+    actionLabel: isPublishChecks ? "Run Publish Checks" : "Run Current Stage Action",
+    command: isPublishChecks
+      ? "vs-code-ai-helper.runPublishChecks"
+      : "vs-code-ai-helper.applyCurrentStageAction",
+    args: [{ taskFolderPath: snapshot.key }],
+    ...(snapshot.resultTargetUri
+      ? {
+          alternatives: [{
+            label: "View Run Log",
+            command: "vscode.open",
+            args: [vscode.Uri.parse(snapshot.resultTargetUri)],
+            consequence: "Opens the run evidence before deciding whether to rerun the stage action.",
+            resumeKind: "unpause",
+          }],
+        }
+      : {}),
+    noticeText: `${reason} The recommended action rechecks the task's current state and runs its current stage action.`,
+    optional: true,
+  });
 }
 
 /**

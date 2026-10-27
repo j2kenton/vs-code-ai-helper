@@ -24,6 +24,7 @@ import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { readChatInteractions } from "../utils/chatHistoryStore";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
@@ -512,6 +513,32 @@ export async function resumePausedTask(
           "chatActionOffer:resumeTask",
           "the task was resumed"
         );
+        // bugs2 finding 1: if an interaction has stored answers awaiting Resume,
+        // trigger its resumption so the task continues with the saved answer.
+        try {
+          const interactions = await readChatInteractions(resolvedTask.taskFolderPath, resolvedTask.canonicalId);
+          const pendingStored = interactions.find(
+            (i) =>
+              (i.state === "unresolved" || i.state === "orphanedTransaction") &&
+              (i.answers?.length ?? 0) > 0
+          );
+          if (pendingStored) {
+            const handoffToken = authorizeWorkAdmissionHandoffV1(resolvedTask.taskFolderPath);
+            try {
+              await vscode.commands.executeCommand("vs-code-ai-helper.resumeStoredInteraction", {
+                taskFolderPath: resolvedTask.taskFolderPath,
+                canonicalId: resolvedTask.canonicalId,
+                interactionId: pendingStored.interactionId,
+                operationId: pendingStored.operationId,
+                admissionHandoffTokenV1: handoffToken,
+              });
+            } finally {
+              revokeWorkAdmissionHandoffV1(resolvedTask.taskFolderPath);
+            }
+          }
+        } catch {
+          // chat interactions file may not exist or be readable
+        }
       }
     );
   } catch (error) {

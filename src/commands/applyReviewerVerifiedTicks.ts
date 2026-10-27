@@ -1,4 +1,7 @@
 import * as vscode from "vscode";
+import * as crypto from "crypto";
+import * as fs from "fs";
+import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { IncompleteTask } from "../types/incompleteTask";
@@ -16,16 +19,21 @@ import {
   formatChecklistItemGlyphV1,
   mergeChecklistProgressV1,
   normalizeChecklistItemTextV1,
+  getPlanRevisionV1,
 } from "../utils/implementationChecklist";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
 import { writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
-import { STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
+import { PlanItemEvidenceV1, PlanItemTestReportV1, STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 import { normalizePath } from "../utils/taskRoot";
 import { WorkflowDecisionCommandResultV1 } from "../types/workflowDecisionV1";
 import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
 import { fastForwardResumeSuffixV1, FastForwardResumeStateV1 } from "./fastForwardResumeSuffixV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { invalidatePlanItemEvidenceForPlanRevisionV1 } from "../utils/taskProgressTransforms";
+import { recordPlanItemReviewerVerificationV1 } from "../utils/taskProgressTransforms";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 type ApplyArg =
   | { task?: IncompleteTask }
@@ -136,6 +144,79 @@ export interface VerifiedTicksDerivationV1 {
    * one.
    */
   readonly applicableEvidence: readonly (string | undefined)[];
+  /** Passing editing-round reports accepted for each applicable item. */
+  readonly applicableTestReportRoundIds: readonly (readonly string[])[];
+  readonly withheldTestItems: readonly string[];
+}
+
+function isTestDependentItemV1(itemText: string): boolean {
+  return /\b(?:tests?|test cases?|fixtures?|regressions?|coverage)\b/i.test(itemText);
+}
+
+function commandRunsTestV1(command: string, testIdentity: string): boolean {
+  const normalized = testIdentity.replace(/\\/g, "/").replace(/^\.\//, "");
+  const basename = normalized.split("/").pop() ?? normalized;
+  return command.split(/[\s'"`;=,]+/).some((part) => {
+    const token = part.replace(/^[([{]+|[),\]}]+$/g, "").replace(/\\/g, "/").replace(/^\.\//, "");
+    return token === normalized || token.split("/").pop() === basename;
+  });
+}
+
+/**
+ * Resolve the workspace folder that owns a task folder, preferring the deepest
+ * open workspace folder that contains it and falling back to the first open
+ * workspace. Used to resolve the workspace-root-relative paths a test report's
+ * `sourceFileStates` snapshots were captured against.
+ */
+function resolveWorkspaceRootForTaskV1(folderUri: vscode.Uri): string | undefined {
+  const taskPath = path.resolve(folderUri.fsPath);
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const containing = folders
+    .map((folder) => path.resolve(folder.uri.fsPath))
+    .find((root) => taskPath === root || taskPath.startsWith(root + path.sep));
+  return containing ?? (folders[0] ? path.resolve(folders[0].uri.fsPath) : undefined);
+}
+
+/**
+ * bugs2 Step 21: a test report's captured source snapshot must still match the
+ * files it exercised before its result may support reviewer verification.
+ * A report is usable only when every declared source file has a captured hash
+ * and every hash still matches the working tree. Legacy or partial snapshots
+ * cannot establish source applicability, so they remain provisional.
+ */
+async function reportSourceStateStillCurrentV1(
+  report: PlanItemTestReportV1,
+  workspaceRoot: string | undefined
+): Promise<boolean> {
+  if (report.sourceFilesTruncated) {
+    return false;
+  }
+  const declared = [...new Set((report.sourceFiles ?? []).map((file) => file.replace(/\\/g, "/").replace(/^\.\//, "")))];
+  const states = report.sourceFileStates ?? [];
+  if (declared.length === 0 || states.length === 0 || !workspaceRoot) {
+    return false;
+  }
+  const stateByPath = new Map(states.map((state) => [state.path.replace(/\\/g, "/").replace(/^\.\//, ""), state]));
+  if (declared.some((file) => !stateByPath.has(file)) || stateByPath.size !== declared.length || states.length !== declared.length) {
+    return false;
+  }
+  for (const state of states) {
+    const absolute = path.resolve(workspaceRoot, state.path);
+    const relative = path.relative(workspaceRoot, absolute);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) || !/^[a-f0-9]{64}$/i.test(state.sha256)) {
+      return false;
+    }
+    try {
+      const contents = await fs.promises.readFile(absolute);
+      const current = crypto.createHash("sha256").update(contents).digest("hex");
+      if (current !== state.sha256) {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+  return true;
 }
 
 export type DeriveVerifiedTicksResultV1 =
@@ -153,6 +234,118 @@ export type DeriveVerifiedTicksResultV1 =
        */
       readonly alreadyAppliedCount?: number;
     };
+
+/**
+ * The test-evidence gate a reviewer's verification passes through: an item
+ * that is not test-dependent is accepted as is; a test-dependent one only
+ * with a passing post-edit test report from an editing round that still
+ * matches the current source. Shared by applying verified ticks and by
+ * recording verification of already-ticked items.
+ */
+async function gateTestDependentItemsV1(
+  items: readonly string[],
+  evidenceRecords: readonly PlanItemEvidenceV1[],
+  planRevision: string,
+  workspaceRoot: string | undefined
+): Promise<{ accepted: string[]; testReportRoundIds: string[][]; withheld: string[] }> {
+  const accepted: string[] = [];
+  const testReportRoundIds: string[][] = [];
+  const withheld: string[] = [];
+  for (const itemText of items) {
+    if (!isTestDependentItemV1(itemText)) {
+      accepted.push(itemText);
+      testReportRoundIds.push([]);
+      continue;
+    }
+    const itemKey = normalizeChecklistItemTextV1(itemText);
+    const candidateReports = evidenceRecords
+      .filter((record) => record.planRevision === planRevision && record.itemKey === itemKey)
+      .flatMap((record) => record.testReports ?? [])
+      .filter((report) =>
+        report.passed > 0 &&
+        report.failed === 0 &&
+        /post[- ]edit/i.test(report.sourceState) &&
+        commandRunsTestV1(report.command, report.testIdentity)
+      );
+    const currentReports: PlanItemTestReportV1[] = [];
+    for (const report of candidateReports) {
+      if (!(await reportSourceStateStillCurrentV1(report, workspaceRoot))) {
+        continue;
+      }
+      currentReports.push(report);
+    }
+    if (currentReports.length === 0) {
+      withheld.push(itemText);
+      continue;
+    }
+    accepted.push(itemText);
+    testReportRoundIds.push([...new Set(currentReports.map((report) => report.roundId))]);
+  }
+  return { accepted, testReportRoundIds, withheld };
+}
+
+/**
+ * Records a review's verification of plan items it names verified complete
+ * that are ALREADY ticked — typically ticked by an Implementation round, so
+ * still provisional. Applying verified ticks only covers unticked items, and
+ * no other path can verify a tick, so without this an implementation-ticked
+ * item could never count as settled and a clean review could never advance
+ * the stage. Writes evidence only, never plan-final.md; test-dependent items
+ * pass the same test-evidence gate as applied ticks. Returns how many items
+ * gained a verification.
+ */
+export async function recordReviewerVerificationOfTickedItemsV1(
+  folderUri: vscode.Uri,
+  reviewStage: TaskStage
+): Promise<number> {
+  const reviewFilename = isReviewStage(reviewStage) ? STAGE_ARTIFACT_FILENAMES[reviewStage] : undefined;
+  if (!reviewFilename) return 0;
+  let reviewContent: string;
+  try {
+    reviewContent = new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(folderUri, reviewFilename)));
+  } catch {
+    return 0;
+  }
+  const verified = parseReviewVerifiedCompleteV1(reviewContent);
+  if (verified.items.length === 0) return 0;
+  const plan = await readPlanOfRecordV1(folderUri);
+  if (!plan.hasChecklist || !plan.text) return 0;
+  const planRevision = getPlanRevisionV1(plan.text);
+  const progressRead = await readTaskProgressStrictV1(folderUri);
+  if (!progressRead.ok) return 0;
+  const evidenceRecords = progressRead.decoded.progress.planItemEvidence ?? [];
+  const alreadyVerified = new Set(evidenceRecords
+    .filter((record) => record.planRevision === planRevision && (record.verifications?.length ?? 0) > 0)
+    .map((record) => record.itemKey));
+  const ticked = filterAlreadyCheckedPlanItemsV1(plan.text, verified.items)
+    .filter((item) => !alreadyVerified.has(normalizeChecklistItemTextV1(item)));
+  if (ticked.length === 0) return 0;
+  const { accepted, testReportRoundIds } = await gateTestDependentItemsV1(
+    ticked,
+    evidenceRecords,
+    planRevision,
+    resolveWorkspaceRootForTaskV1(folderUri)
+  );
+  if (accepted.length === 0) return 0;
+  const evidenceByKey = new Map<string, string | undefined>(
+    verified.entries.map((entry) => [normalizeChecklistItemTextV1(entry.text), entry.evidence])
+  );
+  const verifiedAt = new Date().toISOString();
+  await patchTaskProgressStrictV1(folderUri, (progress) =>
+    accepted.reduce((next, itemText, index) => {
+      const roundIds = testReportRoundIds[index] ?? [];
+      return recordPlanItemReviewerVerificationV1(next, {
+        planRevision,
+        itemText,
+        at: verifiedAt,
+        evidence: evidenceByKey.get(normalizeChecklistItemTextV1(itemText)) ??
+          `verified by reviewer in ${reviewStage} review (${reviewFilename})`,
+        ...(roundIds.length ? { testReportRoundIds: roundIds } : {}),
+      });
+    }, progress)
+  );
+  return accepted.length;
+}
 
 /**
  * Re-derives, from disk, exactly which unchecked plan items the current
@@ -227,26 +420,31 @@ export async function deriveApplicableVerifiedTicksV1(
   // DIFFERENT item, say) must never let a stale card apply something it
   // never promised — see this function's doc comment.
   const offeredKeys = offeredItems ? new Set(offeredItems.map(normalizeChecklistItemTextV1)) : undefined;
-  const applicable = offeredKeys
+  const candidates = offeredKeys
     ? applicableFromReview.filter((item) => offeredKeys.has(normalizeChecklistItemTextV1(item)))
     : applicableFromReview;
-  // RC3 item 1, Step 2c: look each applicable (plan-text) item back up
-  // against the review's own entries by normalized key, so the card can
-  // show the reviewer's own evidence sentence rather than only the item
-  // text.
+  const planRevision = getPlanRevisionV1(plan.text);
+  const progressRead = await readTaskProgressStrictV1(folderUri);
+  const evidenceRecords = progressRead.ok ? progressRead.decoded.progress.planItemEvidence ?? [] : [];
+  const {
+    accepted: applicable,
+    testReportRoundIds: applicableTestReportRoundIds,
+    withheld: withheldTestItems,
+  } = await gateTestDependentItemsV1(candidates, evidenceRecords, planRevision, resolveWorkspaceRootForTaskV1(folderUri));
   const evidenceByKeyV1 = new Map<string, string | undefined>(
     verified.entries.map((entry) => [normalizeChecklistItemTextV1(entry.text), entry.evidence])
   );
   const applicableEvidence = applicable.map((item) => evidenceByKeyV1.get(normalizeChecklistItemTextV1(item)));
   if (applicable.length === 0) {
-    // `verified.items` is the review's raw named text: it can include
-    // entries that match no real plan item at all, which is never
-    // legitimate evidence of already-done work (same reasoning as
-    // `filterAlreadyCheckedPlanItemsV1`'s own doc comment). Scoping to
-    // `offeredItems` when a caller supplies them additionally excludes
-    // matched-and-checked items that this card never offered in the first
-    // place (e.g. checked before the card existed, unrelated to it).
     const alreadyAppliedCount = filterAlreadyCheckedPlanItemsV1(plan.text, offeredItems ?? verified.items).length;
+    if (withheldTestItems.length > 0) {
+      return {
+        kind: "blocked",
+        severity: "warning",
+        message: "The review named test-dependent item(s) without an applicable passing Implementation or Apply Review test report. " +
+          `They remain provisional: ${withheldTestItems.join("; ")}`,
+      };
+    }
     return {
       kind: "blocked",
       severity: "info",
@@ -255,7 +453,17 @@ export async function deriveApplicableVerifiedTicksV1(
     };
   }
 
-  return { kind: "ok", derivation: { reviewStage, reviewFilename, applicable, applicableEvidence } };
+  return {
+    kind: "ok",
+    derivation: {
+      reviewStage,
+      reviewFilename,
+      applicable,
+      applicableEvidence,
+      applicableTestReportRoundIds,
+      withheldTestItems,
+    },
+  };
 }
 
 export type ApplyTicksDecisionPostResultV1 =
@@ -285,7 +493,10 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
   if (derived.kind === "blocked") {
     return { kind: "blocked", message: derived.message, severity: derived.severity };
   }
-  const { reviewFilename, applicable, applicableEvidence } = derived.derivation;
+  const { reviewFilename, applicable, applicableEvidence, withheldTestItems } = derived.derivation;
+  const withheldNote = withheldTestItems.length > 0
+    ? `\nWithheld and still provisional because no applicable passing Implementation or Apply Review test report was found: ${withheldTestItems.join("; ")}`
+    : "";
 
   const target: ChatTarget = {
     canonicalId,
@@ -333,6 +544,7 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
                 return `- ${formatChecklistItemGlyphV1({ checked: false, excluded: false })} ${item}${evidenceLine}`;
               })
               .join("\n") +
+            withheldNote +
             ffResume.consequenceSuffix,
           effect: {
             kind: "command",
@@ -455,7 +667,7 @@ export async function writeVerifiedTicksToPlanV1(
   }
   const evidence = `verified by reviewer in ${resolvedStage} review (${reviewFilename})`;
   const synthetic = buildSyntheticVerifiedCompleteSummaryV1(applicable, evidence);
-  const merged = mergeChecklistProgressV1(freshPlan.text, synthetic);
+  const merged = mergeChecklistProgressV1(freshPlan.text, synthetic, { reviewerVerified: true });
   if (merged.kind !== "merged") {
     return { kind: "notMerged" };
   }
@@ -467,6 +679,21 @@ export async function writeVerifiedTicksToPlanV1(
   if (!written) {
     return { kind: "refused" };
   }
+  const planRevision = getPlanRevisionV1(freshPlan.text);
+  const verifiedAt = new Date().toISOString();
+  await patchTaskProgressStrictV1(folderUri, (progress) => {
+    const currentRevision = invalidatePlanItemEvidenceForPlanRevisionV1(progress, planRevision);
+    return applicable.reduce((next, itemText, index) => {
+      const testReportRoundIds = derivation.applicableTestReportRoundIds[index] ?? [];
+      return recordPlanItemReviewerVerificationV1(next, {
+        planRevision,
+        itemText,
+        at: verifiedAt,
+        evidence: derivation.applicableEvidence[index] ?? `verified by reviewer in ${resolvedStage} review (${reviewFilename})`,
+        ...(testReportRoundIds.length ? { testReportRoundIds } : {}),
+      });
+    }, currentRevision);
+  });
   // Part 11 item 13c (event-driven half): the normal path here is the
   // decision option's own effect command, which the resolve flow already
   // takes off "pending" before this runs — but this command is ALSO

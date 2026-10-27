@@ -3685,9 +3685,11 @@ void describe("Chat With AI — implementation checklist percentage in the heade
 
       const state = lastState(fake);
       const label = String(state?.label ?? "");
+      // Ticks with no reviewer verification on file read as provisional
+      // (Part 3), so the percentage carries that split.
       assert.match(
         label,
-        /— 80%$/,
+        /— 80% \(0 verified, 4 provisional\)$/,
         `expected the header label to end with the checklist percentage, got "${label}"`
       );
     } finally {

@@ -206,6 +206,7 @@ import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
 import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { isInputSnapshotSizeRejectionReasonV1 } from "../types/chatInteractionTransactionV1";
 import { AttachCoordinatorIdentityErrorV1 } from "../utils/roundLedgerV1";
+import { reconcileChatSendStateV1 } from "../commands/pausedStageChatSendV1";
 
 export class TaskActionCoordinatorErrorV1 extends Error {
   constructor(message: string) {
@@ -313,6 +314,7 @@ export interface TaskActionRequestV1 {
   readonly taskStage: string;
   readonly rawInput: unknown;
   readonly cancellationToken: vscode.CancellationToken;
+  readonly operationId?: string;
   readonly preInvocationHook?: () => Promise<void>;
   /**
    * Best-effort observability side channel (review blocker, 2026-08-26:
@@ -484,7 +486,11 @@ export interface TaskActionRequestV1 {
   readonly onCandidateInvokedV1?: (info: {
     readonly storedModelId: string;
     readonly providerLabel: string;
-  }) => void;
+    readonly runnerId: string;
+    readonly operationId?: string;
+    readonly attemptId: string;
+    readonly backup: boolean;
+  }) => void | Promise<void>;
 }
 
 /**
@@ -514,6 +520,10 @@ export interface TaskActionResumeRequestV1 {
    */
   readonly resumeIdempotencyId: string;
   readonly cancellationToken: vscode.CancellationToken;
+  /** Optional current, task-bound context appended to the persisted prompt
+   * when resuming after relevant evidence changed. The transaction remains
+   * immutable; this only refreshes the provider input for this resume drive. */
+  readonly promptAppendix?: string;
   /** See `TaskActionRequestV1.parentOperationId` — identical nested-lease meaning for a Resume drive. */
   readonly parentOperationId?: OperationIdV1;
   /**
@@ -1585,7 +1595,8 @@ export function createTaskActionCoordinatorV1(
       readonly providerLabel: string;
       readonly storedModelId: string;
       readonly providerReadsWorkspaceNatively?: boolean;
-    }
+    },
+    promptAppendix?: string
   ):
     | ({ readonly ok: true } & AssembledAttemptPromptV1)
     | { readonly ok: false; readonly code: "toolSessionsUnavailable" | "toolSessionUnavailable" } {
@@ -1659,6 +1670,7 @@ export function createTaskActionCoordinatorV1(
     const prompt =
       readSessionPreamble +
       row.buildPrompt(context) +
+      (promptAppendix ? `\n\n${promptAppendix}` : "") +
       (resumed !== undefined
         ? "\n\n" + buildResumedAnswersBlockV1(resumed.questions, resumed.answers)
         : "") +
@@ -1744,7 +1756,8 @@ export function createTaskActionCoordinatorV1(
     /** See `TaskActionRequestV1.priorAttemptHistoryV1`. */
     priorAttemptHistoryV1?: readonly MalformedResultAttemptRecordV1[],
     /** See `TaskActionRequestV1.onCandidateInvokedV1`. */
-    onCandidateInvokedV1?: TaskActionRequestV1["onCandidateInvokedV1"]
+    onCandidateInvokedV1?: TaskActionRequestV1["onCandidateInvokedV1"],
+    promptAppendix?: string
   ): Promise<TaskActionOutcomeV1> {
     const terminalSettlementAttemptedV1 = settlementSignalOutV1 ?? { attempted: false };
     const attachmentFailureOutcomeV1 = (
@@ -1929,6 +1942,7 @@ export function createTaskActionCoordinatorV1(
     const malformedRetryEligibleV1 =
       row.providerMode === "text" && row.actionKey !== EDIT_EXECUTION_ACTION_KEY_V1;
     let malformedInvocationCountV1 = malformedInvocationsAlreadyUsedV1 ?? 0;
+    const invokedStoredModelIds = new Set<string>();
     let lastMalformedOutcomeV1: TaskActionOutcomeV1 | undefined;
     // Every attempt this operation's malformed-envelope-parse branch AND its
     // content-contract-check branch below have rejected so far, oldest
@@ -2171,7 +2185,7 @@ export function createTaskActionCoordinatorV1(
             providerLabel: reserved.providerLabel,
             storedModelId: reserved.storedModelId,
             providerReadsWorkspaceNatively: reserved.providerReadsWorkspaceNatively,
-          });
+          }, promptAppendix);
       if (!assembled.ok) {
         session.reportAttemptOutcome(attemptId, "providerUnavailablePreInvocation");
         return { kind: "failed", correlation, code: assembled.code, retryable: false };
@@ -2305,9 +2319,15 @@ export function createTaskActionCoordinatorV1(
         // RC6 item 4: tell the caller which model is about to run (best
         // effort; never alters selection).
         try {
-          onCandidateInvokedV1?.({
+          const backup = invokedStoredModelIds.size > 0 && !invokedStoredModelIds.has(reserved.storedModelId);
+          invokedStoredModelIds.add(reserved.storedModelId);
+          await onCandidateInvokedV1?.({
             storedModelId: reserved.storedModelId,
             providerLabel: reserved.providerLabel,
+            runnerId: reserved.handle.runnerId,
+            operationId,
+            attemptId,
+            backup,
           });
         } catch {
           // an observer failure must never affect the round
@@ -3086,7 +3106,14 @@ export function createTaskActionCoordinatorV1(
       return { kind: "settled", outcome: finalizeOutcome(row, request, undefined, outcome, metrics) };
     }
 
-    const operationId = allocateHex128IdV1();
+    const inputSendId =
+      typeof validation.input === "object" && validation.input !== null && "sendId" in validation.input
+        ? (validation.input as { sendId?: unknown }).sendId
+        : undefined;
+    const sendIdStr = typeof inputSendId === "string" && isHex128IdV1(inputSendId) ? inputSendId : undefined;
+    const candidateOpId: string | undefined =
+      (request.operationId && isHex128IdV1(request.operationId) ? request.operationId : undefined) ?? sendIdStr;
+    const operationId: string = candidateOpId ?? allocateHex128IdV1();
 
     const acquireLeasePhase: AcquireTaskLeasePhaseV1 = () => {
       if (!row.requiresTaskOperationLease) {
@@ -3352,6 +3379,50 @@ export function createTaskActionCoordinatorV1(
       }
       const { promptSha256 } = assembled;
       initialCandidateAssembledPrompt = assembled;
+
+      const checkSendId = sendIdStr ?? (request.operationId && isHex128IdV1(request.operationId) ? request.operationId : undefined);
+      if (checkSendId && typeof validation.input === "object" && validation.input !== null) {
+        const inputObj = validation.input as Record<string, unknown>;
+        const taskFolder = typeof inputObj.taskFolderPath === "string" ? inputObj.taskFolderPath : undefined;
+        const canonicalId = typeof inputObj.canonicalId === "string" ? inputObj.canonicalId : undefined;
+        if (taskFolder) {
+          const reconciled = await reconcileChatSendStateV1(taskFolder, checkSendId, canonicalId, stage);
+          if (reconciled.settled && reconciled.status === "completed") {
+            progress.end();
+            return {
+              kind: "settled",
+              outcome: finalizeOutcome(
+                row,
+                request,
+                operationId,
+                { kind: "completed", correlation, code: "completed" },
+                metrics
+              ),
+            };
+          }
+          if (reconciled.held || reconciled.status === "held") {
+            progress.end();
+            return {
+              kind: "settled",
+              outcome: finalizeOutcome(
+                row,
+                request,
+                operationId,
+                {
+                  kind: "failed",
+                  correlation,
+                  code: "indeterminatePriorAttempt",
+                  retryable: false,
+                  detail:
+                    reconciled.reason ??
+                    "An earlier provider attempt for this message was interrupted during promotion; holding prior attempt to prevent duplicate execution",
+                },
+                metrics
+              ),
+            };
+          }
+        }
+      }
 
       await deps.orchestrator.discardInvocation(operationId);
       const admitted = await deps.orchestrator.admitInvocation({
@@ -3808,7 +3879,8 @@ export function createTaskActionCoordinatorV1(
         request.taskBinding,
         undefined,
         undefined,
-        request.onCandidateInvokedV1
+        request.onCandidateInvokedV1,
+        request.promptAppendix
       );
       // Best-effort durable mirror of the claimed invocation's terminal
       // outcome (plan §3.1 / AC-RUNNER-03): makes it recoverable by a later

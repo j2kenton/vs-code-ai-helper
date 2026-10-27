@@ -441,3 +441,26 @@ test("task-progress corpus: transitions/ input and expected documents dual-decod
     }
   }
 });
+
+test("task-progress per-item provenance validates identically in extension and core", () => {
+  const valid = {
+    taskFolder: "2026-10-26_task_1",
+    currentStage: "impl",
+    createdAt: "2026-10-26T00:00:00.000Z",
+    updatedAt: "2026-10-26T00:00:00.000Z",
+    planItemEvidence: [{
+      planRevision: "a".repeat(64), itemKey: "step 1: example", itemText: "Step 1: Example",
+      claims: [{ source: "implementation", at: "2026-10-26T00:00:00.000Z", roundId: "round-1" }],
+      testReports: [{ at: "2026-10-26T00:01:00.000Z", roundId: "round-1", testIdentity: "src/test/feature.test.ts",
+        command: "pnpm test src/test/feature.test.ts", workingDirectory: "/workspace", passed: 1, failed: 0,
+        sourceState: "post-edit source state", sourceFiles: ["src/feature.ts"],
+        sourceFileStates: [{ path: "src/feature.ts", sha256: "b".repeat(64) }], sourceFilesTruncated: true }],
+      verifications: [{ at: "2026-10-26T00:02:00.000Z", roundId: "review-1", evidence: "accepted report", testReportRoundIds: ["round-1"] }],
+    }],
+  };
+  assertProgressDualDecode("planItemEvidence/valid", JSON.stringify(valid), true);
+  assertProgressDualDecode("planItemEvidence/invalid", JSON.stringify({
+    ...valid,
+    planItemEvidence: [{ ...valid.planItemEvidence[0], claims: [{ source: "invented", at: "today" }] }],
+  }), false);
+});

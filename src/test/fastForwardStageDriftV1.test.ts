@@ -97,8 +97,8 @@ void describe("RC5 source wiring", () => {
   });
 
   void it("persists the effective verdict from both writers of the saved checks result", () => {
-    assert.match(read("src", "utils", "completionLint.ts"), /passedModuloKnownFlakes: result\.passedModuloKnownFlakes,\n\s+summary: result\.summary,[\s\S]{0,120}source: "publish"/);
-    assert.match(reviewActions, /passedModuloKnownFlakes: result\.passedModuloKnownFlakes,\n\s+summary: result\.summary,[\s\S]{0,120}source: "review"/);
+    assert.match(read("src", "utils", "completionLint.ts"), /passedModuloKnownFlakes: result\.passedModuloKnownFlakes,\n\s+summary: result\.summary,[\s\S]{0,300}source: "publish"/);
+    assert.match(reviewActions, /passedModuloKnownFlakes: result\.passedModuloKnownFlakes,\n\s+summary: result\.summary,[\s\S]{0,300}source: "review"/);
     assert.match(read("src", "services", "taskProgressDecoderV1.ts"), /"source", "passedModuloKnownFlakes"\]/);
   });
 });

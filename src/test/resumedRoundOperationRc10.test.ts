@@ -93,7 +93,11 @@ void describe("runResumedRoundOperationV1 (RC10 item 1)", () => {
       await gate;
       return true;
     });
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    // The body starts after the operation's async start-up checks (the
+    // round Git-interference inspection), so wait for it rather than one tick.
+    for (let i = 0; i < 200 && token === undefined; i++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
     const [snapshot] = taskOperations.getTaskOperations(taskPath);
     assert.ok(snapshot, "the operation is registered synchronously");
     assert.ok(token, "the handle exposes a token");

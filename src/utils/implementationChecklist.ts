@@ -462,6 +462,13 @@ export function normalizeChecklistItemTextV1(text: string): string {
   return unescaped.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
+/** Stable identity for plan acceptance: checkbox state is progress, not a
+ * revision. Item wording and exclusion markers remain part of the hash. */
+export function getPlanRevisionV1(planText: string): string {
+  const revisionContent = planText.replace(/^(\s*[-*+]\s+\[)[ xX](\])/gm, "$1 $2");
+  return createHash("sha256").update(revisionContent).digest("hex");
+}
+
 /**
  * A leading step label a round may omit when echoing an item: `Step 4:`,
  * `Step 4 —`, `4.`, or `**Step 4**`. Applied only after exact matching fails
@@ -1661,6 +1668,15 @@ export interface ChecklistProgressV1 {
   readonly closedBeforeImplementation?: number;
 }
 
+export interface ChecklistEvidenceProgressV1 {
+  /** Checkbox state shown to the owner; self-claims remain visible here. */
+  readonly display: ChecklistProgressV1;
+  /** Reviewer-verified completion plus explicit exclusions; used by gates. */
+  readonly gate: ChecklistProgressV1;
+  readonly verified: number;
+  readonly provisional: number;
+}
+
 /**
  * Every checklist item in one rendering, in document order — skipping items
  * inside fenced examples, which are illustrations of a checklist rather than
@@ -1722,6 +1738,26 @@ function itemsInLatestRendering(
     }
   }
   return items;
+}
+
+/** Return newly checked item texts between two plan renderings, preserving plan order. */
+export function listNewlyCheckedChecklistItemsV1(before: string, after: string): readonly string[] {
+  const oldCounts = new Map<string, number>();
+  for (const item of itemsInLatestRendering(before)) {
+    if (!item.checked || item.excluded) continue;
+    const key = normalizeChecklistItemTextV1(item.text);
+    oldCounts.set(key, (oldCounts.get(key) ?? 0) + 1);
+  }
+  const seen = new Map<string, number>();
+  const added: string[] = [];
+  for (const item of itemsInLatestRendering(after)) {
+    if (!item.checked || item.excluded) continue;
+    const key = normalizeChecklistItemTextV1(item.text);
+    const occurrence = (seen.get(key) ?? 0) + 1;
+    seen.set(key, occurrence);
+    if (occurrence > (oldCounts.get(key) ?? 0)) added.push(item.text);
+  }
+  return added;
 }
 
 /** A plan area whose unticked boxes are checks for a person (or Ensemble's own verification run), not work a round can build. */
@@ -1955,6 +1991,52 @@ export function countChecklistProgressV1(
   };
 }
 
+/** Separate visible checkboxes from completion that has reviewer provenance. */
+export function countChecklistEvidenceProgressV1(
+  planOfRecord: string,
+  itemEvidence: readonly {
+    readonly planRevision: string;
+    readonly itemKey: string;
+    readonly verifications?: readonly unknown[];
+  }[]
+): ChecklistEvidenceProgressV1 | undefined {
+  const display = countChecklistProgressV1(planOfRecord);
+  if (!display) return undefined;
+  const revision = getPlanRevisionV1(planOfRecord);
+  const verifiedKeys = new Set(itemEvidence
+    .filter((entry) => entry.planRevision === revision && (entry.verifications?.length ?? 0) > 0)
+    .map((entry) => entry.itemKey));
+  const items = itemsInLatestRendering(planOfRecord);
+  let verified = 0;
+  let provisional = 0;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    if (item.nested || item.excluded || !item.checked) continue;
+    let childrenVerified = true;
+    for (let j = i + 1; j < items.length && items[j]!.nested; j++) {
+      const child = items[j]!;
+      if (!child.excluded && (!child.checked || !verifiedKeys.has(normalizeChecklistItemTextV1(child.text)))) {
+        childrenVerified = false;
+        break;
+      }
+    }
+    if (verifiedKeys.has(normalizeChecklistItemTextV1(item.text)) && childrenVerified) verified++;
+    else provisional++;
+  }
+  const settled = verified + display.closedWithoutDoing;
+  return {
+    display,
+    gate: {
+      ...display,
+      checked: verified,
+      settled,
+      remaining: display.total - settled,
+    },
+    verified,
+    provisional,
+  };
+}
+
 /**
  * Rewrites every top-level excluded item of the latest rendering that does not
  * yet carry {@link CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1}, inserting the
@@ -2081,9 +2163,24 @@ export function formatChecklistPercentV1(settled: number, total: number): number
  * `unknown` when there is no readable checklist, in which case the prompt tells
  * the reviewer to count for itself.
  */
-export function formatChecklistProgressForReviewerV1(planOfRecord: string | undefined): string {
+export function formatChecklistProgressForReviewerV1(
+  planOfRecord: string | undefined,
+  itemEvidence?: readonly { readonly planRevision: string; readonly itemKey: string; readonly verifications?: readonly unknown[] }[]
+): string {
   const counted = planOfRecord ? countChecklistProgressV1(planOfRecord) : undefined;
-  return counted ? `${counted.settled}/${counted.total}` : "unknown";
+  if (!counted || itemEvidence === undefined || !planOfRecord) return counted ? `${counted.settled}/${counted.total}` : "unknown";
+  const evidence = countChecklistEvidenceProgressV1(planOfRecord, itemEvidence);
+  return evidence ? `${evidence.gate.settled}/${evidence.gate.total}` : "unknown";
+}
+
+export function formatChecklistEvidenceForReviewerV1(
+  planOfRecord: string | undefined,
+  itemEvidence: readonly { readonly planRevision: string; readonly itemKey: string; readonly verifications?: readonly unknown[] }[]
+): string {
+  if (!planOfRecord) return "unknown";
+  const evidence = countChecklistEvidenceProgressV1(planOfRecord, itemEvidence);
+  return evidence ? `${evidence.verified} reviewer-verified; ${evidence.provisional} provisional; ` +
+    `${evidence.display.closedWithoutDoing} explicitly excluded` : "unknown";
 }
 
 /**
@@ -2292,6 +2389,64 @@ export function collectCheckedChecklistCountsV1(
   return counts;
 }
 
+/** Count plain `item — done — evidence` claims in the latest round checklist. */
+export function collectPlainDoneChecklistCountsV1(content: string): ReadonlyMap<string, number> {
+  const headings = [...content.matchAll(/^#{1,6}\s+Plan Item Checklist\s*$/gim)];
+  const heading = headings.at(-1);
+  if (!heading || heading.index === undefined) return new Map();
+  const start = heading.index + heading[0].length;
+  const nextHeading = /^#{1,6}\s+.+$/gm;
+  nextHeading.lastIndex = start;
+  const end = nextHeading.exec(content)?.index ?? content.length;
+  const counts = new Map<string, number>();
+  for (const line of content.slice(start, end).split(/\r?\n/)) {
+    const match = /^\s*[-*+]\s+(.+?)\s+—\s*done(?:\s+—|\s*$)/i.exec(line);
+    if (!match?.[1]) continue;
+    const key = normalizeChecklistItemTextV1(match[1]);
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return counts;
+}
+
+export interface ImplementationReportClaimAccountingV1 {
+  readonly claimed: number;
+  readonly matched: number;
+  readonly unmatched: number;
+  readonly newlyRecorded: number;
+}
+
+/** Compare a correction's new done claims with the plan and resulting merge. */
+export function accountImplementationReportCorrectionClaimsV1(
+  planOfRecord: string,
+  correctedReport: string,
+  mergedPlan?: string
+): ImplementationReportClaimAccountingV1 {
+  const planKeys = collectChecklistItemKeysV1(planOfRecord);
+  const priorCounts = collectCheckedChecklistCountsV1(planOfRecord);
+  const reportedCounts = new Map(collectCheckedChecklistCountsV1(correctedReport));
+  for (const [key, count] of collectPlainDoneChecklistCountsV1(correctedReport)) {
+    reportedCounts.set(key, Math.max(reportedCounts.get(key) ?? 0, count));
+  }
+  let claimed = 0;
+  let matched = 0;
+  let unmatched = 0;
+  for (const [key, count] of reportedCounts) {
+    const newlyClaimed = Math.max(0, count - (priorCounts.get(key) ?? 0));
+    if (newlyClaimed === 0) continue;
+    claimed += newlyClaimed;
+    if (planKeys.has(key)) matched += newlyClaimed;
+    else unmatched += newlyClaimed;
+  }
+  let newlyRecorded = 0;
+  if (mergedPlan !== undefined) {
+    const mergedCounts = collectCheckedChecklistCountsV1(mergedPlan);
+    for (const [key, count] of mergedCounts) {
+      newlyRecorded += Math.max(0, count - (priorCounts.get(key) ?? 0));
+    }
+  }
+  return { claimed, matched, unmatched, newlyRecorded };
+}
+
 /** Result of {@link listUncheckedChecklistItemTextsV1}: a bounded preview plus the true total, so a caller can say "and N more" honestly. */
 export interface UncheckedChecklistItemsV1 {
   /** Outstanding item texts, in document order, truncated to the requested limit. */
@@ -2353,6 +2508,202 @@ export function listUncheckedChecklistItemTextsV1(
     }),
     total: outstanding.length,
   };
+}
+
+/**
+ * Checked plan items whose acceptance explicitly depends on tests and whose
+ * latest accepted editing-round report does not provide a matching passing
+ * test record. Keep those items visible as provisional so an editing round
+ * can supply the evidence instead of treating an unexplained tick as settled.
+ * The later provenance step will retain this association across subsequent
+ * reports and bind it to durable source-state evidence.
+ */
+export function listProvisionalTestDependentChecklistItemsV1(
+  planOfRecord: string,
+  editingRoundReport?: string
+): readonly string[] {
+  return itemsInLatestRendering(planOfRecord)
+    .filter((item) => {
+      if (item.excluded || !item.checked) return false;
+      return isTestDependentChecklistItemV1(item.text) &&
+        !hasApplicablePassingTestReportForItemV1(planOfRecord, item.text, editingRoundReport ?? "");
+    })
+    .map((item) => unescapeChecklistItemTextV1(item.text));
+}
+
+function isTestDependentChecklistItemV1(itemText: string): boolean {
+  return /\b(?:tests?|test cases?|fixtures?|regressions?|coverage)\b/i.test(itemText);
+}
+
+/**
+ * A checked test-dependent item is no longer provisional only when its
+ * latest editing-round report ties that exact plan item and its named test
+ * evidence to an actual passing command, and says the report describes the
+ * post-edit source state. This is
+ * deliberately a narrow report contract; it is a prompt/claim qualification
+ * bridge until the later per-item provenance store is implemented.
+ */
+export interface ApplicablePlanItemTestReportV1 {
+  readonly testIdentity: string;
+  readonly command: string;
+  readonly workingDirectory?: string;
+  readonly passed: number;
+  readonly failed: number;
+  readonly sourceState: string;
+}
+
+export function getApplicablePassingTestReportForItemV1(
+  planOfRecord: string,
+  itemText: string,
+  editingRoundReport: string
+): ApplicablePlanItemTestReportV1 | undefined {
+  if (!editingRoundReport || !isTestDependentChecklistItemV1(itemText)) return undefined;
+  const wanted = normalizeChecklistItemTextV1(itemText);
+  const planItemKeys = collectChecklistItemKeysV1(planOfRecord);
+  const { own } = splitSummaryAtEchoV1(editingRoundReport);
+  const all = headingsV1(own);
+  const checklistAt = findLastHeadingV1(all, "Plan Item Checklist");
+  if (checklistAt < 0) return undefined;
+  const checklistHeading = all[checklistAt];
+  if (!checklistHeading) return undefined;
+  const lines = walkLinesV1(own);
+  let checklistEnd = lines.length;
+  for (let i = checklistAt + 1; i < all.length; i++) {
+    const heading = all[i];
+    if (heading && heading.level <= checklistHeading.level) {
+      checklistEnd = heading.line;
+      break;
+    }
+  }
+  let itemClaimEvidence = "";
+  for (let i = checklistHeading.line + 1; i < checklistEnd; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) continue;
+    const parsed = parsePlanItemChecklistLine(line.text, planItemKeys);
+    if (parsed && parsed.status.toLowerCase().startsWith("done") &&
+        normalizeChecklistItemTextV1(parsed.itemText) === wanted) {
+      itemClaimEvidence = parsed.evidence;
+      break;
+    }
+  }
+  if (!itemClaimEvidence || !/\btest\b/i.test(itemClaimEvidence)) return undefined;
+
+  const verificationAt = findLastHeadingV1(all, "Verification");
+  if (verificationAt < 0) return undefined;
+  const verificationHeading = all[verificationAt];
+  if (!verificationHeading) return undefined;
+  let verificationEnd = lines.length;
+  for (let i = verificationAt + 1; i < all.length; i++) {
+    const heading = all[i];
+    if (heading && heading.level <= verificationHeading.level) {
+      verificationEnd = heading.line;
+      break;
+    }
+  }
+  const evidenceKey = itemClaimEvidence
+    .replace(/^\s*test(?:\s+evidence)?\s*[:=]\s*/i, "")
+    .trim()
+    .toLowerCase();
+  if (!evidenceKey) return undefined;
+
+  // Treat a Markdown list item and its indented continuation lines as one
+  // report record. The command must itself identify the test named by the
+  // plan-item claim, and the passing result must belong to that same record;
+  // prose elsewhere in the verification section cannot lend its filename or
+  // pass counts to an unrelated command. Source-state evidence is a report
+  // level assertion and may be on a separate line, as the prompt does not
+  // require all evidence fields to share one physical line.
+  const verificationLines = lines
+    .slice(verificationHeading.line + 1, verificationEnd)
+    .filter((line) => line && !line.fenced);
+  const sourceStateReported = verificationLines.some((line) =>
+    /post[- ]edit source state/i.test(line.text)
+  );
+  if (!sourceStateReported) return undefined;
+
+  const commandMatchesEvidence = (command: string): boolean => {
+    // A claim may name a repository-relative test path while the command uses
+    // its basename. Accept that precise suffix match, but never a substring
+    // such as `required.test.ts.not-run` or a filename mentioned outside the
+    // executable command.
+    const normalizedEvidence = evidenceKey.replace(/\\/g, "/").replace(/^\.\//, "");
+    const basename = normalizedEvidence.split("/").pop() ?? normalizedEvidence;
+    return basename.length > 0 && command
+      .toLowerCase()
+      .split(/[\s'"`;=,]+/)
+      .some((part) => {
+        const token = part.replace(/^[([{]+|[),\]}]+$/g, "").replace(/\\/g, "/").replace(/^\.\//, "");
+        return token === normalizedEvidence || token.split("/").pop() === basename;
+      });
+  };
+  for (let i = 0; i < verificationLines.length; i++) {
+    const line = verificationLines[i];
+    if (!line) continue;
+    const text = line.text;
+    const command = /`([^`]+)`/.exec(text)?.[1];
+    if (!command || !commandMatchesEvidence(command)) continue;
+
+    // Capture continuations until the next peer-level Markdown bullet. This
+    // supports wrapped runner output while keeping results associated with
+    // the command they describe.
+    const record = [text];
+    for (let j = i + 1; j < verificationLines.length; j++) {
+      const continuation = verificationLines[j];
+      if (!continuation) continue;
+      if (/^\s*[-*+]\s+/.test(continuation.text)) break;
+      record.push(continuation.text);
+    }
+    const recordText = record.join(" ");
+    const counts = /(\d+)\s+passed\b/i.exec(recordText);
+    const failures = /(\d+)\s+failed\b/i.exec(recordText);
+    if (counts && failures && Number(failures[1]) === 0) {
+      const workingDirectory = /(?:working directory|cwd)\s*[:=]\s*`?([^`\n]+)`?/i.exec(recordText)?.[1]?.trim();
+      const stateLine = verificationLines.find((candidate) => /post[- ]edit source state/i.test(candidate.text));
+      return {
+        testIdentity: evidenceKey,
+        command,
+        ...(workingDirectory ? { workingDirectory } : {}),
+        passed: Number(counts[1]),
+        failed: Number(failures[1]),
+        sourceState: stateLine?.text.slice(0, 1000) ?? "post-edit source state reported",
+      };
+    }
+  }
+  return undefined;
+}
+
+export function hasApplicablePassingTestReportForItemV1(
+  planOfRecord: string,
+  itemText: string,
+  editingRoundReport: string
+): boolean {
+  return getApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport) !== undefined;
+}
+
+/** Ordered, untruncated authority for what an editing round may claim as open plan work. */
+export function formatOpenPlanItemsForRoundV1(planOfRecord: string, editingRoundReport?: string): string {
+  const parsedItems = itemsInLatestRendering(planOfRecord).filter((item) => !item.excluded);
+  const provisionalTestItems = new Set(listProvisionalTestDependentChecklistItemsV1(planOfRecord, editingRoundReport));
+  const items = parsedItems
+    .filter((item) => !item.checked || provisionalTestItems.has(unescapeChecklistItemTextV1(item.text)))
+    .map((item) => ({
+      text: unescapeChecklistItemTextV1(item.text),
+      provisional: item.checked,
+    }));
+  if (items.length === 0) {
+    return "The plan of record has no unchecked, non-excluded top-level checklist items.";
+  }
+  const hasProvisionalItems = items.some((item) => item.provisional);
+  return [
+    "This is the only ordered list of open plan items eligible for completion claims in this round. The item text and embedded identifiers are copied from the plan of record in its original order. Start with item 1. Do not invent, renumber, combine, paraphrase, or claim an item that is absent from this list.",
+    ...(hasProvisionalItems
+      ? [
+          "A checked item marked PROVISIONAL is not verified: no applicable test report is associated with that item. Keep it open until an Implementation or Apply Review report names the test file or test name in that item's checklist evidence and reports a matching command, passed and failed counts, and the post-edit source state tested.",
+        ]
+      : []),
+    ...items.map((item, index) => `${index + 1}. ${item.provisional ? "[PROVISIONAL — evidence missing] " : ""}${item.text}`),
+    `First item to work on: ${items[0]?.text}`,
+  ].join("\n");
 }
 
 /**
@@ -2742,6 +3093,11 @@ export type MergeChecklistProgressResultV1 =
   | { readonly kind: "unchanged" }
   | { readonly kind: "no-report" }
   | {
+      readonly kind: "unverified-test-evidence";
+      readonly unverifiedSample: readonly string[];
+      readonly unverifiedAll: readonly string[];
+    }
+  | {
       readonly kind: "no-match";
       /** First two unmatched claims, for a short human-facing message. */
       readonly unmatchedSample: readonly string[];
@@ -2755,6 +3111,7 @@ export type MergeChecklistProgressResultV1 =
       readonly kind: "merged";
       readonly content: string;
       readonly retroactiveTicks?: readonly { readonly itemText: string; readonly evidence: string }[];
+      readonly unverifiedTestItems?: readonly string[];
     };
 
 /**
@@ -2786,7 +3143,8 @@ export type MergeChecklistProgressResultV1 =
  */
 export function mergeChecklistProgressV1(
   planOfRecord: string,
-  summary: string
+  summary: string,
+  options?: { readonly reviewerVerified?: boolean }
 ): MergeChecklistProgressResultV1 {
   // Only the echoed checklist counts as reported progress. The summary's own
   // `## Verification` is itself "a short checklist" per the prompt, so reading
@@ -2945,7 +3303,35 @@ export function mergeChecklistProgressV1(
     }
   }
 
+  // Editing-round self-claims require a passing report in the same summary.
+  // Reviewer-tick application opts out only after its host-side derivation has
+  // accepted durable editing-round evidence for the specific items.
+  const planTextByKey = new Map<string, string>();
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    planTextByKey.set(normalizeChecklistItemTextV1(item.text), item.text);
+  }
+  const unverifiedTestItems: string[] = [];
+  if (!options?.reviewerVerified) {
+    for (const key of [...reported.keys()]) {
+      const itemText = planTextByKey.get(key);
+      if (itemText && isTestDependentChecklistItemV1(itemText) &&
+          !hasApplicablePassingTestReportForItemV1(planOfRecord, itemText, summary)) {
+        reported.delete(key);
+        retroactiveKeys.delete(key);
+        retroactiveEvidenceByKey.delete(key);
+        unverifiedTestItems.push(itemText);
+      }
+    }
+  }
+
   if (reported.size === 0) {
+    if (unverifiedTestItems.length > 0) {
+      return {
+        kind: "unverified-test-evidence",
+        unverifiedSample: unverifiedTestItems.slice(0, 2),
+        unverifiedAll: unverifiedTestItems,
+      };
+    }
     if (missingEvidenceSamples.length > 0) {
       return {
         kind: "no-match",
@@ -3009,6 +3395,7 @@ export function mergeChecklistProgressV1(
       kind: "merged",
       content: `${prefix}${mergedRegion}`,
       ...(retroactiveTicks.length > 0 ? { retroactiveTicks } : {}),
+      ...(unverifiedTestItems.length > 0 ? { unverifiedTestItems } : {}),
     };
   }
 

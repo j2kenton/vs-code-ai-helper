@@ -636,7 +636,15 @@ export function createActionConversationOrchestratorV1(options: {
       // crash between scheduling and settlement is recoverable: re-driving
       // with the identical idempotency id is the store's duplicate no-op and
       // proceeds to settlement with a fresh resolution.
-      const scheduled = await store.scheduleResume(ref.operationId, resumeIdempotencyId);
+      // A crash can leave the record at `resumeScheduled` under an earlier
+      // attempt's id; the retry adopts that recorded id rather than minting a
+      // conflicting one (bugs2 finding 1).
+      const scheduled = await store.scheduleResume(
+        ref.operationId,
+        transaction.state === "resumeScheduled" && transaction.resumeIdempotencyId !== undefined
+          ? transaction.resumeIdempotencyId
+          : resumeIdempotencyId
+      );
       if (scheduled.kind !== "ok") {
         throw new ActionConversationErrorV1(storeFailureReason(scheduled));
       }

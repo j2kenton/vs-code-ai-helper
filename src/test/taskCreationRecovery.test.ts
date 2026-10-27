@@ -30,6 +30,9 @@ import {
 } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { resetWorkflowRuntimeServicesForTestV1 } from "../services/workflowRuntimeServicesV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import {
   loadTaskCreationJournalV1,
   recordFinalFolderClaimedV1,
@@ -166,12 +169,95 @@ function writeCreatingProgress(
   fs.writeFileSync(path.join(taskFolderPath, "task-progress.json"), JSON.stringify(progress, null, 2));
 }
 
+function writeActiveTask(taskFolderPath: string): void {
+  fs.mkdirSync(taskFolderPath, { recursive: true });
+  const progress: TaskProgress = {
+    taskFolder: path.basename(taskFolderPath),
+    displayName: "Existing active task",
+    currentStage: "impl",
+    status: "active",
+    createdAt: "2026-07-01T10:00:00.000Z",
+    updatedAt: "2026-07-01T10:00:00.000Z",
+  };
+  fs.writeFileSync(path.join(taskFolderPath, "task-progress.json"), JSON.stringify(progress, null, 2));
+}
+
+async function assertPausedResumeDecisionAndUpdateDuplicate(
+  harness: Harness,
+  taskFolderPath: string,
+  taskFolderName: string,
+  noticeText: string
+): Promise<void> {
+  const store = new WorkflowDecisionStoreV1(harness.memento);
+  const decision = store.listPending(taskFolderPath).find((item) => item.decisionKey === "chatActionOffer:resumeTask");
+  assert.ok(decision, "a paused recovery must offer Resume in task chat");
+  assert.equal(decision.whatHappened, noticeText);
+  assert.deepEqual(decision.options.map((option) => option.label), ["Resume", "Not now"]);
+  assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+  assert.equal(decision.gating?.holdsTaskPaused, true, "the task remains paused until Resume is chosen");
+  assert.deepEqual(decision.options[0]?.effect, {
+    kind: "command",
+    command: "vs-code-ai-helper.resumeTask",
+    args: [{ taskFolderPath }],
+  });
+
+  await offerActionInChatV1({
+    taskFolderPath,
+    taskLabel: taskFolderName,
+    actionLabel: "Resume",
+    command: "vs-code-ai-helper.resumeTask",
+    args: [{ taskFolderPath }],
+    noticeText,
+    holdsTaskPaused: true,
+  });
+  assert.equal(
+    store.listPending(taskFolderPath).filter((item) => item.decisionKey === "chatActionOffer:resumeTask").length,
+    1,
+    "repeated paused-recovery reporting updates the existing Resume card"
+  );
+}
+
+async function assertActiveDraftDecisionAndUpdateDuplicate(
+  harness: Harness,
+  taskFolderPath: string,
+  taskFolderName: string,
+  noticeText: string
+): Promise<void> {
+  const store = new WorkflowDecisionStoreV1(harness.memento);
+  const decision = store.listPending(taskFolderPath).find((item) => item.decisionKey === "chatActionOffer:draftTaskWithAI");
+  assert.ok(decision, "an active recovery must offer Draft with AI in task chat");
+  assert.equal(decision.whatHappened, noticeText);
+  assert.deepEqual(decision.options.map((option) => option.label), ["Draft with AI", "Not now"]);
+  assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+  assert.deepEqual(decision.options[0]?.effect, {
+    kind: "command",
+    command: "vs-code-ai-helper.draftTaskWithAI",
+    args: [{ taskFolderPath }],
+  });
+
+  await offerActionInChatV1({
+    taskFolderPath,
+    taskLabel: taskFolderName,
+    actionLabel: "Draft with AI",
+    command: "vs-code-ai-helper.draftTaskWithAI",
+    args: [{ taskFolderPath }],
+    noticeText,
+    optional: true,
+  });
+  assert.equal(
+    store.listPending(taskFolderPath).filter((item) => item.decisionKey === "chatActionOffer:draftTaskWithAI").length,
+    1,
+    "repeated active-recovery reporting updates the existing Draft with AI card"
+  );
+}
+
 interface Harness {
   workspaceRoot: string;
   metaFolderPath: string;
   inventory: TaskInventory;
   currentTaskStore: CurrentTaskStore;
   entries: Array<{ message: string; level: string; filePath?: string }>;
+  memento: vscode.Memento;
   restore(): void;
 }
 
@@ -183,6 +269,13 @@ function installHarness(): Harness {
   const wsStub = installWorkspaceFoldersStub([workspaceRoot]);
   const fsBridge = installRealFsBridge();
   const currentTaskStore = new CurrentTaskStore(makeMemento());
+  const decisionMemento = makeMemento();
+  __extensionContextV1TestOnly.set({
+    subscriptions: [],
+    extensionUri: vscode.Uri.file(workspaceRoot),
+    workspaceState: decisionMemento,
+    globalState: decisionMemento,
+  } as unknown as vscode.ExtensionContext);
   const windowTarget = vscode.window as unknown as Record<string, unknown>;
   const originalShowWarningMessage = windowTarget.showWarningMessage;
   const originalExecuteCommand = (vscode.commands as unknown as Record<string, unknown>).executeCommand;
@@ -214,6 +307,7 @@ function installHarness(): Harness {
     inventory: fakeInventory(),
     currentTaskStore,
     entries,
+    memento: decisionMemento,
     restore(): void {
       configStub.restore();
       wsStub.restore();
@@ -222,6 +316,7 @@ function installHarness(): Harness {
       chatChoiceModule.askChatChoiceV1 = originalAskChatChoiceV1;
       (vscode.commands as unknown as Record<string, unknown>).executeCommand = originalExecuteCommand;
       deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
       TaskCreationStartupReconcilerV1.resetForTests();
       resetWorkflowRuntimeServicesForTestV1();
       safeRemoveDir(workspaceRoot);
@@ -272,6 +367,62 @@ void describe("retryTaskCreation", () => {
         harness.currentTaskStore.get(),
         normalizePath(taskFolderPath),
         "an activated retry must become the current task"
+      );
+      assert.match(harness.entries.at(-1)?.message ?? "", /creation resumed and set as the active task/);
+      const decision = new WorkflowDecisionStoreV1(harness.memento).listPending(taskFolderPath)
+        .find((item) => item.decisionKey === "chatActionOffer:draftTaskWithAI");
+      assert.ok(decision, "the successful recovery must render its next action in task chat");
+      assert.match(decision.whatHappened, /creation resumed and set as the active task/);
+      assert.deepEqual(decision.options.map((option) => option.label), ["Draft with AI", "Not now"]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(decision.options[0]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.draftTaskWithAI",
+        args: [{ taskFolderPath }],
+      });
+      await assertActiveDraftDecisionAndUpdateDuplicate(
+        harness,
+        taskFolderPath,
+        taskFolderName,
+        `${taskFolderName} creation resumed and set as the active task. Choose Draft with AI in Chat to continue.`
+      );
+    } finally {
+      harness.restore();
+    }
+  });
+
+  void it("keeps a retried task paused behind the active task and offers one actionable Resume card", async () => {
+    const harness = installHarness();
+    try {
+      const taskFolderName = "2026-01-01_task_1";
+      const taskFolderPath = path.join(harness.metaFolderPath, taskFolderName);
+      writeActiveTask(path.join(harness.metaFolderPath, "2026-01-01_task_0"));
+      const recorded = await recordTaskCreationIntentV1({
+        metaFolderPath: harness.metaFolderPath,
+        taskFolderPath,
+        taskFolderName,
+        ownership: defaultOwnership(harness),
+      });
+      assert.equal(recorded.kind, "ok");
+      assert.equal((await recordWorkMaterializedV1(harness.metaFolderPath, taskFolderPath)).kind, "ok");
+      writeCreatingProgress(taskFolderPath);
+
+      const ok = await retryTaskCreation(
+        harness.inventory,
+        vscode.Uri.file(harness.workspaceRoot),
+        harness.currentTaskStore,
+        undefined,
+        { task: { folderUri: vscode.Uri.file(taskFolderPath), folderName: taskFolderName, progress: readProgress(taskFolderPath) } }
+      );
+      assert.equal(ok, true);
+      assert.equal(readProgress(taskFolderPath).status, "paused");
+      assert.equal(harness.currentTaskStore.get(), undefined, "retry must not replace the current active task");
+      assert.match(harness.entries.at(-1)?.message ?? "", /Task creation resumed in paused state/);
+      await assertPausedResumeDecisionAndUpdateDuplicate(
+        harness,
+        taskFolderPath,
+        taskFolderName,
+        "Task creation resumed in paused state."
       );
     } finally {
       harness.restore();
@@ -421,6 +572,55 @@ void describe("adoptAndRetryTaskCreation", () => {
       const progress = readProgress(taskFolderPath);
       assert.equal(progress.status, "active");
       assert.equal(harness.currentTaskStore.get(), normalizePath(taskFolderPath));
+      assert.match(harness.entries.at(-1)?.message ?? "", /creation resumed \(task\.md preserved\) and set as the active task/);
+      const decision = new WorkflowDecisionStoreV1(harness.memento).listPending(taskFolderPath)
+        .find((item) => item.decisionKey === "chatActionOffer:draftTaskWithAI");
+      assert.ok(decision, "the adopted recovery must render its next action in task chat");
+      assert.match(decision.whatHappened, /task\.md preserved/);
+      assert.deepEqual(decision.options.map((option) => option.label), ["Draft with AI", "Not now"]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(decision.options[0]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.draftTaskWithAI",
+        args: [{ taskFolderPath }],
+      });
+      await assertActiveDraftDecisionAndUpdateDuplicate(
+        harness,
+        taskFolderPath,
+        taskFolderName,
+        `${taskFolderName} creation resumed (task.md preserved) and set as the active task. Choose Draft with AI in Chat to continue.`
+      );
+    } finally {
+      harness.restore();
+    }
+  });
+
+  void it("keeps an adopted task paused behind the active task and offers one actionable Resume card", async () => {
+    const harness = installHarness();
+    try {
+      const taskFolderName = "2026-01-01_task_1";
+      const taskFolderPath = path.join(harness.metaFolderPath, taskFolderName);
+      writeActiveTask(path.join(harness.metaFolderPath, "2026-01-01_task_0"));
+      writeCreatingProgress(taskFolderPath, defaultOwnership(harness));
+      fs.writeFileSync(path.join(taskFolderPath, "task.md"), PRESERVABLE_TASK_MD);
+
+      const ok = await adoptAndRetryTaskCreation(
+        harness.inventory,
+        vscode.Uri.file(harness.workspaceRoot),
+        harness.currentTaskStore,
+        undefined,
+        { task: { folderUri: vscode.Uri.file(taskFolderPath), folderName: taskFolderName, progress: readProgress(taskFolderPath) } }
+      );
+      assert.equal(ok, true);
+      assert.equal(readProgress(taskFolderPath).status, "paused");
+      assert.equal(harness.currentTaskStore.get(), undefined, "adoption must not replace the current active task");
+      assert.match(harness.entries.at(-1)?.message ?? "", /Task creation resumed in paused state; task\.md preserved/);
+      await assertPausedResumeDecisionAndUpdateDuplicate(
+        harness,
+        taskFolderPath,
+        taskFolderName,
+        "Task creation resumed in paused state; task.md preserved."
+      );
     } finally {
       harness.restore();
     }

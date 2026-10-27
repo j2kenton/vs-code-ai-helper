@@ -34,7 +34,7 @@ import * as path from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { isUnusableAsExistingReview, nextStage, PUBLISH_SCOPE_REFUSAL_REASON_V1, resumeReviewInteractionV1, runReviewForFolder } from "../commands/reviewActions";
+import { fastForwardReviewWithAI, isUnusableAsExistingReview, nextStage, PUBLISH_SCOPE_REFUSAL_REASON_V1, resumeReviewInteractionV1, runReviewForFolder } from "../commands/reviewActions";
 import { rerunReviewAfterUnchangedTreeCardV1 } from "../commands/rerunReviewAfterUnchangedTreeCardV1";
 import { setTaskStage } from "../commands/setTaskStage";
 import { commitAndPushTask, completeCommitAndPushTask } from "../commands/commitAndPushTask";
@@ -76,6 +76,7 @@ import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/task
 import { safeRemoveDir } from "./testFsUtils";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const settingsModule = require("../config/settings") as Record<string, unknown>;
@@ -88,6 +89,8 @@ const contextPackModule = require("../utils/contextPack") as Record<string, unkn
 const automationChainModule = require("../utils/automationChain") as Record<string, unknown>;
 const publishPreflightModule = require("../utils/publishPreflight") as Record<string, unknown>;
 const gitRepoInfoModule = require("../utils/gitRepoInfo") as Record<string, unknown>;
+const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
+const workAdmissionModule = require("../state/workAdmissionV1") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-owner-"));
@@ -100,12 +103,13 @@ const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-owner-
 // fixtures. That requires REAL_ROOT to actually be a git repo with a
 // resolvable HEAD; `git init` alone leaves HEAD unborn, so one empty commit
 // is made too.
-cp.execSync("git init", { cwd: REAL_ROOT, stdio: "ignore" });
-cp.execSync(
-  'git -c user.email=test@example.invalid -c user.name=test commit --allow-empty -m "init"',
+cp.execFileSync("git", ["init"], { cwd: REAL_ROOT, stdio: "ignore" });
+cp.execFileSync(
+  "git",
+  ["-c", "user.email=test@example.invalid", "-c", "user.name=test@example.invalid", "commit", "--allow-empty", "-m", "init"],
   { cwd: REAL_ROOT, stdio: "ignore" }
 );
-const REAL_ROOT_HEAD_SHA = cp.execSync("git rev-parse HEAD", { cwd: REAL_ROOT }).toString().trim();
+const REAL_ROOT_HEAD_SHA = cp.execFileSync("git", ["rev-parse", "HEAD"], { cwd: REAL_ROOT }).toString().trim();
 
 // runReviewForFolder/commitAndPushTask's AI metadata path run through the
 // real production coordinator (createProductionTaskActionCoordinatorV1),
@@ -1198,7 +1202,7 @@ void describe("Publish review — rebuilding the changed-file scope when implRev
     // other test's fixture files as untracked entries in the SAME git tree, so
     // a real `git ls-files --others` there would pick them all up.
     const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-cap-e2e-"));
-    cp.execSync("git init", { cwd: isolatedRoot, stdio: "ignore" });
+    cp.execFileSync("git", ["init"], { cwd: isolatedRoot, stdio: "ignore" });
     // The task folder must live INSIDE this repo (gitignored) — the Publish
     // freshness gate resolves the "current commit" from the task's own
     // ownership.projectRoot (path.dirname(folderPath)), which must therefore
@@ -1208,12 +1212,13 @@ void describe("Publish review — rebuilding the changed-file scope when implRev
     // out of `git ls-files --others`, so only the real changed file below is
     // ever seen by the baseline diff.
     fs.writeFileSync(path.join(isolatedRoot, ".gitignore"), "plans/\n", "utf8");
-    cp.execSync("git add .gitignore", { cwd: isolatedRoot, stdio: "ignore" });
-    cp.execSync(
-      'git -c user.email=test@example.invalid -c user.name=test commit -q -m "init"',
+    cp.execFileSync("git", ["add", ".gitignore"], { cwd: isolatedRoot, stdio: "ignore" });
+    cp.execFileSync(
+      "git",
+      ["-c", "user.email=test@example.invalid", "-c", "user.name=test@example.invalid", "commit", "-q", "-m", "init"],
       { cwd: isolatedRoot, stdio: "ignore" }
     );
-    const baselineSha = cp.execSync("git rev-parse HEAD", { cwd: isolatedRoot }).toString().trim();
+    const baselineSha = cp.execFileSync("git", ["rev-parse", "HEAD"], { cwd: isolatedRoot }).toString().trim();
     // A real change since baseline that only the baseline-diff fallback can
     // see — the padded ledger below never names this file, so if the
     // dispatch used the ledger (or a partial union) instead of the baseline,
@@ -1354,14 +1359,15 @@ void describe("Publish review — rebuilding the changed-file scope when implRev
     extraLedgerRows: NonNullable<TaskProgress["roundLedger"]>
   ): Promise<{ progressAfter: TaskProgress; logContent: string }> {
     const isolatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), `ensemble-publish-${namePrefix}-`));
-    cp.execSync("git init", { cwd: isolatedRoot, stdio: "ignore" });
+    cp.execFileSync("git", ["init"], { cwd: isolatedRoot, stdio: "ignore" });
     fs.writeFileSync(path.join(isolatedRoot, ".gitignore"), "plans/\n", "utf8");
-    cp.execSync("git add .gitignore", { cwd: isolatedRoot, stdio: "ignore" });
-    cp.execSync(
-      'git -c user.email=test@example.invalid -c user.name=test commit -q -m "init"',
+    cp.execFileSync("git", ["add", ".gitignore"], { cwd: isolatedRoot, stdio: "ignore" });
+    cp.execFileSync(
+      "git",
+      ["-c", "user.email=test@example.invalid", "-c", "user.name=test@example.invalid", "commit", "-q", "-m", "init"],
       { cwd: isolatedRoot, stdio: "ignore" }
     );
-    const baselineSha = cp.execSync("git rev-parse HEAD", { cwd: isolatedRoot }).toString().trim();
+    const baselineSha = cp.execFileSync("git", ["rev-parse", "HEAD"], { cwd: isolatedRoot }).toString().trim();
     // Only the baseline-diff fallback can see this file — a padded/partial
     // ledger union would never name it, so its presence in the persisted
     // scope proves the fallback (not the ledger) actually ran.
@@ -2025,7 +2031,7 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
     const wsStub = installWorkspaceFoldersStub();
     const dispatches: AutomationDispatch[] = [];
     const patches: Patched[] = [
-      patch(settingsModule, "isAutoAdvanceEnabled", () => false),
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
       patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
     ];
     try {
@@ -2042,12 +2048,18 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       );
 
       assert.equal(dispatches.length, 0, "a passing Publish review must never schedule the publish chain — only the user's own click may");
+      const publishNotices = provider.getEntries().filter((entry) =>
+        /Publish review passed|Auto-advancing stage/i.test(entry.message)
+      );
+      assert.equal(publishNotices.length, 1, "a passing Publish review should produce one terminal notice");
+      assert.equal(publishNotices[0]?.level, "info");
       const nudge = provider
         .getEntries()
         .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
       assert.ok(nudge, "expected a Notifications entry opening the Ready to publish decision");
       assert.equal(nudge?.actionCommand?.title, "Open in Chat");
-      assert.match(nudge?.message ?? "", /Ready to publish — Commit & Push is next/);
+      assert.match(nudge?.message ?? "", /Publish review passed — Commit & Push is next/);
+      assert.doesNotMatch(nudge?.message ?? "", /Auto-advancing stage/i);
       assert.deepEqual(nudge?.actionCommand?.args, [
         { canonicalId: vscode.Uri.file(folderPath).fsPath, taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "publish" },
       ]);
@@ -2515,6 +2527,165 @@ void describe("Publish auto-run ownership matrix — passing review, composite, 
       deactivateNotificationRouter();
     }
   });
+
+  void it("a resumed Publish review emits only the terminal information message pointing to Commit & Push", async () => {
+    const { folderPath } = makeTaskFolder(`resumed-publish-${Math.floor(Math.random() * 1e9)}`, "publish");
+    const fixturePackageJson = path.join(path.dirname(folderPath), "package.json");
+    fs.writeFileSync(fixturePackageJson, JSON.stringify({
+      name: "resumed-publish-review-fixture",
+      scripts: {
+        lint: 'node -e "process.exit(0)"',
+        "check-types": 'node -e "process.exit(0)"',
+        test: 'node -e "process.exit(0)"',
+      },
+    }), "utf8");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const execCapture = installExecuteCommandCapture();
+    const chatViewProvider = new ChatViewProvider(makeMemento());
+    const askedRefs: ChatInteractionRefV1[] = [];
+    const originalAskInteraction = chatViewProvider.askInteraction.bind(chatViewProvider);
+    chatViewProvider.askInteraction = (async (question) => {
+      askedRefs.push({
+        operationId: question.operationId,
+        interactionId: question.interactionId,
+        taskBindingId: question.binding!.taskBindingId,
+        chatDocumentId: question.binding!.chatDocumentId,
+        sourceAttemptId: question.sourceAttemptId,
+      });
+      return originalAskInteraction(question);
+    }) as typeof chatViewProvider.askInteraction;
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      stubV1RunnerSelection([questionsTransportV1()]),
+    ];
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT), vscode.Uri.file(folderPath),
+        { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 },
+        "publish", true, { chatViewProvider }
+      );
+      assert.equal(askedRefs.length, 1);
+      const submitted = await getProductionActionConversationOrchestratorV1().submitAnswers(
+        askedRefs[0]!,
+        [{ questionId: "q1", kind: "text", state: "answered", value: "Proceed." }],
+        allocateHex128IdV1()
+      );
+      assert.equal(submitted.ok, true);
+      for (const patchItem of patches.splice(0)) patchItem.restore();
+      patches.push(
+        patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+        patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+        patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+        patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+        stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n## Summary verdict\n\nReady.\n\n<!-- blockers:start -->\n<!-- blockers:end -->\n")])
+      );
+      const resumed = await resumeReviewInteractionV1(
+        vscode.Uri.file(REAL_ROOT), makeBindingInventoryStub(folderPath, "publish"), chatViewProvider,
+        askedRefs[0]!, allocateHex128IdV1(), fakeToken()
+      );
+      assert.equal(resumed.ok, true, resumed.ok ? undefined : resumed.reason);
+      const notices = provider.getEntries().filter((entry) => /Publish review passed|Auto-advancing stage/i.test(entry.message));
+      assert.equal(notices.length, 1);
+      assert.equal(notices[0]?.level, "info");
+      assert.match(notices[0]?.message ?? "", /Publish review passed — Commit & Push is next/);
+      assert.doesNotMatch(notices[0]?.message ?? "", /Auto-advancing stage/i);
+    } finally {
+      for (const patchItem of patches.reverse()) patchItem.restore();
+      execCapture.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+      fs.rmSync(fixturePackageJson, { force: true });
+    }
+  });
+
+  void it("a Fast Forward dispatched Publish review emits one Commit & Push hand-off, never auto-advance text", async () => {
+    const { folderPath } = makeTaskFolder(`fast-forward-publish-${Math.floor(Math.random() * 1e9)}`, "publish", []);
+    const progressPath = path.join(folderPath, "task-progress.json");
+    const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
+    progress.lintPayload = {
+      runAt: "2026-01-01T00:00:00.000Z",
+      passed: true,
+      source: "publish",
+      summary: "All checks passed.",
+      issueCount: 0,
+      failedChecks: [],
+    };
+    fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), "utf8");
+    const fixturePackageJson = path.join(path.dirname(folderPath), "package.json");
+    fs.writeFileSync(fixturePackageJson, JSON.stringify({
+      name: "fast-forward-publish-review-fixture",
+      scripts: {
+        lint: 'node -e "process.exit(0)"',
+        "check-types": 'node -e "process.exit(0)"',
+        test: 'node -e "process.exit(0)"',
+      },
+    }), "utf8");
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const patches: Patched[] = [
+      patch(settingsModule, "isAutoAdvanceEnabled", () => true),
+      patch(settingsModule, "getAutoAdvanceScoreThreshold", () => 8),
+      patch(modelSelectionModule, "resolveModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () => Promise.resolve({ source: "settings", modelId: "stub:model" })),
+      patch(modelSelectionModule, "resolveConfiguredReviewStages", () => Promise.resolve(new Set(REVIEW_STAGES))),
+      patch(runEditActionModule, "checkEditActionProviderPathGateV1", () => Promise.resolve({ ok: true })),
+      patch(workAdmissionModule, "acquireOrAdoptWorkAdmissionV1", () => Promise.resolve({
+        outcome: "acquired",
+        handle: {
+          ownerToken: "test-owner-token",
+          claimId: "test-claim-id",
+          taskFolderPath: folderPath,
+          commandId: "fastForwardReviewWithAI",
+          purpose: "admission",
+          heartbeat: (): Promise<void> => Promise.resolve(),
+          release: (): Promise<void> => Promise.resolve(),
+          handover: (): Promise<void> => Promise.resolve(),
+        },
+      })),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      stubV1RunnerSelection([markdownTransportV1("Readiness: 9/10\n\n## Summary verdict\n\nReady.\n\n<!-- blockers:start -->\n<!-- blockers:end -->\n")]),
+    ];
+    try {
+      const memento = makeMemento();
+      await memento.update(`aiHelper.consent.v${DISCLAIMER_VERSION}`, {
+        acceptedAt: "2026-01-01T00:00:00.000Z",
+        version: DISCLAIMER_VERSION,
+      });
+      const context = {
+        subscriptions: [],
+        extensionUri: vscode.Uri.file(REAL_ROOT),
+        workspaceState: memento,
+        globalState: memento,
+      } as unknown as vscode.ExtensionContext;
+      __extensionContextV1TestOnly.set(context);
+      await fastForwardReviewWithAI(vscode.Uri.file(REAL_ROOT), context, { taskFolderPath: folderPath }, undefined);
+      const notices = provider.getEntries().filter((entry) => /Publish review passed|Auto-advancing stage/i.test(entry.message));
+      assert.equal(notices.length, 1, JSON.stringify(provider.getEntries()));
+      assert.equal(notices[0]?.level, "info");
+      assert.match(notices[0]?.message ?? "", /Publish review passed — Commit & Push is next/);
+      assert.doesNotMatch(notices[0]?.message ?? "", /Auto-advancing stage/i);
+    } finally {
+      __extensionContextV1TestOnly.reset();
+      for (const patchItem of patches.reverse()) patchItem.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+      fs.rmSync(fixturePackageJson, { force: true });
+    }
+  });
 });
 
 /**
@@ -2792,6 +2963,9 @@ void describe("Review generation — a response with no Readiness line advances 
  */
 void describe("resumeReviewInteractionV1 — production Resume delegate", () => {
   void it("resumes a questions-returning review end to end: settles \"resumed\" and promotes the resumed content", async () => {
+    // The original question must be raised from a reviewable scope. The test
+    // adds a newer accepted ledger change while the interaction waits, then
+    // verifies production Resume rebuilds the scope to include it.
     const { folderPath } = makeTaskFolder(`resume-review-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -2862,6 +3036,26 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
       );
       assert.equal(submitted.ok, true, "the clarifying answer must be accepted before Resume");
 
+      // While the review question waits, an accepted Implementation round
+      // adds reviewable task-owned files. Resume must rebuild and supply this
+      // scope before invoking the provider, then route the completed review
+      // through its normal outcome path rather than retaining the original
+      // open-editor fallback.
+      const acceptedFile = "src/test/taskOperations.test.ts";
+      const progressPath = path.join(folderPath, "task-progress.json");
+      const progressWithAcceptedRound = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+      progressWithAcceptedRound["roundLedger"] = [{
+        roundId: "implementation-after-question",
+        attemptIds: ["implementation-after-question"],
+        stage: "impl",
+        mode: "implementation",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        endedAt: "2026-01-01T00:01:00.000Z",
+        state: "completed",
+        outcome: { filesChanged: [acceptedFile] },
+      }];
+      fs.writeFileSync(progressPath, JSON.stringify(progressWithAcceptedRound, null, 2), "utf8");
+
       const inventory = makeBindingInventoryStub(folderPath, "impl-low-review");
       let duringResumedRound: ReturnType<typeof taskOperations.getTaskOperations> = [];
       const resumePatches: Patched[] = [
@@ -2872,6 +3066,8 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
         stubV1RunnerSelection([
           scriptedMarkdownTransportV1(() => {
             duringResumedRound = taskOperations.getTaskOperations(folderPath).map((o) => ({ ...o }));
+            const refreshedPack = fs.readFileSync(path.join(folderPath, "context-pack.md"), "utf8");
+            assert.ok(refreshedPack.includes(acceptedFile), "the provider must receive rebuilt task-owned scope");
             return "Readiness: 9/10\n\n- Ready after clarification.\n";
           }),
         ]),
@@ -2901,6 +3097,11 @@ void describe("resumeReviewInteractionV1 — production Resume delegate", () => 
           true,
           "the resumed attempt's own content must be the one actually promoted to the review artifact"
         );
+        const resumedProgress = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as Record<string, unknown>;
+        const reviewHistory = resumedProgress["reviewScoreHistory"] as Array<Record<string, unknown>>;
+        const resumedReview = reviewHistory.find((entry) => entry["stage"] === "impl-low-review");
+        assert.ok(resumedReview, "the resumed review must reach normal durable outcome routing");
+        assert.notEqual(resumedReview["scope"], "open-editors", "tracked Resume scope must remain eligible for auto-advance routing");
       } finally {
         for (const p of resumePatches.reverse()) { p.restore(); }
       }
@@ -3210,9 +3411,11 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     assert.notEqual(persisted.updatedAt, "2026-01-01T00:00:00.000Z", "updatedAt must be bumped");
 
     const runsDir = path.join(folderPath, "runs");
+    // The review's scope rebuild writes its own run log first; only the
+    // review run record is under test here.
     const logs = fs
       .readdirSync(runsDir)
-      .filter((entry) => entry.endsWith(".md"))
+      .filter((entry) => entry.endsWith(".md") && !entry.includes("-impl-review-scope-rebuild-"))
       .map((entry) =>
         fs.readFileSync(path.join(runsDir, entry), "utf8")
       );

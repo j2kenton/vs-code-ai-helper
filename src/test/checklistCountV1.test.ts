@@ -12,12 +12,16 @@ import {
   carryClosedBeforeImplementationMarkersV1,
   CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1,
   countChecklistProgressV1,
+  countChecklistEvidenceProgressV1,
   EXCLUDED_CHECKLIST_ITEM_MARKER_V1,
   formatChecklistProgressForReviewerV1,
+  formatChecklistEvidenceForReviewerV1,
   formatImplementationProgressLabelV1,
   implementationDisplayCountsV1,
   isClosedBeforeImplementationChecklistItemTextV1,
   isExcludedChecklistItemText,
+  getPlanRevisionV1,
+  normalizeChecklistItemTextV1,
   markClosedBeforeImplementationV1,
   resolveExcludedOwnerHandoffV1,
 } from "../utils/implementationChecklist";
@@ -100,11 +104,35 @@ void describe("the count handed to the reviewer", () => {
     assert.equal(formatChecklistProgressForReviewerV1("no checklist here"), "unknown");
   });
 
+  void it("keeps self-checked items provisional until matching reviewer evidence exists", () => {
+    const text = plan([`- [x] One`, `- [x] Two`, `- [ ] Three ${M}`]);
+    const oneKey = normalizeChecklistItemTextV1("One");
+    const evidence = countChecklistEvidenceProgressV1(text, [{
+      planRevision: getPlanRevisionV1(text), itemKey: oneKey, verifications: [{ at: "reviewed" }],
+    }]);
+    assert.ok(evidence);
+    assert.equal(evidence.display.settled, 3, "visible boxes and the explicit exclusion remain visible");
+    assert.equal(evidence.verified, 1);
+    assert.equal(evidence.provisional, 1);
+    assert.equal(evidence.gate.settled, 2, "the gate counts reviewer verification plus the exclusion");
+    assert.equal(evidence.gate.remaining, 1);
+    assert.equal(
+      formatChecklistProgressForReviewerV1(text, [{
+        planRevision: getPlanRevisionV1(text), itemKey: oneKey, verifications: [{ at: "reviewed" }],
+      }]),
+      "2/3"
+    );
+    assert.equal(formatChecklistEvidenceForReviewerV1(text, [{
+      planRevision: getPlanRevisionV1(text), itemKey: oneKey, verifications: [{ at: "reviewed" }],
+    }]), "1 reviewer-verified; 1 provisional; 1 explicitly excluded");
+  });
+
   void it("both impl-high review prompts state the figure to report", () => {
     for (const name of ["review-impl-high.md", "review-impl-high-rereview.md"]) {
       const body = fs.readFileSync(path.join(process.cwd(), "resources", "prompts", name), "utf8");
       assert.match(body, /\{\{checklistProgress\}\}/, name);
-      assert.match(body, /report exactly it/, name);
+      assert.match(body, /Report the gate count exactly/, name);
+      assert.match(body, /\{\{checklistEvidence\}\}/, name);
     }
   });
 });

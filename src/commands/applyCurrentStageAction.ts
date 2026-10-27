@@ -15,12 +15,15 @@ import {
   IMPL_REVIEW_STAGES_V1,
 } from "../utils/reviewRouting";
 import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
+import { countChecklistEvidenceProgressV1 } from "../utils/implementationChecklist";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { publishDispatchCommandV1 } from "../utils/publishStageActionsV1";
 import {
   clearStageActionRefusalReasonV1,
+  describeStageActionTerminalOutcomeV1,
+  peekStageActionTerminalOutcomeV1,
   recordStageActionRefusalReasonV1,
 } from "../utils/stageActionRefusalV1";
 
@@ -83,6 +86,18 @@ export async function applyCurrentStageAction(
 }
 
 type StageActionRefusalV1 = { reason?: string; taskFolderPath?: string };
+
+/**
+ * A refusal always carries its reason (bugs2 finding 5). When the command
+ * raised no notice, say what could not be established rather than "declined to
+ * start without saying why".
+ */
+function noStatedReasonV1(actionName: string): string {
+  return (
+    `${actionName} did not start, and it raised no notice saying why ` +
+    "(no refusal reason was recorded) — check the task's chat and the Output panel"
+  );
+}
 
 async function applyCurrentStageActionCore(
   inventory: TaskInventory,
@@ -179,13 +194,18 @@ async function applyCurrentStageActionCore(
     const { result, notices } = await captureRaisedNoticesV1(() => execute(command));
     const started = result === true;
     if (!started) {
-      // The command's own last warning/error is its stated cause; only when it
-      // raised none is the command's name all there is to report.
-      const name = command.replace("vs-code-ai-helper.", "");
-      const stated = notices[notices.length - 1];
-      refusal.reason = stated
-        ? `${name} declined to start: ${stated}`
-        : `${name} declined to start without saying why`;
+      const terminal = peekStageActionTerminalOutcomeV1(resolvedTask.taskFolderPath);
+      if (terminal) {
+        refusal.reason = describeStageActionTerminalOutcomeV1(terminal);
+      } else {
+        // The command's own last warning/error is its stated cause; only when it
+        // raised none is the command's name all there is to report.
+        const name = command.replace("vs-code-ai-helper.", "");
+        const stated = notices[notices.length - 1];
+        refusal.reason = stated
+          ? `${name} declined to start: ${stated}`
+          : noStatedReasonV1(name);
+      }
     }
     return started;
   };
@@ -209,10 +229,14 @@ async function applyCurrentStageActionCore(
     const decision = decidePostReviewActionV1({
       history: resolvedTask.progress.reviewScoreHistory,
       stages: IMPL_REVIEW_STAGES_V1,
-      hasUntickedChecklistItems:
-        ((
-          await readPlanOfRecordV1(vscode.Uri.file(resolvedTask.taskFolderPath))
-        ).counts?.remaining ?? 0) > 0,
+        hasUntickedChecklistItems: await readPlanOfRecordV1(vscode.Uri.file(resolvedTask.taskFolderPath)).then((record) =>
+          record.text === undefined
+            ? (record.counts?.remaining ?? 0) > 0
+            : (countChecklistEvidenceProgressV1(
+                record.text,
+                resolvedTask.progress.planItemEvidence ?? []
+              )?.gate.remaining ?? 0) > 0
+        ),
       continuationOwed: resolvedTask.progress.implRecovery !== undefined,
       pendingImplReviewFilesCount: resolvedTask.progress.pendingImplReviewFiles?.length ?? 0,
     });
@@ -240,10 +264,15 @@ async function applyCurrentStageActionCore(
         admissionHandoffTokenV1: explicitArg?.admissionHandoffTokenV1,
       }));
       if (!applied) {
-        const stated = applyNotices[applyNotices.length - 1];
-        refusal.reason = stated
-          ? `Apply Review declined to start: ${stated}`
-          : "Apply Review declined to start without saying why";
+        const terminal = peekStageActionTerminalOutcomeV1(resolvedTask.taskFolderPath);
+        if (terminal) {
+          refusal.reason = describeStageActionTerminalOutcomeV1(terminal);
+        } else {
+          const stated = applyNotices[applyNotices.length - 1];
+          refusal.reason = stated
+            ? `Apply Review declined to start: ${stated}`
+            : noStatedReasonV1("Apply Review");
+        }
       }
       return applied;
     }

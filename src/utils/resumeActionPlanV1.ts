@@ -25,6 +25,8 @@ import { resolveEffectiveProvider } from "../runners/runnerRegistry";
 import { checkPublishChecksFreshnessV1 } from "./publishChecksFreshness";
 import { resolvePublishScopeFolder } from "./completionLint";
 import { PUBLISH_STAGE_ACTIONS_V1, publishNextStepFromActionsV1, type PublishStepV1 } from "./publishStageActionsV1";
+import { countChecklistEvidenceProgressV1 } from "./implementationChecklist";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
 /**
  * What a "Resume and ..." button should do for a paused task, decided from the
@@ -349,7 +351,9 @@ async function loadUnusableSummaryFactV1(
   const previous = await readTextIfPresent(previousVersionUri(getImplementationSummaryUri(taskFolderUri)));
   const canRestore = previous !== undefined && !isUnusableImplementationSummaryV1(previous);
   const plan = await readPlanOfRecordV1(taskFolderUri);
-  const settled = plan.hasChecklist && plan.counts !== undefined && plan.counts.remaining === 0;
+  const progress = await readTaskProgressStrictV1(taskFolderUri);
+  const settled = plan.hasChecklist && plan.text !== undefined && progress.ok &&
+    countChecklistEvidenceProgressV1(plan.text, progress.decoded.progress.planItemEvidence ?? [])?.gate.remaining === 0;
   return { remedy: describeUnusableSummaryRemedyV1(canRestore, settled), canRestore };
 }
 

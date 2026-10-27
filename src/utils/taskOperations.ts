@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { randomUUID } from "node:crypto";
 import { ImplRecoveryV1, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1, TaskStage } from "../types/taskProgress";
 import { NotificationRouter } from "./notificationRouter";
 import { formatTaskNameForDisplay, notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "./notificationTaskContextV1";
@@ -12,6 +13,33 @@ import { isViewerHostV1 } from "../state/hostRoleV1";
 import { isUnrecoverableImplRecoveryV1 } from "./taskWatchdogV1";
 import { runWithRoundProcessTaskFolderV1 } from "../state/roundProcessContextV1";
 import type { TaskProgress } from "../types/taskProgress";
+import { inspectRoundGitInterferenceV1, withRoundGitStateObservationV1 } from "./roundGitStateV1";
+import { offerRoundGitInterferenceDecisionV1 } from "./roundGitInterferenceDecisionV1";
+
+const ROUND_GIT_OBSERVED_KINDS_V1 = new Set<OperationKind>([
+  "draft-task", "generate-plan", "review", "apply-review", "generate-implementation",
+  "run-implementation", "lint-fixes", "chat-send",
+]);
+
+function describeRoundGitDeltaV1(record: import("./roundGitStateV1").RoundGitObservationRecordV1): string | undefined {
+  const delta = record.delta;
+  if (!delta) {
+    // No evidence (not a Git workspace, git not runnable, or a write failed)
+    // is a limit of the observation, not an observed change: it is logged,
+    // never raised as an interference warning on every round.
+    if (record.unavailableReason) {
+      console.warn(`Round Git state evidence unavailable for ${record.operationId}: ${record.unavailableReason}`);
+    }
+    return undefined;
+  }
+  const parts: string[] = [];
+  if (delta.newUnmergedPaths.length) parts.push(`new unmerged paths: ${delta.newUnmergedPaths.join(", ")}`);
+  if (delta.changedIndexEntries.length) parts.push(`changed index paths: ${delta.changedIndexEntries.join(", ")}`);
+  if (delta.addedStashes.length) parts.push(`added stashes: ${delta.addedStashes.map((entry) => entry.selector).join(", ")}`);
+  if (delta.removedStashes.length) parts.push(`removed stashes: ${delta.removedStashes.map((entry) => entry.selector).join(", ")}`);
+  if (!parts.length) return undefined;
+  return `Git state changed during this round (${delta.attribution}): ${parts.join("; ")}. Evidence: round-git-state-v1/${record.operationId}.json`;
+}
 
 /**
  * Lifecycle states of a tracked operation (contract C1):
@@ -34,6 +62,13 @@ export type TaskOperationState =
    * `succeeded`: a refusal is not a completed action (v1 fixes 2, step 11).
    */
   | "refused";
+
+/**
+ * Who asked an operation to stop (bugs2 findings 5/6): carried to the
+ * operation's callers so a cancelled run reports "cancelled by <source>"
+ * instead of being mistaken for a refusal.
+ */
+export type CancelSourceV1 = "notifications" | "chat" | "viewer" | "command" | "unknown";
 
 export interface TaskOperationSpec {
   label: string;              // "Run Implementation" — reused by showTaskBusyWarning
@@ -191,7 +226,13 @@ export interface TaskOperationHandle {
    * return be read as "completed" (pre-1.0.0 fixes register item 8). Calling
    * this more than once keeps the LAST call's state and reason.
    */
-  settleAs(state: "refused" | "failed", reason?: string): void;
+  settleAs(state: "refused" | "failed" | "cancelled" | "interrupted", reason?: string): void;
+  /**
+   * Who asked this operation (or an ancestor) to stop, once a cancellation was
+   * requested through `cancelOperation`; `undefined` when none was (or the
+   * token was cancelled by something that holds the token source directly).
+   */
+  cancelSource?(): CancelSourceV1 | undefined;
 }
 
 /**
@@ -275,6 +316,12 @@ export interface TaskOperationSnapshot {
    * (verification review, 2026-09-18).
    */
   readonly forcedEndV1?: boolean;
+  /**
+   * What the operation's owner stated when it settled the run as cancelled via
+   * `settleAs("cancelled", reason)` — who cancelled it and what it left
+   * behind. Shown on the terminal row in place of the bare word "cancelled".
+   */
+  readonly cancelReasonV1?: string;
 }
 
 /**
@@ -308,8 +355,12 @@ interface MutableOperation {
   cancelRequestedAt?: number;
   /** See TaskOperationSnapshot.forcedEndV1. */
   forcedEndV1?: boolean;
+  /** See TaskOperationSnapshot.cancelReasonV1. */
+  cancelReasonV1?: string;
   /** Set via TaskOperationHandle.settleAs; read back by runTrackedOperation before end() removes this row. */
-  explicitOutcome?: { readonly state: "refused" | "failed"; readonly reason?: string };
+  explicitOutcome?: { readonly state: "refused" | "failed" | "cancelled" | "interrupted"; readonly reason?: string };
+  /** Who requested the cancellation — see `CancelSourceV1`. */
+  cancelSource?: CancelSourceV1;
 }
 
 /**
@@ -427,6 +478,10 @@ export class TaskOperationRegistry implements vscode.Disposable {
   // Cancel machinery lives beside the record, never on it, so snapshots handed
   // to views cannot reach a token source (cancel goes through cancelOperation).
   private readonly tokenSources = new Map<string, vscode.CancellationTokenSource>();
+  // These IDs are persisted in round evidence and shared across runner
+  // windows, so a process-local counter must not be allowed to repeat after
+  // activation and impersonate a still-live operation from an earlier run.
+  private readonly operationNamespace = randomUUID();
   private operationSeq = 0;
   /**
    * Operations another window is running (hostOperationsMirrorV1.ts): a
@@ -587,7 +642,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       }
     }
 
-    const id = `op-${++this.operationSeq}`;
+    const id = `op-${this.operationNamespace}-${++this.operationSeq}`;
     const taskName = spec.taskName ?? path.basename(taskPath);
     const startedAt = Date.now();
     const cancellable = spec.cancellable === true;
@@ -652,9 +707,13 @@ export class TaskOperationRegistry implements vscode.Disposable {
         activity: string | undefined,
         options?: { resetElapsedOrigin?: boolean; stageToken?: number; elapsedOrigin?: number }
       ) => this.reportActivity(id, activity, options),
-      settleAs: (state: "refused" | "failed", reason?: string) => {
+      settleAs: (state: "refused" | "failed" | "cancelled" | "interrupted", reason?: string) => {
         operation.explicitOutcome = { state, reason };
+        if (state === "cancelled" && reason !== undefined) {
+          operation.cancelReasonV1 = reason;
+        }
       },
+      cancelSource: () => operation.cancelSource,
     };
 
     this.triggerChange(true);
@@ -896,7 +955,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * observe the token and call `end()` — cancellation is a request, not a
    * removal.
    */
-  cancelOperation(id: string): boolean {
+  cancelOperation(id: string, source: CancelSourceV1 = "unknown"): boolean {
     if (this.isMirroredOperation(id)) {
       for (const keyMap of this.mirrored.values()) {
         const op = keyMap.get(id);
@@ -912,7 +971,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
     for (const keyMap of this.operations.values()) {
       const op = keyMap.get(id);
       if (op) {
-        const requested = this.cancelSubtree(keyMap, op);
+        const requested = this.cancelSubtree(keyMap, op, source);
         if (requested) {
           this.triggerChange(true);
           return true;
@@ -1016,17 +1075,18 @@ export class TaskOperationRegistry implements vscode.Disposable {
     return true;
   }
 
-  private cancelSubtree(keyMap: Map<string, MutableOperation>, op: MutableOperation): boolean {
+  private cancelSubtree(keyMap: Map<string, MutableOperation>, op: MutableOperation, source: CancelSourceV1): boolean {
     let requested = false;
     for (const candidate of keyMap.values()) {
       if (candidate.parentId === op.id) {
-        requested = this.cancelSubtree(keyMap, candidate) || requested;
+        requested = this.cancelSubtree(keyMap, candidate, source) || requested;
       }
     }
     const cts = this.tokenSources.get(op.id);
     if (cts && !cts.token.isCancellationRequested) {
       op.detail = "cancelling…";
       op.cancelRequestedAt = Date.now();
+      op.cancelSource = source;
       cts.cancel();
       requested = true;
     }
@@ -1039,14 +1099,14 @@ export class TaskOperationRegistry implements vscode.Disposable {
    */
   getExplicitOutcome(
     handle: TaskOperationHandle | null | undefined
-  ): { readonly state: "refused" | "failed"; readonly reason?: string } | undefined {
+  ): { readonly state: "refused" | "failed" | "cancelled" | "interrupted"; readonly reason?: string } | undefined {
     if (!handle) {return undefined;}
     return this.operations.get(handle.key)?.get(handle.id)?.explicitOutcome;
   }
 
   end(
     handle: TaskOperationHandle | null | undefined,
-    state?: Exclude<TaskOperationState, "running" | "interrupted">
+    state?: Exclude<TaskOperationState, "running">
   ): void {
     if (!handle) {return;}
     const keyMap = this.operations.get(handle.key);
@@ -1303,6 +1363,50 @@ export async function runTrackedOperation<T>(
     await showTaskBusyWarning(taskPath);
     return undefined;
   }
+  const refuseAfterAdmission = (reason: string): void => {
+    try {
+      spec.onSettled?.("refused", reason);
+    } catch (observerError) {
+      console.warn("[taskOperations] onSettled observer threw", observerError);
+    }
+    taskOperations.end(handle, "refused");
+  };
+  if (spec.kind && ROUND_GIT_OBSERVED_KINDS_V1.has(spec.kind)) {
+    try {
+      const liveOperationIds = new Set(taskOperations.getTaskOperations(taskPath).map((operation): string =>
+        operation.id.startsWith(MIRRORED_OPERATION_ID_PREFIX)
+          ? operation.id.slice(MIRRORED_OPERATION_ID_PREFIX.length)
+          : operation.id
+      ));
+      const interference = await inspectRoundGitInterferenceV1(taskPath, { liveOperationIds });
+      const reasons = [
+        ...(interference.unmergedPaths.length ? [`unmerged paths: ${interference.unmergedPaths.join(", ")}`] : []),
+        ...(interference.stashOperationIds.length ? [`unacknowledged stash changes in operations ${interference.stashOperationIds.join(", ")}`] : []),
+      ];
+      if (reasons.length) {
+        const reason = `Git interference needs review (${reasons.join("; ")})`;
+        const progressRead = await readTaskProgressStrictV1(vscode.Uri.file(taskPath), { expectedTaskFolder: path.basename(taskPath) });
+        if (progressRead.ok) {
+          await offerRoundGitInterferenceDecisionV1({
+            taskFolderPath: taskPath,
+            taskName: notificationTaskDisplayNameV1(spec.taskName ?? progressRead.decoded.progress.displayName, taskPath),
+            stage: spec.stage ?? progressRead.decoded.progress.currentStage,
+            hold: interference,
+          });
+        }
+        NotificationRouter.showWarning(`${formatTaskNameForDisplay(notificationTaskDisplayNameV1(spec.taskName, taskPath))} — ${spec.label} was not started because ${reason}. Review the Git recovery choices in task chat.`);
+        refuseAfterAdmission(reason);
+        return undefined;
+      }
+    } catch (error) {
+      const reason = `Git interference could not be checked: ${error instanceof Error ? error.message : String(error)}`;
+      NotificationRouter.showWarning(
+        `${formatTaskNameForDisplay(notificationTaskDisplayNameV1(spec.taskName, taskPath))} — ${spec.label} was not started because ${reason}.`
+      );
+      refuseAfterAdmission(reason);
+      return undefined;
+    }
+  }
   // Notifications raised anywhere inside `fn`'s async call path name this
   // operation's own task (item 6). Per-operation, not ambient: overlapping
   // operations on other tasks attribute their own, and the context is ended
@@ -1311,9 +1415,24 @@ export async function runTrackedOperation<T>(
   // this folder path (roundProcessContextV1.ts, 1.0 RC1 Part B item 2).
   return runWithNotificationTaskContextV1(spec.taskName, taskPath, () => runWithRoundProcessTaskFolderV1(taskPath, async () => {
     try {
-      const result = await fn(handle);
+      const invoke = (): Promise<T> => fn(handle);
+      const result = spec.kind && ROUND_GIT_OBSERVED_KINDS_V1.has(spec.kind)
+        ? (await withRoundGitStateObservationV1(
+            { taskFolderPath: taskPath, roundId: handle.id, operationId: handle.id },
+            invoke,
+            (record) => {
+              const detail = describeRoundGitDeltaV1(record);
+              if (detail) {
+                handle.reportRootDetail?.(detail);
+                NotificationRouter.showWarning(
+                  `${formatTaskNameForDisplay(notificationTaskDisplayNameV1(spec.taskName, taskPath))} — ${detail} Changes are observed, but another actor may have made them. Review and resolve Git state before starting another round.`
+                );
+              }
+            }
+          )).result
+        : await invoke();
       const explicit = taskOperations.getExplicitOutcome(handle);
-      let finalState: Exclude<TaskOperationState, "running" | "interrupted">;
+      let finalState: Exclude<TaskOperationState, "running">;
       let finalReason: string | undefined;
       if (explicit) {
         // Takes precedence over refusedWhenFalse and the normal-return

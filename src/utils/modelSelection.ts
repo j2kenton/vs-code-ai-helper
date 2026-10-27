@@ -8,7 +8,7 @@ import {
 import { getConfiguredTaskRoot } from "./taskRoot";
 import { NotificationRouter } from "./notificationRouter";
 import { formatNotificationTaskLabelV1 } from "./notificationTaskContextV1";
-import { type FallbackStrategy, type StageModelSetting } from "./modelFallback";
+import { type FallbackStrategy, type ModelSettings, type StageModelSetting } from "./modelFallback";
 import { cliCommandExists, resolveCliCommand } from "../runners/cliAgentRunner";
 import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -203,8 +203,7 @@ function hasAnyConfiguredCandidate(setting: StageModelSetting | undefined): bool
  * provider-disabled filtering (`filterEnabledBackupModels`) stays layered on
  * top by callers.
  */
-export function resolveEffectiveStageChainV1(stage: TaskStage): EffectiveStageChainV1 {
-  const settings = getModelSettings();
+export function resolveEffectiveStageChainV1(stage: TaskStage, settings: ModelSettings = getModelSettings()): EffectiveStageChainV1 {
   const own = skipFilteredChainOf(settings[stage]);
   if (own.primary) {
     return {

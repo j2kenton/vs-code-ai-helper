@@ -3984,6 +3984,33 @@ void describe("taskActionCoordinatorV1", () => {
     assert.ok(prompts[before]!.includes("Answer: the publish stage"));
   });
 
+  void it("adds refreshed task-bound context to the resumed provider prompt", async () => {
+    const completed = envelopeTransport((correlation) =>
+      frame({
+        version: 1,
+        correlation,
+        kind: "completed",
+        content: { contentType: "markdown-artifact.v1", schemaVersion: 1, markdown: "# resumed" },
+      })
+    );
+    const harness = makeHarness([RESUME_QUESTIONS_TRANSPORT(), completed]);
+    const { ref, prompts } = await askAndAnswerV1(harness, {
+      questionId: "q1",
+      kind: "text",
+      state: "answered",
+      value: "continue",
+    });
+    const start = prompts.length;
+    const request = resumeRequestV1(ref, prompts);
+    const outcome = await harness.coordinator.resumeAction({
+      ...request,
+      promptAppendix: "## Refreshed implementation review scope\n\nsrc/current.ts",
+    });
+    assert.equal(outcome.kind, "completed");
+    assert.match(prompts[start] ?? "", /## Refreshed implementation review scope/);
+    assert.match(prompts[start] ?? "", /src\/current\.ts/);
+  });
+
   void it("RC12 item 3: a resumed sameOperation run that asks again fails in plain words and posts no new interaction", async () => {
     const harness = makeHarness([RESUME_QUESTIONS_TRANSPORT(), RESUME_QUESTIONS_TRANSPORT()]);
     const { ref, prompts } = await askAndAnswerV1(harness, {
@@ -5445,7 +5472,9 @@ void describe("taskActionCoordinatorV1 — item 2 / Step 55: cancellation termin
       const wrapped = withMalformedResultRetryV1(harness.coordinator, 3);
       const outcome = await wrapped.executeAction({
         ...baseRequest(),
-        onCandidateInvokedV1: (info) => reservedModels.push(info.storedModelId),
+        onCandidateInvokedV1: (info) => {
+          reservedModels.push(info.storedModelId);
+        },
       });
 
       assert.equal(outcome.kind, "completed");

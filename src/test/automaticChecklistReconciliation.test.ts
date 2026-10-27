@@ -769,7 +769,7 @@ void describe("runAutomaticChecklistReconciliationV1", () => {
       assert.doesNotMatch(outcome.reason, /this round\)/);
     });
 
-    void it("reports every item as a tier-1 candidate once a later review also covers the previously-overlapped item, still latched", async () => {
+    void it("a later review covering both items makes the non-test item a tier-1 candidate; the test-dependent one stays unresolved without a test report, still latched", async () => {
       const folder = makeTaskFolder(plan, {
         "impl-high-review.md": verifiedCompleteReview([
           "Wire the completeness gate in `src/commands/reconcilePlanChecklist.ts`",
@@ -784,7 +784,16 @@ void describe("runAutomaticChecklistReconciliationV1", () => {
 
       assert.equal(outcome.kind, "candidatesFound");
       if (outcome.kind !== "candidatesFound") return;
-      assert.deepEqual(outcome.unresolvedOverlap, []);
+      // The test-writing item is test-dependent: a review naming it verified
+      // is not enough without a passing test report from an editing round
+      // (fail-closed reviewer acceptance), so it stays an unresolved overlap
+      // rather than a tier-1 candidate.
+      assert.deepEqual(outcome.reviewVerifiedItems, [
+        "Wire the completeness gate in `src/commands/reconcilePlanChecklist.ts`",
+      ]);
+      assert.deepEqual(outcome.unresolvedOverlap, [
+        "Add the missing test in `src/test/reconcilePlanChecklist.test.ts`",
+      ]);
 
       // NINTH review round: unlike the earlier auto-tick design, full tier-1
       // coverage no longer clears the latch by itself — only explicit human

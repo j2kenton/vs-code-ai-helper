@@ -337,6 +337,54 @@ void describe("TaskTreeProvider — explicit expand/collapse state", () => {
     const provider = new TaskTreeProvider(makeInventoryStub());
     assert.strictEqual(provider.getTaskNodeById("/workspace/nonexistent"), undefined);
   });
+
+  void it("retains automatic expansion and the last readable row until collapse or confirmed deletion", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-tree-retention-"));
+    const taskPath = path.join(root, "task-a");
+    fs.mkdirSync(taskPath);
+    const active = makeTaskWithStatus(taskPath, "task-a", "active");
+    let inventoryTasks = [active];
+    let failInventoryRead = false;
+    const provider = new TaskTreeProvider(makeInventoryWithTasks(inventoryTasks));
+    const inventory = (provider as unknown as { inventory: { getTasks: () => unknown } }).inventory;
+    inventory.getTasks = () => {
+      if (failInventoryRead) throw new Error("temporary inventory read failure");
+      return inventoryTasks.map((task) => ({
+        taskFolderPath: task.folderUri.fsPath,
+        folderName: task.folderName,
+        progress: task.progress,
+        canonicalId: task.canonicalId,
+      }));
+    };
+    try {
+      await withStubbedCommands(async () => {
+        const initial = await provider.getChildren();
+        assert.equal(initial[0]?.collapsibleState, vscode.TreeItemCollapsibleState.Expanded);
+        failInventoryRead = true;
+        const unreadableRefresh = await provider.getChildren();
+        assert.equal(unreadableRefresh.length, 1);
+        assert.equal(unreadableRefresh[0]?.collapsibleState, vscode.TreeItemCollapsibleState.Expanded);
+        failInventoryRead = false;
+        inventoryTasks = [{ ...active, progress: { ...active.progress, status: "paused" } }];
+        const paused = await provider.getChildren();
+        assert.equal(paused[0]?.collapsibleState, vscode.TreeItemCollapsibleState.Expanded);
+        inventoryTasks = [];
+        const temporarilyMissing = await provider.getChildren();
+        assert.equal(temporarilyMissing.length, 1);
+        assert.equal(temporarilyMissing[0]?.collapsibleState, vscode.TreeItemCollapsibleState.Expanded);
+        provider.notifyCollapsed(active);
+        inventoryTasks = [active];
+        const collapsed = await provider.getChildren();
+        assert.equal(collapsed[0]?.collapsibleState, vscode.TreeItemCollapsibleState.Collapsed);
+        inventoryTasks = [];
+        fs.rmSync(taskPath, { recursive: true, force: true });
+        assert.equal((await provider.getChildren()).length, 0);
+      });
+    } finally {
+      provider.dispose();
+      safeRemoveDir(root);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------

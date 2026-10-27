@@ -501,7 +501,11 @@ void describe("RC8 item 5: reportFastForwardMovedOnV1", () => {
     assert.equal(run.dispatched.length, 1);
     const declined = warnings(run).filter((w) => /did not start/.test(w));
     assert.equal(declined.length, 1);
-    assert.match(declined[0]!, /declined to start/);
+    assert.match(
+      declined[0]!,
+      /queued command returned without starting a round but did not provide its refusal reason/
+    );
+    assert.doesNotMatch(declined[0]!, /declined to start/);
   });
 
   void it("started: no warning", async () => {

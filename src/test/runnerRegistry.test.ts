@@ -4472,6 +4472,105 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  void it("runs Antigravity NOT_FOUND through backup success and exhausted-chain outcomes", async () => {
+    const diagnostic = 'error: NOT_FOUND (code 404): Requested entity was not found. AGY_ERROR: {"short_error":"NOT_FOUND (code 404): Requested entity was not found.","status":"NOT_FOUND","error_code":404,"code_kind":"http","retryable":false}';
+    for (const backupSucceeds of [true, false]) {
+      const originalSpawn = childProcess.spawn;
+      const metaRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-antigravity-not-found-"));
+      const taskFolder = path.join(metaRoot, "tasks", "task-a");
+      fs.mkdirSync(taskFolder, { recursive: true });
+      const taskFolderUri = vscode.Uri.file(taskFolder);
+      childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+      let cliAttempts = 0;
+      // An earlier test may have cached `agy` as not installed.
+      resetCliCommandLookupCacheForTest();
+      childProcess.spawn = ((command: string) => {
+        const child = new EventEmitter() as import("node:child_process").ChildProcess;
+        Object.defineProperty(child, "pid", { value: 5558 + cliAttempts });
+        child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+        child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+        child.stdin = Object.assign(new EventEmitter(), { write: () => true, end: () => undefined }) as unknown as import("node:child_process").ChildProcess["stdin"];
+        if (/^(which|where\.exe)$/.test(command)) {
+          process.nextTick(() => child.emit("close", 0));
+          return child;
+        }
+        cliAttempts += 1;
+        process.nextTick(() => {
+          child.stderr?.emit("data", Buffer.from(diagnostic));
+          child.emit("close", 1);
+        });
+        return child;
+      }) as typeof childProcess.spawn;
+
+      const lm = lmStub();
+      const originalSelectChatModels = lm.selectChatModels;
+      const { LanguageModelTextPart } = vscode as unknown as { LanguageModelTextPart: new (value: string) => { value: string } };
+      const responseStream = function* (): Iterable<unknown> {
+        yield new LanguageModelTextPart("Antigravity backup completed");
+      };
+      lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> => Promise.resolve([{
+        id: "auto",
+        name: "Auto",
+        sendRequest: () => Promise.resolve({ stream: responseStream() }),
+      } as unknown as vscode.LanguageModelChat]);
+      const workspace = vscode.workspace as unknown as { fs: { readFile: (uri: vscode.Uri) => Promise<Uint8Array>; writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void> } };
+      const originalReadFile = workspace.fs.readFile;
+      const originalWriteFile = workspace.fs.writeFile;
+      workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath);
+      workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> => fs.promises.writeFile(uri.fsPath, bytes);
+      const now = new Date().toISOString();
+      fs.writeFileSync(path.join(taskFolder, "task-progress.json"), JSON.stringify({ taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now }), "utf8");
+      const settings = installModelSettings({
+        impl: {
+          primary: "antigravity-cli:missing-model",
+          backup: backupSucceeds ? "auto" : "antigravity-cli:also-missing",
+          strategy: "switch-to-backup",
+        },
+      });
+      const invokedCandidates: Array<{ attemptId: string; backup: boolean }> = [];
+      try {
+        const result = await runImplementationForModel({
+          modelId: "antigravity-cli:missing-model",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+          dispatchOperationId: "operation-antigravity-not-found",
+          onCandidateInvokedV1: (info) => {
+            invokedCandidates.push({ attemptId: info.attemptId, backup: info.backup });
+          },
+        });
+        assert.equal(invokedCandidates.length, 2);
+        assert.equal(invokedCandidates[0]?.backup, false);
+        assert.equal(invokedCandidates[1]?.backup, true);
+        assert.notEqual(invokedCandidates[0]?.attemptId, invokedCandidates[1]?.attemptId);
+        if (backupSucceeds) {
+          assert.equal(result.status, "completed");
+          assert.equal(result.summary, "Antigravity backup completed");
+          assert.equal(result.actualStoredModelId, "auto");
+          assert.equal(cliAttempts, 1);
+        } else {
+          assert.equal(result.status, "failed");
+          assert.equal(result.failureKind, "model-entitlement");
+          assert.equal(cliAttempts, 2);
+          assert.match(result.errorMessage ?? "", /missing-model|also-missing/);
+          assert.match(result.errorMessage ?? "", /AI Models for this stage/);
+        }
+      } finally {
+        settings.restore();
+        childProcess.spawn = originalSpawn;
+        lm.selectChatModels = originalSelectChatModels;
+        workspace.fs.readFile = originalReadFile;
+        workspace.fs.writeFile = originalWriteFile;
+        safeRemoveDir(metaRoot);
+      }
+    }
+  });
+
   // Sibling of the dirty-tree-withheld test above, for model-entitlement: the
   // same dirty-tree safety boundary applies — a second model must never be
   // dispatched at a tree the failed primary already edited, regardless of

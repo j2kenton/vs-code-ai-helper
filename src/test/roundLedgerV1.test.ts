@@ -18,7 +18,6 @@
  * linkage remain unwired — that is the rest of Part 4, still outstanding.
  */
 import * as assert from "node:assert/strict";
-import * as cp from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -42,6 +41,7 @@ import {
   attachCoordinatorIdentityToRoundTrackingDegradationV1,
   attachCoordinatorIdentityToRoundV1,
   claimImplementationRoundLedgerV1,
+  captureRoundArtifactSnapshotV1,
   consumePendingAutomationRoundIntentV1,
   formatRoundOutcomeMessageV1,
   openAutomationRoundLedgerRowBestEffortV1,
@@ -81,7 +81,6 @@ const productionRuntimeModule = require("../actions/productionTaskActionRuntimeV
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-round-ledger-"));
-cp.execFileSync("git", ["init", "-q"], { cwd: REAL_ROOT, windowsHide: true });
 
 const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-round-ledger-private-"));
 configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
@@ -357,6 +356,86 @@ function installWorkspaceFoldersStub(): { restore: () => void } {
 }
 
 void describe("terminalizeRoundV1 (Part 4 step 12/13/47)", () => {
+  void it("reports foreign task artifacts changed during a round in the terminal chat outcome", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("round_artifact_owner");
+      const foreignFolder = path.join(REAL_ROOT, "plans", "round_artifact_neighbor");
+      fs.mkdirSync(foreignFolder, { recursive: true });
+      fs.writeFileSync(path.join(foreignFolder, "task-progress.json"), "{}", "utf8");
+      await captureRoundArtifactSnapshotV1(folderUri, ["round-open-1"]);
+      const misplaced = path.join(foreignFolder, "round-progress.md");
+      fs.writeFileSync(misplaced, "- [x] wrote into the neighboring task\n", "utf8");
+
+      const result = await terminalizeRoundV1("round-open-1", "completed", undefined, { taskFolderUri: folderUri });
+      assert.equal(result.ok, true);
+      const messages = await readChatHistory(folderPath, folderPath);
+      const outcome = messages.find((message) => message.kind === "outcome");
+      assert.match(outcome?.text ?? "", /Task-artifact changes were detected under another task folder/);
+      assert.ok((outcome?.text ?? "").includes(misplaced));
+      assert.equal(fs.existsSync(misplaced), true, "ambiguous ownership keeps the foreign file in place");
+      assert.equal(fs.existsSync(path.join(folderPath, "round-progress.md")), false);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("contains an exact plan-owned round-progress item into its bound task folder", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("round_artifact_owned");
+      const item = "Step 11: Detect and contain task artifacts written into another task.";
+      fs.writeFileSync(path.join(folderPath, "plan-final.md"), `- [ ] **${item}**\n`, "utf8");
+      const foreignFolder = path.join(REAL_ROOT, ".ensemble", "2026-10-22_task_1");
+      fs.mkdirSync(foreignFolder, { recursive: true });
+      fs.writeFileSync(path.join(foreignFolder, "task-progress.json"), JSON.stringify({ status: "paused" }), "utf8");
+      await captureRoundArtifactSnapshotV1(folderUri, ["round-open-1"]);
+      const misplaced = path.join(foreignFolder, "round-progress.md");
+      fs.writeFileSync(misplaced, `- [x] **${item}**\n`, "utf8");
+
+      const result = await terminalizeRoundV1("round-open-1", "completed", undefined, { taskFolderUri: folderUri });
+      assert.equal(result.ok, true);
+      assert.equal(fs.existsSync(misplaced), false);
+      assert.equal(fs.readFileSync(path.join(folderPath, "round-progress.md"), "utf8"), `- [x] **${item}**\n`);
+      const messages = await readChatHistory(folderPath, folderPath);
+      assert.match(messages.find((message) => message.kind === "outcome")?.text ?? "", /Misplaced artifact contained/);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("preserves mixed existing progress history even when an appended line matches this task's plan", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("round_artifact_mixed_history");
+      const item = "Step 11: Detect and contain task artifacts written into another task.";
+      fs.writeFileSync(path.join(folderPath, "plan-final.md"), `- [ ] **${item}**\n`, "utf8");
+      const foreignFolder = path.join(REAL_ROOT, ".ensemble", "2026-10-22_task_2");
+      fs.mkdirSync(foreignFolder, { recursive: true });
+      fs.writeFileSync(path.join(foreignFolder, "task-progress.json"), JSON.stringify({ status: "paused" }), "utf8");
+      const misplaced = path.join(foreignFolder, "round-progress.md");
+      fs.writeFileSync(misplaced, "- [x] Earlier progress belonging to the neighboring task\n", "utf8");
+      await captureRoundArtifactSnapshotV1(folderUri, ["round-open-1"]);
+      fs.appendFileSync(misplaced, `- [x] **${item}**\n`, "utf8");
+
+      const result = await terminalizeRoundV1("round-open-1", "completed", undefined, { taskFolderUri: folderUri });
+      assert.equal(result.ok, true);
+      assert.equal(fs.existsSync(misplaced), true, "mixed foreign history must never be moved or deleted");
+      assert.equal(fs.readFileSync(misplaced, "utf8"), `- [x] Earlier progress belonging to the neighboring task\n- [x] **${item}**\n`);
+      assert.equal(fs.existsSync(path.join(folderPath, "round-progress.md")), false);
+      const messages = await readChatHistory(folderPath, folderPath);
+      assert.match(messages.find((message) => message.kind === "outcome")?.text ?? "", /ownership is ambiguous|ownership was not established/i);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("terminalizes an open row, writes the ledger state, and appends a kind:'outcome' chat message", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();

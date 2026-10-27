@@ -43,6 +43,7 @@ export const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set([
   // A chat send (its stage and message travel as the command argument);
   // chatWithStage forwards only a send, opening the panel stays local.
   "vs-code-ai-helper.chatWithStage",
+  "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
 ]);
 
 /**
@@ -71,6 +72,11 @@ export function decodeRelayedCommandArgV1(commandId: string, arg: unknown): Reco
   }
   if (typeof record.taskName === "string") {
     decoded.taskName = record.taskName;
+  }
+  // The send's identity (bugs2 finding 8): lets the runner keep a message for
+  // a paused task under one id and never write or send it twice.
+  if (typeof record.sendId === "string" && /^[0-9a-f]{32}$/.test(record.sendId)) {
+    decoded.sendId = record.sendId;
   }
   return decoded;
 }
@@ -184,18 +190,20 @@ export function taskFolderPathFromCommandArgV1(arg: unknown): string | undefined
 export function forwardInViewerV1<A extends unknown[], R>(
   commandId: string,
   handler: (...args: A) => R
-): (...args: A) => R | Promise<void> {
+): (...args: A) => R | Promise<boolean> {
   if (!RELAYABLE_COMMAND_IDS_V1.has(commandId)) {
     throw new Error(`${commandId} is not in RELAYABLE_COMMAND_IDS_V1 — the runner would refuse to run it`);
   }
-  return (...args: A): R | Promise<void> => {
+  return (...args: A): R | Promise<boolean> => {
     if (!isViewerHostV1()) {
       return handler(...args);
     }
     if (forwarder === undefined) {
       NotificationRouter.showWarning("This viewer window has no connection to the runner yet.");
-      return Promise.resolve();
+      return Promise.resolve(false);
     }
-    return forwarder(commandId, taskFolderPathFromCommandArgV1(args[0])).then(() => undefined);
+    return forwarder(commandId, taskFolderPathFromCommandArgV1(args[0])).then(
+      (res) => res.ok === true && !res.indeterminate
+    );
   };
 }

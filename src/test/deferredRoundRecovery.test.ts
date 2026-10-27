@@ -26,6 +26,7 @@
  *   - the continuation cap escalates to human — pausing the task — even at
  *     an implementation stage where `reviewAttemptId` is legitimately absent.
  */
+import { recordReviewerVerificationOfTickedItemsV1 } from "../commands/applyReviewerVerifiedTicks";
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
@@ -146,7 +147,12 @@ const PLAN_FINAL = [
   "",
 ].join("\n");
 
-/** A summary that passes the shape gate: echo + own Files Changed + Verification. */
+/**
+ * A summary that passes the shape gate: echo + own Files Changed +
+ * Verification, plus the `## Plan Item Checklist` section whose absence
+ * would otherwise trigger Step 18's report-only correction (unavailable for
+ * the test CLI, so the round would be parked as a rejected report).
+ */
 const GOOD_SUMMARY = [
   "<!-- ensemble:implementation-checklist -->",
   "",
@@ -156,6 +162,11 @@ const GOOD_SUMMARY = [
   "## Files Changed",
   "",
   "- `src/resolver.ts` — added the resolver",
+  "",
+  "## Plan Item Checklist",
+  "",
+  "- [x] Add the resolver",
+  "- [ ] Wire the decoder",
   "",
   "## Verification",
   "",
@@ -3775,7 +3786,7 @@ void describe("the completeness gate honors an already-set checklistProgressUnre
  * review rounds through the actual advance chain, closing the gap this
  * comment used to justify leaving open.)
  */
-void describe("checklistProgressUnreliable stand-down lets the next review advance (Part 3, end to end)", () => {
+void describe("checklistProgressUnreliable no longer stands the advance gate down (Part 3, bugs2 Step 20)", () => {
   const zeroBlockerFullMarks = [
     {
       stage: "impl-high-review" as const,
@@ -3792,7 +3803,12 @@ void describe("checklistProgressUnreliable stand-down lets the next review advan
   // 2 unticked items, 0 checked).
   const NO_MARKER_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out.\n";
 
-  void it("a latched task's next full-marks review is no longer blocked by the plan's unticked items", async () => {
+  // bugs2 Step 20: the latch is no longer a completeness-gate bypass. A
+  // latched task reconciles exactly like an unlatched one, against the
+  // evidence gate, so a clean review cannot advance an unverified plan; the
+  // latch only offers reconciliation (and, once set, the review router
+  // applies the review's verified ticks before the stage decision).
+  void it("a latched task's next full-marks review is still judged against the plan's evidence gate, not stood down", async () => {
     const { folderUri } = makeTaskFolder("latch_stands_down_advance", {
       reviewScoreHistory: zeroBlockerFullMarks,
       // The state a task is in the round AFTER the sterile-round latch
@@ -3807,17 +3823,15 @@ void describe("checklistProgressUnreliable stand-down lets the next review advan
         NO_MARKER_REVIEW,
         "strict"
       );
-      assert.equal(
+      assert.deepEqual(
         progress,
-        null,
-        "readEffectivePlanChecklistProgressV1 must stand down under the latch, so reconciliation returns " +
-          "the review's own (absent) marker unchanged rather than the plan's 2 unticked items"
+        { complete: 0, total: 2 },
+        "under the latch the gate still reads the evidence count: nothing verified of the plan's 2 items"
       );
       assert.equal(
         readyToAdvanceStage(10, getAutoAdvanceScoreThreshold(), progress),
-        true,
-        "with the checklist stood down, a full-marks review is no longer judged incomplete and the stage " +
-          "advance gate — the same predicate reviewActions.ts calls at the real advance site — now passes"
+        false,
+        "a full-marks review cannot advance a plan with no verified items, latched or not"
       );
     } finally {
       fsBridge.restore();
@@ -3941,15 +3955,30 @@ void describe("a prose-only Plan Item Checklist claim reaches advance-eligibilit
       "a round whose claim actually merged must not surface any reconciliation/manual-edit affordance"
     );
 
-    // 3. The stage is now advance-eligible on the next full-marks review —
+    // 3. The stage is advance-eligible once a full-marks review verifies the
+    // ticked items — the round's own ticks are provisional until then — via
     // the same predicate the real advance gate calls at its call site.
     const fsBridge = installFsBridge();
     try {
-      const NO_MARKER_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out.\n";
+      const VERIFYING_REVIEW = [
+        "# Implementation Review",
+        "",
+        "Readiness: 10/10",
+        "",
+        "<!-- verified-complete:start -->",
+        "- Add the resolver",
+        "- Wire the decoder",
+        "<!-- verified-complete:end -->",
+        "",
+        "Everything checks out.",
+        "",
+      ].join("\n");
+      fs.writeFileSync(path.join(folderPath, "impl-high-review.md"), VERIFYING_REVIEW, "utf8");
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(folderUri, "impl-high-review"), 2);
       const reconciled = await effectiveReviewProgressV1(
         folderUri,
         "impl-high-review",
-        NO_MARKER_REVIEW,
+        VERIFYING_REVIEW,
         "strict"
       );
       assert.equal(
@@ -3997,7 +4026,21 @@ void describe("the prose-claim exit reaches literal Publish with no manual editi
     "- ran the unit tests",
   ].join("\n");
 
-  const FULL_MARKS_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out. No blockers.\n";
+  // The reviews verify both items: the round's ticks are provisional until a
+  // review does (Part 3), and only verified ticks settle the checklist.
+  const FULL_MARKS_REVIEW = [
+    "# Implementation Review",
+    "",
+    "Readiness: 10/10",
+    "",
+    "<!-- verified-complete:start -->",
+    "- Add the resolver",
+    "- Wire the decoder",
+    "<!-- verified-complete:end -->",
+    "",
+    "Everything checks out. No blockers.",
+    "",
+  ].join("\n");
 
   void it("a zero-file prose-only round ticks the checklist, then two real review rounds advance impl-high-review -> impl-low-review -> publish", async () => {
     const { folderPath, progress } = makeTaskFolder("prose_claim_reaches_literal_publish");
@@ -4102,7 +4145,23 @@ void describe("the checklistProgressUnreliable latch exit reaches literal Publis
     "- ran the unit tests",
   ].join("\n");
 
-  const FULL_MARKS_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverything checks out. No blockers.\n";
+  // bugs2 Step 20: the latch no longer stands the gate down. Under the latch
+  // the review router applies the review's verified ticks BEFORE the stage
+  // decision (RC8 item 4), so the latch exit is a review that verifies the
+  // items, not one that merely scores well.
+  const FULL_MARKS_REVIEW = [
+    "# Implementation Review",
+    "",
+    "Readiness: 10/10",
+    "",
+    "<!-- verified-complete:start -->",
+    "- Add the resolver",
+    "- Wire the decoder",
+    "<!-- verified-complete:end -->",
+    "",
+    "Everything checks out. No blockers.",
+    "",
+  ].join("\n");
 
   void it("a sterile round behind a qualifying review latches the gate, then two real review rounds advance impl-high-review -> impl-low-review -> publish", async () => {
     const { folderPath, progress } = makeTaskFolder("latch_reaches_literal_publish", {
@@ -4132,7 +4191,7 @@ void describe("the checklistProgressUnreliable latch exit reaches literal Publis
       latched.checklistProgressUnreliable,
       true,
       "precondition: the sterile round behind a qualifying review must latch the gate before the review " +
-        "rounds below can prove it stands the advance down"
+        "rounds below run"
     );
     assert.equal(
       latched.currentStage,
@@ -4140,21 +4199,21 @@ void describe("the checklistProgressUnreliable latch exit reaches literal Publis
       "precondition: latching the checklist gate must not itself advance the stage — only a passing review does"
     );
 
-    // Round 2: a real, full-marks review at impl-high-review. The plan's
-    // own 2 items are STILL unticked on disk — the latch stands the count
-    // down, it never ticks anything.
+    // Round 2: a real, full-marks review at impl-high-review that verifies
+    // both items. Under the latch, its verified ticks are applied before the
+    // stage decision, so the plan is settled and the stage advances.
     await runPassingReviewHarnessed(folderPath, "impl-high-review", FULL_MARKS_REVIEW);
     const afterFirstReview = readProgress(folderPath);
     assert.equal(
       afterFirstReview.currentStage,
       "impl-low-review",
-      "a full-marks review must advance the stage for real under the stood-down latch, via the same " +
-        "advanceStageViaNextStageRowV1 transition production uses — with the plan's 2 items still genuinely unticked"
+      "a full-marks review that verifies the items must advance the latched task for real, via the same " +
+        "advanceStageViaNextStageRowV1 transition production uses"
     );
-    const planStillUnticked = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+    const planTicked = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
     assert.ok(
-      planStillUnticked.includes("- [ ] Add the resolver") && planStillUnticked.includes("- [ ] Wire the decoder"),
-      "the latch exit advances WITHOUT ticking the plan — proving this is the stand-down path, not the merge path"
+      planTicked.includes("- [x] Add the resolver") && planTicked.includes("- [x] Wire the decoder"),
+      "the latch exit ticks the plan from the review's verified items — no human edits plan-final.md"
     );
 
     // Round 3: the same real review, now at impl-low-review — the last hop
@@ -5101,6 +5160,11 @@ void describe("recovery mode selection and enforcement (Part 2, end to end)", ()
       "",
       "- `src/newfile.ts` — the quarantined delta, reported",
       "- `src/prior.ts` — previously-reviewed work, reported",
+      "",
+      "## Plan Item Checklist",
+      "",
+      "- [x] Add the resolver",
+      "- [ ] Wire the decoder",
       "",
       "## Verification",
       "",

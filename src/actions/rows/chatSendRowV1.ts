@@ -33,6 +33,7 @@ import {
   getWorkflowFileStoreV1,
 } from "../../services/workflowRuntimeServicesV1";
 import { WorkflowFileLocatorV1 } from "../../services/workflowFileStoreV1";
+import { recordChatSendStateV1 } from "../../commands/pausedStageChatSendV1";
 
 /** Generous bound for reading a review artifact just to count its recorded
  * blockers — reviews are prose documents, never anywhere near this size. */
@@ -44,6 +45,7 @@ export interface ChatSendActionInputV1 {
   readonly prompt: string;
   readonly taskFolderPath?: string;
   readonly canonicalId?: string;
+  readonly sendId?: string;
 }
 
 const MAX_PROMPT_LENGTH_V1 = 8 * 1024 * 1024;
@@ -72,7 +74,10 @@ export function validateChatSendInputV1(
   if (raw.canonicalId !== undefined && !isNonEmptyString(raw.canonicalId)) {
     return { ok: false, reason: "input \"canonicalId\" must be a non-empty string when present" };
   }
-  const allowedKeys = new Set(["prompt", "taskFolderPath", "canonicalId"]);
+  if (raw.sendId !== undefined && !isNonEmptyString(raw.sendId)) {
+    return { ok: false, reason: "input \"sendId\" must be a non-empty string when present" };
+  }
+  const allowedKeys = new Set(["prompt", "taskFolderPath", "canonicalId", "sendId"]);
   for (const key of Object.keys(raw)) {
     if (!allowedKeys.has(key)) {
       return { ok: false, reason: `input has an unknown field: ${key}` };
@@ -82,6 +87,7 @@ export function validateChatSendInputV1(
     prompt: raw.prompt,
     ...(raw.taskFolderPath !== undefined ? { taskFolderPath: raw.taskFolderPath } : {}),
     ...(raw.canonicalId !== undefined ? { canonicalId: raw.canonicalId } : {}),
+    ...(raw.sendId !== undefined ? { sendId: raw.sendId } : {}),
   };
   return { ok: true, input: validated };
 }
@@ -278,6 +284,19 @@ async function promoteChatSendContentV1(
   if (input.taskFolderPath) {
     let finalText = strippedText;
     const stage = (context.stage as TaskStage) ?? "desc";
+    if (input.sendId) {
+      await recordChatSendStateV1(input.taskFolderPath, input.sendId, "promoting", {
+        stage,
+        message: input.prompt,
+        promotionEvidence: {
+          contentText: content.text,
+          strippedText,
+          stage,
+          proposedStageAction,
+          actionOutcomeNote,
+        },
+      });
+    }
     const fileOutcome = await applyChatFileUpdateEnvelopesV1(input.taskFolderPath, stage, updates, resolvesBlocker);
     for (const note of [fileOutcome.note, actionOutcomeNote]) {
       if (note) {
@@ -285,12 +304,23 @@ async function promoteChatSendContentV1(
       }
     }
     const canonicalId = input.canonicalId ?? input.taskFolderPath;
+    if (input.sendId) {
+      await recordChatSendStateV1(input.taskFolderPath, input.sendId, "promoting", {
+        stage,
+        message: input.prompt,
+        effectsApplied: true,
+        finalText,
+        proposedStageAction,
+        proposedBlockerSupersessionEdit: fileOutcome.proposedEdit,
+      });
+    }
     // Review-flagged (2026-08-23): a caller-computed read-then-full-write
     // (readChatHistory + writeChatHistory) silently discards any message a
     // concurrent writer (e.g. the scheduling-intent auto-start announcement)
     // appends in between. `appendChatMessageV1` re-reads and appends onto
     // the CURRENT document inside the shared per-document queue instead.
     await appendChatMessageV1(input.taskFolderPath, {
+      ...(input.sendId ? { id: input.sendId } : {}),
       role: "assistant",
       text: finalText,
       stage,
@@ -298,6 +328,13 @@ async function promoteChatSendContentV1(
       ...(proposedStageAction ? { proposedStageAction } : {}),
       ...(fileOutcome.proposedEdit ? { proposedBlockerSupersessionEdit: fileOutcome.proposedEdit } : {}),
     }, canonicalId);
+    if (input.sendId) {
+      await recordChatSendStateV1(input.taskFolderPath, input.sendId, "completed", {
+        stage,
+        message: input.prompt,
+        promotionSettled: true,
+      });
+    }
   }
   return "completed";
 }

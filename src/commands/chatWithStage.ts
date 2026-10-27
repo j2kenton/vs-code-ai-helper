@@ -1,6 +1,17 @@
+import * as crypto from "node:crypto";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
+import { hasAutomaticOriginV1 } from "../state/automationDispatchContextV1";
+import { resumePausedTask } from "./resumeTask";
+import {
+  describeResumedSendAcknowledgementV1,
+  describeRetainedPausedSendV1,
+  reconcileChatSendStateV1,
+  recordChatSendStateV1,
+  resumePausedTaskForUserSendV1,
+} from "./pausedStageChatSendV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { isViewerHostV1 } from "../state/hostRoleV1";
 import { isUnattendedExecutionV1, unattendedRefusalV1 } from "../state/unattendedExecutionV1";
 import { forwardToRunnerV1 } from "../services/viewerForwardingV1";
@@ -48,7 +59,7 @@ import {
   getVerifiedTaskBindingIdV1,
 } from "../services/workflowRuntimeServicesV1";
 import { readChatDocumentIdentityV1, readChatHistory, ChatMessage } from "../utils/chatHistoryStore";
-import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
+import { allocateHex128IdV1, isHex128IdV1 } from "../types/actionCorrelationV1";
 import {
   admitAndContinueWithMalformedResultRetryV1,
   createProductionTaskActionCoordinatorV1,
@@ -83,20 +94,22 @@ import {
 } from "../state/workAdmissionV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { describeResumeNotSettledV1 } from "../utils/storedAnswerResumeV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
 
 type ChatWithStageArg =
-  | { task?: IncompleteTask; stage?: TaskStage; message?: string }
-  | { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage; message?: string };
+  | { task?: IncompleteTask; stage?: TaskStage; message?: string; sendId?: string }
+  | { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage; message?: string; sendId?: string };
 
 function normalizeArg(node: ChatWithStageArg | undefined): {
   resolverArg: { canonicalId?: string; taskFolderPath?: string } | undefined;
-  stage: TaskStage | undefined; message: string | undefined;
+  stage: TaskStage | undefined; message: string | undefined; sendId: string | undefined;
 } {
-  if (!node) return { resolverArg: undefined, stage: undefined, message: undefined };
+  if (!node) return { resolverArg: undefined, stage: undefined, message: undefined, sendId: undefined };
+  const sendId = typeof node.sendId === "string" && /^[0-9a-f]{32}$/.test(node.sendId) ? node.sendId : undefined;
   if ("task" in node && node.task) {
-    return { resolverArg: { taskFolderPath: node.task.folderUri.fsPath }, stage: node.stage, message: node.message };
+    return { resolverArg: { taskFolderPath: node.task.folderUri.fsPath }, stage: node.stage, message: node.message, sendId };
   }
   const value = node as { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage; message?: string };
   return {
@@ -105,6 +118,7 @@ function normalizeArg(node: ChatWithStageArg | undefined): {
       : undefined,
     stage: value.stage,
     message: value.message,
+    sendId,
   };
 }
 
@@ -439,7 +453,11 @@ export async function chatWithStage(
     return chatWithStageInViewerV1(inventory, chatViewProvider, explicitArg);
   }
   assertLegacyAiRouteAllowedV0("chatSend.v1");
-  const { resolverArg, stage, message } = normalizeArg(explicitArg);
+  const normalized = normalizeArg(explicitArg);
+  const resolverArg = normalized.resolverArg;
+  const stage = normalized.stage;
+  const message = normalized.message;
+  let sendId = normalized.sendId;
 
   // ── Early work admission (v1 fixes item 1, Part 1a) ───────────────────────
   // Acquire durable admission BEFORE task resolution and the consent gate
@@ -538,6 +556,29 @@ export async function chatWithStage(
     if (targetResolutionHandle) {
       await endTargetResolutionV1(targetResolutionHandle);
     }
+    const refusalNotice = describeWorkAdmissionRefusalV1(early);
+    const candidateTask = wantsSend && !hasAutomaticOriginV1() && earlyFolderPath
+      ? inventory.getTaskByPath(earlyFolderPath) ??
+        inventory.getTasks().find((t) => t.taskFolderPath === earlyFolderPath || t.canonicalId === resolverArg?.canonicalId)
+      : undefined;
+    // Only a task the inventory knows: this runs before validateChatSendV1's
+    // ownership/containment checks, so an unresolved candidate path must not
+    // get a transcript entry or send-state file written into it.
+    if (candidateTask) {
+      const effectiveStage = stage ?? candidateTask.progress.currentStage ?? "plan";
+      const pausedSendId = sendId ?? crypto.randomBytes(16).toString("hex");
+      sendId = pausedSendId;
+      const taskLabel = notificationTaskDisplayNameV1(candidateTask.progress.displayName, candidateTask.taskFolderPath);
+      await retainPausedSendV1(
+        chatViewProvider,
+        candidateTask,
+        effectiveStage,
+        message!,
+        pausedSendId,
+        taskLabel,
+        refusalNotice
+      );
+    }
     NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
     return;
   }
@@ -604,6 +645,10 @@ export async function chatWithStage(
   };
 
   let dispatch: ChatSendDispatchV1 | undefined;
+  // Set only when this send resumed a paused task for the user (finding 8):
+  // the Resume's admission is held across the send and released in `finally`.
+  let heldResumeRelease: ((outcome?: TaskActionOutcomeV1) => Promise<void>) | undefined;
+  let resumedForSend: { taskLabel: string; pausedOthers: readonly string[] } | undefined;
   try {
     const validated: ChatSendValidationResultV1 = await validateChatSendV1(inventory, resolverArg, stage);
     if (!validated.ok) {
@@ -611,7 +656,16 @@ export async function chatWithStage(
       NotificationRouter.showWarning(validated.reason);
       return;
     }
-    const { task, targetStage } = validated;
+    // `let`: a paused task is resumed below and its context re-resolved.
+    let task = validated.task;
+    const targetStage = validated.targetStage;
+    if (sendId) {
+      const reconciled = await reconcileChatSendStateV1(task.taskFolderPath, sendId, task.canonicalId, targetStage);
+      if (reconciled.settled) {
+        await endTargetResolutionOnceV1();
+        return;
+      }
+    }
     if (!message?.trim()) {
       await endTargetResolutionOnceV1();
       await chatViewProvider.open({
@@ -668,12 +722,95 @@ export async function chatWithStage(
     // must stop this command, exactly as runPublishChecks/
     // completeCommitAndPushTask already do.
     const chatReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(vscode.Uri.file(task.taskFolderPath));
-    if (chatReconcileOutcome.outcome === "userPaused" || chatReconcileOutcome.outcome === "unreadable") {
-      await showPausedTaskRefusalV1("sending a message", task.taskFolderPath, task.progress.displayName);
-      return;
+    if (chatReconcileOutcome.outcome === "reversed") {
+      resumedForSend = {
+        taskLabel: notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath),
+        pausedOthers: [],
+      };
+    } else if (chatReconcileOutcome.outcome === "userPaused" || chatReconcileOutcome.outcome === "unreadable") {
+      // An automatic dispatch never typed anything: unchanged, refused and
+      // logged only.
+      if (hasAutomaticOriginV1()) {
+        await showPausedTaskRefusalV1("sending a message", task.taskFolderPath, task.progress.displayName);
+        return;
+      }
+      // bugs2 finding 8: a message the USER typed into a paused task's chat
+      // resumes the task and is sent as one action (owner decision
+      // 2026-10-25). Whatever stops that keeps the message and says why.
+      const taskLabel = notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath);
+      const pausedSendId = sendId ?? crypto.randomBytes(16).toString("hex");
+      sendId = pausedSendId;
+      const existingSend = await reconcileChatSendStateV1(task.taskFolderPath, pausedSendId, task.canonicalId, targetStage);
+      if (existingSend.settled) {
+        return;
+      }
+      // Persist the user message before attempting Resume or admission
+      const existing = await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId, targetStage);
+      if (!existing.some((entry) => entry.role === "user" && entry.id === pausedSendId)) {
+        await chatViewProvider.append(
+          "user",
+          message,
+          targetStage,
+          { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath },
+          false,
+          pausedSendId
+        );
+      }
+      noteSendAcceptedV1(task.taskFolderPath, message);
+      await recordChatSendStateV1(task.taskFolderPath, pausedSendId, "retained", {
+        message,
+        stage: targetStage,
+      });
+
+      const retainBlockedSend = async (reason: string): Promise<void> => {
+        await retainPausedSendV1(chatViewProvider, task, targetStage, message, pausedSendId, taskLabel, reason);
+      };
+      if (chatReconcileOutcome.outcome === "unreadable") {
+        await retainBlockedSend("its progress could not be read, so it could not be resumed safely");
+        return;
+      }
+      if (!currentTaskStore) {
+        await retainBlockedSend("the current-task store is unavailable in this window, so it could not be resumed");
+        return;
+      }
+      const taskFolderPath = task.taskFolderPath;
+      const canonicalId = task.canonicalId;
+      const resumeResult = await resumePausedTaskForUserSendV1({
+        listOtherActiveTaskLabels: async () => {
+          await inventory.refresh();
+          return inventory
+            .getTasks()
+            .filter((other) => other.taskFolderPath !== taskFolderPath && (other.progress.status ?? "active") === "active")
+            .map((other) => notificationTaskDisplayNameV1(other.progress.displayName, other.taskFolderPath));
+        },
+        releaseOwnAdmission: releaseCurrentAdmissionV1,
+        resume: () =>
+          resumePausedTask(inventory, currentTaskStore, { taskFolderPath, canonicalId }, { holdAdmissionForCaller: true }),
+      });
+      if (resumeResult.kind === "blocked") {
+        await retainBlockedSend(resumeResult.reason);
+        return;
+      }
+      heldResumeRelease = resumeResult.release;
+      // The send must see the task as the active task it now is.
+      const refreshed = await validateChatSendV1(inventory, resolverArg, targetStage);
+      if (!refreshed.ok) {
+        await retainBlockedSend(`it was resumed, but could not be reloaded (${refreshed.reason})`);
+        return;
+      }
+      task = refreshed.task;
+      resumedForSend = { taskLabel, pausedOthers: resumeResult.pausedOthers };
     }
 
-    dispatch = await chatWithStageSendV1(chatViewProvider, task, targetStage, message);
+    dispatch = await chatWithStageSendV1(chatViewProvider, task, targetStage, message, sendId, resumedForSend);
+    if (resumedForSend && dispatch?.messageDelivered === true) {
+      await chatViewProvider.append(
+        "assistant",
+        describeResumedSendAcknowledgementV1(resumedForSend.taskLabel, resumedForSend.pausedOthers),
+        targetStage,
+        { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath }
+      );
+    }
 
     // 2026-09-10 review completion blocker fix (`d620c877...-2`): `triggerStageAI`
     // is the one pinned stage action that starts real work — it goes through
@@ -730,7 +867,58 @@ export async function chatWithStage(
     await endTargetResolutionOnceV1();
     recordAdmissionReleaseTriggerV1(safeReleaseStateV1, dispatch?.coordinatorOutcome);
     await releaseAdmissionSafelyV1();
+    if (heldResumeRelease) {
+      const release = heldResumeRelease;
+      heldResumeRelease = undefined;
+      await release(dispatch?.coordinatorOutcome);
+    }
   }
+}
+
+/**
+ * Keeps a user's message for a paused task that could not be resumed for it:
+ * the message is written to the transcript under its send id (so it stays
+ * visible and a retry never writes it twice), the chat says it was NOT sent and
+ * why, and a "Resume and send" action re-runs the same send once the blocker is
+ * cleared (bugs2 finding 8). Never claims the message was sent.
+ */
+async function retainPausedSendV1(
+  chatViewProvider: ChatViewProvider,
+  task: { canonicalId: string; taskFolderPath: string },
+  targetStage: TaskStage,
+  message: string,
+  sendId: string,
+  taskLabel: string,
+  reason: string
+): Promise<void> {
+  const existingSend = await reconcileChatSendStateV1(task.taskFolderPath, sendId, task.canonicalId, targetStage);
+  if (existingSend.settled) {
+    return;
+  }
+  const identity = { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath };
+  const existing = await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId, targetStage);
+  if (!existing.some((entry) => entry.role === "user" && entry.id === sendId)) {
+    await chatViewProvider.append("user", message, targetStage, identity, false, sendId);
+  }
+  // The text is in the transcript now, which is what tells a viewer the runner
+  // took it (so the viewer clears its input rather than inviting a duplicate).
+  noteSendAcceptedV1(task.taskFolderPath, message);
+  await recordChatSendStateV1(task.taskFolderPath, sendId, "retained", {
+    message,
+    stage: targetStage,
+    reason,
+  });
+  const notice = describeRetainedPausedSendV1(taskLabel, reason);
+  await chatViewProvider.append("assistant", notice, targetStage, identity);
+  await offerActionInChatV1({
+    taskFolderPath: task.taskFolderPath,
+    taskLabel,
+    actionLabel: "Resume and send",
+    command: "vs-code-ai-helper.chatWithStage",
+    args: [{ canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath, stage: targetStage, message, sendId }],
+    noticeText: notice,
+    optional: true,
+  });
 }
 
 interface ChatSendDispatchV1 {
@@ -746,6 +934,10 @@ interface ChatSendDispatchV1 {
    * that never reached `admitAndContinueWithMalformedResultRetryV1` (a
    * validation failure, or a thrown error before the coordinator call). */
   readonly coordinatorOutcome?: TaskActionOutcomeV1;
+  /** True once the user's message reached the transcript, i.e. every
+   * precondition passed and the round was admitted (finding 8: only then may
+   * the chat say a resumed task "received the message"). */
+  readonly messageDelivered?: boolean;
 }
 
 /**
@@ -760,9 +952,54 @@ async function chatWithStageSendV1(
   chatViewProvider: ChatViewProvider,
   task: ResolvedTaskContext,
   targetStage: TaskStage,
-  message: string
+  message: string,
+  sendId?: string,
+  resumedForSend?: { readonly taskLabel: string; readonly pausedOthers: readonly string[] }
 ): Promise<ChatSendDispatchV1 | undefined> {
   const lockKey = task.taskFolderPath;
+  const sendState = sendId
+    ? await reconcileChatSendStateV1(task.taskFolderPath, sendId, task.canonicalId, targetStage)
+    : undefined;
+  if (sendState?.settled) {
+    return {
+      task,
+      targetStage,
+      proposedAction: undefined,
+      proposedBlockerSupersessionEdit: undefined,
+      proposedBlockerSupersessionEditAt: undefined,
+      messageDelivered: true,
+    };
+  }
+  if (sendState?.held) {
+    await chatViewProvider.append(
+      "assistant",
+      `Unable to respond: ${sendState.reason ?? "indeterminate prior attempt"}`,
+      targetStage,
+      { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath }
+    );
+    return undefined;
+  }
+  const initialTranscript = await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId, targetStage);
+  const initialUserIndex = sendId !== undefined
+    ? initialTranscript.findIndex((entry) => entry.role === "user" && entry.id === sendId)
+    : -1;
+  const alreadyAnswered =
+    sendId !== undefined
+      ? false
+      : initialUserIndex >= 0 &&
+        initialTranscript
+          .slice(initialUserIndex + 1)
+          .some((entry) => entry.role === "assistant" && entry.kind === undefined && !entry.text.includes("kept but NOT sent"));
+  if (alreadyAnswered) {
+    return {
+      task,
+      targetStage,
+      proposedAction: undefined,
+      proposedBlockerSupersessionEdit: undefined,
+      proposedBlockerSupersessionEditAt: undefined,
+      messageDelivered: true,
+    };
+  }
   let proposedAction: StageChatActionProposal | undefined;
   let proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
   // The proposing assistant message's own timestamp — the durable pointer to
@@ -776,6 +1013,7 @@ async function chatWithStageSendV1(
   // block below reports it as a notification instead of an assistant
   // reply to a message that was never shown.
   let userMessagePersisted = false;
+  let alreadyRetained = false;
   let coordinatorOutcomeForAdmissionV1: TaskActionOutcomeV1 | undefined;
   try {
     await runTrackedOperation(lockKey, {
@@ -798,10 +1036,35 @@ async function chatWithStageSendV1(
         undefined,
         { command: "vs-code-ai-helper.openSettings", title: "Open Settings" }
       );
+      if (resumedForSend) {
+        await retainPausedSendV1(
+          chatViewProvider,
+          task,
+          targetStage,
+          message,
+          sendId ?? crypto.randomBytes(16).toString("hex"),
+          resumedForSend.taskLabel,
+          `no model is configured for ${STAGE_DISPLAY_NAMES[targetStage]}`
+        );
+      }
       return;
     }
     const { availability: available, providerLabel } = await checkRunnerAvailabilityForModel(modelId, targetStage);
-    if (!available.available) throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
+    if (!available.available) {
+      if (resumedForSend) {
+        await retainPausedSendV1(
+          chatViewProvider,
+          task,
+          targetStage,
+          message,
+          sendId ?? crypto.randomBytes(16).toString("hex"),
+          resumedForSend.taskLabel,
+          available.reason ?? `${providerLabel} is unavailable.`
+        );
+        return;
+      }
+      throw new Error(available.reason ?? `${providerLabel} is unavailable.`);
+    }
 
     const rootId = ensureWorkflowTaskFolderRootV1(task.taskFolderPath);
     const verifiedBindingId = getVerifiedTaskBindingIdV1(rootId);
@@ -823,8 +1086,12 @@ async function chatWithStageSendV1(
     // user's message actually get written to chat-v1.json, so a rejection
     // never leaves an unanswerable orphan message in the transcript.
     const existingTranscript = await chatViewProvider.transcript(task.taskFolderPath, task.canonicalId, targetStage);
+    const userIndex = sendId !== undefined
+      ? existingTranscript.findIndex((entry) => entry.role === "user" && entry.id === sendId)
+      : -1;
+    alreadyRetained = userIndex >= 0;
     const pendingEntry: ChatMessage = { role: "user", text: message, stage: targetStage, at: new Date().toISOString() };
-    const conversation = [...existingTranscript, pendingEntry]
+    const conversation = [...existingTranscript, ...(alreadyRetained ? [] : [pendingEntry])]
       .slice(-20)
       .map(entry => `${entry.role.toUpperCase()}: ${entry.text}`)
       .join("\n");
@@ -845,6 +1112,7 @@ async function chatWithStageSendV1(
       prompt,
       taskFolderPath: task.taskFolderPath,
       canonicalId: task.canonicalId,
+      ...(sendId ? { sendId } : {}),
     };
     const inputValidation = validateChatSendInputV1(validatedInput);
     if (!inputValidation.ok) {
@@ -878,12 +1146,19 @@ async function chatWithStageSendV1(
       taskStage: targetStage,
       rawInput: validatedInput,
       cancellationToken: op.token!,
+      ...(sendId && isHex128IdV1(sendId) ? { operationId: sendId } : {}),
       preInvocationHook: async () => {
         if (!userMessagePersisted) {
-          await chatViewProvider.append("user", message, targetStage, {
-            canonicalId: task.canonicalId,
-            taskFolderPath: task.taskFolderPath,
-          });
+          if (!alreadyRetained) {
+            await chatViewProvider.append(
+              "user",
+              message,
+              targetStage,
+              { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath },
+              false,
+              sendId
+            );
+          }
           userMessagePersisted = true;
           noteSendAcceptedV1(task.taskFolderPath, message);
         }
@@ -892,6 +1167,12 @@ async function chatWithStageSendV1(
     coordinatorOutcomeForAdmissionV1 = outcome;
 
     if (outcome.kind === "completed") {
+      if (sendId) {
+        await recordChatSendStateV1(task.taskFolderPath, sendId, "completed", {
+          stage: targetStage,
+          message,
+        });
+      }
       // Completed message has already been written to chat-v1.json by
       // promoteChatSendContentV1, which also attached any recognized stage-
       // action proposal to that message (`proposedStageAction`) rather than
@@ -939,15 +1220,36 @@ async function chatWithStageSendV1(
         });
       }
     } else if (outcome.kind === "cancelled") {
+      if (sendId) {
+        await recordChatSendStateV1(task.taskFolderPath, sendId, "failed", {
+          stage: targetStage,
+          message,
+          reason: "cancelled",
+        });
+      }
       await chatViewProvider.append("assistant", "Stage chat was cancelled.", targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     } else {
       const code = "code" in outcome ? outcome.code : outcome.kind;
+      if (sendId) {
+        await recordChatSendStateV1(task.taskFolderPath, sendId, "failed", {
+          stage: targetStage,
+          message,
+          reason: String(code),
+        });
+      }
       await chatViewProvider.append("assistant", `Unable to respond: ${code}`, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     }
     });
   } catch (error) {
     const text = error instanceof Error ? error.message : String(error);
-    if (userMessagePersisted) {
+    if (sendId) {
+      await recordChatSendStateV1(task.taskFolderPath, sendId, "failed", {
+        stage: targetStage,
+        message,
+        reason: text,
+      });
+    }
+    if (userMessagePersisted || alreadyRetained) {
       await chatViewProvider.append("assistant", `Unable to respond: ${text}`, targetStage, { canonicalId: task.canonicalId, taskFolderPath: task.taskFolderPath });
     } else {
       // Nothing was ever written to chat-v1.json for this send, so report
@@ -967,6 +1269,7 @@ async function chatWithStageSendV1(
     proposedBlockerSupersessionEdit,
     proposedBlockerSupersessionEditAt,
     coordinatorOutcome: coordinatorOutcomeForAdmissionV1,
+    messageDelivered: userMessagePersisted,
   };
 }
 
@@ -1290,7 +1593,7 @@ export async function resumeChatSendInteractionV1(
       : undefined;
 
   if (settlement === undefined) {
-    return { ok: false, reason: "Resume failed to settle the interaction", coordinatorOutcome: outcome };
+    return { ok: false, reason: `Resume did not settle the interaction: ${describeResumeNotSettledV1(outcome)}`, coordinatorOutcome: outcome };
   }
   if (proposedAction) {
     await dispatchProposedStageActionV1(
@@ -1351,6 +1654,9 @@ async function chatWithStageInViewerV1(
       stage: validated.targetStage,
       taskName: validated.task.progress.displayName,
       message: normalized.message,
+      // One identity per typed send, so a paused task keeps the message under
+      // it and a retry never writes or sends it twice (bugs2 finding 8).
+      sendId: normalized.sendId ?? crypto.randomBytes(16).toString("hex"),
     });
     if (!sent.ok && sent.indeterminate !== true) {
       // Definitely not sent, so hand the text back. When the runner TOOK it

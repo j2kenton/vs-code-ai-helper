@@ -101,5 +101,9 @@ void describe("Step 12 choices are asked in chat", () => {
     const source = read("utils/chatChoiceV1.ts");
     assert.match(source, /awaitWorkflowDecisionAnswerV1/);
     assert.match(source, /effect: \{ kind: "doNothing" as const \}/);
+    assert.match(source, /input\.target,\s*input\.token/);
+    const lintFixes = read("commands/runLintingFixes.ts");
+    assert.equal((lintFixes.match(/token: cancelToken/g) ?? []).length >= 2, true);
+    assert.equal((lintFixes.match(/throwIfPublishChecksCancelledV1\(cancelToken\);/g) ?? []).length >= 2, true);
   });
 });

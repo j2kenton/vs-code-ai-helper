@@ -12,7 +12,9 @@ import * as assert from "node:assert/strict";
 import { after, before, describe, it } from "node:test";
 import {
   STALE_DISPATCH_GRACE_MS,
+  classifyPendingUserInputV1,
   effectiveNextActorV1,
+  hasPendingUserInputV1,
   hasOpenRoundLedgerRowV1,
   isImpossibleActiveStateV1,
   isWaitingForHumanV1,
@@ -595,5 +597,131 @@ void describe("withWaitingForHumanFallbackV1 (pre-1.0.0 fixes register item 16) 
       ),
       { kind: "owedWillNotRetry", blocker: "x", surfacedAt: "2026-01-01T00:00:00.000Z", quarantinedFiles: [], willRetry: false }
     );
+  });
+
+  void it("uses durable pending user input evidence to classify waiting questions and submitted answers", () => {
+    // Unanswered questions mean waiting for human
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1({ kind: "unknown" }, undefined, {
+        state: "read",
+        unansweredQuestions: 1,
+        submittedAwaitingResume: 0,
+      }),
+      { kind: "waitingForYou" }
+    );
+
+    // Submitted answers awaiting resume upgrade unknown/waiting to scheduled
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1({ kind: "unknown" }, undefined, {
+        state: "read",
+        unansweredQuestions: 0,
+        submittedAwaitingResume: 1,
+      }),
+      {
+        kind: "scheduled",
+        trigger: "an answered question is waiting to resume",
+        expectedTiming: "as soon as the runner can dispatch it",
+      }
+    );
+
+    // Unreadable pending user input yields unknown
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1({ kind: "waitingForYou" }, undefined, {
+        state: "unreadable",
+        unansweredQuestions: 0,
+        submittedAwaitingResume: 0,
+      }),
+      { kind: "unknown" }
+    );
+
+    // Running posture is never overridden by pending input
+    assert.deepEqual(
+      withWaitingForHumanFallbackV1({ kind: "running" }, undefined, {
+        state: "read",
+        unansweredQuestions: 1,
+        submittedAwaitingResume: 0,
+      }),
+      { kind: "running" }
+    );
+  });
+});
+
+void describe("pending user input exempts a task from the stall pause (bugs2 finding 1)", () => {
+  let fakeContext: { restore: () => void };
+  before(() => { fakeContext = installFakeMemento(); });
+  after(() => { fakeContext.restore(); });
+
+  // 14:32 question posted, 14:46 (14 minutes later, past the 10-minute quiet
+  // period) the watchdog looked: the task must not be called quiet.
+  const NOW = Date.parse("2026-10-22T14:46:59.000Z");
+  const stalled = baseProgress({ updatedAt: "2026-10-22T14:32:14.000Z" });
+
+  void it("classifies unanswered, stored-answer and finished interactions separately", () => {
+    assert.deepEqual(classifyPendingUserInputV1([]), {
+      state: "read",
+      unansweredQuestions: 0,
+      submittedAwaitingResume: 0,
+    });
+    assert.deepEqual(
+      classifyPendingUserInputV1([
+        { state: "unresolved" },
+        { state: "orphanedTransaction", answers: [] },
+        { state: "unresolved", answers: [{}] },
+        { state: "resumed", answers: [{}] },
+        { state: "cancelled" },
+        { state: "expired" },
+        { state: "resetByChatRecovery" },
+        { state: "missingTransaction" },
+        { state: "supersededByReplacementOperation" },
+      ]),
+      { state: "read", unansweredQuestions: 2, submittedAwaitingResume: 1 }
+    );
+  });
+
+  void it("is stalled without question evidence, and not stalled with an unanswered question", () => {
+    assert.equal(isImpossibleActiveStateV1({ progress: stalled, taskCanonicalId: "task-q", now: NOW }), true);
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: stalled,
+        taskCanonicalId: "task-q",
+        now: NOW,
+        pendingUserInput: { state: "read", unansweredQuestions: 1, submittedAwaitingResume: 0 },
+      }),
+      false
+    );
+  });
+
+  void it("treats a stored answer awaiting Resume as owed work, not quiet", () => {
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: stalled,
+        taskCanonicalId: "task-q",
+        now: NOW,
+        pendingUserInput: { state: "read", unansweredQuestions: 0, submittedAwaitingResume: 1 },
+      }),
+      false
+    );
+  });
+
+  void it("keeps the stall pause when the questions are settled, and fails open when they cannot be read", () => {
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: stalled,
+        taskCanonicalId: "task-q",
+        now: NOW,
+        pendingUserInput: classifyPendingUserInputV1([{ state: "resumed", answers: [{}] }, { state: "cancelled" }]),
+      }),
+      true
+    );
+    assert.equal(
+      isImpossibleActiveStateV1({
+        progress: stalled,
+        taskCanonicalId: "task-q",
+        now: NOW,
+        pendingUserInput: { state: "unreadable", unansweredQuestions: 0, submittedAwaitingResume: 0 },
+      }),
+      false
+    );
+    assert.equal(hasPendingUserInputV1(undefined), false);
   });
 });

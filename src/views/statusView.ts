@@ -3,7 +3,7 @@ import { StatusSurface } from "../utils/notificationRouter";
 import { formatTaskNameForDisplay, taskOperations } from "../utils/taskOperations";
 import { TaskOperationSnapshot } from "../utils/taskOperations";
 import { OperationKind } from "../utils/operationTaxonomy";
-import { terminalEntryFor } from "../utils/operationNotificationBridge";
+import { offerInterruptedOperationRecoveryV1, terminalEntryFor } from "../utils/operationNotificationBridge";
 import { notificationFallbackUri } from "../utils/notificationContentProvider";
 import { formatTimestampForDisplay } from "../utils/timeFormat";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
@@ -11,6 +11,7 @@ import { REVIEW_TARGETS } from "../utils/reviewReadiness";
 import { describeModelWithProviderV1 } from "../runners/providers";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
+import { recordStageActionTerminalOutcomeV1 } from "../utils/stageActionRefusalV1";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -194,6 +195,14 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
     // by reload rather than silently losing its Notifications row.
     const interrupted = state?.get<SerializedOperation[]>(RUNNING_OPERATIONS_STATE_KEY, []) ?? [];
     for (const snapshot of interrupted) {
+      if (snapshot.key) {
+        recordStageActionTerminalOutcomeV1(snapshot.key, {
+          kind: "interrupted",
+          actionLabel: snapshot.label,
+          reason: "window was reloaded or runner stopped",
+          operationId: snapshot.id,
+        });
+      }
       const entry = terminalEntryFor({ ...snapshot, state: "interrupted", waitingForUser: false });
       if (entry) {
         this.entries.unshift({
@@ -202,6 +211,11 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
           timestamp: new Date(),
         });
       }
+      // The warning entry explains what happened; the chat decision gives
+      // the owner a durable stage-action recovery choice, including after a restart.
+      void offerInterruptedOperationRecoveryV1({ ...snapshot, state: "interrupted", waitingForUser: false }).catch((error) => {
+        console.warn("[statusView] Could not post recovery for an interrupted operation", error);
+      });
     }
     if (interrupted.length > 0) {
       // 1.0.0 gate, A4 (review-narrowed, 2026-09-06): the array was already

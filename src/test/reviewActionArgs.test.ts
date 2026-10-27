@@ -245,7 +245,7 @@ void describe("implementation review apply prompt contract", () => {
     );
     assert.match(
       source,
-      /approvedPlan,\s*implementation:\s*implementationNotes,\s*review:\s*reviewContentCapped,/s,
+      /approvedPlan,\s*implementation:\s*implementationNotes,\s*(?:openPlanItems:[^\n]*\n\s*)?review:\s*reviewContentCapped,/s,
       "the apply prompt must receive both the contract and historical notes"
     );
   });

@@ -768,7 +768,7 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
     }
   });
 
-  void it("offers Advance via a workflow decision card when nothing is left open after applying", async () => {
+  void it("keeps a self-ticked item provisional and continues instead of offering Advance", async () => {
     const folder = makeTaskFolder("flow-6", PLAN);
     const workspaceStateValues = new Map<string, unknown>();
     const memento = {
@@ -788,7 +788,9 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
     setExtensionContextV1(context);
     const exec = installExecuteCommandCapture();
     try {
-      // Settle every remaining open item: exclude two, tick one.
+      // Exclude two owner-only items and self-tick one. The checkbox is now
+      // visible as complete, but without reviewer evidence it remains open to
+      // the stage gate and must not offer Advance.
       const form = await postForm(folder, [
         { itemText: "A human deployment step", reason: "" },
         { itemText: "A measurement only the owner can take", reason: "" },
@@ -801,20 +803,13 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
       ]);
       assert.equal(result.kind, "applied");
       assert.ok(
-        !exec.calls.some((c) => c.command === "vs-code-ai-helper.resumeAndApplyCurrentStageAction"),
-        "nothing remains open — the ordinary continuing action must not be dispatched"
+        exec.calls.some((c) => c.command === "vs-code-ai-helper.resumeAndApplyCurrentStageAction"),
+        "the self-ticked item is provisional, so the ordinary continuing action must be dispatched"
       );
       const store = new WorkflowDecisionStoreV1(context.workspaceState);
       const pending = store.listPending(folder);
       const advanceCard = pending.find((d) => d.decisionKey === "openPlanItemsSettledOfferAdvance");
-      assert.ok(advanceCard, `expected an Advance-offering card; pending: ${JSON.stringify(pending)}`);
-      const advanceOption = advanceCard.options.find((o) => o.optionId === "advance");
-      assert.ok(advanceOption, "the card must offer an 'advance' option");
-      assert.equal(advanceCard.recommendation.kind, "option");
-      assert.equal(
-        advanceCard.recommendation.kind === "option" ? advanceCard.recommendation.optionId : undefined,
-        "advance"
-      );
+      assert.equal(advanceCard, undefined, `provisional work must not offer Advance; pending: ${JSON.stringify(pending)}`);
     } finally {
       exec.restore();
       setExtensionContextV1(undefined as unknown as vscode.ExtensionContext);

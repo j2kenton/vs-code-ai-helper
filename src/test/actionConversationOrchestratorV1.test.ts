@@ -216,7 +216,7 @@ void describe("actionConversationOrchestratorV1", () => {
     assert.equal((await orchestrator.getRecord(ref))?.state, "answersSubmitted");
   });
 
-  void it("treats only the identical idempotency id + answers as a duplicate no-op", async () => {
+  void it("treats identical answers as a duplicate no-op under any id, and rejects different answers (bugs2 finding 1)", async () => {
     const { ref } = await postedInteraction();
     const idempotencyId = allocateHex128IdV1();
     assert.equal((await orchestrator.submitAnswers(ref, VALID_ANSWERS, idempotencyId)).ok, true);
@@ -231,8 +231,18 @@ void describe("actionConversationOrchestratorV1", () => {
     );
     assert.equal(differentAnswers.ok, false);
 
+    // A second click mints a fresh id: the same answers are still the same
+    // answer, never a "different idempotency record".
     const differentId = await orchestrator.submitAnswers(ref, VALID_ANSWERS, allocateHex128IdV1());
-    assert.equal(differentId.ok, false);
+    assert.deepEqual(differentId, { ok: true, duplicate: true });
+
+    const differentAnswersNewId = await orchestrator.submitAnswers(
+      ref,
+      [{ questionId: "q1", kind: "text", state: "answered", value: "different" }],
+      allocateHex128IdV1()
+    );
+    assert.equal(differentAnswersNewId.ok, false);
+    assert.doesNotMatch(failureReason(differentAnswersNewId), /different idempotency record/);
   });
 
   void it("resolves a sameOperation Resume with the original operation and a fresh attempt", async () => {
@@ -325,6 +335,37 @@ void describe("actionConversationOrchestratorV1", () => {
     await orchestrator.resolveResume(ref, resumeIdempotencyId);
     const settled = await orchestrator.getRecord(ref);
     assert.equal(settled?.resumeIdempotencyId, resumeIdempotencyId);
+  });
+
+  void it("adopts the recorded Resume id when a crash left the record at resumeScheduled (bugs2 finding 1)", async () => {
+    const { ref } = await postedInteraction("sameOperation");
+    await orchestrator.submitAnswers(ref, VALID_ANSWERS, allocateHex128IdV1());
+
+    // Simulate the crash window: a first attempt journalled resumeScheduled and
+    // died before settling.
+    const registry = createWorkflowPathRegistryV1();
+    registry.registerRoot({
+      rootId: "private-storage",
+      fsPath: tmpRoot,
+      kind: "privateStorage",
+      trustedForMutation: true,
+    });
+    const store = createChatInteractionTransactionStoreV1({
+      registry,
+      fileStore: createWorkflowFileStoreV1(registry.registeredRoots()),
+      privateRootId: "private-storage",
+    });
+    const firstResumeId = allocateHex128IdV1();
+    const scheduled = await store.scheduleResume(ref.operationId, firstResumeId);
+    assert.equal(scheduled.kind, "ok");
+
+    // The retry mints a NEW id (every click does); it must settle, once, under
+    // the recorded one instead of failing "a Resume was already recorded".
+    const resolution = await orchestrator.resolveResume(ref, allocateHex128IdV1());
+    assert.equal(resolution.kind, "sameOperation");
+    const record = await orchestrator.getRecord(ref);
+    assert.equal(record?.state, "settled");
+    assert.equal(record?.resumeIdempotencyId, firstResumeId);
   });
 
   void it("rejects a second Resume, a malformed id, and a Resume without submitted answers", async () => {

@@ -915,16 +915,19 @@ export function createChatInteractionTransactionStoreV1(options: {
         const answers: readonly StructuredAnswerV1[] = decoded.answers;
         const digest = computeChatTransactionAnswersSha256V1(answers);
         if (transaction.answerIdempotencyId !== undefined) {
-          // Already submitted: a byte-identical re-submission under the same
-          // idempotency id is a no-op; anything else is rejected (§3.6).
-          if (
-            transaction.answerIdempotencyId === answerIdempotencyId &&
-            transaction.answersSha256 === digest
-          ) {
+          // Already submitted. The accepted record is immutable, but the SAME
+          // canonical answers submitted again (a second click, a reload,
+          // another window, a retry after a refused Resume) are a no-op under
+          // the RECORDED idempotency identity, never a conflicting record:
+          // every UI click mints a fresh random id, so comparing ids refused a
+          // harmless repeat and stranded a stored answer whose Resume had not
+          // run (bugs2 finding 1). Only genuinely different answers are
+          // rejected (§3.6).
+          if (transaction.answersSha256 === digest) {
             return { kind: "ok", transaction, duplicate: true };
           }
           return rejected(
-            "answers were already submitted for this interaction with a different idempotency record"
+            "different answers were already submitted for this interaction; the accepted answer cannot be changed"
           );
         }
         if (transaction.state !== "questionsPosted" && transaction.state !== "answersDraft") {

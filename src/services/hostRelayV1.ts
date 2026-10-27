@@ -73,10 +73,9 @@ export type HostRelayRequestV1 =
       /** The runner's own id for a running operation it mirrored (hostOperationsMirrorV1.ts). */
       readonly operationId: string;
       /**
-       * The runner activation the cancelled row was read from. Operation ids
-       * restart at `op-1` on every runner start, so the runner refuses a
-       * request from an earlier activation rather than cancelling whatever
-       * that id names now.
+       * The runner activation the cancelled row was read from. The runner
+       * refuses a request from an earlier activation rather than allowing a
+       * stale viewer row to target a different runner session.
        */
       readonly activationId?: string;
       readonly timeoutMs?: number;

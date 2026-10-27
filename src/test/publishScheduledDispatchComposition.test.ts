@@ -316,7 +316,7 @@ void describe("applyCurrentStageAction records the downstream command's own stat
     }
   });
 
-  void it("a Publish dispatch that declines with no notice records that it declined without saying why (RC7 item 5)", async () => {
+  void it("a Publish dispatch that declines with no notice records that no reason was stated, never 'without saying why' (RC7 item 5, bugs2 finding 5)", async () => {
     const taskFolderPath = makeTaskFolder("declined-downstream-silent");
     const progress = fixtureProgress(taskFolderPath);
     writeProgress(taskFolderPath, progress);
@@ -340,10 +340,9 @@ void describe("applyCurrentStageAction records the downstream command's own stat
         canonicalId: taskFolderPath,
       } as never);
       assert.equal(dispatched, false);
-      assert.equal(
-        takeStageActionRefusalReasonV1(taskFolderPath),
-        "runPublishChecks declined to start without saying why"
-      );
+      const reason = takeStageActionRefusalReasonV1(taskFolderPath);
+      assert.match(reason ?? "", /^runPublishChecks did not start, and it raised no notice saying why/);
+      assert.doesNotMatch(reason ?? "", /without saying why/);
     } finally {
       commands.executeCommand = original;
       model.restore();

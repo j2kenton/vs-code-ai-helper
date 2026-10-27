@@ -23,6 +23,7 @@
  * taskProgressUtils.ts) — so these tests assert the write never lands, not
  * just that no error is thrown.
  */
+import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -160,6 +161,28 @@ function readProgress(store: MemStore, folderUri: vscode.Uri): TaskProgress {
     return JSON.parse(fs.readFileSync(uri.fsPath, "utf8")) as TaskProgress;
   }
   return JSON.parse(store.get(uri.toString())!) as TaskProgress;
+}
+
+/**
+ * Ticks only count as settled once a reviewer has verified them (Part 3):
+ * give every ticked item in the seeded plan-final.md a reviewer verification,
+ * so fixtures about open-versus-settled counts are not read as provisional.
+ */
+function verifyTickedPlanItems(store: MemStore, folderUri: vscode.Uri): void {
+  const plan = store.get(vscode.Uri.joinPath(folderUri, "plan-final.md").toString()) ?? "";
+  const progressUri = vscode.Uri.joinPath(folderUri, "task-progress.json").toString();
+  const existing = store.get(progressUri);
+  const progress = (existing
+    ? JSON.parse(existing)
+    : { ...baseProgress(), taskFolder: path.basename(folderUri.fsPath) }) as Record<string, unknown>;
+  progress["planItemEvidence"] = [...plan.matchAll(/^- \[x\] (.+)$/gm)].map(([, itemText]) => ({
+    planRevision: getPlanRevisionV1(plan),
+    itemKey: normalizeChecklistItemTextV1(itemText!),
+    itemText,
+    claims: [{ source: "implementation", at: "2026-01-01T00:00:00.000Z" }],
+    verifications: [{ at: "2026-01-01T00:00:00.000Z", evidence: "verified by review" }],
+  }));
+  store.set(progressUri, JSON.stringify(progress, null, 2));
 }
 
 function baseProgress(overrides: Partial<TaskProgress> = {}): TaskProgress {
@@ -1023,6 +1046,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       "- [ ] item 10",
     ].join("\n");
     store.set(planFinalUri.toString(), checklist);
+    verifyTickedPlanItems(store, folderUri);
 
     const blockers: ReviewBlocker[] = [
       { category: "review-confidence", resolver: "environmental", description: "The five live-AWS acceptance checks remain unexecuted" },
@@ -1083,6 +1107,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       "- [ ] item 3",
     ].join("\n");
     store.set(planFinalUri.toString(), checklist);
+    verifyTickedPlanItems(store, folderUri);
 
     const blockers: ReviewBlocker[] = [
       { category: "review-confidence", resolver: "unverifiable", description: "Evidence for the retry path could not be confirmed" },
@@ -1218,6 +1243,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     const planFinalUri = vscode.Uri.joinPath(folderUri, "plan-final.md");
     const checklist = ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [x] item 2"].join("\n");
     store.set(planFinalUri.toString(), checklist);
+    verifyTickedPlanItems(store, folderUri);
 
     const blockers: ReviewBlocker[] = [
       { category: "review-confidence", resolver: "unverifiable", description: "Evidence for the retry path could not be confirmed" },
@@ -2810,6 +2836,7 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       planFinalUri.toString(),
       ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [ ] item 2", "- [ ] item 3"].join("\n")
     );
+    verifyTickedPlanItems(store, folderUri);
     const blockers: ReviewBlocker[] = [
       { category: "completion", resolver: "environmental", description: "some environmental failure" },
     ];
@@ -2860,6 +2887,7 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       planFinalUri.toString(),
       ["<!-- ensemble:implementation-checklist -->", "- [x] item 1", "- [ ] item 2", "- [ ] item 3"].join("\n")
     );
+    verifyTickedPlanItems(store, folderUri);
     const blockers: ReviewBlocker[] = [
       { category: "completion", resolver: "environmental", description: "some environmental failure" },
     ];

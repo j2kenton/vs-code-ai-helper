@@ -3308,7 +3308,21 @@ function toFriendlyError(
   // otherwise read as auth. A re-login hint can never fix an entitlement
   // block, so it must never classify as authFailure regardless of which
   // provider-specific marker matches.
-  const entitlementFailure = isModelEntitlementFailure(structured ? scanSource : stderr);
+  const antigravity404 = def.id === "antigravity-cli" &&
+    /\bNOT_FOUND\b/i.test(scanSource) && /(?:\b404\b|error_code\s*["']?\s*:\s*404)/i.test(scanSource);
+  // NOT_FOUND can refer to a project, file, conversation, or other API
+  // resource. Only classify an explicit model miss (or the CLI's ambiguous
+  // generic "Requested entity was not found" response) as recoverable by
+  // changing the configured model. Preserve unrelated resource failures as
+  // ordinary failures so they do not consume a backup candidate.
+  const antigravityExplicitModelNotFound =
+    /\bmodel(?:\s+(?:id|name))?\b[^\n.]{0,120}\b(?:not found|does not exist|unavailable|unknown model)\b/i.test(scanSource) ||
+    /\bresource\s*["']?\s*:\s*["']model["']/i.test(scanSource);
+  const antigravityUnrelatedResourceNotFound = antigravity404 &&
+    /\b(?:workspace|project|artifact|file|directory|conversation|session|repository)\b/i.test(scanSource) &&
+    !antigravityExplicitModelNotFound;
+  const antigravityNotFound = antigravity404 && !antigravityUnrelatedResourceNotFound;
+  const entitlementFailure = antigravityNotFound || isModelEntitlementFailure(structured ? scanSource : stderr);
   const authFailure =
     !entitlementFailure &&
     (def.authErrorMarkers.some((marker) => combined.includes(marker)) ||
@@ -3351,8 +3365,19 @@ function toFriendlyError(
     def.unsupportedVersionSignature !== undefined && rawStderr.includes(def.unsupportedVersionSignature.marker)
       ? def.unsupportedVersionSignature.message
       : undefined;
-  const diagnosticText =
-    diagnosticTextOverride ??
+  const diagnosticText = antigravityNotFound
+    ? antigravityExplicitModelNotFound
+      ? `Antigravity CLI could not find configured model "${model ?? "unknown model"}" for this account or CLI version. ` +
+        `The model is unavailable; the enabled backup chain may help. Open AI Models for this stage to choose another model. Provider detail: ${
+          diagnosticTextOverride ?? realDiagnosticContent ?? "NOT_FOUND (404)"
+        }`
+      : `Antigravity CLI returned NOT_FOUND (404) while using configured model "${model ?? "unknown model"}". ` +
+        `The diagnostic does not identify whether the model or another resource was missing, so model availability is uncertain; ` +
+        `the configured model may not be available for this account or CLI version. The enabled backup chain may help. ` +
+        `Open AI Models for this stage to choose another model. Provider detail: ${
+          diagnosticTextOverride ?? realDiagnosticContent ?? "NOT_FOUND (404)"
+        }`
+    : diagnosticTextOverride ??
     `${cliDisplayLabel(def)} CLI failed: ${
       unsupportedVersion ||
       realDiagnosticContent ||
@@ -3367,12 +3392,16 @@ function toFriendlyError(
   const authSuffix = authFailure
     ? ` ${def.loginHintForModel?.(model) ?? def.loginHint}`
     : entitlementFailure
-      ? " Switch this stage's model to one your account has access to, then try again."
+      ? antigravityNotFound
+        ? " Try an enabled backup or change the model in AI Models for this stage."
+        : " Switch this stage's model to one your account has access to, then try again."
       : "";
   return {
     message: `${diagnosticText}${authSuffix}`,
     authFailure,
-    diagnosticText,
+    diagnosticText: antigravityNotFound
+      ? `The configured model may not be available for this account or CLI version. ${diagnosticText}`
+      : diagnosticText,
     retryableHint: structured?.retryable === true,
     quotaSignal: structured?.quotaSignal === true,
     hadNoDiagnosticContent,

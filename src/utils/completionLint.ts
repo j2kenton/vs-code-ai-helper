@@ -26,6 +26,7 @@ import {
 } from "./publishChecksFreshness";
 import {
   composeCheckFailureOutputV1,
+  extractFailingTestsV1,
   truncateKeepingFailingTestIndexV1,
 } from "./failingTestsV1";
 
@@ -145,6 +146,9 @@ export interface CompletionLintResult {
     command: string;
     exitCode: number;
     output: string;
+    /** Extracted before output truncation so failed-first targeting never has
+     * to reconstruct identities from the bounded persisted output. */
+    failingTests?: import("./failingTestsV1").FailingTestSummaryV1;
     retryCount?: number;
     /** Set once, at collection time, when this failure matched a configured
      * known-flaky-check allowlist entry. See {@link QuarantineStampV1} and
@@ -209,9 +213,9 @@ export interface CompletionLintResult {
     /** The resolved cwd checks ran in, or a redacted placeholder if it
      * classifies as a private workflow path (see safeCwdForDisclosure). */
     cwd: string;
-    /** e.g. "npm 10.8.2" — falls back to the bare manager name if a
-     * `--version` lookup fails or times out. */
-    packageManager: string;
+    /** e.g. "npm 10.8.2"; null means version discovery failed and failed-first
+     * compatibility must use the full command plan. */
+    packageManager: string | null;
     /** Sorted env var NAMES present in the process the checks were spawned
      * from. Never values — see the field doc above. */
     envVarNames: string[];
@@ -1112,7 +1116,7 @@ function packageManager(folder: string): string {
 
 /** "npm 10.8.2" (or just the bare name if the `--version` lookup fails or
  * takes too long — this is diagnostic best-effort, never a gate). */
-function describePackageManagerVersion(cwd: string, manager: string): string {
+function describePackageManagerVersion(cwd: string, manager: string): string | null {
   try {
     const resolved = resolveManagerExecutable(cwd, manager);
     const useShell = process.platform === "win32" && /\.(cmd|bat)$/i.test(resolved);
@@ -1122,9 +1126,49 @@ function describePackageManagerVersion(cwd: string, manager: string): string {
       shell: useShell,
       timeout: 5_000,
     }).toString("utf8").trim();
-    return version ? `${manager} ${version}` : manager;
+    return version ? `${manager} ${version}` : null;
   } catch {
-    return manager;
+    return null;
+  }
+}
+
+/** Resolve the manager and version for the current compatibility probe. */
+export function describeCurrentPackageManagerV1(cwd: string): string | null {
+  return describePackageManagerVersion(cwd, packageManager(cwd));
+}
+
+/** Resolve today's complete default Publish command plan using the same
+ * workspace/script discovery rules as collectCompletionLint. Unknown or
+ * unreadable plans are returned as null so they can never authorize reuse. */
+export function resolveCurrentPublishCommandPlanV1(folder: string): string[] | null {
+  try {
+    const configured = getPublishVerificationCommands();
+    if (configured?.length) return [...configured];
+    const manager = packageManager(folder);
+    const scripts = readPackageScripts(folder);
+    const verify = selectVerifyScriptCandidate(scripts, manager);
+    const root = verify
+      ? [verify[0]]
+      : ["lint", "check-types", "test", "build"].flatMap((script) => {
+          if (script !== "check-types" && !scripts?.[script]) return [];
+          return [`${manager} run ${script}`];
+        });
+    const members: string[] = [];
+    if (isMonorepoWorkspace(folder)) {
+      for (const memberFolder of discoverWorkspaceMemberFolders(folder)) {
+        const memberScripts = readPackageScripts(memberFolder);
+        if (!memberScripts) continue;
+        const packageDir = path.relative(folder, memberFolder).replace(/\\/g, "/");
+        for (const script of ["lint", "check-types", "test", "build"] as const) {
+          if (Object.prototype.hasOwnProperty.call(memberScripts, script)) {
+            members.push(`[${packageDir}] ${manager} run ${script}`);
+          }
+        }
+      }
+    }
+    return [...root, ...members];
+  } catch {
+    return null;
   }
 }
 
@@ -1206,6 +1250,12 @@ export interface CollectCompletionLintOptions {
    * inspected to confirm it excludes `verify`/`test`/`build`.
    */
   explicitCommands?: readonly string[];
+  /** Internal commands with an authoritative working directory and display identity. */
+  explicitChecks?: readonly {
+    readonly command: string;
+    readonly executableCommand?: string;
+    readonly cwd: string;
+  }[];
   /**
    * `"fast"` (implementation review rounds, item 4 of the 1.0 plan) runs
    * only `lint` and `check-types` — never `verify`, `test`, or `build`,
@@ -1293,6 +1343,8 @@ export async function collectCompletionLint(
     : (options?.explicitCommands ?? [])
         .map((command) => command.trim())
         .filter((command) => command.length > 0);
+  const explicitChecks = checkSet === "fast" ? [] : (options?.explicitChecks ?? []);
+  const hasExplicitChecks = explicitCommands.length > 0 || explicitChecks.length > 0;
   const guard: { token?: vscode.CancellationToken; timeoutMs?: number } = {
     token: options?.token,
     timeoutMs: options?.timeoutMs ?? getCompletionCheckTimeoutMs(),
@@ -1312,7 +1364,7 @@ export async function collectCompletionLint(
   // completed-looking "N/N".
   const memberCommands: Array<{ packageDir: string; command: string; memberFolder: string; args: string[] }> = [];
   monorepoDetected = isMonorepoWorkspace(folder);
-  if (monorepoDetected && explicitCommands.length === 0) {
+  if (monorepoDetected && !hasExplicitChecks) {
     const memberFolders = discoverWorkspaceMemberFolders(folder);
     const scriptNames = checkSet === "fast"
       ? (["lint", "check-types"] as const)
@@ -1341,7 +1393,7 @@ export async function collectCompletionLint(
   // length is known before `planned` fires below, without altering which
   // commands actually run or how `missingScripts` is computed.
   let runnableChecks: Array<readonly [string, string[]]> = [];
-  if (explicitCommands.length === 0) {
+  if (!hasExplicitChecks) {
     const scripts = readPackageScripts(folder);
     // 1b: a repo's own aggregate `verify` script, when safe, replaces the
     // conventional candidate list outright (see selectVerifyScriptCandidate).
@@ -1381,23 +1433,27 @@ export async function collectCompletionLint(
         });
   }
 
-  const rootCount = explicitCommands.length > 0 ? explicitCommands.length : runnableChecks.length;
+  const rootCount = hasExplicitChecks ? explicitCommands.length + explicitChecks.length : runnableChecks.length;
   // Fires exactly once, before any `started` call — see the option's doc
   // comment: this is the fixed denominator for the whole pass, correct from
   // the first report onward.
   options?.onCheckEvent?.planned?.(rootCount + memberCommands.length);
 
-  if (explicitCommands.length > 0) {
+  if (hasExplicitChecks) {
     // Toolchain resolution order (publish pre-check contract): explicitly
     // configured verification commands win over conventional npm scripts.
+    const checksToRun = [
+      ...explicitCommands.map((command) => ({ command, executableCommand: command, cwd: folder })),
+      ...explicitChecks.map((check) => ({ ...check, executableCommand: check.executableCommand ?? check.command })),
+    ];
     checks = await Promise.all(
-      explicitCommands.map(async (command) => {
+      checksToRun.map(async ({ command, executableCommand, cwd }) => {
         const descriptor: CompletionCheckDescriptor = { command };
         options?.onCheckEvent?.started(descriptor);
         try {
           return {
             command,
-            ...(await runWithRetry((extraEnv) => runExplicitCheck(folder, command, guard, extraEnv), guard.token)),
+            ...(await runWithRetry((extraEnv) => runExplicitCheck(cwd, executableCommand, guard, extraEnv), guard.token)),
           };
         } finally {
           options?.onCheckEvent?.settled(descriptor);
@@ -1442,7 +1498,7 @@ export async function collectCompletionLint(
   // only when a member batch is genuinely about to run — exists purely to
   // mark the moment in time so an observer can render a "starting next
   // batch" hint that is actually true, not to correct any count.
-  if (monorepoDetected && explicitCommands.length === 0 && memberCommands.length > 0) {
+  if (monorepoDetected && !hasExplicitChecks && memberCommands.length > 0) {
     options?.onCheckEvent?.batchBoundary?.();
     const memberResults = await Promise.all(
       memberCommands.map(async ({ packageDir, command, memberFolder, args }) => {
@@ -1559,6 +1615,7 @@ export async function collectCompletionLint(
       return {
         command,
         exitCode: code,
+        failingTests: extractFailingTestsV1(output),
         // Truncated at the PERSIST boundary, not just the display ones. This
         // payload is written into task-progress.json, which is re-read and
         // rewritten on every stage transition, so an untruncated failure makes
@@ -1841,7 +1898,7 @@ function renderVerificationEnvironmentLines(
 ): string[] {
   return [
     `- Resolved cwd: ${env.cwd}`,
-    `- Package manager: ${env.packageManager}`,
+    `- Package manager: ${env.packageManager ?? "version unavailable (failed-first reuse disabled)"}`,
     `- Environment variable names present (values redacted — names only, so a variable that differs between environments can be spotted without ever disclosing what it holds): ${env.envVarNames.map((name) => `\`${name}\``).join(", ")}`,
   ];
 }
@@ -2494,6 +2551,9 @@ export async function collectCompletionLintPreview(
     onCheckEvent?: CollectCompletionLintOptions["onCheckEvent"];
     /** See CollectCompletionLintOptions.checkSet. Defaults to `"full"`. */
     checkSet?: CollectCompletionLintOptions["checkSet"];
+    /** Internal override for an already validated failed-first command plan. */
+    explicitCommands?: readonly string[];
+    explicitChecks?: CollectCompletionLintOptions["explicitChecks"];
     /** Relative location for raw report, defaults to "runs/raw-check-output.log". */
     rawReportLocation?: string;
   }
@@ -2541,7 +2601,8 @@ export async function collectCompletionLintPreview(
     scopeFolder = repicked;
   }
   const result = await collectCompletionLint(scopeFolder, relevantFiles, {
-    explicitCommands: getPublishVerificationCommands(),
+    explicitCommands: options?.explicitCommands ?? (options?.explicitChecks ? [] : getPublishVerificationCommands()),
+    explicitChecks: options?.explicitChecks,
     token: options?.token,
     timeoutMs: options?.timeoutMs,
     onCheckEvent: options?.onCheckEvent,
@@ -2587,19 +2648,48 @@ export function throwIfPublishChecksCancelledV1(token: vscode.CancellationToken 
  * should use `collectCompletionLintPreview` instead (see
  * `checkPublishPreflight` in publishPreflight.ts).
  */
-export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[], options?: { token?: vscode.CancellationToken }): Promise<CompletionLintResult> {
-  const result = await collectCompletionLintPreview(folderUri, relevantFiles, { allowScopePrompt: true, token: options?.token });
+export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: readonly string[], options?: {
+  token?: vscode.CancellationToken;
+  /** Internal failed-first mode: execute only the supplied, already validated commands. */
+  explicitCommands?: readonly string[];
+  explicitChecks?: CollectCompletionLintOptions["explicitChecks"];
+  /** Collect without publishing an intermediate result or report. */
+  persist?: boolean;
+  /** Label a failed-first subset as incomplete and never let it look like a full pass. */
+  incompleteReason?: string;
+  /** Isolate raw diagnostics for failed-first attempts from the source full run. */
+  rawReportLocation?: string;
+}): Promise<CompletionLintResult> {
+  const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
+    allowScopePrompt: true,
+    token: options?.token,
+    explicitCommands: options?.explicitCommands,
+    explicitChecks: options?.explicitChecks,
+    rawReportLocation: options?.rawReportLocation,
+  });
+  if (options?.incompleteReason) {
+    result.passed = false;
+    result.passedModuloKnownFlakes = false;
+    result.summary = `${options.incompleteReason} ${result.summary}`;
+  }
   // v1 fixes 2, item 29: a cancelled run's child processes were killed by the
   // run guards, and their output is an incomplete "[check cancelled]" record —
   // never persist it as this task's lint result or Completion Checks report.
   throwIfPublishChecksCancelledV1(options?.token);
+  if (options?.persist === false) return result;
+  await persistCompletionLintResultV1(folderUri, result);
+  return result;
+}
+
+/** Persist an already collected Publish result, including an explicitly partial failed-first result. */
+export async function persistCompletionLintResultV1(folderUri: vscode.Uri, result: CompletionLintResult): Promise<void> {
   const persisted = await patchTaskProgressStrictV1(folderUri, (current) => updateLintPayload(current, {
     runAt: result.runAt,
     passed: result.passed,
     passedModuloKnownFlakes: result.passedModuloKnownFlakes,
     summary: result.summary,
     issueCount: result.issueCount,
-    failedChecks: result.failedChecks,
+    failedChecks: result.failedChecks.map(({ failingTests: _failingTests, ...failure }) => failure),
     source: "publish",
   }));
   if (!persisted) {
@@ -2610,5 +2700,4 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   // publish-review.md's checks section current here rather than at each of
   // the eight call sites individually.
   await upsertCompletionChecksReportV1(folderUri, result);
-  return result;
 }

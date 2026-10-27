@@ -6,8 +6,12 @@
  */
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
+import * as vscode from "vscode";
 
 import { buildStalledTaskEscalationDecisionV1 } from "../commands/scheduleTaskResume";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import type { RoundLedgerEntryV1, RoundLedgerStateV1, TaskProgress } from "../types/taskProgress";
 import {
   describeStalledActiveTaskEscalationV1,
@@ -92,7 +96,7 @@ void describe("stalled card readings (RC1 item 9)", () => {
     }
   });
 
-  void it("puts both readings and the next action on the posted card", () => {
+  void it("puts both readings and the next action on one updateable posted card", async () => {
     const target = {
       canonicalId: "task-id",
       taskFolderPath: "/tmp/task",
@@ -100,6 +104,16 @@ void describe("stalled card readings (RC1 item 9)", () => {
       taskName: "Task A",
     };
     const plan = { kind: "run-review" as const, label: "Resume and run the review again (Copilot)" };
+    const backing = new Map<string, unknown>();
+    const memento = {
+      keys: () => [...backing.keys()],
+      get: <T>(key: string, fallback?: T): T | undefined => backing.has(key) ? backing.get(key) as T : fallback,
+      update: (key: string, value: unknown): Thenable<void> => {
+        if (value === undefined) backing.delete(key); else backing.set(key, value);
+        return Promise.resolve();
+      },
+    } as vscode.Memento;
+    __extensionContextV1TestOnly.set({ subscriptions: [], workspaceState: memento, globalState: memento } as unknown as vscode.ExtensionContext);
 
     const finished = buildStalledTaskEscalationDecisionV1(
       false,
@@ -109,6 +123,14 @@ void describe("stalled card readings (RC1 item 9)", () => {
     );
     assert.match(finished.whatHappened, /finished \(score 9\/10, 0 blockers\)/);
     assert.match(finished.whatHappened, /The obvious next step: Resume and run the review again \(Copilot\)/);
+    assert.deepEqual(finished.options.map((option) => option.optionId), ["resumeAndRerun", "handleMyself"]);
+    assert.equal(finished.recommendation.kind === "option" ? finished.recommendation.optionId : undefined, "resumeAndRerun");
+    assert.deepEqual(finished.options[0]?.effect, {
+      kind: "command",
+      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+      args: [{ taskFolderPath: "/tmp/task" }],
+    });
+    assert.deepEqual(finished.options[1]?.effect, { kind: "doNothing" });
 
     const lost = buildStalledTaskEscalationDecisionV1(
       false,
@@ -118,8 +140,6 @@ void describe("stalled card readings (RC1 item 9)", () => {
     );
     assert.match(lost.whatHappened, /2 consecutive rounds/);
 
-    // A blocked plan has no runnable next action to name; the precondition is
-    // already on the card, so no "obvious next step" sentence is added.
     const blocked = buildStalledTaskEscalationDecisionV1(
       false,
       target,
@@ -127,6 +147,16 @@ void describe("stalled card readings (RC1 item 9)", () => {
       progressWith([row(1, "failed")])
     );
     assert.doesNotMatch(blocked.whatHappened, /obvious next step/);
+    try {
+      await postWorkflowDecisionV1(finished, target);
+      await postWorkflowDecisionV1(lost, target);
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending("task-id")
+        .filter((decision) => decision.decisionKey === "watchdogStalledEscalation");
+      assert.equal(decisions.length, 1, "the later terminal watchdog report updates the existing card");
+      assert.match(decisions[0]?.whatHappened ?? "", /2 consecutive rounds/);
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
   });
 
   void it("persists a different pause reason for a finished round than for lost rounds", () => {

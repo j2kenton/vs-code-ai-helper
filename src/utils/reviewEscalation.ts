@@ -1155,7 +1155,7 @@ export async function postEnvironmentalAdvanceNoticeV1(
   // count is therefore always read as 0, exactly like the plateau branch.
   const planItemsOpen = isPlanReviewStage(stage)
     ? 0
-    : ((await readDisplayPlanChecklistProgressV1(folderUri))?.counts.remaining ?? 0);
+    : ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0);
   // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: quote every
   // non-fixable blocker verbatim, not just the first with "(and N more of
   // the same kind)" — a summarized count is not the "command, file,
@@ -2207,7 +2207,7 @@ export async function escalateReviewToHuman(
     // function is a best-effort notification path that must never fail the
     // review round that triggered it.
     const genericPlanItemsOpen = !isPlanReviewStage(stage)
-      ? ((await readDisplayPlanChecklistProgressV1(folderUri))?.counts.remaining ?? 0)
+      ? ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0)
       : 0;
     const genericDecisionInput = buildEscalationDecisionV1(
       kind,

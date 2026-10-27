@@ -134,6 +134,13 @@ export type PostWorkflowDecisionResultV1 =
        * earlier resolved record).
        */
       readonly suppressed?: true;
+      /**
+       * Set when an already-pending decision with the same key and task was
+       * refreshed in place (same `decisionId`) instead of a new one being
+       * appended — lets a caller that re-posts a standing condition skip the
+       * chat anchor and notification it only needs the first time.
+       */
+      readonly updatedInPlace?: true;
     }
   | { readonly ok: false; readonly reason: string };
 
@@ -288,7 +295,7 @@ export class WorkflowDecisionStoreV1 {
         };
       }
       await this.saveAll(next);
-      return { ok: true, decision: updated };
+      return { ok: true, decision: updated, updatedInPlace: true };
     }
     if (input.suppressWhileAnswered !== undefined && created.decision.identity !== undefined) {
       const lastSettled = [...existing]

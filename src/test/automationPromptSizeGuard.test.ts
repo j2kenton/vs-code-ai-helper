@@ -124,16 +124,33 @@ void describe("prompt-size confirmation under automation", () => {
         { folderPath: taskFolderPath }
       )));
       assert.equal(result, "declined");
-      const decision = new WorkflowDecisionStoreV1(memento).listPending().find((item) =>
+      await withFsBridge(() => runAsAutomationDispatchV1(() => checkAndConfirmPromptSize(
+        bigPrompt,
+        "Claude",
+        0,
+        { folderPath: taskFolderPath }
+      )));
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending(taskFolderPath).filter((item) =>
         item.decisionKey === "chatActionOffer:openSettings"
       );
+      assert.equal(decisions.length, 1, "repeated hand-backs update one stable decision");
+      const decision = decisions[0];
       assert.ok(decision, "the stop and remedy are posted in task chat");
       assert.match(decision.whatHappened, /large prompts need a confirmation/);
+      assert.deepEqual(decision.options.map((item) => item.label), [
+        "Open Ensemble Settings", "Open task.md to shorten the prompt", "Not now",
+      ]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
       assert.equal(decision.options.find((item) => item.optionId === "runAction")?.label, "Open Ensemble Settings");
       assert.deepEqual(decision.options.find((item) => item.optionId === "runAction")?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.openSettings",
         args: [],
+      });
+      assert.deepEqual(decision.options[1]?.effect, {
+        kind: "command",
+        command: "vscode.open",
+        args: [vscode.Uri.file(path.join(taskFolderPath, "task.md"))],
       });
     } finally {
       __extensionContextV1TestOnly.reset();
@@ -174,17 +191,31 @@ void describe("prompt-size confirmation under automation", () => {
         "x".repeat(PROMPT_TOTAL_MAX_BYTES + 1), "Codex", 0, { folderPath: taskFolderPath }
       )));
       assert.equal(result, "abort", "the hard limit remains in force");
-      const decision = new WorkflowDecisionStoreV1(memento).listPending().find((item) =>
+      await withFsBridge(() => runAsAutomationDispatchV1(() => checkAndConfirmPromptSize(
+        "x".repeat(PROMPT_TOTAL_MAX_BYTES + 1), "Codex", 0, { folderPath: taskFolderPath }
+      )));
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending(taskFolderPath).filter((item) =>
         item.decisionKey === "chatActionOffer:vscode.open"
       );
+      assert.equal(decisions.length, 1, "repeated hand-backs update one stable decision");
+      const decision = decisions[0];
       assert.ok(decision, "automation explains the hard stop and offers a useful next action");
       assert.match(decision.whatHappened, /hard limit/);
       assert.match(decision.whatHappened, /close large editors/);
+      assert.deepEqual(decision.options.map((item) => item.label), [
+        "Open task.md to shorten the prompt", "Close all editors", "Not now",
+      ]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
       assert.equal(decision.options.find((item) => item.optionId === "runAction")?.label, "Open task.md to shorten the prompt");
       assert.deepEqual(decision.options.find((item) => item.optionId === "runAction")?.effect, {
         kind: "command",
         command: "vscode.open",
         args: [vscode.Uri.file(path.join(taskFolderPath, "task.md"))],
+      });
+      assert.deepEqual(decision.options[1]?.effect, {
+        kind: "command",
+        command: "workbench.action.closeAllEditors",
+        args: [],
       });
     } finally {
       __extensionContextV1TestOnly.reset();

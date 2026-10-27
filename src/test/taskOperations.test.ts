@@ -1,6 +1,11 @@
 import * as assert from "node:assert/strict";
 import { describe, it, beforeEach } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import * as vscode from "vscode";
+import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import { taskKey, TaskOperationRegistry, runTrackedOperation } from "../utils/taskOperations";
 
 void describe("taskOperations", () => {
@@ -11,6 +16,22 @@ void describe("taskOperations", () => {
   });
 
   void describe("Windows key normalization", () => {
+    void it("uses distinct operation identities across registry activations", () => {
+      const firstRegistry = new TaskOperationRegistry();
+      const secondRegistry = new TaskOperationRegistry();
+      const first = firstRegistry.begin("/dev/task_identity", { label: "Interrupted round" });
+      const second = secondRegistry.begin("/dev/task_identity", { label: "Round after restart" });
+      assert.ok(first);
+      assert.ok(second);
+      assert.notEqual(first.id, second.id);
+      assert.match(first.id, /^op-[0-9a-f-]{36}-1$/);
+      assert.match(second.id, /^op-[0-9a-f-]{36}-1$/);
+      firstRegistry.end(first);
+      secondRegistry.end(second);
+      firstRegistry.dispose();
+      secondRegistry.dispose();
+    });
+
     void it("normalizes Windows paths to be case-insensitive", () => {
       const path1 = "C:\\Dev\\Plans\\Task_1";
       const path2 = "c:\\dev\\plans\\task_1";
@@ -37,6 +58,55 @@ void describe("taskOperations", () => {
 
       registry.end(op);
       assert.strictEqual(registry.getTaskOperations(path2).length, 0);
+    });
+  });
+
+  void describe("cancellation source and explicit cancelled outcome (bugs2 findings 5/6)", () => {
+    void it("records who cancelled the operation and cascades the source to running children", () => {
+      const task = "/dev/task_cancel_source";
+      const parent = registry.begin(task, { label: "Fast Forward", exclusive: true, cancellable: true });
+      assert.ok(parent);
+      const child = registry.begin(task, { label: "Publish Checks", cancellable: true, parent });
+      assert.ok(child);
+      assert.strictEqual(parent.cancelSource?.(), undefined);
+
+      assert.strictEqual(registry.cancelOperation(parent.id, "notifications"), true);
+      assert.strictEqual(parent.cancelSource?.(), "notifications");
+      assert.strictEqual(child.cancelSource?.(), "notifications");
+      assert.strictEqual(child.token?.isCancellationRequested, true);
+      registry.end(child);
+      registry.end(parent);
+    });
+
+    void it("defaults an unspecified cancel to an unknown source and keeps the first requester", () => {
+      const task = "/dev/task_cancel_unknown";
+      const op = registry.begin(task, { label: "Run Review", exclusive: true, cancellable: true });
+      assert.ok(op);
+      registry.cancelOperation(op.id);
+      assert.strictEqual(op.cancelSource?.(), "unknown");
+      registry.cancelOperation(op.id, "viewer");
+      assert.strictEqual(op.cancelSource?.(), "unknown", "the first cancellation request is the one that stopped it");
+      registry.end(op);
+    });
+
+    void it("settleAs('cancelled', reason) wins over the normal-return default and is stated on the snapshot", () => {
+      const task = "/dev/task_settle_cancelled";
+      const ended: Array<{ state: string; cancelReasonV1?: string }> = [];
+      const sub = (registry as unknown as { _onDidEnd: { event: (l: (s: never) => void) => { dispose(): void } } })._onDidEnd.event(
+        (snap) => ended.push(snap as unknown as { state: string; cancelReasonV1?: string })
+      );
+      const handle = registry.begin(task, { label: "Fast Forward", exclusive: true });
+      assert.ok(handle);
+      handle.settleAs("cancelled", "Publish Checks was cancelled from a viewer");
+      assert.deepStrictEqual(registry.getExplicitOutcome(handle), {
+        state: "cancelled",
+        reason: "Publish Checks was cancelled from a viewer",
+      });
+      registry.end(handle, "cancelled");
+      assert.strictEqual(ended.length, 1);
+      assert.strictEqual(ended[0]?.state, "cancelled");
+      assert.strictEqual(ended[0]?.cancelReasonV1, "Publish Checks was cancelled from a viewer");
+      sub.dispose();
     });
   });
 
@@ -227,6 +297,92 @@ void describe("taskOperations", () => {
   // `runTrackedOperation` (the global singleton registry), not the local
   // `registry` instance the rest of this file exercises directly.
   void describe("runTrackedOperation onSettled observer (item 16, Part 4 Step 10)", () => {
+    void it("captures and persists Git state around a provider-round operation", async () => {
+      initNotificationRouter({ addEntry: () => undefined });
+      const task = fs.mkdtempSync(path.join(os.tmpdir(), "tracked-round-git-state-"));
+      const git = (...args: string[]): void => { execFileSync("git", args, { cwd: task, stdio: "ignore" }); };
+      try {
+        git("init", "-q");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Round Test");
+        fs.writeFileSync(path.join(task, "tracked.txt"), "base\n");
+        fs.writeFileSync(path.join(task, "stash.txt"), "stash base\n");
+        git("add", "tracked.txt", "stash.txt");
+        git("commit", "-qm", "base");
+        fs.writeFileSync(path.join(task, "stash.txt"), "stash candidate\n");
+        let operationId = "";
+        await runTrackedOperation(task, { label: "Review", kind: "review" }, (op) => {
+          operationId = op.id;
+          fs.writeFileSync(path.join(task, "tracked.txt"), "changed\n");
+          git("add", "tracked.txt");
+          git("stash", "push", "-m", "round stash interference", "--", "stash.txt");
+          return Promise.resolve(true);
+        });
+        const recordValue = JSON.parse(fs.readFileSync(path.join(task, "round-git-state-v1", `${operationId}.json`), "utf8")) as unknown;
+        assert.ok(recordValue && typeof recordValue === "object");
+        const record = recordValue as Record<string, unknown>;
+        assert.equal(record["operationId"], operationId);
+        assert.deepEqual((record["delta"] as Record<string, unknown>)["changedIndexEntries"], ["tracked.txt"]);
+        let secondRoundStarted = false;
+        const blocked = await runTrackedOperation(task, { label: "Next Review", kind: "review" }, () => {
+          secondRoundStarted = true;
+          return Promise.resolve(true);
+        });
+        assert.equal(blocked, undefined);
+        assert.equal(secondRoundStarted, false, "a later round must not enter its callback while stash handling is pending");
+      } finally {
+        fs.rmSync(task, { recursive: true, force: true });
+        deactivateNotificationRouter();
+      }
+    });
+
+    void it("a busy-refused round cannot finalize the live round's before snapshot", async () => {
+      initNotificationRouter({ addEntry: () => undefined });
+      const task = fs.mkdtempSync(path.join(os.tmpdir(), "tracked-round-git-live-"));
+      const git = (...args: string[]): void => { execFileSync("git", args, { cwd: task, stdio: "ignore" }); };
+      let releaseRound!: () => void;
+      let signalStarted!: () => void;
+      const roundStarted = new Promise<void>((resolve) => { signalStarted = resolve; });
+      const waitForRelease = new Promise<void>((resolve) => { releaseRound = resolve; });
+      try {
+        git("init", "-q");
+        git("config", "user.email", "test@example.invalid");
+        git("config", "user.name", "Round Test");
+        fs.writeFileSync(path.join(task, "tracked.txt"), "base\n");
+        git("add", "tracked.txt");
+        git("commit", "-qm", "base");
+        let operationId = "";
+        const firstRound = runTrackedOperation(task, { label: "Review", kind: "review" }, async (op) => {
+          operationId = op.id;
+          signalStarted();
+          await waitForRelease;
+          fs.writeFileSync(path.join(task, "tracked.txt"), "changed by first round\n");
+          git("add", "tracked.txt");
+          return true;
+        });
+        await roundStarted;
+        const evidencePath = path.join(task, "round-git-state-v1", `${operationId}.json`);
+        const beforeBusyRequest = JSON.parse(fs.readFileSync(evidencePath, "utf8")) as Record<string, unknown>;
+        assert.ok(beforeBusyRequest["before"]);
+        assert.equal(beforeBusyRequest["after"], undefined);
+
+        const refused = await runTrackedOperation(task, { label: "Concurrent Review", kind: "review" }, () => Promise.resolve(true));
+        assert.equal(refused, undefined, "the task admission registry refuses the second operation");
+        const afterBusyRequest = JSON.parse(fs.readFileSync(evidencePath, "utf8")) as Record<string, unknown>;
+        assert.equal(afterBusyRequest["after"], undefined, "busy refusal must leave live evidence pending");
+
+        releaseRound();
+        assert.equal(await firstRound, true);
+        const terminal = JSON.parse(fs.readFileSync(evidencePath, "utf8")) as Record<string, unknown>;
+        assert.ok(terminal["after"]);
+        assert.deepEqual((terminal["delta"] as Record<string, unknown>)["changedIndexEntries"], ["tracked.txt"]);
+      } finally {
+        releaseRound();
+        fs.rmSync(task, { recursive: true, force: true });
+        deactivateNotificationRouter();
+      }
+    });
+
     void it("reports the explicit settleAs state and reason before end() removes the row", async () => {
       const seen: { state?: string; reason?: string } = {};
       const result = await runTrackedOperation(

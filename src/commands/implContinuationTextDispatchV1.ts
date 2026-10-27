@@ -126,6 +126,19 @@ export interface SummaryOnlyContinuationOptionsV1 {
   readonly onProgress: (message: string) => void;
   /** The task's display name, for notification labels. */
   readonly taskDisplayName?: string;
+  /** Pin a report correction to the original candidate. Ordinary recovery
+   * continuations retain the configured backup chain. */
+  readonly restrictToPrimaryModel?: boolean;
+  /** Observe and persist the exact provider candidate immediately before it
+   * is invoked. Backup selection remains owned by the coordinator. */
+  readonly onCandidateInvokedV1?: (info: {
+    readonly storedModelId: string;
+    readonly providerLabel: string;
+    readonly runnerId: string;
+    readonly operationId?: string;
+    readonly attemptId: string;
+    readonly backup: boolean;
+  }) => void | Promise<void>;
 }
 
 /**
@@ -209,6 +222,7 @@ export async function runSummaryOnlyContinuationV1(
     // place of a summary-only-capable primary. See the option's own doc
     // comment.
     requireSummaryOnlyCapableText: true,
+    ...(options.restrictToPrimaryModel === true ? { restrictToPrimaryModel: true } : {}),
   });
   const validatedInput: ImplContinuationReportActionInputV1 = {
     prompt: options.prompt,
@@ -222,6 +236,7 @@ export async function runSummaryOnlyContinuationV1(
     taskStage: options.taskStage,
     rawInput: validatedInput as unknown as Record<string, unknown>,
     cancellationToken: options.token,
+    onCandidateInvokedV1: options.onCandidateInvokedV1,
   });
 
   // Delta AFTER the provider ran, filtered to exclude the task folder's own
@@ -340,6 +355,72 @@ export function buildSealedEditReportPromptV1(
   );
 }
 
+/** Build the single bounded correction request for an implementation report. */
+export function buildImplementationReportCorrectionPromptV1(options: {
+  readonly planPath: string;
+  readonly planOfRecord: string;
+  readonly originalReport: string;
+  readonly changedPaths: readonly string[];
+  readonly changedPathsUnknown?: boolean;
+}): string {
+  return [
+    "## Report correction only — no project edits or test execution",
+    "",
+    "The preceding implementation round has already ended. Return only its corrected final report; do not edit files, run commands, or claim checks that are not evidenced in the original report below.",
+    "Use the plan of record and its exact existing checklist items. Include the required `## Files Changed`, `## Verification`, and `## Plan Item Checklist` sections. Report only work and tests evidenced by the original report and observed changed-file set. If a fact is unknown, say so plainly. Do not invent checklist items or replace the plan's item set.",
+    "",
+    `Canonical plan of record: ${options.planPath}`,
+    "",
+    "Plan of record:",
+    options.planOfRecord,
+    "",
+    "Observed files changed by the original round:",
+    ...(options.changedPathsUnknown
+      ? ["- unknown: the round's change set could not be enumerated"]
+      : options.changedPaths.length
+        ? options.changedPaths.map((file) => `- ${file}`)
+        : ["- none recorded"]),
+    "",
+    "Original final report (the only source for reported tests and results):",
+    options.originalReport,
+  ].join("\n");
+}
+
+/** A correction may reorganize test evidence but cannot create new execution claims. */
+export function isImplementationReportCorrectionEvidenceGroundedV1(
+  originalReport: string,
+  correctedReport: string
+): boolean {
+  const verification = (text: string): string => {
+    const match = /^#{1,6}\s+Verification\s*\r?\n([\s\S]*?)(?=^#{1,6}\s+|(?![\s\S]))/im.exec(text);
+    return match?.[1] ?? "";
+  };
+  const evidenceRecords = (text: string, verificationOnly: boolean): Set<string> => {
+    const records = new Set<string>();
+    for (const line of (verificationOnly ? verification(text) : text).split(/\r?\n/)) {
+      const command = /`([^`]+)`/.exec(line)?.[1]?.trim().replace(/\s+/g, " ").toLowerCase();
+      const passed = /\b(\d+)\s+passed\b/i.exec(line)?.[1];
+      const failed = /\b(\d+)\s+failed\b/i.exec(line)?.[1];
+      if (command && passed !== undefined && failed !== undefined) {
+        records.add(`${command}\u0000${passed}\u0000${failed}`);
+      }
+    }
+    return records;
+  };
+  const originalRecords = evidenceRecords(originalReport, false);
+  for (const line of verification(correctedReport).split(/\r?\n/)) {
+    // Any line asserting test counts must preserve a complete, associated
+    // command/result record from the original Verification section.
+    if (!/\b\d+\s+(?:passed|failed)\b/i.test(line)) continue;
+    const command = /`([^`]+)`/.exec(line)?.[1]?.trim().replace(/\s+/g, " ").toLowerCase();
+    const passed = /\b(\d+)\s+passed\b/i.exec(line)?.[1];
+    const failed = /\b(\d+)\s+failed\b/i.exec(line)?.[1];
+    if (!command || passed === undefined || failed === undefined ||
+        !originalRecords.has(`${command}\u0000${passed}\u0000${failed}`)) return false;
+  }
+  return true;
+}
+
 export interface SealedEditReportOptionsV1 {
   readonly taskFolderUri: vscode.Uri;
   readonly workspaceUri: vscode.Uri;
@@ -353,6 +434,7 @@ export interface SealedEditReportOptionsV1 {
   readonly onProgress: (message: string) => void;
   /** The task's display name, for notification labels. */
   readonly taskDisplayName?: string;
+  readonly onCandidateInvokedV1?: SummaryOnlyContinuationOptionsV1["onCandidateInvokedV1"];
 }
 
 /**
@@ -384,5 +466,6 @@ export async function runSealedEditContinuationReportV1(
     token: options.token,
     onProgress: options.onProgress,
     taskDisplayName: options.taskDisplayName,
+    onCandidateInvokedV1: options.onCandidateInvokedV1,
   });
 }

@@ -381,8 +381,48 @@ void describe("chatInteractionTransactionStoreV1", () => {
     );
     assert.equal(differentAnswers.kind, "rejected");
 
+    // bugs2 finding 1: the same canonical answers under a fresh id (a second
+    // click, a reload, a retry after a refused Resume) are a harmless duplicate
+    // against the RECORDED identity, never a "different idempotency record".
     const differentId = await store.submitAnswers(operationId, VALID_ANSWERS, allocateHex128IdV1());
-    assert.equal(differentId.kind, "rejected");
+    expectOk(differentId);
+    assert.equal(differentId.duplicate, true);
+    assert.equal(differentId.transaction.answerIdempotencyId, answerIdempotencyId);
+
+    const differentAnswersNewId = await store.submitAnswers(
+      operationId,
+      [
+        { questionId: "scope", kind: "singleChoice", state: "answered", selectedOptionId: "task" },
+        { questionId: "notes", kind: "text", state: "skipped" },
+      ],
+      allocateHex128IdV1()
+    );
+    assert.equal(differentAnswersNewId.kind, "rejected");
+    assert.doesNotMatch(
+      (differentAnswersNewId as { reason: string }).reason,
+      /different idempotency record/
+    );
+  });
+
+  void it("keeps a stored answer resumable: resubmitting it after a refused Resume is accepted, then Resume schedules once", async () => {
+    const input = beginInput();
+    const operationId = input.correlation.operationId;
+    expectOk(await store.begin(input));
+    expectOk(await store.submitAnswers(operationId, VALID_ANSWERS, allocateHex128IdV1()));
+    // The first Resume never reached scheduleResume (paused task, busy runner):
+    // the record stays answersSubmitted with the answer stored.
+    const stuck = await store.load(operationId);
+    expectOk(stuck);
+    assert.equal(stuck.transaction.state, "answersSubmitted");
+
+    const again = await store.submitAnswers(operationId, VALID_ANSWERS, allocateHex128IdV1());
+    expectOk(again);
+    assert.equal(again.duplicate, true);
+    assert.equal(again.transaction.state, "answersSubmitted");
+
+    const scheduled = await store.scheduleResume(operationId, allocateHex128IdV1());
+    expectOk(scheduled);
+    assert.equal(scheduled.transaction.state, "resumeScheduled");
   });
 
   void it("validates answers against the stored question set before writing through", async () => {

@@ -6,6 +6,7 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
   offerCompleteStageAndMoveOnInChatV1,
+  offerCompletedImplementationReviewInChatV1,
   routeAutomaticReviewAfterAdvanceV1,
   routeAutomaticPublishReviewAfterFreshnessV1,
   warnHandOverNotStartedV1,
@@ -52,6 +53,41 @@ function makeTask(): string {
 }
 
 void describe("automatic review advancement hand-back", () => {
+  void it("posts the completed Implementation review action with the actual optional decision", async () => {
+    const dir = makeTask();
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    initNotificationRouter({ addEntry: () => undefined });
+    const fsBridge = vscode.workspace.fs as unknown as { readFile: (uri: vscode.Uri) => Promise<Uint8Array> };
+    const previousReadFile = fsBridge.readFile;
+    fsBridge.readFile = (uri): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath).then((b) => new Uint8Array(b));
+    try {
+      await offerCompletedImplementationReviewInChatV1(vscode.Uri.file(dir), "task");
+      await offerCompletedImplementationReviewInChatV1(vscode.Uri.file(dir), "task");
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending(dir)
+        .filter((item) => item.decisionKey === "chatActionOffer:runReviewWithAI");
+      assert.equal(decisions.length, 1, "repeated completion hand-backs update the existing decision");
+      const decision = decisions[0];
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /Implementation finished and no review was started automatically/);
+      assert.deepEqual(decision.options.map((option) => option.label), ["Run Review", "Not now"]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(decision.options[0]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.runReviewWithAI",
+        args: [{ taskFolderPath: dir }],
+      });
+    } finally {
+      fsBridge.readFile = previousReadFile;
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("posts the stage action to task chat when an automatic hand-over is declined", async () => {
     const dir = makeTask();
     const memento = makeMemento();
@@ -68,6 +104,12 @@ void describe("automatic review advancement hand-back", () => {
     fsBridge.readFile = (uri): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath).then((b) => new Uint8Array(b));
     try {
       await warnHandOverNotStartedV1(vscode.Uri.file(dir), "task", "impl", "declined", "implementation");
+      await warnHandOverNotStartedV1(vscode.Uri.file(dir), "task", "impl", "declined", "implementation");
+      await offerCompleteStageAndMoveOnInChatV1(
+        vscode.Uri.file(dir),
+        "The automatic stage advance stopped because the plan is missing.",
+        "task"
+      );
       await offerCompleteStageAndMoveOnInChatV1(
         vscode.Uri.file(dir),
         "The automatic stage advance stopped because the plan is missing.",
@@ -76,17 +118,31 @@ void describe("automatic review advancement hand-back", () => {
       const decisions = new WorkflowDecisionStoreV1(memento).listPending().filter((item) => item.decisionKey.startsWith("chatActionOffer:"));
       const decision = decisions.find((item) => item.options.some((option) => option.label === "Run Implementation"));
       assert.ok(decision, "the hand-back decision is present in task chat");
+      assert.equal(
+        decisions.filter((item) => item.options.some((option) => option.label === "Run Implementation")).length,
+        1,
+        "a repeated terminal hand-back updates one stable decision"
+      );
+      assert.match(decision.whatHappened, /auto-advance reached Implementation, but its Implementation round did not start because the queued command returned without starting a round but did not provide its refusal reason/);
+      assert.deepEqual(decision.options.map((option) => option.label), ["Run Implementation", "Not now"]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
       assert.equal(decision.options.find((option) => option.optionId === "runAction")?.label, "Run Implementation");
       assert.deepEqual(
         decision.options.find((option) => option.optionId === "runAction")?.effect,
         { kind: "command", command: "vs-code-ai-helper.runImplementationWithAI", args: [{ taskFolderPath: dir }] }
       );
-      const advanceDecision = decisions.find((item) => item.options.some((option) => option.label === "Complete Stage & Move On"));
+      const advanceDecisions = decisions.filter((item) => item.options.some((option) => option.label === "Complete Stage & Move On"));
+      assert.equal(advanceDecisions.length, 1, "repeated transition failures update one recovery card");
+      const advanceDecision = advanceDecisions[0];
       assert.ok(advanceDecision, "the automatic advance hand-back is also posted in task chat");
+      assert.match(advanceDecision.whatHappened, /The automatic stage advance stopped because the plan is missing/);
+      assert.deepEqual(advanceDecision.options.map((option) => option.label), ["Complete Stage & Move On", "Not now"]);
+      assert.equal(advanceDecision.recommendation.kind === "option" ? advanceDecision.recommendation.optionId : undefined, "runAction");
       assert.deepEqual(
-        advanceDecision.options.find((option) => option.optionId === "runAction")?.effect,
+        advanceDecision.options[0]?.effect,
         { kind: "command", command: "vs-code-ai-helper.nextStage", args: [{ taskFolderPath: dir }] }
       );
+      assert.deepEqual(advanceDecision.options[1]?.effect, { kind: "doNothing" });
     } finally {
       fsBridge.readFile = previousReadFile;
       deactivateNotificationRouter();
@@ -154,7 +210,7 @@ void describe("automatic review advancement hand-back", () => {
     initNotificationRouter({ addEntry: () => undefined });
     try {
       let freshnessRead = false;
-      assert.equal(await routeAutomaticReviewAfterAdvanceV1({
+      const route = {
         folderUri: vscode.Uri.file(dir),
         nextStage: "publish",
         transitionShouldAutoReview: true,
@@ -163,13 +219,19 @@ void describe("automatic review advancement hand-back", () => {
           freshnessRead = true;
           return Promise.resolve("staleCommit" as const);
         },
-      }), true);
+      } as const;
+      assert.equal(await routeAutomaticReviewAfterAdvanceV1(route), true);
+      assert.equal(await routeAutomaticReviewAfterAdvanceV1(route), true);
       assert.equal(freshnessRead, true, "the automatic advance branch checks Publish freshness");
-      const decision = new WorkflowDecisionStoreV1(memento).listPending().find((item) =>
+      const matching = new WorkflowDecisionStoreV1(memento).listPending().filter((item) =>
         item.decisionKey === "chatActionOffer:runPublishChecks"
       );
+      assert.equal(matching.length, 1, "repeated stale-review hand-backs update one chat decision");
+      const decision = matching[0];
       assert.ok(decision);
       assert.match(decision.whatHappened, /Run Publish Checks, then Review/);
+      assert.deepEqual(decision.options.map((option) => option.label), ["Run Publish Checks", "Not now"]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
       assert.equal(decision.options.find((option) => option.optionId === "runAction")?.label, "Run Publish Checks");
       assert.deepEqual(
         decision.options.find((option) => option.optionId === "runAction")?.effect,

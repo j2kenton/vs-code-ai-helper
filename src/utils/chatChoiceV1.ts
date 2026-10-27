@@ -33,6 +33,8 @@ export interface ChatChoiceInputV1 {
   readonly detail?: string;
   /** Optional evidence lines shown above the options. */
   readonly evidence?: readonly { readonly label: string; readonly detail: string }[];
+  /** Cancelling the owning operation dismisses this pending choice. */
+  readonly token?: import("vscode").CancellationToken;
 }
 
 /**
@@ -76,6 +78,7 @@ export async function askChatChoiceV1(input: ChatChoiceInputV1): Promise<string 
         detail: input.detail ?? "Answering continues the command that asked.",
       },
     },
-    input.target
+    input.target,
+    input.token
   );
 }

@@ -28,6 +28,7 @@ import * as assert from "node:assert/strict";
 import * as nodeFs from "node:fs";
 import * as nodeOs from "node:os";
 import * as nodePath from "node:path";
+import { createHash } from "node:crypto";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
@@ -50,7 +51,9 @@ import {
 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
+import { taskOperations } from "../utils/taskOperations";
 import { TaskProgress } from "../types/taskProgress";
+import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import {
   StatusSurface,
   deactivateNotificationRouter,
@@ -523,14 +526,13 @@ void describe("reconcilePlanChecklist — confirmation", () => {
       result.captured.filter((m) => m.method === "info").pop()?.message ?? "",
       /completeness now gates advancement again/
     );
-    // Part 3, Step 5: clearing the latch succeeds, so it also tries the
-    // stage's next action again.
-    // RC3 item 4, Step 3: no Fast Forward run was active, so no provenance
-    // is forwarded.
-    assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
-      taskFolderPath: result.folder,
-      resumeFastForwardV1: undefined,
-    });
+    // Step 9: clearing the latch is an idle action that does not resume or dispatch
+    // another action (continuation is a separate option).
+    assert.equal(
+      resumeAndApplyCurrentStageActionCalls.length,
+      0,
+      "reconcile confirmation must not dispatch resumeAndApplyCurrentStageAction"
+    );
   });
 });
 
@@ -605,6 +607,113 @@ void describe("applyReconciliationReviewVerifiedTicksV1 / applyReconciliationRev
         true,
         "applying candidate ticks must not by itself clear checklistProgressUnreliable"
       );
+    } finally {
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("withholds a test-dependent reconciliation claim without an applicable editing-round report", async () => {
+    const item = "Add regression cases in dispatch.test.ts";
+    const plan = `<!-- ensemble:implementation-checklist -->\n\n- [ ] ${item}\n`;
+    const { folder } = makeTask("apply-recon-test-evidence-missing", { latched: true, plan });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      `<!-- verified-complete:start -->\n- ${item}\n<!-- verified-complete:end -->\n`,
+      "utf8"
+    );
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    try {
+      const result = await applyReconciliationReviewVerifiedTicksV1(vscode.Uri.file(folder));
+      assert.deepEqual(result, { kind: "noCandidates" });
+      assert.match(nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8"), /- \[ \] Add regression cases/);
+    } finally {
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("accepts a passing editing-round report during reconciliation without review-time execution", async () => {
+    const item = "Add regression cases in dispatch.test.ts";
+    const plan = `<!-- ensemble:implementation-checklist -->\n\n- [ ] ${item}\n`;
+    const { folder, progress } = makeTask("apply-recon-test-evidence-pass", { latched: true, plan });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      `<!-- verified-complete:start -->\n- ${item}\n  evidence: Accepted editing round edit-1.\n<!-- verified-complete:end -->\n`,
+      "utf8"
+    );
+    writeProgress(folder, {
+      ...progress,
+      planItemEvidence: [{
+        planRevision: getPlanRevisionV1(plan),
+        itemKey: normalizeChecklistItemTextV1(item),
+        itemText: item,
+        claims: [{ source: "implementation", at: "2026-10-26T00:00:00.000Z", roundId: "edit-1" }],
+        testReports: [{
+          at: "2026-10-26T00:01:00.000Z",
+          roundId: "edit-1",
+          testIdentity: "src/test/dispatch.test.ts",
+          command: "node src/test/dispatch.test.ts",
+          workingDirectory: "/workspace",
+          passed: 3,
+          failed: 0,
+          sourceState: "post-edit source state",
+          sourceFiles: ["src/commands/dispatch.ts"],
+          sourceFileStates: (() => {
+            const sourcePath = nodePath.join(ROOT, "src/commands/dispatch.ts");
+            nodeFs.mkdirSync(nodePath.dirname(sourcePath), { recursive: true });
+            nodeFs.writeFileSync(sourcePath, "export function dispatch(): void {}\n", "utf8");
+            return [{ path: "src/commands/dispatch.ts", sha256: createHash("sha256").update(nodeFs.readFileSync(sourcePath)).digest("hex") }];
+          })(),
+        }],
+      }],
+    });
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    try {
+      const result = await applyReconciliationReviewVerifiedTicksV1(vscode.Uri.file(folder));
+      assert.deepEqual(result, { kind: "applied", count: 1 });
+      assert.match(nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8"), /- \[x\] Add regression cases/);
+      assert.deepEqual(readProgress(folder).planItemEvidence?.[0]?.verifications?.[0]?.testReportRoundIds, ["edit-1"]);
+    } finally {
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("keeps reconciliation test claims provisional when source hashes are missing", async () => {
+    const item = "Add regression cases in dispatch.test.ts";
+    const plan = `<!-- ensemble:implementation-checklist -->\n\n- [ ] ${item}\n`;
+    const { folder, progress } = makeTask("apply-recon-test-evidence-missing-source-state", { latched: true, plan });
+    nodeFs.writeFileSync(nodePath.join(folder, "impl-high-review.md"),
+      `<!-- verified-complete:start -->\n- ${item}\n<!-- verified-complete:end -->\n`, "utf8");
+    writeProgress(folder, {
+      ...progress,
+      planItemEvidence: [{
+        planRevision: getPlanRevisionV1(plan),
+        itemKey: normalizeChecklistItemTextV1(item),
+        itemText: item,
+        claims: [{ source: "implementation", at: "2026-10-26T00:00:00.000Z", roundId: "edit-1" }],
+        testReports: [{
+          at: "2026-10-26T00:01:00.000Z",
+          roundId: "edit-1",
+          testIdentity: "src/test/dispatch.test.ts",
+          command: "node src/test/dispatch.test.ts",
+          workingDirectory: ROOT,
+          passed: 3,
+          failed: 0,
+          sourceState: "post-edit source state",
+          sourceFiles: ["src/commands/dispatch.ts"],
+        }],
+      }],
+    });
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    try {
+      const result = await applyReconciliationReviewVerifiedTicksV1(vscode.Uri.file(folder));
+      assert.deepEqual(result, { kind: "noCandidates" });
+      assert.match(nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8"), /- \[ \] Add regression cases/);
     } finally {
       fs.restore();
       workspace.restore();
@@ -1565,8 +1674,8 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.ok(decision, "a decision must be posted");
       const reconcileOption = decision.options.find((o) => o.optionId === "reconcile");
       assert.ok(reconcileOption, "the reconcile option must be offered");
-      assert.equal(reconcileOption.label, "Mark reconciled and resume Fast Forward (iteration 2 of 5)");
-      assert.match(reconcileOption.consequence, /Resumes Fast Forward at iteration 2 of 5/);
+      assert.equal(reconcileOption.label, "Mark reconciled");
+      assert.match(reconcileOption.consequence, /without dispatching a stage action/);
       assert.equal(reconcileOption.effect.kind, "command");
       if (reconcileOption.effect.kind === "command") {
         assert.deepEqual(reconcileOption.effect.args, [
@@ -1574,6 +1683,18 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
             taskFolderPath: folder,
             canonicalId,
             decisionId: decision.decisionId,
+          },
+        ]);
+      }
+      const continueOption = decision.options.find((o) => o.optionId === "continueStage");
+      assert.ok(continueOption, "the continueStage option must be offered");
+      assert.equal(continueOption.label, "Resume and continue stage and resume Fast Forward (iteration 2 of 5)");
+      assert.match(continueOption.consequence, /Resumes Fast Forward at iteration 2 of 5/);
+      assert.equal(continueOption.effect.kind, "command");
+      if (continueOption.effect.kind === "command") {
+        assert.deepEqual(continueOption.effect.args, [
+          {
+            taskFolderPath: folder,
             resumeFastForwardV1: {
               attemptNumber: 2,
               maxAttempts: 5,
@@ -1628,14 +1749,18 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.ok(decision, "a decision must be posted");
       const reconcileOption = decision.options.find((o) => o.optionId === "reconcile");
       assert.ok(reconcileOption, "the reconcile option must be offered");
-      assert.equal(reconcileOption.label, "Mark reconciled and try again (one cycle)");
-      assert.match(reconcileOption.consequence, /does not start or resume Fast Forward/);
+      assert.equal(reconcileOption.label, "Mark reconciled");
+      assert.match(reconcileOption.consequence, /without dispatching a stage action/);
       assert.equal(reconcileOption.effect.kind, "command");
       if (reconcileOption.effect.kind === "command") {
         assert.deepEqual(reconcileOption.effect.args, [
           { taskFolderPath: folder, canonicalId, decisionId: decision.decisionId },
         ]);
       }
+      const continueOption = decision.options.find((o) => o.optionId === "continueStage");
+      assert.ok(continueOption, "the continueStage option must be offered");
+      assert.equal(continueOption.label, "Resume and continue stage and try again (one cycle)");
+      assert.match(continueOption.consequence, /does not start or resume Fast Forward/);
     } finally {
       fs.restore();
       workspace.restore();
@@ -2020,7 +2145,7 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       // clicking it is still the correct next step.
       assert.ok(
         decision.options.some(
-          (o) => o.optionId === "reconcile" && o.label === "Mark reconciled and try again (one cycle)"
+          (o) => o.optionId === "reconcile" && o.label === "Mark reconciled"
         ),
         "Mark reconciled must remain available as a non-recommended option"
       );
@@ -4569,33 +4694,33 @@ void describe("linkManualChecksToBlockerConfirmedV1 — write races", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. Finding 3 — while the latch is set, count-dependent gating stays stood
-//    down and every "N of M" reporting surface carries the unverified
-//    qualifier. The latch's ONE exit stays reconcilePlanChecklist (above).
+// 6. Finding 3 — while the latch is set, evidence-based gating remains active
+//    and every "N of M" reporting surface carries the unverified qualifier.
+//    The latch's ONE exit stays reconcilePlanChecklist (above).
 // ---------------------------------------------------------------------------
 
 void describe("checklistProgressUnreliable — gating and reporting surfaces", () => {
-  void it("readPlanChecklistProgressV1 stands down while latched, and returns counts once cleared", async () => {
+  void it("readPlanChecklistProgressV1 keeps evidence gating active while latched", async () => {
     const { folder } = makeTask("gating-stood-down", { latched: true });
     const workspace = installWorkspaceFolders();
     const fs = installRealFs();
     const win = installWindowStub({});
     try {
       const folderUri = vscode.Uri.file(folder);
-      assert.equal(
-        await readPlanChecklistProgressV1(folderUri),
-        undefined,
-        "a latched task's checklist counts must not feed count-dependent gating"
-      );
+      const latchedCounts = await readPlanChecklistProgressV1(folderUri);
+      assert.ok(latchedCounts, "the latch must not stand down evidence-based gating");
+      assert.equal(latchedCounts.total, 2);
+      assert.equal(latchedCounts.checked, 0);
+      assert.equal(latchedCounts.remaining, 2);
 
       writeProgress(folder, {
         ...readProgress(folder),
         checklistProgressUnreliable: undefined,
       });
       const counts = await readPlanChecklistProgressV1(folderUri);
-      assert.ok(counts, "clearing the latch restores the checklist as authoritative");
+      assert.ok(counts);
       assert.equal(counts.total, 2);
-      assert.equal(counts.checked, 1);
+      assert.equal(counts.checked, 0, "clearing the latch must not verify a self-claimed tick");
     } finally {
       win.restore();
       fs.restore();
@@ -4999,6 +5124,86 @@ void describe("withPlanFileWriteLockV1 — shares one FIFO with writeTextFileIfU
       );
     } finally {
       fs.restore();
+    }
+  });
+});
+
+void describe("Step 9 / Finding 17: reconcilePlanChecklist idle action", () => {
+  void it("refuses reconcilePlanChecklist and reconcilePlanChecklistConfirmedV1 when an operation is running", async () => {
+    const { folder, progress } = makeTask("busy-reconcile-task", { latched: true });
+    const canonicalId = folder;
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const store = makeStore(canonicalId);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+
+    const op = taskOperations.begin(folder, {
+      label: "Running Implementation",
+      stage: "impl",
+    });
+    assert.ok(op, "operation must begin");
+
+    try {
+      await reconcilePlanChecklist(inventory, store, { taskFolderPath: folder });
+      assert.match(
+        win.captured.find((m: { method: string; message: string }) => m.method === "warning")?.message ?? "",
+        /Cannot reconcile the checklist while an operation is running/
+      );
+
+      win.captured.length = 0;
+      await reconcilePlanChecklistConfirmedV1(inventory, store, { taskFolderPath: folder });
+      assert.match(
+        win.captured.find((m: { method: string; message: string }) => m.method === "warning")?.message ?? "",
+        /Cannot reconcile the checklist while an operation is running/
+      );
+      assert.equal(readProgress(folder).checklistProgressUnreliable, true, "latch must remain set");
+    } finally {
+      taskOperations.end(op);
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("postReconcilePlanChecklistDecisionV1 provides separate continueStage option and reconcile does not resume", async () => {
+    const { folder, progress } = makeTask("idle-reconcile-options-task", { latched: true });
+    const canonicalId = folder;
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(
+        vscode.Uri.file(folder),
+        canonicalId,
+        folder,
+        progress
+      );
+      assert.equal(result.kind, "posted");
+
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decisions = store.listPending(canonicalId);
+      const reconcileDecision = decisions.find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(reconcileDecision);
+
+      const reconcileOpt = reconcileDecision.options.find((opt) => opt.optionId === "reconcile");
+      assert.ok(reconcileOpt);
+      assert.equal(reconcileOpt.resumeKind, "unpause");
+      assert.match(reconcileOpt.consequence, /without dispatching a stage action/);
+
+      const continueOpt = reconcileDecision.options.find((opt) => opt.optionId === "continueStage");
+      assert.ok(continueOpt);
+      assert.equal(continueOpt.resumeKind, "continue");
+      assert.equal(continueOpt.effect.kind, "command");
+      assert.equal(continueOpt.effect.command, "vs-code-ai-helper.resumeAndApplyCurrentStageAction");
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
     }
   });
 });

@@ -43,6 +43,10 @@ import {
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
+import {
+  recordStageActionRefusalReasonV1,
+  recordStageActionTerminalOutcomeV1,
+} from "../utils/stageActionRefusalV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 
 import {
@@ -628,6 +632,7 @@ export interface GeneratePlanOutcomeContextV1 {
   readonly providerLabel: string;
   readonly modelLabel: string | undefined;
   readonly effectiveReviewMode: AutoTriggerMode;
+  readonly operation?: TaskOperationHandle;
 }
 
 export interface GeneratePlanOutcomeResultV1 {
@@ -739,6 +744,8 @@ export async function handleGeneratePlanOutcomeV1(
         entryResult?.ready === false
           ? entryResult.reason
           : "the task's current stage could not be read";
+      recordStageActionRefusalReasonV1(ctx.taskRef.taskFolderPath, stageEntryRefusalReason);
+      ctx.operation?.settleAs("refused", stageEntryRefusalReason);
       NotificationRouter.showWarning(
         `${GENERATE_PLAN_TARGET_RELATIVE_PATH_V1} was generated, but the task is no longer at Description or ` +
           `Plan, so its stage was not moved.`
@@ -777,10 +784,33 @@ export async function handleGeneratePlanOutcomeV1(
       });
     }
   } else if (outcome.kind === "cancelled") {
+    recordStageActionTerminalOutcomeV1(ctx.taskRef.taskFolderPath, {
+      kind: "cancelled",
+      actionLabel: "Generate Plan",
+      source: ctx.operation?.cancelSource?.(),
+      operationId: ("correlation" in outcome ? outcome.correlation?.operationId : undefined) ?? ctx.operation?.id,
+    });
+    ctx.operation?.settleAs("cancelled", "Plan generation cancelled.");
     NotificationRouter.showInformation("Plan generation cancelled.");
+  } else if (
+    outcome.kind === "failed" &&
+    (outcome.code === "actionNotEligibleForStage" || outcome.code === "actionNotEligibleForStatus")
+  ) {
+    const refusalReason = describeTaskActionFailureV1(outcome);
+    recordStageActionRefusalReasonV1(ctx.taskRef.taskFolderPath, refusalReason);
+    ctx.operation?.settleAs("refused", refusalReason);
+    NotificationRouter.showWarning(`Plan generation refused: ${refusalReason}.`);
   } else {
+    const failureReason = describeTaskActionFailureV1(outcome);
+    recordStageActionTerminalOutcomeV1(ctx.taskRef.taskFolderPath, {
+      kind: "failed",
+      actionLabel: "Generate Plan",
+      reason: failureReason,
+      operationId: ("correlation" in outcome ? outcome.correlation?.operationId : undefined) ?? ctx.operation?.id,
+    });
+    ctx.operation?.settleAs("failed", failureReason);
     NotificationRouter.showError(
-      `Plan generation failed: ${describeTaskActionFailureV1(outcome)}. ` +
+      `Plan generation failed: ${failureReason}. ` +
         (outcome.kind === "failed" && outcome.code === "resumedRunAskedAgain"
           ? "Run Generate Plan again, or write plan.md yourself."
           : "Use the manual planning workflow instead.")
@@ -1067,6 +1097,7 @@ async function generatePlanWithAIForResolvedTask(
           providerLabel,
           modelLabel,
           effectiveReviewMode,
+          operation: op,
         });
         succeeded = handled.succeeded;
         triggerAutoReview = handled.triggerAutoReview;

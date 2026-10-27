@@ -103,6 +103,34 @@ void describe("taskProgressFieldPolicyV1", () => {
     }
   });
 
+  void it("planItemEvidence survives nextStage, markTaskDone and reopen, as its policy row says", () => {
+    const planItemEvidence = [{
+      planRevision: "rev-1",
+      itemKey: "add the resolver",
+      itemText: "Add the resolver",
+      claims: [{ source: "implementation" as const, at: NOW }],
+      verifications: [{ at: NOW, evidence: "verified by review" }],
+    }];
+    const next = applyNextStagePolicyV1(baseProgress({ planItemEvidence }), { now: NOW });
+    assert.equal(next.ok, true);
+    if (next.ok) {
+      assert.deepEqual(next.progress.planItemEvidence, planItemEvidence, "a stage advance must not erase reviewer verification");
+    }
+    const done = applyMarkTaskDonePolicyV1(baseProgress({ currentStage: "publish", planItemEvidence }), { now: NOW });
+    assert.equal(done.ok, true);
+    if (done.ok) {
+      assert.deepEqual(done.progress.planItemEvidence, planItemEvidence);
+    }
+    const reopened = applyReopenPolicyV1(
+      baseProgress({ status: "completed", currentStage: "publish", completedAt: "2026-07-09T00:00:00.000Z", planItemEvidence }),
+      { now: NOW, selectedStage: "impl" }
+    );
+    assert.equal(reopened.ok, true);
+    if (reopened.ok) {
+      assert.deepEqual(reopened.progress.planItemEvidence, planItemEvidence);
+    }
+  });
+
   void it("nextStage applies every column rule", () => {
     const input = baseProgress({
       lintPayload: { runAt: NOW, passed: true },

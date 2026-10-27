@@ -35,12 +35,14 @@ import {
   MAX_BLOCKER_SUPERSESSIONS,
   MAX_CHECKLIST_CHANGE_PROPOSALS,
   MAX_OVERRIDDEN_ESCALATIONS,
+  MAX_PLAN_ITEM_EVIDENCE_ENTRIES,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
   MAX_ROUND_LEDGER_ENTRIES,
   MAX_ROUND_OUTCOMES,
   PlanRevisionStateV1,
+  PlanItemEvidenceV1,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
@@ -148,6 +150,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "reviewRejections",
   "roundOutcomes",
   "roundLedger",
+  "planItemEvidence",
   "blockerSupersessions",
   "checklistChangeProposals",
   "planRevision",
@@ -648,11 +651,18 @@ function validateScheduledRun(
   if (!isPlainObject(value)) {
     return "scheduledRun must be an object";
   }
-  const allowed = new Set(["runAt", "stage", "leaseOwner", "leaseUntil"]);
+  const allowed = new Set(["runAt", "stage", "leaseOwner", "leaseUntil", "quotaStopId"]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
       return `scheduledRun has an unknown property ${JSON.stringify(key)}`;
     }
+  }
+  if (
+    value["quotaStopId"] !== undefined &&
+    (typeof value["quotaStopId"] !== "string" || value["quotaStopId"].length === 0 ||
+      value["quotaStopId"].length > MAX_ID_LENGTH)
+  ) {
+    return "scheduledRun.quotaStopId must be a bounded non-empty string when present";
   }
   if (!isIsoTimestamp(value["runAt"])) {
     return "scheduledRun.runAt must be an ISO timestamp";
@@ -1311,6 +1321,69 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
   return undefined;
 }
 
+function validatePlanItemEvidence(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_PLAN_ITEM_EVIDENCE_ENTRIES) {
+    return "planItemEvidence must be a bounded array";
+  }
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry)) return "planItemEvidence entries must be objects";
+    const allowed = new Set(["planRevision", "itemKey", "itemText", "claims", "verifications", "testReports"]);
+    if (Object.keys(entry).some((key) => !allowed.has(key))) return "planItemEvidence entry has an unknown property";
+    if (!boundedString(entry["planRevision"], 128) || !boundedString(entry["itemKey"], 4000) ||
+        !boundedString(entry["itemText"], 4000) || !Array.isArray(entry["claims"]) || entry["claims"].length > 100) {
+      return "planItemEvidence entry has an invalid identity or claims array";
+    }
+    for (const claim of entry["claims"] as unknown[]) {
+      if (!isPlainObject(claim)) return "planItemEvidence claims must be objects";
+      const claimKeys = new Set(["source", "at", "roundId", "evidence"]);
+      if (Object.keys(claim).some((key) => !claimKeys.has(key)) ||
+          !["implementation", "retroactive", "reviewer"].includes(String(claim["source"])) ||
+          !boundedString(claim["at"], 64) ||
+          (claim["roundId"] !== undefined && !boundedString(claim["roundId"], MAX_ID_LENGTH)) ||
+          (claim["evidence"] !== undefined && !boundedString(claim["evidence"], 4000))) {
+        return "planItemEvidence claim has an invalid source or field";
+      }
+    }
+    if (entry["verifications"] !== undefined) {
+      if (!Array.isArray(entry["verifications"]) || entry["verifications"].length > 100) {
+        return "planItemEvidence verifications must be a bounded array";
+      }
+      for (const verification of entry["verifications"] as unknown[]) {
+        if (!isPlainObject(verification)) return "planItemEvidence verifications must be objects";
+        const keys = new Set(["at", "roundId", "evidence", "testReportRoundIds"]);
+        if (Object.keys(verification).some((key) => !keys.has(key)) ||
+            !boundedString(verification["at"], 64) || !boundedString(verification["evidence"], 4000) ||
+            (verification["roundId"] !== undefined && !boundedString(verification["roundId"], MAX_ID_LENGTH)) ||
+            (verification["testReportRoundIds"] !== undefined && (!Array.isArray(verification["testReportRoundIds"]) || verification["testReportRoundIds"].length > 100 || verification["testReportRoundIds"].some((id) => !boundedString(id, 200))))) {
+          return "planItemEvidence verification has an invalid field";
+        }
+      }
+    }
+    if (entry["testReports"] !== undefined) {
+      if (!Array.isArray(entry["testReports"]) || entry["testReports"].length > 100) {
+        return "planItemEvidence testReports must be a bounded array";
+      }
+      for (const report of entry["testReports"] as unknown[]) {
+        if (!isPlainObject(report)) return "planItemEvidence testReports must be objects";
+        const keys = new Set(["at", "roundId", "testIdentity", "command", "workingDirectory", "passed", "failed", "sourceState", "sourceFiles", "sourceFileStates", "sourceFilesTruncated"]);
+        if (Object.keys(report).some((key) => !keys.has(key)) ||
+            !boundedString(report["at"], 64) || !boundedString(report["roundId"], MAX_ID_LENGTH) ||
+            !boundedString(report["testIdentity"], 1000) || !boundedString(report["command"], 4000) ||
+            (report["workingDirectory"] !== undefined && !boundedString(report["workingDirectory"], 1000)) ||
+            !Number.isInteger(report["passed"]) || (report["passed"] as number) < 0 ||
+            !Number.isInteger(report["failed"]) || (report["failed"] as number) < 0 ||
+            !boundedString(report["sourceState"], 1000) ||
+            (report["sourceFiles"] !== undefined && (!Array.isArray(report["sourceFiles"]) || report["sourceFiles"].length > 100 || report["sourceFiles"].some((file) => !boundedString(file, 1000)))) ||
+            (report["sourceFileStates"] !== undefined && (!Array.isArray(report["sourceFileStates"]) || report["sourceFileStates"].length > 100 || report["sourceFileStates"].some((state) => !isPlainObject(state) || Object.keys(state).some((key) => key !== "path" && key !== "sha256") || !boundedString(state["path"], 1000) || !/^[a-f0-9]{64}$/.test(String(state["sha256"]))))) ||
+            (report["sourceFilesTruncated"] !== undefined && typeof report["sourceFilesTruncated"] !== "boolean")) {
+          return "planItemEvidence test report has an invalid field";
+        }
+      }
+    }
+  }
+  return undefined;
+}
+
 function validateChecklistRevisionAdopted(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "roundLedger entry checklistRevisionAdopted must be an object";
@@ -1584,6 +1657,9 @@ function validateImplRecovery(
     "sourceDispatchMode",
     "sourceReviewStage",
     "sourceRoundId",
+    "operationId",
+    "failedProvider",
+    "failedModel",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
@@ -1666,6 +1742,30 @@ function validateImplRecovery(
   ) {
     return "implRecovery.sourceRoundId must be a bounded non-empty string when present";
   }
+  if (
+    value["operationId"] !== undefined &&
+    (typeof value["operationId"] !== "string" ||
+      value["operationId"].length === 0 ||
+      value["operationId"].length > MAX_ID_LENGTH)
+  ) {
+    return "implRecovery.operationId must be a bounded non-empty string when present";
+  }
+  if (
+    value["failedProvider"] !== undefined &&
+    (typeof value["failedProvider"] !== "string" ||
+      value["failedProvider"].length === 0 ||
+      value["failedProvider"].length > MAX_ID_LENGTH)
+  ) {
+    return "implRecovery.failedProvider must be a bounded non-empty string when present";
+  }
+  if (
+    value["failedModel"] !== undefined &&
+    (typeof value["failedModel"] !== "string" ||
+      value["failedModel"].length === 0 ||
+      value["failedModel"].length > MAX_ID_LENGTH)
+  ) {
+    return "implRecovery.failedModel must be a bounded non-empty string when present";
+  }
   return undefined;
 }
 
@@ -1685,11 +1785,20 @@ function validateQuotaParkRecord(value: unknown): string | undefined {
     "failureKind",
     "resetAt",
     "observedAt",
+    "stopId",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
       return `quotaParkRecord has an unknown property ${JSON.stringify(key)}`;
     }
+  }
+  if (
+    value["stopId"] !== undefined &&
+    (typeof value["stopId"] !== "string" ||
+      value["stopId"].length === 0 ||
+      value["stopId"].length > MAX_ID_LENGTH)
+  ) {
+    return "quotaParkRecord.stopId must be a bounded non-empty string when present";
   }
   if (
     typeof value["modelId"] !== "string" ||
@@ -2306,6 +2415,9 @@ export function decodeTaskProgressTextV1(
           ...(scheduled["leaseUntil"] !== undefined
             ? { leaseUntil: scheduled["leaseUntil"] as string }
             : {}),
+          ...(scheduled["quotaStopId"] !== undefined
+            ? { quotaStopId: scheduled["quotaStopId"] as string }
+            : {}),
         };
         break;
       }
@@ -2373,6 +2485,12 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.roundLedger = value as RoundLedgerEntryV1[];
+        break;
+      }
+      case "planItemEvidence": {
+        const error = validatePlanItemEvidence(value);
+        if (error !== undefined) return recovery("invalidFieldValue", error);
+        draft.planItemEvidence = value as PlanItemEvidenceV1[];
         break;
       }
       case "blockerSupersessions": {

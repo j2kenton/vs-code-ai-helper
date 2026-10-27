@@ -454,6 +454,12 @@ export interface ImplementationRecoveryInputV1 {
   readonly postRunReviewStage: TaskStage;
   /** Root operation whose end gates the continuation chain dispatch. */
   readonly parentOperation?: Pick<TaskOperationHandle, "id">;
+  /** Operation holding the continuation claim, if live. */
+  readonly operationId?: string;
+  /** Provider that failed, triggering or holding the recovery. */
+  readonly failedProvider?: string;
+  /** Model that failed, triggering or holding the recovery. */
+  readonly failedModel?: string;
   /**
    * True when a `_prev` backup pair actually exists to restore from — a
    * completed round (`incompleteRound === undefined` at the call site), never
@@ -662,6 +668,11 @@ export async function beginImplementationRecoveryV1(
         ...(input.sourceDispatchMode ? { sourceDispatchMode: input.sourceDispatchMode } : {}),
         ...(input.sourceDispatchMode === "apply-review" && input.sourceReviewStage
           ? { sourceReviewStage: input.sourceReviewStage }
+          : {}),
+        ...(input.failedProvider ? { failedProvider: input.failedProvider } : {}),
+        ...(input.failedModel ? { failedModel: input.failedModel } : {}),
+        ...(input.operationId ?? input.parentOperation?.id
+          ? { operationId: input.operationId ?? input.parentOperation?.id }
           : {}),
         // The lease covers only the in-process hand-off to the continuation
         // chain; a cap-reached record gets none — nothing will ever fire it,
@@ -967,7 +978,8 @@ export interface ClaimedImplRecoveryV1 {
  * so `dispatched` is always a true statement that a round started.
  */
 export async function claimImplRecoveryDispatchV1(
-  folderUri: vscode.Uri
+  folderUri: vscode.Uri,
+  options?: { operationId?: string }
 ): Promise<ClaimedImplRecoveryV1> {
   const currentOwner = await resolveCurrentRecoveryClaimOwnerV1();
   let record: ImplRecoveryV1 | undefined;
@@ -987,6 +999,7 @@ export async function claimImplRecoveryDispatchV1(
         dispatch: "dispatched",
         attemptId: freshToken("impl-continuation"),
         leaseOwner: currentOwner,
+        ...(options?.operationId ? { operationId: options.operationId } : {}),
       };
       record = claimed;
       let next: TaskProgress = {
@@ -1109,6 +1122,85 @@ export async function claimImplRecoveryDispatchV1(
     owedContinuationSourceV1(record, priorPendingFiles)
   );
   return { record, priorImplReviewFiles, priorPendingFiles };
+}
+
+/**
+ * Release an ended continuation claim and reset its dispatch to "pending"
+ * without a lease so Run now is immediately available (Step 8 / Finding 9).
+ * Persists any failed provider or model for the recovery decision card.
+ */
+export async function releaseImplRecoveryClaimV1(
+  folderUri: vscode.Uri,
+  options?: {
+    failedProvider?: string;
+    failedModel?: string;
+    reason?: string;
+    operationId?: string;
+    attemptId?: string;
+    leaseOwner?: string;
+  }
+): Promise<TaskProgress | undefined> {
+  let released: TaskProgress | undefined;
+  await patchTaskProgressStrictV1(folderUri, (current) => {
+    const recovery = current.implRecovery;
+    if (!recovery) {
+      return current;
+    }
+    // Must provide identity authorization to release an active claim.
+    if (!options?.operationId && !options?.attemptId && !options?.leaseOwner) {
+      return current;
+    }
+    // If operationId is set on the recovery record, authorization must match operationId or attemptId.
+    if (recovery.operationId) {
+      const opMatch = options?.operationId !== undefined && options.operationId === recovery.operationId;
+      const attemptMatch =
+        recovery.attemptId !== undefined &&
+        options?.attemptId !== undefined &&
+        options.attemptId === recovery.attemptId;
+      if (!opMatch && !attemptMatch) {
+        return current;
+      }
+    }
+    // If attemptId is set on the recovery record, authorization must match attemptId or operationId.
+    if (recovery.attemptId) {
+      const attemptMatch = options?.attemptId !== undefined && options.attemptId === recovery.attemptId;
+      const opMatch =
+        recovery.operationId !== undefined &&
+        options?.operationId !== undefined &&
+        options.operationId === recovery.operationId;
+      if (!attemptMatch && !opMatch) {
+        return current;
+      }
+    }
+    // If leaseOwner is set on the recovery record, caller specifying leaseOwner must match.
+    if (recovery.leaseOwner && options?.leaseOwner && recovery.leaseOwner !== options.leaseOwner) {
+      return current;
+    }
+    const updated: ImplRecoveryV1 = {
+      ...recovery,
+      dispatch: "pending",
+      leaseOwner: undefined,
+      leaseUntil: undefined,
+      operationId: undefined,
+      attemptId: undefined,
+      ...(options?.failedProvider ? { failedProvider: options.failedProvider } : {}),
+      ...(options?.failedModel ? { failedModel: options.failedModel } : {}),
+      ...(options?.reason ? { reason: options.reason } : {}),
+    };
+    released = {
+      ...current,
+      implRecovery: updated,
+      updatedAt: new Date().toISOString(),
+    };
+    return released;
+  });
+  if (released?.implRecovery) {
+    await syncOwedContinuationLedgerBestEffortV1(
+      folderUri.fsPath,
+      owedContinuationSourceV1(released.implRecovery, released.pendingImplReviewFiles ?? [])
+    );
+  }
+  return released;
 }
 
 /**

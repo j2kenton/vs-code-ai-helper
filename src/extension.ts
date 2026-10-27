@@ -74,7 +74,8 @@ import {
 import "./state/effectivePauseStatusV1";
 import { registerStartNewTaskCommand } from "./commands/startNewTask";
 import { TaskCreationStartupReconcilerV1 } from "./state/taskCreationStartupReconcilerV1";
-import { registerResumeTaskCommand } from "./commands/resumeTask";
+import { registerResumeTaskCommand, resumePausedTask } from "./commands/resumeTask";
+import { registerRoundGitInterferenceCommandV1 } from "./commands/roundGitInterferenceV1";
 import {
   registerGeneratePlanWithAICommand,
   resumeGeneratePlanInteractionV1,
@@ -199,6 +200,7 @@ import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import type { WorkflowDecisionV1 } from "./types/workflowDecisionV1";
 import { IncompleteTask } from "./types/incompleteTask";
 import { getModelSettings, installAutoImplementConfirmation, migrateEnabledProvidersForExistingModels, migrateProviderAccountActionsSetting, migrateSettingsNamespace, migrateSettingsScope } from "./config/settings";
+import { changedModelSettingStagesV1, consumeLocalModelSettingsWriteV1 } from "./utils/modelSettingsChangeV1";
 import { setExtensionContextV1 } from "./utils/extensionContextV1";
 import {
   configureWorkflowDecisionStateV1,
@@ -378,6 +380,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Create a single shared TaskInventory instance. All commands and the tree
   // provider use this same instance so discovery results are always consistent.
   const inventory = new TaskInventory();
+  context.subscriptions.push(registerRoundGitInterferenceCommandV1(inventory));
 
   const settingsViewProvider = new SettingsViewProvider(context.extensionUri);
   // A viewer's chat and tree read the RUNNER's pending decisions
@@ -875,8 +878,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         if (request.kind === "cancelOperation") {
           // A viewer's Stop button on a row it mirrors from this runner. The
-          // activation must be ours: operation ids restart at op-1 every time
-          // this extension host starts, so a Stop pressed on a row a viewer
+          // activation must be ours: a Stop pressed on a row a viewer
           // read from a PREVIOUS runner would otherwise cancel whatever that
           // id names now (review, 2026-09-17).
           // An absent activation means the viewer read a snapshot from a build
@@ -884,7 +886,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           if (request.activationId !== undefined && request.activationId !== runnerActivationIdV1) {
             throw new Error("that operation belonged to an earlier run of the runner — reload the window to refresh what it is doing");
           }
-          if (!taskOperations.cancelOperation(request.operationId)) {
+          if (!taskOperations.cancelOperation(request.operationId, "viewer")) {
             // The viewer prefixes this with "The runner could not cancel the
             // operation: ", so it reads as one sentence about the row the
             // user is looking at.
@@ -1190,9 +1192,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     );
   };
   refreshModelsConfiguredContext();
+  let previousModelSettings = getModelSettings();
   const modelsConfiguredListener = vscode.workspace.onDidChangeConfiguration((event) => {
     if (event.affectsConfiguration("ensemble") || event.affectsConfiguration("vs-code-ai-helper")) {
       refreshModelsConfiguredContext();
+    }
+    if (event.affectsConfiguration("ensemble.modelSettings") || event.affectsConfiguration("vs-code-ai-helper.modelSettings")) {
+      const currentModelSettings = getModelSettings();
+      const changedStages = changedModelSettingStagesV1(previousModelSettings, currentModelSettings);
+      previousModelSettings = currentModelSettings;
+      if (changedStages.length > 0 && !consumeLocalModelSettingsWriteV1(currentModelSettings)) {
+        NotificationRouter.showInformation(
+          `AI Models settings changed outside this window for ${changedStages.map((stage) => STAGE_DISPLAY_NAMES[stage]).join(", ")}. ` +
+          "Future rounds will use the new configuration; a round already started retains its captured model chain."
+        );
+      }
     }
   });
   context.subscriptions.push(modelsConfiguredListener);
@@ -1330,6 +1344,38 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // context to every command that needs them.
   registerStartNewTaskCommand(context, inventory, currentTaskStore);
   registerResumeTaskCommand(context, inventory, currentTaskStore);
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.resumeStoredInteraction",
+      async (arg?: {
+        taskFolderPath: string;
+        canonicalId?: string;
+        interactionId?: string;
+        operationId?: string;
+        admissionHandoffTokenV1?: string;
+      }) => {
+        if (!arg?.taskFolderPath) {
+          return false;
+        }
+        const progress = await readTaskProgressStrictV1(vscode.Uri.file(arg.taskFolderPath));
+        if (progress.ok && progress.decoded.progress.status === "paused") {
+          const outcome = await resumePausedTask(inventory, currentTaskStore, {
+            taskFolderPath: arg.taskFolderPath,
+            canonicalId: arg.canonicalId,
+          });
+          if (outcome.outcome !== "resumed") {
+            return false;
+          }
+        }
+        return await chatViewProvider.resumeStoredInteractionForTaskV1(
+          arg.taskFolderPath,
+          arg.canonicalId,
+          arg.interactionId && arg.operationId ? { interactionId: arg.interactionId, operationId: arg.operationId } : undefined,
+          arg.admissionHandoffTokenV1
+        );
+      }
+    )
+  );
   // AI commands receive the full context so they can call ensureAiConsent
   registerGeneratePlanWithAICommand(context, inventory, chatViewProvider);
   registerReviewActionCommands(context, chatViewProvider);
@@ -1343,7 +1389,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.openAiModels",
-    () => vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus")
+    (stage?: TaskStage) => {
+      void vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+      if (stage) {
+        settingsViewProvider.focusStage(stage);
+      }
+    }
   ));
   registerViewArtifactCommands(context);
   registerOpenRetainedPromptCommand(context);
@@ -1518,7 +1569,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       const operationId = typeof node?.id === "string" ? node.id : node?.sourceOperationId;
       if (typeof operationId !== "string") return;
       const opTaskName = taskOperations.getAll().find((op) => op.id === operationId)?.taskName;
-      if (!taskOperations.cancelOperation(operationId)) {
+      if (!taskOperations.cancelOperation(operationId, "notifications")) {
         const refusal = taskOperations.describeCancelRefusalV1(operationId);
         NotificationRouter.showInformation(
           opTaskName !== undefined ? `${formatTaskNameForDisplay(opTaskName)} — ${refusal}` : refusal

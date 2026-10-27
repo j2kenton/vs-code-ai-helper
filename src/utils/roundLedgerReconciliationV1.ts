@@ -73,6 +73,7 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendChatMessageV1, ChatMessage, readChatHistory } from "./chatHistoryStore";
 import { formatRoundOutcomeMessageV1, terminalizeRoundV1 } from "./roundLedgerV1";
 import { resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
+import { recordStageActionTerminalOutcomeV1 } from "./stageActionRefusalV1";
 import { RoundLedgerEntryV1, RoundLedgerModeV1, STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { formatTimeHHmm } from "./timeFormat";
 import { STALE_DISPATCH_GRACE_MS } from "./taskWatchdogV1";
@@ -349,6 +350,12 @@ export async function reconcileOrphanedRoundLedgerRowsV1(
       { taskFolderUri: input.taskFolderUri }
     );
     if (result.ok && !result.alreadyTerminal) {
+      recordStageActionTerminalOutcomeV1(input.taskFolderUri.fsPath, {
+        kind: "interrupted",
+        actionLabel: row.stage ?? "Stage Action",
+        reason,
+        operationId: row.operationId,
+      });
       closed.push(row.roundId);
     }
   }

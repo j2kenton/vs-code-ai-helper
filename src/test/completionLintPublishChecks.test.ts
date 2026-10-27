@@ -22,6 +22,7 @@ import * as vscode from "vscode";
 import {
   collectAiVerifiedPlanItems,
   collectCompletionLint,
+  resolveCurrentPublishCommandPlanV1,
   readPackageScripts,
   mergeCompletionChecksSection,
   truncateCheckOutput,
@@ -100,9 +101,106 @@ void describe("readPackageScripts", () => {
     const dir = makeWorkspace("read-scripts-no-scripts-key", { name: "x" });
     assert.equal(readPackageScripts(dir), undefined);
   });
+
+  void it("rediscovers the current default plan including newly added workspace members", () => {
+    const dir = makeWorkspace("current-publish-plan", {
+      name: "root",
+      workspaces: ["packages/*"],
+      scripts: { verify: "npm run verify:workflow-safety", "verify:workflow-safety": "node verify.js" },
+    });
+    nodeFs.mkdirSync(nodePath.join(dir, "packages", "first"), { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(dir, "packages", "first", "package.json"), JSON.stringify({
+      scripts: { test: "node --test" },
+    }));
+    assert.deepEqual(resolveCurrentPublishCommandPlanV1(dir), [
+      "npm run verify",
+      "[packages/first] npm run test",
+    ]);
+    nodeFs.mkdirSync(nodePath.join(dir, "packages", "added"), { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(dir, "packages", "added", "package.json"), JSON.stringify({
+      scripts: { lint: "eslint .", "check-types": "tsc", test: "node --test" },
+    }));
+    assert.deepEqual(resolveCurrentPublishCommandPlanV1(dir), [
+      "npm run verify",
+      "[packages/added] npm run lint",
+      "[packages/added] npm run check-types",
+      "[packages/added] npm run test",
+      "[packages/first] npm run test",
+    ]);
+  });
 });
 
 void describe("collectCompletionLint — publish pre-check schema (lint/test scripts)", () => {
+  void it("preserves the source full-run log when a failed-first preparation command fails", async () => {
+    const scope = makeWorkspace("failed-first-preparation-log-isolation", {
+      name: "x",
+      scripts: {},
+    });
+    const taskFolder = nodePath.join(TEST_ROOT, "failed-first-preparation-task");
+    const runsFolder = nodePath.join(taskFolder, "runs");
+    nodeFs.mkdirSync(runsFolder, { recursive: true });
+    const sourceLog = nodePath.join(runsFolder, "raw-check-output.log");
+    const attemptLog = nodePath.join(runsFolder, "failed-first-source-original-attempt-1.log");
+    const originalSourceEvidence = "complete source full-run evidence\n";
+    nodeFs.writeFileSync(sourceLog, originalSourceEvidence, "utf8");
+
+    const result = await collectCompletionLint(scope, [], {
+      explicitChecks: [{
+        command: "prepare failed-first recheck",
+        executableCommand: `${process.execPath} -e "process.stdout.write('preparation failed\\n'); process.exit(1)"`,
+        cwd: scope,
+      }],
+      taskFolderUri: vscode.Uri.file(taskFolder),
+      rawReportLocation: "runs/failed-first-source-original-attempt-1.log",
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.rawReportLocation, "runs/failed-first-source-original-attempt-1.log");
+    assert.equal(nodeFs.readFileSync(sourceLog, "utf8"), originalSourceEvidence,
+      "failed preparation must not replace the complete source-run evidence");
+    assert.match(nodeFs.readFileSync(attemptLog, "utf8"), /=== prepare failed-first recheck \(exit code 1\) ===/,
+      "the failed preparation result must be persisted at the isolated attempt path");
+  });
+
+  void it("preserves source evidence and writes isolated output when a targeted check is cancelled", async () => {
+    const scope = makeWorkspace("failed-first-cancelled-log-isolation", {
+      name: "x",
+      scripts: {},
+    });
+    const taskFolder = nodePath.join(TEST_ROOT, "failed-first-cancelled-task");
+    const runsFolder = nodePath.join(taskFolder, "runs");
+    nodeFs.mkdirSync(runsFolder, { recursive: true });
+    const sourceLog = nodePath.join(runsFolder, "raw-check-output.log");
+    const attemptLog = nodePath.join(runsFolder, "failed-first-source-original-attempt-2.log");
+    const originalSourceEvidence = "complete source full-run evidence before cancellation\n";
+    nodeFs.writeFileSync(sourceLog, originalSourceEvidence, "utf8");
+    const cancellation = new vscode.CancellationTokenSource();
+
+    const result = await collectCompletionLint(scope, [], {
+      explicitChecks: [{
+        command: "targeted recheck cancelled after start",
+        executableCommand: `${process.execPath} -e "process.exit(1)"`,
+        cwd: scope,
+      }],
+      token: cancellation.token,
+      taskFolderUri: vscode.Uri.file(taskFolder),
+      rawReportLocation: "runs/failed-first-source-original-attempt-2.log",
+      onCheckEvent: {
+        started: () => cancellation.cancel(),
+        settled: () => undefined,
+      },
+    });
+
+    assert.equal(result.passed, false);
+    assert.equal(result.rawReportLocation, "runs/failed-first-source-original-attempt-2.log");
+    assert.equal(nodeFs.readFileSync(sourceLog, "utf8"), originalSourceEvidence,
+      "cancellation must not overwrite the source full-run evidence");
+    assert.match(nodeFs.readFileSync(attemptLog, "utf8"), /=== targeted recheck cancelled after start \(exit code 1\) ===/,
+      "the cancelled attempt result must remain available separately");
+    assert.match(result.failedChecks[0]?.output ?? "", /cancelled/);
+    cancellation.dispose();
+  });
+
   void it("skips a missing test script with guidance instead of failing, while still running lint", async () => {
     const dir = makeWorkspace("missing-test-script", {
       name: "x",
@@ -159,6 +257,22 @@ void describe("collectCompletionLint — publish pre-check schema (lint/test scr
     assert.deepEqual(result.missingScripts, [], "explicit commands bypass missing-script reporting");
     assert.deepEqual(result.failedChecks, [], "only the explicit command runs, and it passed");
     assert.equal(result.passed, true);
+  });
+
+  void it("runs internal explicit checks in their original member working directory", async () => {
+    const dir = makeWorkspace("explicit-check-member-cwd", { name: "root" });
+    const member = nodePath.join(dir, "packages", "core");
+    nodeFs.mkdirSync(member, { recursive: true });
+    const result = await collectCompletionLint(dir, [], {
+      explicitChecks: [{
+        command: "[packages/core] pnpm test",
+        executableCommand: "node -e \"console.log(process.cwd()); process.exit(1)\"",
+        cwd: member,
+      }],
+    });
+    assert.equal(result.failedChecks.length, 1);
+    assert.match(result.failedChecks[0]?.output ?? "", new RegExp(member.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.equal(result.commandsRun?.[0], "[packages/core] pnpm test");
   });
 
   void it("reports a failing explicit verification command as a failed check", async () => {

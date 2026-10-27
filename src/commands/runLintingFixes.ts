@@ -11,8 +11,10 @@ import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import {
+  PublishChecksCancelledError,
   runCompletionLint,
   resolvePublishScopeFolder,
+  throwIfPublishChecksCancelledV1,
 } from "../utils/completionLint";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { renderPromptTemplate } from "../utils/promptTemplates";
@@ -37,6 +39,7 @@ import { deterministicFixOutcomeV1 } from "../utils/deterministicFixOutcomeV1";
 import { classifyFixCheckStatusesV1, fixHasUnresolvedChecksV1 } from "../utils/fixChecksReportV1";
 import {
   runTrackedOperation,
+  linkCancellationTokens,
   taskOperations,
   TaskOperationHandle,
   resolveWorkflowRootTaskName,
@@ -57,6 +60,9 @@ import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { scheduleAutomationChain } from "../utils/automationChain";
 import { CHECK_AND_REVIEW_PUBLISH_COMMAND_ID_V1 } from "./checkAndReviewPublish";
+import type { CandidateInvocationInfoV1 } from "../runners/runnerRegistry";
+import { candidateInvocationMessageV1, persistCandidateDispatchModelChainV1 } from "../utils/dispatchModelChainV1";
+import { writeRunLog } from "../utils/runLog";
 import {
   computePublishScopeId,
   computeTreeFingerprintV1,
@@ -149,6 +155,29 @@ function isFileInFolder(fileUri: vscode.Uri, folderPath: string): boolean {
 
   return compareFilePath.startsWith(folderPathWithSeparator) ||
          compareFilePath === compareFolderPath;
+}
+
+/** Build the user-visible recovery choice shared by every lint-fix hand-back. */
+export function offerLintFixRecoveryInChatV1(
+  taskFolderPath: string,
+  taskLabel: string,
+  noticeText: string,
+  optional = false
+): Promise<Awaited<ReturnType<typeof offerActionInChatV1>>> {
+  return offerActionInChatV1({
+    taskFolderPath,
+    taskLabel,
+    actionLabel: "Run Publish Checks",
+    command: "vs-code-ai-helper.runPublishChecks",
+    args: [{ taskFolderPath }],
+    alternatives: [{
+      label: "Back to Implementation",
+      command: "vs-code-ai-helper.setTaskStage",
+      args: [{ taskFolderPath, stage: "implementation" }],
+    }],
+    noticeText,
+    ...(optional ? { optional: true as const } : {}),
+  });
 }
 
 /**
@@ -536,6 +565,7 @@ export async function runLintingFixes(
   const publishFixV1: { taskFolderUri?: vscode.Uri; lockKey?: string } = {};
   let finalChecksV1: { passed: boolean; failedChecks: readonly { command: string }[] } | undefined;
   let fixSucceededV1 = false;
+  const changedFilesV1 = new Set<string>();
   // Item 2 / Step 57a completion fix (2026-09-29 review): out-param the AI
   // final-fixes dispatch below fills from its own runImplementationOrSealedV1
   // call, read back here so the terminal recordAdmissionReleaseTriggerV1 call
@@ -601,7 +631,20 @@ export async function runLintingFixes(
     await renderPromptTemplate(extensionUri, "final-fixes-code.md", { lint: "", contextPack: "" });
   } catch (error) {
     if (!isExtensionFolderRemovedErrorV1(error)) throw error;
-    NotificationRouter.showError(`${taskLabel} — Linting fixes were not started. ${error.message}`);
+    const notice = `${taskLabel} — Linting fixes were not started. ${error.message} ` +
+      "The extension resources are unavailable, so Publish Checks cannot run from this window yet.";
+    const chatPointer = await offerActionInChatV1({
+      taskFolderPath: resolvedTask.taskFolderPath,
+      taskLabel,
+      actionLabel: "Open Extensions",
+      command: "workbench.view.extensions",
+      noticeText: notice,
+      optional: true,
+    }).catch((offerError: unknown) => {
+      console.warn("Could not post the removed-extension recovery action in chat:", offerError);
+      return undefined;
+    });
+    NotificationRouter.showError(notice /* taskLabel */, undefined, undefined, undefined, chatPointer);
     return;
   }
 
@@ -647,14 +690,7 @@ export async function runLintingFixes(
       undefined,
       undefined,
       undefined,
-      await offerActionInChatV1({
-        taskFolderPath: resolvedTask.taskFolderPath,
-        taskLabel,
-        actionLabel: "Run Publish Checks",
-        command: "vs-code-ai-helper.runPublishChecks",
-        args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
-        noticeText: notRunNotice,
-      })
+      await offerLintFixRecoveryInChatV1(resolvedTask.taskFolderPath, taskLabel, notRunNotice)
     );
     return;
   }
@@ -673,15 +709,12 @@ export async function runLintingFixes(
     noticeText: string,
     level: "warning" | "error" = "warning"
   ): Promise<void> => {
-    const chatPointer = await offerActionInChatV1({
-      taskFolderPath: resolvedTask.taskFolderPath,
+    const chatPointer = await offerLintFixRecoveryInChatV1(
+      resolvedTask.taskFolderPath,
       taskLabel,
-      actionLabel: "Run Publish Checks",
-      command: "vs-code-ai-helper.runPublishChecks",
-      args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
       noticeText,
-      optional: true,
-    });
+      true
+    );
     const message = `${noticeText}${chatPointer ? " Open the decision in Chat to continue." : ""}`;
     if (level === "error") {
       NotificationRouter.showError(message /* taskLabel */, undefined, undefined, undefined, chatPointer);
@@ -717,14 +750,7 @@ export async function runLintingFixes(
       undefined,
       undefined,
       undefined,
-      await offerActionInChatV1({
-        taskFolderPath: resolvedTask.taskFolderPath,
-        taskLabel,
-        actionLabel: "Run Publish Checks",
-        command: "vs-code-ai-helper.runPublishChecks",
-        args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
-        noticeText: staleScopeNotice,
-      })
+      await offerLintFixRecoveryInChatV1(resolvedTask.taskFolderPath, taskLabel, staleScopeNotice)
     );
     return;
   }
@@ -755,15 +781,32 @@ export async function runLintingFixes(
       ),
       kind: "lint-fixes",
       parent: parentOperation,
+      cancellable: true,
     },
     async (op) => {
+      let runLogRunnerId = "lint-fixes";
+      let runLogOperationId = op.id;
+      let runLogUriV1: vscode.Uri | undefined;
+      const runLogAttemptIds: string[] = [];
+      let runLogOutcome = "operation ended without a recorded terminal result";
+      const settleFixOperation = (
+        status: "failed" | "cancelled" | "interrupted",
+        message: string
+      ): void => {
+        runLogOutcome = `${status}: ${message}`;
+        op.settleAs(status, message);
+      };
+      try {
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Window,
           title: "Running linting fixes...",
-          cancellable: false,
+          cancellable: true,
         },
-        async (progress) => {
+        async (progress, progressToken) => {
+          const linked = linkCancellationTokens(progressToken, op.token);
+          const cancelToken = linked.token;
+          try {
           NotificationRouter.emitProgressSummary(
             "Running linting fixes...",
             taskOperations.rootOperationIdFor(lockKey)
@@ -781,6 +824,7 @@ export async function runLintingFixes(
               "workspace files (Fix Linting & Code Errors)",
               new Date().toISOString()
             );
+            throwIfPublishChecksCancelledV1(cancelToken);
             progress.report({ message: "Checking for linting errors..." });
 
             // Check for TypeScript/JavaScript files with problems inside the
@@ -842,6 +886,7 @@ export async function runLintingFixes(
             let eslintUnavailable = false;
 
             for (const [uri, diags] of lintingIssues) {
+              throwIfPublishChecksCancelledV1(cancelToken);
               const hasEslintIssues = diags.some((d) => d.source === "eslint");
 
               try {
@@ -874,16 +919,19 @@ export async function runLintingFixes(
                 // exclusion.
                 if (doc.isDirty) {
                   await doc.save();
+                  changedFilesV1.add(uri.fsPath);
                   if (workspaceFolderForSnapshot) {
-                    autofixedRelativePaths.add(
-                      path.relative(workspaceFolderForSnapshot.uri.fsPath, uri.fsPath).replace(/\\/g, "/")
-                    );
+                    const relativePath = path.relative(workspaceFolderForSnapshot.uri.fsPath, uri.fsPath).replace(/\\/g, "/");
+                    autofixedRelativePaths.add(relativePath);
                   }
                 }
-              } catch {
+              } catch (error) {
+                if (cancelToken.isCancellationRequested) throw error;
                 failedCount++;
               }
             }
+
+            throwIfPublishChecksCancelledV1(cancelToken);
 
             const remainingLintIssues = vscode.languages
               .getDiagnostics()
@@ -903,8 +951,10 @@ export async function runLintingFixes(
             const deterministicBeforeSha = await resolveHeadCommitSha(deterministicScopeFolder);
             const deterministicBeforeFingerprint = await computeTreeFingerprintV1(deterministicScopeFolder);
 
-            const postFixLint = await runCompletionLint(taskFolderUri, relevantFiles);
+            const postFixLint = await runCompletionLint(taskFolderUri, relevantFiles, { token: cancelToken });
+            throwIfPublishChecksCancelledV1(cancelToken);
             await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+            throwIfPublishChecksCancelledV1(cancelToken);
             finalChecksV1 = { passed: postFixLint.passed, failedChecks: postFixLint.failedChecks };
 
             if (!postFixLint.passed) {
@@ -944,12 +994,13 @@ export async function runLintingFixes(
                     fixedCount > 0
                       ? " The deterministic autofixes above were still applied."
                       : "";
-                  op.settleAs("failed", "AI final fixes unavailable; checks still fail");
+                  settleFixOperation("failed", "AI final fixes unavailable; checks still fail");
                   await showFixHandbackV1(
                     `AI final fixes are unavailable: ${editAvailability.reason}${autofixNote} (${checkClassification.summary}) Fix the remaining issues, then run Publish Checks.`
                   );
                   return;
                 }
+                throwIfPublishChecksCancelledV1(cancelToken);
                 const postFixDiagnostics = vscode.languages.getDiagnostics().filter(([uri, ds]) => isFileInFolder(uri, fixScopeFolder) && ds.some((d) => d.source === "eslint" || d.source === "ts" || d.source === "typescript"));
                 const lint = JSON.stringify({
                   summary: postFixLint.summary,
@@ -964,11 +1015,15 @@ export async function runLintingFixes(
                 const sizeCheck = await checkAndConfirmPromptSize(prompt, "the configured Publish-stage agent", 0, {
                   displayName: resolvedTask.progress.displayName,
                   folderPath: taskFolderUri.fsPath,
+                  token: cancelToken,
                 });
+                throwIfPublishChecksCancelledV1(cancelToken);
                 if (sizeCheck === "ok" || sizeCheck === "confirmed") {
-                  if (!context || !(await ensureAiConsent(context, taskFolderUri.fsPath))) {
+                  if (!context || !(await ensureAiConsent(context, taskFolderUri.fsPath, cancelToken))) {
+                    throwIfPublishChecksCancelledV1(cancelToken);
                     return;
                   }
+                  throwIfPublishChecksCancelledV1(cancelToken);
                   // Pre-run safety checks for agentic file-editing runs —
                   // the same gate executeImplementationRun applies (in the
                   // same size-gate → consent → safety-check order) before
@@ -998,7 +1053,9 @@ export async function runLintingFixes(
                         { optionId: "proceed", label: "Proceed Anyway" },
                         { optionId: "cancel", label: "Cancel" },
                       ],
+                      token: cancelToken,
                     });
+                    throwIfPublishChecksCancelledV1(cancelToken);
                     if (proceed !== "proceed") {
                       NotificationRouter.showInformation("AI final fixes cancelled.");
                       return;
@@ -1031,7 +1088,9 @@ export async function runLintingFixes(
                           { optionId: "proceed", label: "Proceed" },
                           { optionId: "cancel", label: "Cancel" },
                         ],
+                        token: cancelToken,
                       });
+                      throwIfPublishChecksCancelledV1(cancelToken);
                       if (proceed !== "proceed") {
                         NotificationRouter.showInformation("AI final fixes cancelled.");
                         return;
@@ -1040,6 +1099,8 @@ export async function runLintingFixes(
                   }
                   let result: Awaited<ReturnType<typeof runImplementationOrSealedV1>> | undefined;
                   await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: "Applying AI final fixes...", cancellable: true }, async (aiProgress, token) => {
+                    const aiLinked = linkCancellationTokens(token, cancelToken);
+                    try {
                     // Copilot-resolved models run the sealed two-phase
                     // pipeline; CLI-resolved models run their own direct
                     // edit-mode invocation instead (see
@@ -1052,7 +1113,7 @@ export async function runLintingFixes(
                       modelId: model.modelId,
                       prompt,
                       workspaceUri: workspaceFolder.uri,
-                      token,
+                      token: aiLinked.token,
                       stage: "publish",
                       taskStage: "publish",
                       taskFolderUri: taskFolderUri,
@@ -1079,6 +1140,42 @@ export async function runLintingFixes(
                         };
                       }),
                       dispatchProbe: lintDispatchProbeV1,
+                      dispatchOperationId: op.id,
+                      onCandidateInvokedV1: async (info: CandidateInvocationInfoV1) => {
+                        runLogRunnerId = info.runnerId;
+                        runLogOperationId = info.operationId ?? op.id;
+                        if (info.attemptId && !runLogAttemptIds.includes(info.attemptId)) {
+                          runLogAttemptIds.push(info.attemptId);
+                        }
+                        op.setModel?.(info.storedModelId);
+                        const message = candidateInvocationMessageV1(
+                          "AI final fixes",
+                          info.storedModelId,
+                          info.providerLabel,
+                          info.backup
+                        );
+                        op.report?.(message);
+                        NotificationRouter.showInformation(message);
+                        await persistCandidateDispatchModelChainV1({
+                          taskFolderUri,
+                          stage: "publish",
+                          operationId: info.operationId ?? op.id,
+                          attemptId: info.attemptId,
+                          runnerId: info.runnerId,
+                          storedModelId: info.storedModelId,
+                          providerLabel: info.providerLabel,
+                        }).catch((error) => console.warn("Could not persist lint-fix dispatch model chain:", error));
+                        runLogUriV1 = await writeRunLog(
+                          taskFolderUri,
+                          runLogRunnerId,
+                          "publish",
+                          `# Fix Linting & Code Errors\n\nDispatch started with ${info.providerLabel} — ${info.storedModelId}.\nOperation: ${runLogOperationId}. Attempt: ${info.attemptId ?? "unknown"}.`,
+                          { operationId: runLogOperationId, attemptIds: runLogAttemptIds }
+                        ).catch((error) => {
+                          console.warn("Could not write lint-fix dispatch run log:", error);
+                          return undefined;
+                        });
+                      },
                       onProgress: (message) => aiProgress.report({ message }),
                       // Mirror structured preflight questions into task-local
                       // Chat so Answer/Resume work (plan §5.5).
@@ -1114,14 +1211,33 @@ export async function runLintingFixes(
                         }
                       },
                     });
+                    } finally {
+                      aiLinked.dispose();
+                    }
                   });
+                  if (result?.filesChanged) {
+                    for (const file of result.filesChanged) changedFilesV1.add(path.resolve(workspaceFolder.uri.fsPath, file));
+                  }
+                  if (cancelToken.isCancellationRequested || result?.status === "cancelled") {
+                    const changed = [...changedFilesV1].sort();
+                    const detail = changed.length > 0 ? ` Files already changed: ${changed.join(", ")}.` : " No changed files were reported.";
+                    fixSucceededV1 = false;
+                    finalChecksV1 = undefined;
+                    settleFixOperation("cancelled", `Fix Linting & Code Errors was cancelled.${detail}`);
+                    await showFixHandbackV1(
+                      `Fix Linting & Code Errors was cancelled.${detail} Review any retained edits, then run Publish Checks to verify the current workspace.`
+                    );
+                    return;
+                  }
                   if (result?.status === "completed") {
                     const scopeFolder = resolvePublishScopeFolder(taskFolderUri, resolvedTask.progress).folder;
                     const beforeSha = await resolveHeadCommitSha(scopeFolder);
                     const beforeFingerprint = await computeTreeFingerprintV1(scopeFolder);
 
-                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles);
+                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles, { token: cancelToken });
+                    throwIfPublishChecksCancelledV1(cancelToken);
                     await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    throwIfPublishChecksCancelledV1(cancelToken);
                     finalChecksV1 = { passed: rerunLint.passed, failedChecks: rerunLint.failedChecks };
                     await inventory.refresh();
                     const deniedCommands =
@@ -1151,17 +1267,17 @@ export async function runLintingFixes(
                       };
                       fixSucceededV1 = false;
                       if (!rerunLint.passed) {
-                        op.settleAs("failed", "checks still fail after the AI fixes were applied");
+                        settleFixOperation("failed", "checks still fail after the AI fixes were applied");
                         await showFixHandbackV1(
                           `AI final fixes were applied, but checks still fail (${classification.summary}). Fix the remaining issues, then run Publish Checks.`
                         );
                       } else if (classification.hasUnrun) {
-                        op.settleAs("failed", "prior failing checks were omitted or unrun after the AI fixes were applied");
+                        settleFixOperation("failed", "prior failing checks were omitted or unrun after the AI fixes were applied");
                         await showFixHandbackV1(
                           `AI final fixes were applied, but prior checks were not rerun (${classification.summary}). Fix the remaining issues, then run Publish Checks.`
                         );
                       } else {
-                        op.settleAs("failed", "prior failing checks were denied in the sandbox and remain untested");
+                        settleFixOperation("failed", "prior failing checks were denied in the sandbox and remain untested");
                         await showFixHandbackV1(
                           `AI final fixes were applied, but checks remain untested (${classification.summary}). Fix the remaining issues, then run Publish Checks.`
                         );
@@ -1187,6 +1303,7 @@ export async function runLintingFixes(
                         afterSha &&
                         afterFingerprint
                       ) {
+                        throwIfPublishChecksCancelledV1(cancelToken);
                         await writePublishChecksFreshnessStampV1(taskFolderUri, {
                           formatVersion: 1,
                           runId: crypto.randomUUID(),
@@ -1196,6 +1313,7 @@ export async function runLintingFixes(
                           treeFingerprint: afterFingerprint,
                         });
                       }
+                      throwIfPublishChecksCancelledV1(cancelToken);
                       // Every awaited step on this path has returned.
                       fixSucceededV1 = true;
                       NotificationRouter.showInformation(
@@ -1210,8 +1328,10 @@ export async function runLintingFixes(
                     // the last word for this run, not silently overridden by
                     // the unrelated deterministic-autofix-count message
                     // below (see the `return` after this block).
-                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles);
+                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles, { token: cancelToken });
+                    throwIfPublishChecksCancelledV1(cancelToken);
                     await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    throwIfPublishChecksCancelledV1(cancelToken);
                     finalChecksV1 = { passed: rerunLint.passed, failedChecks: rerunLint.failedChecks };
                     await inventory.refresh();
                     const deniedCommands =
@@ -1230,12 +1350,12 @@ export async function runLintingFixes(
                     // applied, so neither may report "completed" at the
                     // operation level.
                     if (result?.status === "failed") {
-                      op.settleAs("failed", result.errorMessage ?? "no reason was reported");
+                      settleFixOperation("failed", result.errorMessage ?? "no reason was reported");
                       await showFixHandbackV1(
                         `AI final fixes failed: ${result.errorMessage ?? "no reason was reported"} (${classification.summary}). Review the changes, then run Publish Checks.`
                       );
                     } else {
-                      op.settleAs("failed", "AI final fixes were cancelled before completing");
+                      settleFixOperation("failed", "AI final fixes were cancelled before completing");
                       await showFixHandbackV1(
                         `AI final fixes were cancelled; completion lint was rerun (${classification.summary}). Run Publish Checks when ready.`
                       );
@@ -1275,6 +1395,7 @@ export async function runLintingFixes(
                 afterSha &&
                 afterFingerprint
               ) {
+                throwIfPublishChecksCancelledV1(cancelToken);
                 await writePublishChecksFreshnessStampV1(taskFolderUri, {
                   formatVersion: 1,
                   runId: crypto.randomUUID(),
@@ -1285,6 +1406,8 @@ export async function runLintingFixes(
                 });
               }
             }
+
+            throwIfPublishChecksCancelledV1(cancelToken);
 
             // A fix "succeeded" only when the checks it was meant to satisfy pass.
             if (postFixLint.passed && fixedCount > 0) {
@@ -1297,7 +1420,7 @@ export async function runLintingFixes(
               failedCommands: postFixLint.failedChecks.map((check) => check.command),
             });
             if (deterministicOutcome.kind === "failure" && !fixSucceededV1) {
-              op.settleAs(
+              settleFixOperation(
                 "failed",
                 fixedCount > 0 ? "deterministic fixes applied but checks still fail" : "completion lint failed with no automatic fixes available"
               );
@@ -1320,7 +1443,7 @@ export async function runLintingFixes(
               if (stillFailingChecks.length > 0) {
                 // RC3 item 11 (Step 9): checks are still failing here, so the
                 // operation-level notification must not read "completed".
-                op.settleAs("failed", "no automatic fixes were available; checks still fail");
+                settleFixOperation("failed", "no automatic fixes were available; checks still fail");
               }
               await showFixHandbackV1(
                 stillFailingChecks.length > 0
@@ -1329,12 +1452,23 @@ export async function runLintingFixes(
               );
             }
           } catch (error) {
+            if (cancelToken.isCancellationRequested || error instanceof PublishChecksCancelledError) {
+              const changed = [...changedFilesV1].sort();
+              const detail = changed.length > 0 ? ` Files already changed: ${changed.join(", ")}.` : " No changed files were reported.";
+              fixSucceededV1 = false;
+              finalChecksV1 = undefined;
+              settleFixOperation("cancelled", `Fix Linting & Code Errors was cancelled.${detail}`);
+              await showFixHandbackV1(
+                `Fix Linting & Code Errors was cancelled.${detail} Review any retained edits, then run Publish Checks to verify the current workspace.`
+              );
+              return;
+            }
             if (isExtensionFolderRemovedErrorV1(error)) {
               // Do not run more checks or persist another lint verdict after
               // the extension-owned prompt read proved this window is stale.
               fixSucceededV1 = false;
               finalChecksV1 = undefined;
-              op.settleAs("failed", "linting fixes were not started because the extension folder was removed");
+              settleFixOperation("failed", "linting fixes were not started because the extension folder was removed");
               await showFixHandbackV1(
                 `Linting fixes were not started. ${error.message} The fix checks were not run; run Publish Checks after resolving this.`,
                 "error"
@@ -1346,7 +1480,7 @@ export async function runLintingFixes(
             fixSucceededV1 = false;
             finalChecksV1 = undefined;
             try {
-              await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles);
+              await runCompletionLint(taskFolderUri, resolvedTask.progress.implReviewFiles, { token: cancelToken });
               await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
             } catch {
               await persistLintState(
@@ -1359,8 +1493,46 @@ export async function runLintingFixes(
               "error"
             );
           }
+          } finally {
+            linked.dispose();
+          }
         }
       );
+      } finally {
+        if (runLogOutcome === "operation ended without a recorded terminal result") {
+          runLogOutcome = fixSucceededV1
+            ? "completed: lint fixes and required follow-up checks passed"
+            : finalChecksV1
+              ? `failed: final checks ${finalChecksV1.passed ? "passed" : "failed"} without an explicit operation outcome`
+              : "interrupted or incomplete: no final check result was recorded";
+        }
+        const changed = [...changedFilesV1].sort();
+        const summary = [
+          "# Fix Linting & Code Errors",
+          "",
+          `Outcome: ${runLogOutcome}`,
+          `Changed files: ${changed.length > 0 ? changed.join(", ") : "none reported"}`,
+          finalChecksV1
+            ? `Final checks: ${finalChecksV1.passed ? "passed" : "failed"}; ${finalChecksV1.failedChecks.length} failing checks.`
+            : "Final checks: no final result was recorded.",
+        ].join("\n");
+        if (runLogUriV1) {
+          try {
+            const existing = new TextDecoder().decode(await vscode.workspace.fs.readFile(runLogUriV1));
+            await vscode.workspace.fs.writeFile(
+              runLogUriV1,
+              new TextEncoder().encode(`${existing}\n\n## Terminal outcome\n\n${summary}\n`)
+            );
+          } catch (error) {
+            console.warn("Could not finalize lint-fix run log:", error);
+          }
+        } else {
+          await writeRunLog(taskFolderUri, runLogRunnerId, "publish", summary, {
+            operationId: runLogOperationId,
+            attemptIds: runLogAttemptIds,
+          }).catch((error) => console.warn("Could not write lint-fix run log:", error));
+        }
+      }
     }
   );
   } finally {

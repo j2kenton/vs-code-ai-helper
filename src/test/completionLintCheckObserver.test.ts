@@ -224,8 +224,7 @@ void describe("collectCompletionLint — onCheckEvent observer", () => {
   void it("runCompletionLint (the commit/push and Publish-Checks-command entry point) has no way to pass an observer", () => {
     // `runCompletionLint` — used by runPublishChecks.ts (commit/push),
     // publishPreflight.ts's persisted-preflight branch, and
-    // runLintingFixes.ts — takes only `(folderUri, relevantFiles?, { token }?)`
-    // (the token lets Publish Checks be cancelled, item 29) and forwards to
+    // runLintingFixes.ts — accepts cancellation and failed-first options and forwards to
     // `collectCompletionLintPreview` with no `onCheckEvent`.
     // This is a structural (not just conventional) guarantee: there is no
     // parameter through which one of those callers COULD publish activity,
@@ -235,11 +234,9 @@ void describe("collectCompletionLint — onCheckEvent observer", () => {
       nodePath.join(process.cwd(), "src", "utils", "completionLint.ts"),
       "utf8"
     );
-    assert.match(
-      source,
-      /export async function runCompletionLint\(folderUri: vscode\.Uri, relevantFiles\?: readonly string\[\], options\?: \{ token\?: vscode\.CancellationToken \}\): Promise<CompletionLintResult> \{\s*const result = await collectCompletionLintPreview\(folderUri, relevantFiles, \{ allowScopePrompt: true, token: options\?\.token \}\);/,
-      "runCompletionLint must take no onCheckEvent-shaped option (only a cancellation token) and must not forward an observer to collectCompletionLintPreview"
-    );
+    const entryPoint = source.match(/export async function runCompletionLint\([\s\S]*?const result = await collectCompletionLintPreview\([\s\S]*?\);/);
+    assert.ok(entryPoint, "runCompletionLint must call collectCompletionLintPreview");
+    assert.doesNotMatch(entryPoint[0], /onCheckEvent/, "runCompletionLint must not accept or forward an observer");
 
     const preflightSource = nodeFs.readFileSync(
       nodePath.join(process.cwd(), "src", "utils", "publishPreflight.ts"),

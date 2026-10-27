@@ -61,6 +61,7 @@ const runnerRegistryModule = require("../runners/runnerRegistry") as Record<stri
 const productionRuntimeModule = require("../actions/productionTaskActionRuntimeV1") as Record<string, unknown>;
 const promptTemplatesModule = require("../utils/promptTemplates") as Record<string, unknown>;
 const runLogModule = require("../utils/runLog") as Record<string, unknown>;
+const implContinuationModule = require("../commands/implContinuationTextDispatchV1") as Record<string, unknown>;
 const contextPackModule = require("../utils/contextPack") as Record<string, unknown>;
 const promptSizeGuardModule = require("../utils/promptSizeGuard") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
@@ -82,7 +83,17 @@ const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-activity-
 // untracked and — being under the task's own folder — excluded by
 // `getUnrelatedWorkspaceChanges`'s own path filter), which is deterministic
 // and environment-independent instead of accidentally correct.
-execFileSync("git", ["init", "--quiet"], { cwd: REAL_ROOT });
+try {
+  execFileSync("git", ["init", "--quiet"], { cwd: REAL_ROOT });
+} catch (error) {
+  // Sandboxed test runners may deny child-process creation entirely. In that
+  // case the production git probes also resolve as unavailable and the suite
+  // exercises its explicit non-git-workspace path. Do not mask real Git
+  // failures: only EPERM is an environment limitation we can safely tolerate.
+  if (!error || typeof error !== "object" || (error as NodeJS.ErrnoException).code !== "EPERM") {
+    throw error;
+  }
+}
 
 const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-activity-private-"));
 const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
@@ -353,6 +364,12 @@ function patch(module: Record<string, unknown>, name: string, replacement: unkno
 }
 
 /**
+ * Pin the two same-module safety probes to an empty repository view for this
+ * fixture. `git init` is best-effort because sandbox policies can reject
+ * synchronous child creation; these callbacks keep the test's branch choice
+ * deterministic either way and never inspect the enclosing checkout.
+ */
+/**
  * Spies on the registry's own `reportActivity` choke point (every
  * `TaskOperationHandle.reportActivity`/`reportStageStartingV1`/
  * `reportStageRunningV1` call resolves to this one method — see its doc
@@ -436,7 +453,7 @@ function installImplementationPatches(): Patched[] {
       backups: [],
     })),
     patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
-    patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+    patch(runLogModule, "writeRunLog", () => Promise.resolve(vscode.Uri.file(path.join(REAL_ROOT, "runs", "round.md")))),
     patch(contextPackModule, "generateContextPack", () => Promise.resolve("# Context\n")),
     patch(runnerRegistryModule, "checkImplementationAvailabilityForModel", () =>
       Promise.resolve({
@@ -1017,6 +1034,251 @@ void describe("runImplementationWithAI — real in-flight activity through the p
  * seeded on real disk before dispatch.
  */
 void describe("round-progress.md lifecycle through the real implementation dispatch", () => {
+  async function runReportCorrectionScenario(input: {
+    readonly safeTransport: boolean;
+    readonly planText?: string;
+    readonly originalFilesChanged?: readonly string[];
+    readonly trackedSourceFiles?: readonly string[];
+    readonly originalSummary?: string;
+    readonly correction?: {
+      readonly status: "completed" | "failed";
+      readonly filesChanged: string[];
+      readonly filesChangedUnknown: boolean;
+      readonly summary: string;
+      readonly runnerId: string;
+      readonly storedModelId: string;
+    };
+  }): Promise<{ corrections: number; modelIds: string[]; primaryOnly: boolean[]; summary: string; plan: string; changedFiles: readonly string[]; progress: Record<string, unknown> }> {
+    const { folderPath } = makeImplTaskFolder(`impl-report-correction-${Math.floor(Math.random() * 1e9)}`);
+    if (input.trackedSourceFiles?.length) {
+      const progressPath = path.join(folderPath, "task-progress.json");
+      const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+      progress["implReviewFiles"] = [...input.trackedSourceFiles];
+      fs.writeFileSync(progressPath, JSON.stringify(progress, null, 2), "utf8");
+      for (const sourceFile of input.trackedSourceFiles) {
+        const absolute = path.join(REAL_ROOT, sourceFile);
+        fs.mkdirSync(path.dirname(absolute), { recursive: true });
+        fs.writeFileSync(absolute, "seeded tested source\n", "utf8");
+      }
+    }
+    const provider = new StatusTreeProvider();
+    initNotificationRouter(provider);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const warnStub = installProceedAnywayStub();
+    const tabGroupsStub = installTabGroupsStub();
+    const controllable = controllableImplementationRun();
+    let corrections = 0;
+    const modelIds: string[] = [];
+    const primaryOnly: boolean[] = [];
+    const patches = [
+      ...installImplementationPatches(),
+      patch(runnerRegistryModule, "runImplementationForModel", controllable.fn),
+      patch(implContinuationModule, "isSummaryOnlyDispatchAvailableV1", () => input.safeTransport),
+      patch(implContinuationModule, "runSummaryOnlyContinuationV1", (options: { modelId?: string; restrictToPrimaryModel?: boolean }) => {
+        corrections += 1;
+        modelIds.push(options.modelId ?? "<missing>");
+        primaryOnly.push(options.restrictToPrimaryModel === true);
+        const result = input.correction;
+        if (!result) throw new Error("correction should not have been dispatched");
+        return Promise.resolve({
+          ...result,
+          summaryIsSynthetic: false,
+          providerLabel: "Claude Code",
+        });
+      }),
+    ];
+    try {
+      if (input.planText) {
+        fs.writeFileSync(path.join(folderPath, "plan-final.md"), input.planText, "utf8");
+      }
+      const dispatchPromise = runImplementationWithAI(
+        vscode.Uri.file(REAL_ROOT),
+        makeExtensionContext(),
+        { taskFolderPath: folderPath }
+      );
+      await controllable.invoked;
+      for (const relativePath of input.originalFilesChanged ?? []) {
+        const changedPath = path.join(REAL_ROOT, relativePath);
+        fs.mkdirSync(path.dirname(changedPath), { recursive: true });
+        fs.writeFileSync(changedPath, "original round edit\n", "utf8");
+      }
+      controllable.resolveWith({
+        status: "completed",
+        filesChanged: [...(input.originalFilesChanged ?? [])],
+        filesChangedUnknown: false,
+        summary: input.originalSummary ?? "The work is complete, but the required final report is missing.",
+        summaryIsSynthetic: false,
+        runnerId: "claude-cli",
+        actualProviderLabel: "Claude Code",
+        actualStoredModelId: "claude-cli:sonnet@high",
+        storedModelId: "claude-cli:sonnet@high",
+      });
+      await dispatchPromise;
+      return {
+        corrections,
+        modelIds,
+        primaryOnly,
+        summary: fs.existsSync(path.join(folderPath, "impl-summary.md"))
+          ? fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8")
+          : "",
+        plan: fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8"),
+        changedFiles: input.originalFilesChanged ?? [],
+        progress: JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as Record<string, unknown>,
+      };
+    } finally {
+      for (const p of patches.reverse()) p.restore();
+      tabGroupsStub.restore();
+      warnStub.restore();
+      wsStub.restore();
+      fsBridge.restore();
+      provider.dispose();
+      deactivateNotificationRouter();
+    }
+  }
+
+  void it("requests one report correction from the original model and accepts only its grounded report", async () => {
+    const result = await runReportCorrectionScenario({
+      safeTransport: true,
+      correction: {
+        status: "completed", filesChanged: [], filesChangedUnknown: false,
+        summary: ["## Files Changed", "- none", "## Verification", "- Not run.",
+          "## Plan Item Checklist", "- [x] Do the thing."].join("\n"),
+        runnerId: "claude-cli", storedModelId: "claude-cli:sonnet@high",
+      },
+    });
+    assert.equal(result.corrections, 1, "the correction lifecycle makes one report-only attempt");
+    assert.deepEqual(result.modelIds, ["claude-cli:sonnet@high"], "the correction remains on the original model");
+    assert.deepEqual(result.primaryOnly, [true], "only the correction dispatch disables the backup chain");
+    assert.match(result.summary, /## Plan Item Checklist/);
+  });
+
+  void it("does not dispatch a correction when no enforced safe transport exists", async () => {
+    const changedPath = "src/report-correction-safe-fallback-edit.txt";
+    const result = await runReportCorrectionScenario({ safeTransport: false, originalFilesChanged: [changedPath] });
+    assert.equal(result.corrections, 0);
+    assert.doesNotMatch(result.summary, /## Plan Item Checklist/);
+    assert.equal(fs.readFileSync(path.join(REAL_ROOT, changedPath), "utf8"), "original round edit\n",
+      "unavailable correction retains the original implementation edit");
+    assert.ok(result.progress.implRecovery, "the rejected report leaves durable continuation recovery");
+    assert.match(
+      JSON.stringify(result.progress.implRecovery),
+      /resolved model has no enforced safe report-only transport/,
+      "durable recovery explains why report correction was unavailable"
+    );
+    assert.deepEqual(result.progress.pendingImplReviewFiles, [changedPath],
+      "recovery retains the original changed-file attribution");
+  });
+
+  void it("rejects a correction that reports workspace edits and keeps the original report", async () => {
+    const changedPath = "src/report-correction-rejected-edit.txt";
+    const result = await runReportCorrectionScenario({
+      safeTransport: true,
+      originalFilesChanged: [changedPath],
+      correction: {
+        status: "completed", filesChanged: ["src/changed-by-correction.ts"], filesChangedUnknown: false,
+        summary: ["## Files Changed", "- none", "## Verification", "- Not run.",
+          "## Plan Item Checklist", "- [x] Do the thing."].join("\n"),
+        runnerId: "claude-cli", storedModelId: "claude-cli:sonnet@high",
+      },
+    });
+    assert.equal(result.corrections, 1);
+    assert.doesNotMatch(result.summary, /## Plan Item Checklist/);
+    assert.equal(fs.readFileSync(path.join(REAL_ROOT, changedPath), "utf8"), "original round edit\n",
+      "a rejected correction does not discard the original round's edits");
+    assert.deepEqual(result.progress.pendingImplReviewFiles, [changedPath],
+      "recovery retains the original edit attribution");
+    assert.match(JSON.stringify(result.progress.implRecovery), /could not prove that it made no project edits/,
+      "durable recovery states why the correction was rejected");
+  });
+
+  void it("accepts a partial match and accounts for the unmatched claim", async () => {
+    const item = "Update the greeting text.";
+    const changedPath = "src/report-correction-original-edit.txt";
+    const result = await runReportCorrectionScenario({
+      safeTransport: true,
+      planText: `# Implementation Notes\n\n${IMPLEMENTATION_CHECKLIST_MARKER}\n\n- [ ] ${item}\n`,
+      originalFilesChanged: [changedPath],
+      correction: {
+        status: "completed", filesChanged: [], filesChangedUnknown: false,
+        summary: [IMPLEMENTATION_CHECKLIST_MARKER, `- [x] ${item}`, "- [x] Invented item",
+          "## Files Changed", `- ${changedPath}`, "## Verification", "- Not run."].join("\n"),
+        runnerId: "claude-cli", storedModelId: "claude-cli:sonnet@high",
+      },
+    });
+    assert.equal(result.corrections, 1);
+    assert.ok(result.plan.includes(`- [x] ${item}`), "the matching open plan item is newly recorded");
+    assert.equal(fs.readFileSync(path.join(REAL_ROOT, changedPath), "utf8"), "original round edit\n",
+      "a report-only correction must retain the original round's workspace edit");
+    assert.deepEqual(result.changedFiles, [changedPath]);
+    assert.match(result.summary, /Report correction accepted: 2 claimed, 1 matched, 1 unmatched, 1 newly recorded items/);
+  });
+
+  void it("corrects an unrelated checklist and retains the reason when the correction still does not match", async () => {
+    const item = "Step 1: Preserve the task's actual plan item.";
+    const result = await runReportCorrectionScenario({
+      safeTransport: true,
+      planText: `# Plan\n\n${IMPLEMENTATION_CHECKLIST_MARKER}\n\n- [ ] ${item}\n`,
+      originalSummary: [
+        IMPLEMENTATION_CHECKLIST_MARKER, "- [x] A model-generated replacement item.",
+        "## Files Changed", "- none", "## Verification", "- Not run.",
+      ].join("\n"),
+      correction: {
+        status: "completed", filesChanged: [], filesChangedUnknown: false,
+        summary: [
+          IMPLEMENTATION_CHECKLIST_MARKER, "- [x] Still an invented checklist item.",
+          "## Files Changed", "- none", "## Verification", "- Not run.",
+        ].join("\n"),
+        runnerId: "claude-cli", storedModelId: "claude-cli:sonnet@high",
+      },
+    });
+    assert.equal(result.corrections, 1, `an unrelated original list gets exactly one correction attempt; recovery=${JSON.stringify(result.progress.implRecovery)}`);
+    assert.doesNotMatch(result.summary, /## Plan Item Checklist/, "an unrelated correction is not accepted");
+    assert.match(
+      JSON.stringify(result.progress.implRecovery),
+      /checklist claims still did not match the plan/,
+      "durable recovery retains the no-match correction reason"
+    );
+    assert.deepEqual(result.progress.pendingImplReviewFiles ?? [], [],
+      "the report-only mismatch does not invent an implementation change set");
+  });
+
+  void it("persists a passing test report when an accepted correction adds no new checklist tick", async () => {
+    const item = "Add regression tests for the summary writer.";
+    const sourcePath = "src/test/summary-writer.test.ts";
+    const result = await runReportCorrectionScenario({
+      safeTransport: true,
+      planText: `# Implementation Notes\n\n${IMPLEMENTATION_CHECKLIST_MARKER}\n\n- [x] ${item}\n`,
+      trackedSourceFiles: [sourcePath],
+      originalFilesChanged: [sourcePath],
+      originalSummary: ["## Files Changed", `- ${sourcePath}`, "## Verification",
+        "- `node src/test/summary-writer.test.js` — 1 passed, 0 failed",
+        "- Tests ran against the post-edit source state."].join("\n"),
+      correction: {
+        status: "completed", filesChanged: [], filesChangedUnknown: false,
+        summary: ["## Files Changed", "- none", "## Verification",
+          "- `node src/test/summary-writer.test.js` — 1 passed, 0 failed",
+          "- Tests ran against the post-edit source state.",
+          "## Plan Item Checklist", `- ${item} — done — test: summary-writer.test.js`].join("\n"),
+        runnerId: "claude-cli", storedModelId: "claude-cli:sonnet@high",
+      },
+    });
+    assert.equal(result.corrections, 1);
+    const evidence = result.progress.planItemEvidence as Array<{
+      itemText: string;
+      testReports?: Array<{ command: string; passed: number; failed: number; roundId: string; sourceFiles?: string[]; sourceFileStates?: Array<{ path: string; sha256: string }> }>;
+    }>;
+    const row = evidence.find((entry) => entry.itemText === item);
+    assert.ok(row, "evidence is persisted for the already-ticked plan item");
+    assert.deepEqual(row?.testReports?.map(({ command, passed, failed }) => ({ command, passed, failed })), [
+      { command: "node src/test/summary-writer.test.js", passed: 1, failed: 0 },
+    ]);
+    assert.ok(row?.testReports?.[0]?.roundId, "the report remains attributed to the originating round");
+    assert.ok(row?.testReports?.[0]?.sourceFiles?.includes(sourcePath), "the report records the accumulated task source scope it tested");
+    assert.match(row?.testReports?.[0]?.sourceFileStates?.find((state) => state.path === sourcePath)?.sha256 ?? "", /^[a-f0-9]{64}$/,
+      "the post-edit source state is captured as a content hash, not only accepted from report prose");
+  });
+
   void it("accepted-replaces: a banked (accepted) round deletes round-progress.md", async () => {
     const { folderPath } = makeImplTaskFolder(`impl-activity-rp-accept-${Math.floor(Math.random() * 1e9)}`);
     const roundProgressPath = path.join(folderPath, "round-progress.md");

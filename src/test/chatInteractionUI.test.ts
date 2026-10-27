@@ -33,6 +33,8 @@ import { bindingIdForOwnedFolder, makeOwnedTaskFolder } from "./taskFolderFixtur
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import { ADMISSION_DIRNAME_V1, acquireWorkAdmissionV1 } from "../state/workAdmissionV1";
 import { safeRemoveDir } from "./testFsUtils";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 
 /** open() (invoked by askInteraction) raises an internal Notifications entry
  * and executes the webview-focus command — neither of which this test
@@ -159,10 +161,11 @@ void describe("Chat With AI — Confirm runs the resumed round outside the chat 
 
   async function withConfirmHarness(
     resume: NonNullable<ChatInteractionServicesV1["resume"]>,
-    body: (h: { folder: string; provider: ChatViewProvider; fake: FakeWebviewView; confirm: () => Promise<void> }) => Promise<void>
+    body: (h: { folder: string; provider: ChatViewProvider; fake: FakeWebviewView; memento: vscode.Memento; confirm: () => Promise<void> }) => Promise<void>
   ): Promise<void> {
     const folder = makeFolder();
-    const provider = new ChatViewProvider(makeMemento());
+    const memento = makeMemento();
+    const provider = new ChatViewProvider(memento);
     const fake = makeFakeWebviewView();
     const cmds = installExecuteCommandCapture();
     const notify = installNotificationRouterStub();
@@ -192,6 +195,7 @@ void describe("Chat With AI — Confirm runs the resumed round outside the chat 
         folder,
         provider,
         fake,
+        memento,
         confirm: () => fake.send({ type: "confirmInteraction", operationId: OP, interactionId: IID, answers: VALID_ANSWERS }),
       });
     } finally {
@@ -288,6 +292,61 @@ void describe("Chat With AI — Confirm runs the resumed round outside the chat 
       }
     );
   });
+
+  void it("a blocked stored-answer recovery decision names its reason, recommendation and alternatives, and updates in place", async () => {
+    await withConfirmHarness(
+      () => Promise.resolve({ ok: false, reason: "the task is paused" }),
+      async ({ folder, confirm, memento }) => {
+        const fsBridge = vscode.workspace.fs as unknown as { readFile?: (uri: vscode.Uri) => Promise<Uint8Array> };
+        const originalReadFile = fsBridge.readFile;
+        fsBridge.readFile = (uri: vscode.Uri) => fs.promises.readFile(uri.fsPath).then((buffer) => new Uint8Array(buffer));
+        __extensionContextV1TestOnly.set({
+          subscriptions: [],
+          extensionUri: vscode.Uri.file(folder),
+          workspaceState: memento,
+          globalState: memento,
+        } as unknown as vscode.ExtensionContext);
+        try {
+          await confirm();
+          await waitForStoredAnswerDecision(memento);
+          const store = new WorkflowDecisionStoreV1(memento);
+          let matching = store.listPending(folder).filter((d) => d.decisionKey === "chatActionOffer:resumeStoredInteraction");
+          assert.equal(matching.length, 1);
+          assert.match(matching[0]!.whatHappened, /task is paused/);
+          assert.match(matching[0]!.whatHappened, /answer is saved and will be used/);
+          assert.deepEqual(matching[0]!.options.map((option) => option.label), ["Resume with stored answer", "Not now"]);
+          assert.equal(
+            matching[0]!.recommendation.kind === "option" ? matching[0]!.recommendation.optionId : undefined,
+            "runAction"
+          );
+          assert.deepEqual(matching[0]!.options[0]!.effect, {
+            kind: "command",
+            command: "vs-code-ai-helper.resumeStoredInteraction",
+            args: [{ taskFolderPath: folder, canonicalId: folder, interactionId: IID, operationId: OP }],
+          });
+          assert.deepEqual(matching[0]!.options[1]!.effect, { kind: "doNothing" });
+
+          await confirm();
+          await waitForStoredAnswerDecision(memento);
+          matching = store.listPending(folder).filter((d) => d.decisionKey === "chatActionOffer:resumeStoredInteraction");
+          assert.equal(matching.length, 1, "a repeated blocked resume updates one decision instead of posting duplicates");
+          assert.deepEqual(matching[0]!.options.map((option) => option.label), ["Resume with stored answer", "Not now"]);
+        } finally {
+          __extensionContextV1TestOnly.reset();
+          fsBridge.readFile = originalReadFile;
+        }
+      }
+    );
+  });
+
+  async function waitForStoredAnswerDecision(memento: vscode.Memento): Promise<void> {
+    const store = new WorkflowDecisionStoreV1(memento);
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      if (store.listPending().some((d) => d.decisionKey === "chatActionOffer:resumeStoredInteraction")) return;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.fail("the stored-answer recovery decision was not posted");
+  }
 
   void it("describeInteractionAnswersV1 summarises single, multiple, long text and skipped answers", () => {
     const questions: StructuredQuestionV1[] = [

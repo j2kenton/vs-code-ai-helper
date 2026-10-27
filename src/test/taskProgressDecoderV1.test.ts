@@ -38,6 +38,26 @@ function expectRecovery(text: string, code: string): void {
 }
 
 void describe("taskProgressDecoderV1", () => {
+  void it("decodes bounded per-item provenance and rejects malformed claim records", () => {
+    const validReport = { at: "2026-10-26T00:02:00.000Z", roundId: "round-2", testIdentity: "case.test.ts",
+      command: "pnpm test case.test.ts", workingDirectory: "/workspace", passed: 1, failed: 0,
+      sourceState: "post-edit source state", sourceFiles: ["src/feature.ts"],
+      sourceFileStates: [{ path: "src/feature.ts", sha256: "b".repeat(64) }], sourceFilesTruncated: false };
+    const evidence = [{
+      planRevision: "a".repeat(64),
+      itemKey: "step 1: example",
+      itemText: "Step 1: Example",
+      claims: [{ source: "retroactive", at: "2026-10-26T00:00:00.000Z", roundId: "round-1", evidence: "prior report" }],
+      verifications: [{ at: "2026-10-26T00:01:00.000Z", roundId: "review-1", evidence: "review accepted", testReportRoundIds: ["round-2"] }],
+      testReports: [validReport],
+    }];
+    const decoded = decodeTaskProgressTextV1(doc({ planItemEvidence: evidence }));
+    assert.equal(decoded.ok, true);
+    if (decoded.ok) assert.deepEqual(decoded.decoded.progress.planItemEvidence, evidence);
+    expectRecovery(doc({ planItemEvidence: [{ ...evidence[0]!, claims: [{ source: "unknown", at: "today" }] }] }), "invalidFieldValue");
+    expectRecovery(doc({ planItemEvidence: [{ ...evidence[0]!, testReports: [{ ...validReport, failed: -1 }] }] }), "invalidFieldValue");
+  });
+
   void it("decodes minimal legacy input, materializing active status and version 1", () => {
     const result = decodeTaskProgressTextV1(doc({}));
     assert.equal(result.ok, true);

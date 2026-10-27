@@ -873,7 +873,7 @@ import {
   hasLiveWorkAdmissionBestEffortV1,
 } from "../state/workAdmissionV1";
 import { safeRemoveDir } from "./testFsUtils";
-import { setExtensionContextV1 } from "../utils/extensionContextV1";
+import { setExtensionContextV1, __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import type { CreateWorkflowDecisionInputV1 } from "../types/workflowDecisionV1";
@@ -3756,14 +3756,23 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
   // be corrected to "human" rather than left standing, and the task must
   // stay active (never re-paused: this is not a refusal of Advance itself).
   void it(
-    "corrects nextActor to human, and leaves the task active, when the new stage's next step has nothing to " +
-      "arrange automatically",
+    "corrects nextActor to human, and leaves one reasoned recovery card, when the new stage has nothing to arrange",
     async () => {
       const store = new Map<string, string>();
       const fs = installMemStore(store);
       const msgs = installMessageCapture();
       const wsFolders = installWorkspaceFoldersStub();
       const execCmd = installExecuteCommandStub(store);
+      const backing = new Map<string, unknown>();
+      const memento = {
+        keys: () => [...backing.keys()],
+        get: <T>(key: string, fallback?: T): T | undefined => backing.has(key) ? backing.get(key) as T : fallback,
+        update: (key: string, value: unknown): Thenable<void> => {
+          if (value === undefined) backing.delete(key); else backing.set(key, value);
+          return Promise.resolve();
+        },
+      } as vscode.Memento;
+      setExtensionContextV1({ subscriptions: [], workspaceState: memento, globalState: memento } as unknown as vscode.ExtensionContext);
       try {
         const folderUri = makeTaskFolderUri("resume-and-set-stage-blocked");
         const folderPath = folderUri.fsPath;
@@ -3775,11 +3784,6 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
           updatedAt: "2026-08-24T00:00:00.000Z",
         };
         await seedProgress(store, folderUri, progress);
-        // No plan-final.md is seeded, so entering "impl" leaves
-        // loadResumeActionPlanV1's runImplementation prerequisite unmet —
-        // a real, reachable "blocked" outcome (item 15's own scenario),
-        // independent of `nextActor`.
-
         const inv = makeInventoryStub(folderPath, folderPath, "paused");
         const currentStore = makeCurrentTaskStoreStub(undefined);
 
@@ -3792,11 +3796,7 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
         const stored = await readStoredProgress(store, folderUri);
         assert.strictEqual(stored!.currentStage, "impl", "precondition: the stub must have moved the stage");
         assert.strictEqual(stored!.status, "active", "a legitimate human-next wait must not re-pause the task");
-        assert.strictEqual(
-          stored!.nextActor,
-          "human",
-          "the provisional 'automation' stamp must be corrected once nothing was actually arranged"
-        );
+        assert.strictEqual(stored!.nextActor, "human");
 
         assert.strictEqual(
           execCmd.captured.some(
@@ -3808,7 +3808,26 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
           false,
           "nothing may be dispatched at a stage whose next step is the human's"
         );
+        await seedProgress(store, folderUri, { ...stored!, currentStage: "plan-high-review", status: "paused" });
+        await resumeAndSetTaskStageV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          stage: "impl",
+          resumeFastForward: false,
+        });
+        const decisions = new WorkflowDecisionStoreV1(memento).listPending(folderPath)
+          .filter((decision) => decision.decisionKey === "chatActionOffer:applyCurrentStageAction");
+        assert.equal(decisions.length, 1, "repeated human-owned destinations update one card");
+        const decision = decisions[0];
+        assert.ok(decision);
+        assert.match(decision.whatHappened, /No plan-final\.md or implementation\.md found/);
+        assert.deepEqual(decision.options.map((option) => option.label), ["Run Current Stage Action", "Not now"]);
+        assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+        assert.deepEqual(decision.options[0]?.effect, {
+          kind: "command", command: "vs-code-ai-helper.applyCurrentStageAction", args: [{ taskFolderPath: folderPath }],
+        });
+        assert.deepEqual(decision.options[1]?.effect, { kind: "doNothing" });
       } finally {
+        __extensionContextV1TestOnly.reset();
         execCmd.restore();
         msgs.restore();
         fs.restore();
@@ -3842,6 +3861,16 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
           "a previous Stop request was ignored for over a minute, so its row was force-removed — the work " +
           "itself may still be running underneath. Confirm it has actually finished, then try again.",
       });
+      const backing = new Map<string, unknown>();
+      const memento = {
+        keys: () => [...backing.keys()],
+        get: <T>(key: string, fallback?: T): T | undefined => backing.has(key) ? backing.get(key) as T : fallback,
+        update: (key: string, value: unknown): Thenable<void> => {
+          if (value === undefined) backing.delete(key); else backing.set(key, value);
+          return Promise.resolve();
+        },
+      } as vscode.Memento;
+      setExtensionContextV1({ subscriptions: [], workspaceState: memento, globalState: memento } as unknown as vscode.ExtensionContext);
       try {
         const folderUri = makeTaskFolderUri("resume-and-set-stage-forced-end");
         const folderPath = folderUri.fsPath;
@@ -3865,16 +3894,8 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
 
         const stored = await readStoredProgress(store, folderUri);
         assert.strictEqual(stored!.currentStage, "impl-low-review", "the stage move itself must still commit");
-        assert.strictEqual(
-          stored!.status,
-          "active",
-          "an unsafe cancellation result is not a refusal of the move itself — the task stays active"
-        );
-        assert.strictEqual(
-          stored!.nextActor,
-          "human",
-          "the provisional 'automation' stamp must be corrected back once no follow-up could safely be arranged"
-        );
+        assert.strictEqual(stored!.status, "active");
+        assert.strictEqual(stored!.nextActor, "human");
 
         assert.strictEqual(
           execCmd.captured.some((e) => e.command === "vs-code-ai-helper.fastForwardReviewWithAI"),
@@ -3895,7 +3916,27 @@ void describe("resumeAndSetTaskStageV1 (production code)", () => {
           msgs.captured.some((m) => /could not be stopped/.test(m.message) && /No automatic follow-up was started/.test(m.message)),
           "the unsafe cancellation outcome must be reported where the user is looking, not silently swallowed"
         );
+        await seedProgress(store, folderUri, { ...stored!, currentStage: "impl-high-review", status: "paused" });
+        await resumeAndSetTaskStageV1(inv, currentStore, {
+          taskFolderPath: folderPath,
+          stage: "impl-low-review",
+          resumeFastForward: true,
+        });
+        const decisions = new WorkflowDecisionStoreV1(memento).listPending(folderPath)
+          .filter((decision) => decision.decisionKey === "chatActionOffer:resumeTask");
+        assert.equal(decisions.length, 1, "repeated stale-operation hand-backs update one card");
+        const decision = decisions[0];
+        assert.ok(decision);
+        assert.match(decision.whatHappened, /could not be stopped/);
+        assert.match(decision.whatHappened, /force-removed/);
+        assert.deepEqual(decision.options.map((option) => option.label), ["Resume", "Not now"]);
+        assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+        assert.deepEqual(decision.options[0]?.effect, {
+          kind: "command", command: "vs-code-ai-helper.resumeTask", args: [{ taskFolderPath: folderPath }],
+        });
+        assert.deepEqual(decision.options[1]?.effect, { kind: "doNothing" });
       } finally {
+        __extensionContextV1TestOnly.reset();
         execCmd.restore();
         msgs.restore();
         fs.restore();

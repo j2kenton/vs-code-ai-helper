@@ -150,7 +150,8 @@ const INVENTORY: readonly InventoryRow[] = [
   // src/commands/reconcilePlanChecklist.ts
   { file: "commands/reconcilePlanChecklist.ts", optionId: "applyVerifiedTicks", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: applyVerifiedTicks dispatches the stage's next action after ticking" },
   { file: "commands/reconcilePlanChecklist.ts", optionId: "linkManualChecks", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: linkManualChecks dispatches the stage's next action after linking" },
-  { file: "commands/reconcilePlanChecklist.ts", optionId: "reconcile", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: reconcile dispatches the stage's next action" },
+  { file: "commands/reconcilePlanChecklist.ts", optionId: "reconcile", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: reconcile clears the flag without dispatching the stage" },
+  { file: "commands/reconcilePlanChecklist.ts", optionId: "continueStage", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: continueStage dispatches the stage action" },
   { file: "commands/reconcilePlanChecklist.ts", optionId: "notYet", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: notYet dispatches nothing" },
 
   // src/commands/applyReviewerVerifiedTicks.ts
@@ -182,6 +183,8 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "commands/scheduleTaskResume.ts", optionId: "runNow", occurrence: 0, resumeKind: "continue", dispatchProof: "scheduleTaskResume.test.ts: runNow dispatches immediately" },
   { file: "commands/scheduleTaskResume.ts", optionId: "waitForRetry", occurrence: 1, resumeKind: "unpause", dispatchProof: "scheduleTaskResume.test.ts: waitForRetry (quota variant) dispatches nothing" },
   { file: "commands/scheduleTaskResume.ts", optionId: "runNow", occurrence: 1, resumeKind: "continue", dispatchProof: "scheduleTaskResume.test.ts: runNow (quota variant) dispatches immediately" },
+  { file: "commands/scheduleTaskResume.ts", optionId: "resumeTask", occurrence: 0, resumeKind: "unpause", dispatchProof: "scheduledQuotaRerunV1.test.ts: resumes the task without starting the action" },
+  { file: "commands/scheduleTaskResume.ts", optionId: "changeModel", occurrence: 0, resumeKind: "unpause", dispatchProof: "scheduleTaskResume.test.ts: opens stage model settings" },
 
   // src/commands/handoffChecksV1.ts
   { file: "commands/handoffChecksV1.ts", optionId: "tick-${index}", occurrence: 0, resumeKind: "continue", dispatchProof: "handoffChecksV1 tick options re-post the successor card or dispatch the stage action" },
@@ -377,6 +380,7 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("commands/reconcilePlanChecklist.ts", "applyVerifiedTicks", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
   [rowKey("commands/reconcilePlanChecklist.ts", "linkManualChecks", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
   [rowKey("commands/reconcilePlanChecklist.ts", "reconcile", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
+  [rowKey("commands/reconcilePlanChecklist.ts", "continueStage", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
   // Corrected during verification: notYet's effect IS doNothing
   // (reconcilePlanChecklist.ts:1749), not a command — the original
   // dispatchProof column's "notYet dispatches nothing" was true but this
@@ -389,12 +393,7 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("commands/applyReviewerVerifiedTicks.ts", "skip", 0), { kind: "trivial-no-dispatch" }],
 
   [rowKey("commands/reviewActions.ts", "retry", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts", "reviewRouting.test.ts"] }],
-  // Corrected during verification: no test file references
-  // setStageBackupModel (adjustSettings's command) at all — the original
-  // dispatchProof's "reviewEscalation.test.ts" citation was wrong (that
-  // file covers reviewEscalation.ts's own adjustSettings-shaped options,
-  // not this reviewActions.ts one). Handler-traced instead.
-  // Review fix, 2026-09-24: both rows below now have a genuine runtime
+  // Both rows below have a genuine runtime
   // assertion on the actual `.effect` the production `providerChainExhausted`
   // decision returns (providerChainExhaustion.test.ts), not merely a
   // resumeKind label — closing what was previously a known-gap citation.
@@ -453,6 +452,8 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("commands/scheduleTaskResume.ts", "runNow", 0), { kind: "runtime-test", proofFiles: ["scheduleTaskResume.test.ts"] }],
   [rowKey("commands/scheduleTaskResume.ts", "waitForRetry", 1), { kind: "runtime-test", proofFiles: ["scheduleTaskResume.test.ts"] }],
   [rowKey("commands/scheduleTaskResume.ts", "runNow", 1), { kind: "runtime-test", proofFiles: ["scheduleTaskResume.test.ts"] }],
+  [rowKey("commands/scheduleTaskResume.ts", "resumeTask", 0), { kind: "runtime-test", proofFiles: ["scheduledQuotaRerunV1.test.ts"] }],
+  [rowKey("commands/scheduleTaskResume.ts", "changeModel", 0), { kind: "runtime-test", proofFiles: ["scheduleTaskResume.test.ts"] }],
 
   // handoffChecksV1.ts: classified `continue` per the plan's Step 2
   // ("Ensemble performs the adjustment... after the adjustment succeeds,

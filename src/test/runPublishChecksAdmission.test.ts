@@ -46,6 +46,10 @@ import { safeRemoveDir } from "./testFsUtils";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { runFastForwardPublishChecksV1 } from "../utils/fastForwardPublishChecksV1";
+import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
+import { associatePublishFailuresWithPlanItemsV1 } from "../utils/publishFailurePlanAssociationV1";
 import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { taskOperations } from "../utils/taskOperations";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
@@ -95,13 +99,14 @@ const completionLintModule = require("../utils/completionLint") as Record<string
 const publishScopeCheckModule = require("../utils/publishScopeCheck") as Record<string, unknown>;
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const gitRepoInfoModule = require("../utils/gitRepoInfo") as Record<string, unknown>;
+const failedPublishRunModule = require("../utils/failedPublishRunV1") as Record<string, unknown>;
 
 /**
  * Lets `runPublishChecks` run to a result without a model, git or real
  * lint/test processes: the model guard passes and the check run is a counted
  * stub, so a lint call proves the run got past the stage guard.
  */
-function stubPublishChecksRun(): { lintCalls: () => number; restore: () => void } {
+function stubPublishChecksRun(result: unknown = { passed: true, summary: "stubbed checks passed" }): { lintCalls: () => number; restore: () => void } {
   const originals = {
     ensure: modelSelectionModule.ensureStageModelConfigured,
     lint: completionLintModule.runCompletionLint,
@@ -112,7 +117,7 @@ function stubPublishChecksRun(): { lintCalls: () => number; restore: () => void 
   modelSelectionModule.ensureStageModelConfigured = (): Promise<boolean> => Promise.resolve(true);
   completionLintModule.runCompletionLint = (): Promise<unknown> => {
     lintCalls += 1;
-    return Promise.resolve({ passed: true, summary: "stubbed checks passed" });
+    return Promise.resolve(result);
   };
   publishScopeCheckModule.runPublishScopeCheck = (): Promise<void> => Promise.resolve();
   gitRepoInfoModule.resolveHeadCommitSha = (): Promise<undefined> => Promise.resolve(undefined);
@@ -201,6 +206,106 @@ function applyCurrentStageActionDispatchArg(
 }
 
 void describe("runPublishChecks work admission against applyCurrentStageAction's dispatch shape (v1 fixes item 1, Part 1a)", () => {
+  void it("associates a failed acceptance test before invalidation and preserves the durable relationship", async () => {
+    const taskFolderPath = makeTaskFolder("publish-failure-association-order");
+    const itemText = "Step 1: Keep retry handling working";
+    const progress = fixtureProgress(taskFolderPath, {
+      currentStage: "publish",
+      planItemEvidence: [{
+        planRevision: "plan-revision",
+        itemKey: "step 1",
+        itemText,
+        claims: [{ source: "implementation", at: "2026-10-26T00:00:00.000Z", roundId: "impl-1" }],
+        testReports: [{
+          at: "2026-10-26T00:01:00.000Z",
+          roundId: "impl-1",
+          testIdentity: path.join(taskFolderPath, "src/test/retry.test.ts"),
+          command: "node out/test/retry.test.js",
+          workingDirectory: taskFolderPath,
+          passed: 2,
+          failed: 0,
+          sourceState: "post-edit",
+          sourceFiles: ["src/retry.ts"],
+        }],
+      }],
+    });
+    writeProgress(taskFolderPath, progress);
+    fs.writeFileSync(path.join(taskFolderPath, "plan-final.md"), `<!-- ensemble:implementation-checklist -->\n\n# Plan\n\n- [x] ${itemText}\n`, "utf8");
+
+    const surface = new RecordingSurface();
+    const decisionState = fakeStatefulMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: decisionState,
+      globalState: decisionState,
+    } as unknown as vscode.ExtensionContext);
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const planRead = await readPlanOfRecordV1(vscode.Uri.file(taskFolderPath));
+    const progressRead = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath));
+    assert.equal(planRead.hasChecklist, true, "fixture plan should be readable as the canonical checklist");
+    assert.equal(progressRead.ok, true, `fixture progress should decode: ${JSON.stringify(progressRead)}`);
+    assert.deepEqual(listCheckedChecklistItemTextsV1(planRead.text ?? ""), [itemText]);
+    assert.equal(progressRead.ok && progressRead.decoded.progress.planItemEvidence?.[0]?.testReports?.length, 1);
+    const compiledNodeFailure = [
+      "✔ unrelated passing test",
+      "✖ failing tests:",
+      "test at out/test/retry.test.js:18:5",
+      "✖ resumes after retry",
+      "  AssertionError: expected true",
+      "ℹ tests 2",
+      "ℹ pass 1",
+      "ℹ fail 1",
+    ].join("\n");
+    assert.equal(associatePublishFailuresWithPlanItemsV1({
+      checkedItems: listCheckedChecklistItemTextsV1(planRead.text ?? ""),
+      evidence: progressRead.ok ? progressRead.decoded.progress.planItemEvidence ?? [] : [],
+      failures: [{ command: "node test-stubs/run-unit-tests.js", output: compiledNodeFailure }],
+    }).length, 1);
+    const run = stubPublishChecksRun({
+      passed: false,
+      passedModuloKnownFlakes: false,
+      summary: "one failed acceptance check",
+      failedChecks: [{ command: "node test-stubs/run-unit-tests.js", exitCode: 1, output: compiledNodeFailure }],
+    });
+    try {
+      const started = await runPublishChecks(makeInventory(taskFolderPath, progress), {
+        taskFolderPath,
+        canonicalId: taskFolderPath,
+      });
+      assert.equal(started, true);
+      assert.equal(run.lintCalls(), 1, "the integrated Publish path must consume the injected failing check result");
+      assert.match(surface.entries.map((entry) => entry.message).join("\n"), /Publish checks found issues/, `unexpected Publish outcome: ${JSON.stringify(surface.entries)}`);
+      const recoveryCards = new WorkflowDecisionStoreV1(decisionState).listPending(taskFolderPath)
+        .filter((decision) => decision.decisionKey === "chatActionOffer:setTaskStage");
+      assert.equal(recoveryCards.length, 1, "one terminal Publish failure produces one recovery card");
+      const recovery = recoveryCards[0];
+      assert.ok(recovery);
+      assert.match(recovery.whatHappened, /one failed acceptance check/);
+      assert.equal(recovery.options[0]?.label, "Back to Implementation", "a test failure recommends implementation");
+      assert.deepEqual(recovery.options.map((option) => option.label), ["Back to Implementation", "Run Publish Checks", "Not now"]);
+      assert.deepEqual(recovery.options.map((option) => option.optionId), ["runAction", "alternative1", "notNow"]);
+      assert.equal(recovery.recommendation.kind === "option" ? recovery.recommendation.optionId : undefined, "runAction");
+      assert.ok(!recovery.options.some((option) => option.label === "Fix Linting & Code Errors"),
+        "test failures do not recommend an unrelated lint-fix action");
+      assert.ok(fs.existsSync(path.join(taskFolderPath, "publish-failure-associations-v1.json")), `association artifact missing; task files: ${fs.readdirSync(taskFolderPath).join(", ")}`);
+      const evidenceAfter = JSON.parse(fs.readFileSync(path.join(taskFolderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.deepEqual(evidenceAfter.planItemEvidence?.[0]?.testReports, [], "confirmed acceptance-test failure invalidates its report after association");
+      const durable = JSON.parse(fs.readFileSync(path.join(taskFolderPath, "publish-failure-associations-v1.json"), "utf8")) as { records?: Array<{ associations?: Array<{ itemText: string; disposition: string; paths: string[] }> }> };
+      assert.equal(durable.records?.[0]?.associations?.[0]?.itemText, itemText);
+      assert.equal(durable.records?.[0]?.associations?.[0]?.disposition, "contradicted");
+      assert.deepEqual(durable.records?.[0]?.associations?.[0]?.paths, ["out/test/retry.test.js", "src/test/retry.test.ts"]);
+    } finally {
+      __extensionContextV1TestOnly.reset();
+      run.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("does not crash on the partial-task dispatch shape, and refuses busy (naming the real owner) when durable admission is already held", async () => {
     const taskFolderPath = makeTaskFolder("acas-shape-busy");
     const progress = fixtureProgress(taskFolderPath);
@@ -330,6 +435,7 @@ void describe("runPublishChecks work admission against applyCurrentStageAction's
     try {
       const settled: string[] = [];
       const ok = await runFastForwardPublishChecksV1({
+        taskFolderPath,
         runChecks: () =>
           runPublishChecks(
             makeInventory(taskFolderPath, staleProgress),
@@ -1056,8 +1162,9 @@ void describe(
 void describe("runPublishChecks pass notice (RC9 item 2, b)", () => {
   async function runPassing(
     name: string,
-    withParent: boolean
-  ): Promise<{ surface: RecordingSurface; cards: number }> {
+    withParent: boolean,
+    repeat = false
+  ): Promise<{ surface: RecordingSurface; decisions: ReturnType<WorkflowDecisionStoreV1["listPending"]> }> {
     const taskFolderPath = makeTaskFolder(name);
     const progress = fixtureProgress(taskFolderPath, { currentStage: "publish" });
     writeProgress(taskFolderPath, progress);
@@ -1085,11 +1192,14 @@ void describe("runPublishChecks pass notice (RC9 item 2, b)", () => {
     try {
       const arg = applyCurrentStageActionDispatchArg(taskFolderPath, progress);
       await runPublishChecks(makeInventory(taskFolderPath, progress), arg as never, parent ?? undefined);
-      assert.equal(run.lintCalls(), 1, "the checks ran to a pass");
-      const cards = new WorkflowDecisionStoreV1(memento)
+      if (repeat) {
+        await runPublishChecks(makeInventory(taskFolderPath, progress), arg as never, parent ?? undefined);
+      }
+      assert.equal(run.lintCalls(), repeat ? 2 : 1, "the checks ran to a pass");
+      const decisions = new WorkflowDecisionStoreV1(memento)
         .listPending()
-        .filter((d) => d.decisionKey === "chatActionOffer:runReviewWithAI").length;
-      return { surface, cards };
+        .filter((d) => d.decisionKey === "chatActionOffer:runReviewWithAI");
+      return { surface, decisions };
     } finally {
       __extensionContextV1TestOnly.reset();
       taskOperations.end(parent, "succeeded");
@@ -1102,20 +1212,164 @@ void describe("runPublishChecks pass notice (RC9 item 2, b)", () => {
   }
 
   void it("with a parent operation the pass notice says the review runs next", async () => {
-    const { surface, cards } = await runPassing("rc9-pass-parent", true);
-    assert.equal(cards, 0, "Fast Forward runs the review itself, so no Run Publish Review card is posted");
+    const { surface, decisions } = await runPassing("rc9-pass-parent", true);
+    assert.equal(decisions.length, 0, "Fast Forward runs the review itself, so no Run Publish Review card is posted");
     const passed = surface.entries.filter((e) => /Publish checks passed/.test(e.message));
     assert.equal(passed.length, 1, JSON.stringify(surface.entries));
     assert.match(passed[0]?.message ?? "", /Fast Forward runs the Publish review next\./);
     assert.doesNotMatch(passed[0]?.message ?? "", /Request a Publish review/);
   });
 
-  void it("without a parent operation today's wording is kept", async () => {
-    const { surface, cards } = await runPassing("rc9-pass-no-parent", false);
-    assert.equal(cards, 1, "a manual run still posts the Run Publish Review card");
-    // The card's own "Decision needed" warning repeats the notice text; the pass notice itself is the info entry.
+  void it("without a parent operation one reasoned review card survives repeated terminal reporting", async () => {
+    const { surface, decisions } = await runPassing("rc9-pass-no-parent", false, true);
+    assert.equal(decisions.length, 1, "repeated manual passes update one Run Publish Review card");
+    const decision = decisions[0];
+    assert.ok(decision);
+    assert.match(decision.whatHappened, /Publish checks passed/);
+    assert.deepEqual(decision.options.map((option) => option.label), ["Run Publish Review", "Not now"]);
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+    assert.equal(decision.options[0]?.effect.kind, "command");
+    assert.deepEqual(decision.options[1]?.effect, { kind: "doNothing" });
     const passed = surface.entries.filter((e) => e.level === "info" && /Publish checks passed/.test(e.message));
-    assert.equal(passed.length, 1, JSON.stringify(surface.entries));
+    assert.equal(passed.length, 2, JSON.stringify(surface.entries));
     assert.doesNotMatch(passed[0]?.message ?? "", /Fast Forward runs the Publish review next/);
+  });
+});
+
+
+void describe("runPublishChecks failed-first execution sequences", () => {
+  async function runSequence(
+    name: string,
+    targeted: "fail" | "pass" | "cancel",
+    compatible = true
+  ): Promise<{ calls: Array<Record<string, unknown>>; surface: RecordingSurface; clearCalls: number; decisions: vscode.Memento }> {
+    const taskFolderPath = makeTaskFolder(name);
+    const progress = fixtureProgress(taskFolderPath, { currentStage: "publish" });
+    writeProgress(taskFolderPath, progress);
+    const surface = new RecordingSurface();
+    const decisions = fakeStatefulMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: decisions,
+      globalState: decisions,
+    } as unknown as vscode.ExtensionContext);
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const run = stubPublishChecksRun();
+    const modelsStub = stubOpenAiModelsCommand();
+    const originals = {
+      read: failedPublishRunModule.readFailedPublishRunSnapshotV1,
+      compatible: failedPublishRunModule.isFailedPublishRunCompatibleV1,
+      clear: failedPublishRunModule.clearFailedPublishRunSnapshotV1,
+      commandPlan: completionLintModule.resolveCurrentPublishCommandPlanV1,
+    };
+    const previous = {
+      schemaVersion: 1,
+      taskFolder: taskFolderPath,
+      repositoryRoot: REAL_ROOT,
+      verificationScopeId: "scope",
+      headCommit: "a".repeat(40),
+      failedAt: "2026-10-26T20:00:00.000Z",
+      runner: { platform: process.platform, nodeVersion: process.version, packageManager: "npm 1" },
+      commands: [{ command: "custom verify", cwd: REAL_ROOT, phase: "test", exitCode: 1 }],
+      configuredCommands: [],
+      failures: [{
+        command: "custom verify", exitCode: 1, testFiles: [], failureCount: 1,
+        completeFailureIdentities: true, unidentifiedFailureCount: 1,
+      }],
+      observedInputFingerprint: "observed",
+      compatibilityUnknownReason: null,
+      compatibilityFingerprint: "compatible",
+    };
+    let clearCalls = 0;
+    failedPublishRunModule.readFailedPublishRunSnapshotV1 = (): Promise<unknown> => Promise.resolve(previous);
+    failedPublishRunModule.isFailedPublishRunCompatibleV1 = (): boolean => compatible;
+    failedPublishRunModule.clearFailedPublishRunSnapshotV1 = (): Promise<void> => {
+      clearCalls += 1;
+      return Promise.resolve();
+    };
+    completionLintModule.resolveCurrentPublishCommandPlanV1 = (): string[] => ["custom verify"];
+    const calls: Array<Record<string, unknown>> = [];
+    completionLintModule.runCompletionLint = (_uri: unknown, _files: unknown, options?: Record<string, unknown>): Promise<unknown> => {
+      calls.push(options ?? {});
+      if (options?.explicitChecks) {
+        if (targeted === "cancel") {
+          const Cancelled = completionLintModule.PublishChecksCancelledError as new () => Error;
+          return Promise.reject(new Cancelled());
+        }
+        return Promise.resolve({
+          runAt: "2026-10-27T00:00:00.000Z",
+          passed: targeted === "pass",
+          passedModuloKnownFlakes: targeted === "pass",
+          summary: targeted === "pass" ? "targeted pass" : "targeted failure",
+          issueCount: targeted === "pass" ? 0 : 1,
+          missingScripts: [],
+          commandsRun: ["custom verify"],
+          failedChecks: targeted === "pass" ? [] : [{ command: "custom verify", exitCode: 1, output: "still failing" }],
+        });
+      }
+      return Promise.resolve({
+        runAt: "2026-10-27T00:00:00.000Z", passed: true, passedModuloKnownFlakes: true,
+        summary: "full pass", issueCount: 0, missingScripts: [], commandsRun: ["custom verify"], failedChecks: [],
+      });
+    };
+    try {
+      await runPublishChecks(makeInventory(taskFolderPath, progress), { taskFolderPath, canonicalId: taskFolderPath });
+      return { calls, surface, clearCalls, decisions };
+    } finally {
+      __extensionContextV1TestOnly.reset();
+      failedPublishRunModule.readFailedPublishRunSnapshotV1 = originals.read;
+      failedPublishRunModule.isFailedPublishRunCompatibleV1 = originals.compatible;
+      failedPublishRunModule.clearFailedPublishRunSnapshotV1 = originals.clear;
+      completionLintModule.resolveCurrentPublishCommandPlanV1 = originals.commandPlan;
+      modelsStub.restore();
+      run.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  }
+
+  void it("stops after a persistent targeted failure and marks the remainder unrun", async () => {
+    const { calls, surface } = await runSequence("failed-first-still-fails", "fail");
+    assert.equal(calls.length, 1);
+    assert.ok(calls[0]?.explicitChecks);
+    assert.match(String(calls[0]?.rawReportLocation), /^runs\/failed-first-/);
+    assert.match(String(calls[0]?.rawReportLocation), /source-2026-10-26T20-00-00-000Z/,
+      "recheck raw evidence stays correlated to the source full failure");
+    assert.match(surface.entries.map((entry) => entry.message).join("\n"), /Remaining Publish checks were not run/);
+  });
+
+  void it("runs the complete selected set after targeted checks pass", async () => {
+    const { calls } = await runSequence("failed-first-then-full", "pass");
+    assert.equal(calls.length, 2);
+    assert.ok(calls[0]?.explicitChecks);
+    assert.match(String(calls[0]?.rawReportLocation), /^runs\/failed-first-/);
+    assert.equal(calls[1]?.explicitChecks, undefined);
+    const report = fs.readFileSync(path.join(REAL_ROOT, "tasks", "failed-first-then-full", "publish-review.md"), "utf8");
+    assert.match(report, /Running the complete selected Publish check set now/);
+  });
+
+  void it("does not turn a cancelled targeted recheck into a full run or a pass", async () => {
+    const { calls, surface, clearCalls, decisions } = await runSequence("failed-first-cancelled", "cancel");
+    assert.equal(calls.length, 1);
+    assert.equal(clearCalls, 0, "cancellation must preserve the prior failed-run snapshot for a later recheck");
+    const retries = new WorkflowDecisionStoreV1(decisions).listPending()
+      .filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks");
+    assert.equal(retries.length, 1, "cancelled started checks expose one retry card");
+    assert.match(retries[0]?.whatHappened ?? "", /cancelled/i);
+    assert.equal(retries[0]?.options[0]?.label, "Run Publish Checks");
+    assert.deepEqual(retries[0]?.options.map((option) => option.label), ["Run Publish Checks", "Not now"]);
+    assert.equal(retries[0]?.recommendation.kind === "option" ? retries[0]?.recommendation.optionId : undefined, "runAction");
+    assert.match(surface.entries.map((entry) => entry.message).join("\n"), /cancelled/i);
+    assert.doesNotMatch(surface.entries.map((entry) => entry.message).join("\n"), /Publish checks passed/);
+  });
+
+  void it("uses the full set directly when compatibility changes", async () => {
+    const { calls } = await runSequence("failed-first-incompatible", "pass", false);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]?.explicitChecks, undefined);
   });
 });

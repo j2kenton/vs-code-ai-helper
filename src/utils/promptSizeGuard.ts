@@ -61,7 +61,7 @@ export async function checkAndConfirmPromptSize(
    * site but the Global Assistant's does. Used only to name the task in the
    * notifications below; never affects the size check itself.
    */
-  task?: { displayName?: string; folderPath: string }
+  task?: { displayName?: string; folderPath: string; token?: vscode.CancellationToken }
 ): Promise<"ok" | "confirmed" | "declined" | "abort"> {
   const bytes = measurePromptBytes(prompt);
   const taskLabel = task ? formatNotificationTaskLabelV1(task.displayName, task.folderPath) : undefined;
@@ -81,6 +81,10 @@ export async function checkAndConfirmPromptSize(
         actionLabel: "Open task.md to shorten the prompt",
         command: "vscode.open",
         args: [vscode.Uri.file(path.join(task.folderPath, "task.md"))],
+        alternatives: [{
+          label: "Close all editors",
+          command: "workbench.action.closeAllEditors",
+        }],
         noticeText: `${reason} Edit task.md or close large editors, then run the action again.`,
       });
     }
@@ -111,6 +115,12 @@ export async function checkAndConfirmPromptSize(
           taskFolderPath: task.folderPath,
           actionLabel: "Open Ensemble Settings",
           command: "vs-code-ai-helper.openSettings",
+          alternatives: [{
+            label: "Open task.md to shorten the prompt",
+            command: "vscode.open",
+            args: [vscode.Uri.file(path.join(task.folderPath, "task.md"))],
+            resumeKind: "unpause",
+          }],
           noticeText: reason,
         });
       }
@@ -133,6 +143,12 @@ export async function checkAndConfirmPromptSize(
           taskFolderPath: task.folderPath,
           actionLabel: "Open Ensemble Settings",
           command: "vs-code-ai-helper.openSettings",
+          alternatives: [{
+            label: "Open task.md to shorten the prompt",
+            command: "vscode.open",
+            args: [vscode.Uri.file(path.join(task.folderPath, "task.md"))],
+            resumeKind: "unpause",
+          }],
           noticeText: reason,
         });
       }
@@ -167,6 +183,7 @@ export async function checkAndConfirmPromptSize(
         },
         { optionId: "cancel", label: "Cancel" },
       ],
+      token: task?.token,
     });
     if (choice === "proceedDontAsk") {
       await setLargeTokenRequestWarningEnabled(false);

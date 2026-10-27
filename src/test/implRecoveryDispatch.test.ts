@@ -57,6 +57,8 @@ import { setProcessLivenessTestHooksForTestV1 } from "../state/processStartTimeP
 import { IMPLEMENTATION_SUMMARY_UNUSABLE_MARKER_V1 } from "../utils/implementationArtifactResolver";
 import { registerReviewActionCommands } from "../commands/reviewActions";
 import { safeRemoveDir } from "./testFsUtils";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 
 // Monkey-patchable so a test can answer the chat confirmation a command asks.
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -877,6 +879,19 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
       });
 
       const restore = installFsStub();
+      const backing = new Map<string, unknown>();
+      const memento = {
+        keys: () => [...backing.keys()],
+        get: <T>(key: string, defaultValue?: T): T | undefined => backing.has(key) ? backing.get(key) as T : defaultValue,
+        update: (key: string, value: unknown): Thenable<void> => {
+          if (value === undefined) backing.delete(key);
+          else backing.set(key, value);
+          return Promise.resolve();
+        },
+      } as vscode.Memento;
+      __extensionContextV1TestOnly.set({
+        subscriptions: [], extensionUri: vscode.Uri.file(ROOT), workspaceState: memento, globalState: memento,
+      } as unknown as vscode.ExtensionContext);
       initNotificationRouter(new StatusTreeProvider());
       const clock = {
         now: (): number => BASE_NOW,
@@ -903,9 +918,26 @@ void describe("retireSatisfiedSummaryRejectedRecoveryV1 / discardOwedImplRecover
           "human",
           "the sweep's own call site continues immediately after retiring — nothing further is arranged for this task in this pass"
         );
+        seedProgress(folderPath, {
+          updatedAt: new Date(BASE_NOW).toISOString(),
+          implRecovery: pendingRecord({ trigger: "summaryRejected" }),
+          pendingImplReviewFiles: ["src/a.ts"],
+        });
+        await scheduler.armAll();
+        const cards = new WorkflowDecisionStoreV1(memento).listPending(folderPath)
+          .filter((decision) => decision.decisionKey === "chatActionOffer:nextStage");
+        assert.equal(cards.length, 1, "repeated retirement outcomes update one actual chat choice");
+        assert.match(cards[0]?.whatHappened ?? "", /Implementation recovery was cleared because its summary is usable again/);
+        assert.deepEqual(cards[0]?.options.map((option) => option.label), ["Complete Stage & Move On", "Not now"]);
+        assert.equal(cards[0]?.recommendation.kind === "option" ? cards[0]?.recommendation.optionId : undefined, "runAction");
+        assert.deepEqual(cards[0]?.options[0]?.effect, {
+          kind: "command", command: "vs-code-ai-helper.nextStage", args: [{ taskFolderPath: folderPath }],
+        });
+        assert.deepEqual(cards[0]?.options[1]?.effect, { kind: "doNothing" });
       } finally {
         scheduler.dispose();
         deactivateNotificationRouter();
+        __extensionContextV1TestOnly.reset();
         restore();
       }
     });

@@ -1235,6 +1235,78 @@ void describe("toFriendlyError — model-entitlement failures (not auth)", () =>
   });
 });
 
+void describe("Antigravity NOT_FOUND model recovery", () => {
+  const antigravity = getCliProvider("antigravity-cli");
+  const diagnostic = 'error: NOT_FOUND (code 404): Requested entity was not found. AGY_ERROR: {"short_error":"NOT_FOUND (code 404): Requested entity was not found.","status":"NOT_FOUND","error_code":404,"code_kind":"http","retryable":false}';
+
+  void it("classifies the supplied ambiguous 404 as backup-eligible and names the configured model", () => {
+    assert.ok(antigravity);
+    const friendly = toFriendlyError(antigravity, "gemini-3.8-flash-high", 1, diagnostic, "");
+    const classified = classifyCliFailure({
+      status: "failed" as const,
+      output: "",
+      errorMessage: friendly.message,
+      authFailure: friendly.authFailure,
+      authDiagnosticText: friendly.diagnosticText,
+    });
+    assert.equal(friendly.authFailure, false);
+    assert.equal(classified.failureKind, "model-entitlement");
+    assert.match(friendly.message, /gemini-3\.8-flash-high/);
+    assert.match(friendly.message, /model or another resource was missing/i);
+    assert.match(friendly.message, /backup/i);
+    assert.match(friendly.message, /AI Models for this stage/i);
+  });
+
+  void it("does not reinterpret an unrelated Antigravity HTTP 404 without NOT_FOUND evidence", () => {
+    assert.ok(antigravity);
+    const friendly = toFriendlyError(antigravity, "gemini-3.8-flash-high", 1, "HTTP 404: workspace artifact missing", "");
+    const classified = classifyCliFailure({
+      status: "failed" as const,
+      output: "",
+      errorMessage: friendly.message,
+      authFailure: friendly.authFailure,
+      authDiagnosticText: friendly.diagnosticText,
+    });
+    assert.equal(classified.failureKind, "generic");
+    assert.doesNotMatch(friendly.message, /AI Models for this stage/);
+  });
+
+  void it("keeps an explicitly unrelated NOT_FOUND resource out of model recovery", () => {
+    assert.ok(antigravity);
+    const unrelated = 'error: NOT_FOUND (code 404): workspace artifact "security-findings.json" was not found. AGY_ERROR: {"status":"NOT_FOUND","error_code":404,"resource":"workspace artifact"}';
+    const friendly = toFriendlyError(antigravity, "gemini-3.8-flash-high", 1, unrelated, "");
+    const classified = classifyCliFailure({
+      status: "failed" as const,
+      output: "",
+      errorMessage: friendly.message,
+      authFailure: friendly.authFailure,
+      authDiagnosticText: friendly.diagnosticText,
+    });
+    assert.equal(classified.failureKind, "generic");
+    assert.doesNotMatch(friendly.message, /model availability is uncertain/i);
+    assert.doesNotMatch(friendly.message, /AI Models for this stage/i);
+    assert.match(friendly.message, /workspace artifact/i);
+  });
+
+  void it("keeps an explicit model NOT_FOUND backup-eligible and names the requested model", () => {
+    assert.ok(antigravity);
+    const modelNotFound = 'error: NOT_FOUND (code 404): model "gemini-3.8-flash-high" was not found for this account. AGY_ERROR: {"status":"NOT_FOUND","error_code":404,"resource":"model"}';
+    const friendly = toFriendlyError(antigravity, "gemini-3.8-flash-high", 1, modelNotFound, "");
+    const classified = classifyCliFailure({
+      status: "failed" as const,
+      output: "",
+      errorMessage: friendly.message,
+      authFailure: friendly.authFailure,
+      authDiagnosticText: friendly.diagnosticText,
+    });
+    assert.equal(classified.failureKind, "model-entitlement");
+    assert.match(friendly.message, /gemini-3\.8-flash-high/);
+    assert.match(friendly.message, /could not find configured model .* for this account or CLI version/i);
+    assert.match(friendly.message, /backup/i);
+    assert.match(friendly.message, /AI Models for this stage/i);
+  });
+});
+
 void describe("stream-transport failures are cascade-eligible", () => {
   const transportFriendly = {
     message: "OpenCode CLI failed: UnknownError: Streaming response failed",

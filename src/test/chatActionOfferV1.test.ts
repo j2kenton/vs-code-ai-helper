@@ -11,6 +11,8 @@ import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { offerInterruptedOperationRecoveryV1 } from "../utils/operationNotificationBridge";
+import type { TaskOperationSnapshot } from "../utils/taskOperations";
 import { offerPublishChecksRetryAfterExecutionFailureV1 } from "../commands/runPublishChecks";
 import { showResumeStaysPausedV1 } from "../commands/resumeTask";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
@@ -78,6 +80,58 @@ const OFFERS = [
 ];
 
 void describe("offerActionInChatV1 (RC7 item 4)", () => {
+  void it("renders one actionable stage recovery for an interrupted operation and updates it on duplicate recovery", async () => {
+    const dir = makeTask("interrupted-recovery");
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    const snapshot: TaskOperationSnapshot = {
+      id: "operation-interrupted",
+      key: dir,
+      label: "Run Publish Checks",
+      taskName: "Interrupted recovery",
+      startedAt: 1,
+      finishedAt: 2,
+      exclusive: true,
+      cancellable: true,
+      state: "interrupted",
+      waitingForUser: false,
+      resultTargetUri: vscode.Uri.file(path.join(dir, "runs", "001.md")).toString(),
+    };
+    try {
+      await withFsBridge(async () => {
+        await offerInterruptedOperationRecoveryV1(snapshot);
+        await offerInterruptedOperationRecoveryV1(snapshot);
+      });
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending()
+        .filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks");
+      assert.equal(decisions.length, 1, "repeated recovery refreshes the existing decision");
+      assert.match(decisions[0]?.whatHappened ?? "", /outcome is unknown/);
+      const recovery = decisions[0]?.options.find((option) => option.optionId === "runAction");
+      assert.equal(recovery?.label, "Run Publish Checks");
+      assert.deepEqual(recovery?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.runPublishChecks",
+        args: [{ taskFolderPath: dir }],
+      });
+      const inspect = decisions[0]?.options.find((option) => option.optionId === "alternative1");
+      assert.equal(inspect?.label, "View Run Log");
+      assert.equal(inspect?.resumeKind, "unpause", "an inspect-only alternative must not claim to resume the task");
+      assert.deepEqual(inspect?.effect, {
+        kind: "command",
+        command: "vscode.open",
+        args: [vscode.Uri.file(path.join(dir, "runs", "001.md"))],
+      });
+      assert.equal(decisions[0]?.recommendation.kind === "option" && decisions[0]?.recommendation.optionId, "runAction");
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
   for (const offer of OFFERS) {
     void it(`posts "${offer.label}" as the recommended option and returns the chat pointer`, async () => {
       const dir = makeTask(`offer-${offer.label.replace(/\W+/g, "-").toLowerCase()}`);
@@ -193,10 +247,22 @@ void describe("offerActionInChatV1 (RC7 item 4)", () => {
         "publish-checks-execution-failure",
         new Error("spawn failed")
       ));
+      await withFsBridge(() => offerPublishChecksRetryAfterExecutionFailureV1(
+        vscode.Uri.file(dir),
+        "publish-checks-execution-failure",
+        new Error("spawn failed")
+      ));
       const decision = new WorkflowDecisionStoreV1(memento).listPending().find((item) =>
         item.decisionKey === "chatActionOffer:runPublishChecks"
       );
       assert.ok(decision);
+      assert.equal(
+        new WorkflowDecisionStoreV1(memento).listPending().filter((item) =>
+          item.decisionKey === "chatActionOffer:runPublishChecks"
+        ).length,
+        1,
+        "repeated terminal reports update the same actionable card instead of duplicating it"
+      );
       assert.equal(decision.state, "pending");
       assert.equal(decision.recommendation.kind, "option");
       if (decision.recommendation.kind === "option") {
@@ -204,6 +270,7 @@ void describe("offerActionInChatV1 (RC7 item 4)", () => {
       }
       assert.match(decision.whatHappened, /Publish checks failed to run: spawn failed/);
       assert.equal(decision.options.find((option) => option.optionId === "runAction")?.label, "Run Publish Checks");
+      assert.deepEqual(decision.options.map((option) => option.optionId), ["runAction", "notNow"]);
       assert.deepEqual(
         decision.options.find((option) => option.optionId === "runAction")?.effect,
         { kind: "command", command: "vs-code-ai-helper.runPublishChecks", args: [{ taskFolderPath: dir }] }
@@ -214,6 +281,47 @@ void describe("offerActionInChatV1 (RC7 item 4)", () => {
       __extensionContextV1TestOnly.reset();
     }
   });
+
+  void it("keeps the no-report lint-fix reason, recommended retry and alternatives in one updateable decision", async () => {
+    const dir = makeTask("offer-multi-choice");
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    try {
+      const input = {
+        taskFolderPath: dir,
+        actionLabel: "Back to Implementation",
+        command: "vs-code-ai-helper.setTaskStage",
+        args: [{ taskFolderPath: dir, stage: "implementation" }],
+        alternatives: [
+          { label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", args: [{ taskFolderPath: dir }] },
+          { label: "Fix Linting & Code Errors", command: "vs-code-ai-helper.runLintingFixes", args: [{ taskFolderPath: dir }] },
+        ],
+        noticeText: "Publish Checks have not run yet. Run them first.",
+      } as const;
+      await withFsBridge(() => offerActionInChatV1(input));
+      await withFsBridge(() => offerActionInChatV1(input));
+      const store = new WorkflowDecisionStoreV1(memento);
+      const matching = store.listPending(dir).filter((d) => d.decisionKey === "chatActionOffer:setTaskStage");
+      assert.equal(matching.length, 1, "a repeated terminal outcome updates the same card");
+      const [decision] = matching;
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /Publish Checks have not run yet/);
+      assert.deepEqual(decision.options.map((o) => o.label), [
+        "Back to Implementation", "Run Publish Checks", "Fix Linting & Code Errors", "Not now",
+      ]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(decision.options.slice(0, 3).map((o) => o.effect.kind === "command" ? o.effect.command : "no-op"), [
+        "vs-code-ai-helper.setTaskStage", "vs-code-ai-helper.runPublishChecks", "vs-code-ai-helper.runLintingFixes",
+      ]);
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
 });
 
 void describe("converted call sites (RC7 item 4)", () => {
@@ -221,8 +329,6 @@ void describe("converted call sites (RC7 item 4)", () => {
   const SITES: ReadonlyArray<{ file: string; label: string; command: string; count: number; noDirectTitle?: boolean }> = [
     { file: "utils/pausedTaskRefusalV1.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 1 },
     { file: "commands/taskCreationRecovery.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 2 },
-    { file: "commands/runLintingFixes.ts", label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", count: 3 },
-    { file: "commands/runPublishChecks.ts", label: "Fix Linting & Code Errors", command: "vs-code-ai-helper.runLintingFixes", count: 1 },
     { file: "commands/runPublishChecks.ts", label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", count: 2 },
     { file: "commands/scheduleTaskResume.ts", label: "Complete Stage & Move On", command: "vs-code-ai-helper.nextStage", count: 1 },
     { file: "commands/reviewActions.ts", label: "Complete Stage & Move On", command: "vs-code-ai-helper.nextStage", count: 1 },
@@ -263,8 +369,9 @@ void describe("converted call sites (RC7 item 4)", () => {
     assert.match(implementation, /followUpReviewScheduled = true;\s*dispatchReviewChainAfterLockRelease\(/);
     assert.match(
       implementation,
-      /if \(!followUpReviewScheduled && !options\.suppressAutoReviewDispatch\)\s*\{[\s\S]*?actionLabel: "Run Review"[\s\S]*?optional: true/
+      /if \(!followUpReviewScheduled && !options\.suppressAutoReviewDispatch\)\s*\{[\s\S]*?offerCompletedImplementationReviewInChatV1\(folderUri\)/
     );
+    assert.match(source, /export async function offerCompletedImplementationReviewInChatV1\([\s\S]*?actionLabel: "Run Review"[\s\S]*?optional: true/);
   });
 
   // RC8 item 7: creating a task while another is active is routine, so it
@@ -298,16 +405,10 @@ void describe("converted call sites (RC7 item 4)", () => {
 
   void it("failed and cancelled check hand-backs offer their next action in chat", () => {
     const publishChecks = fs.readFileSync(path.join(root, "commands/runPublishChecks.ts"), "utf8");
-    assert.match(publishChecks, /Publish checks found issues:[\s\S]*?await offerActionInChatV1\([\s\S]*?actionLabel: "Fix Linting & Code Errors"/);
+    assert.match(publishChecks, /Publish checks found issues:[\s\S]*?await offerActionInChatV1\([\s\S]*?alternatives: \[[\s\S]*?label: "Fix Linting & Code Errors"/);
     assert.match(publishChecks, /Publish checks were cancelled\.[\s\S]*?await offerActionInChatV1\([\s\S]*?actionLabel: "Run Publish Checks"/);
-    const fix = fs.readFileSync(path.join(root, "commands/runLintingFixes.ts"), "utf8");
-    assert.match(fix, /const showFixHandbackV1 = async[\s\S]*?actionLabel: "Run Publish Checks"[\s\S]*?showWarning\(/);
-    assert.match(fix, /await showFixHandbackV1\([\s\S]*?AI final fixes were applied, but checks still fail/);
-    assert.match(fix, /await showFixHandbackV1\([\s\S]*?final checks could not be confirmed/);
-    assert.match(fix, /AI final fixes unavailable; checks still fail[\s\S]*?await showFixHandbackV1\([\s\S]*?AI final fixes are unavailable:/);
-    assert.match(fix, /eslintAutofixAttempted && eslintUnavailable[\s\S]*?await showFixHandbackV1\([\s\S]*?Could not apply automatic fixes because the ESLint extension is unavailable/);
-    assert.match(fix, /deterministicFixOutcomeV1\([\s\S]*?passed: postFixLint\.passed[\s\S]*?deterministicOutcome\.kind === "failure"[\s\S]*?await showFixHandbackV1\(deterministicOutcome\.handback!/);
-    assert.match(fix, /No automatic fixes were available\.[\s\S]*?await showFixHandbackV1\(/);
+    // Lint-fix branch reasons and their rendered options are exercised by
+    // runLintingFixesExecutionV1's terminal-path integration cases.
     assert.match(publishChecks, /reviewFollows && freshStampWritten[\s\S]*?The Publish review runs next/);
   });
 
@@ -320,9 +421,7 @@ void describe("converted call sites (RC7 item 4)", () => {
     assert.match(source.slice(catchStart, handlerCall), /if \(error instanceof PublishChecksCancelledError\)[\s\S]*?return;[\s\S]*$/);
   });
 
-  void it("activation recovery retirement offers the next stage and task creation recovery has a visible active path", () => {
-    const recovery = fs.readFileSync(path.join(root, "commands/scheduleTaskResume.ts"), "utf8");
-    assert.match(recovery, /retireSatisfiedSummaryRejectedRecoveryV1\([\s\S]*?nextActorOnRetire: "human"[\s\S]*?await offerActionInChatV1\([\s\S]*?actionLabel: "Complete Stage & Move On"/);
+  void it("task creation recovery keeps an active task's next action visible", () => {
     const creation = fs.readFileSync(path.join(root, "commands/taskCreationRecovery.ts"), "utf8");
     assert.match(creation, /if \(outcome\.initialStatus === "active"\) \{[\s\S]*?currentTaskStore\.set\([\s\S]*?actionLabel: "Draft with AI"[\s\S]*?command: "vs-code-ai-helper\.draftTaskWithAI"[\s\S]*?safeOpenTextDocument\(taskFileUri, TASK_FILENAME\)/);
     assert.match(creation, /if \(outcome\.initialStatus === "active"\) \{[\s\S]*?currentTaskStore\.set\([\s\S]*?creation resumed \(task\.md preserved\)[\s\S]*?actionLabel: "Draft with AI"[\s\S]*?command: "vs-code-ai-helper\.draftTaskWithAI"/);

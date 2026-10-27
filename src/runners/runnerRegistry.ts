@@ -4,7 +4,7 @@ import {
   AgentRunner,
   AgentRunResult,
 } from "../types/agentRunner";
-import { AttemptIdV1 } from "../types/actionCorrelationV1";
+import { allocateHex128IdV1, AttemptIdV1 } from "../types/actionCorrelationV1";
 import { AgentExecutionModeV1, AgentTransportV1 } from "../types/agentExecutionV1";
 import { ProviderReservationHandleV1 } from "../types/providerReservationV1";
 import { ProviderSelectionSessionV1 } from "../services/providerSelectionPolicyV1";
@@ -87,6 +87,15 @@ import {
 } from "../types/taskActionOutcomeV1";
 import { assertNoUnauthorizedV1CorrelationV0 } from "../services/legacyAiActionSafetyGateV0";
 import { assertAiExecutionAllowedInThisHostV1 } from "../state/hostRoleV1";
+
+export interface CandidateInvocationInfoV1 {
+  readonly storedModelId: string;
+  readonly providerLabel: string;
+  readonly runnerId: string;
+  readonly operationId?: string;
+  readonly attemptId: string;
+  readonly backup: boolean;
+}
 
 type EffectiveProvider =
   | { kind: "copilot"; model: string | undefined }
@@ -979,6 +988,9 @@ export async function runImplementationForModel(options: {
    * explicitly given a value that differs from `modelId`.
    */
   configuredPrimaryModelId?: string;
+  /** Called immediately before each actual candidate invocation, including runtime fallbacks. */
+  dispatchOperationId?: string;
+  onCandidateInvokedV1?: (info: CandidateInvocationInfoV1) => void | Promise<void>;
   /** Configured failing check commands for check execution feedback (Step 27 / Defect 13). */
   configuredFailingCommands?: readonly (string | ConfiguredCheckCommandV1)[];
   /** Host check runner for fallback execution (Step 27 / Defect 13). */
@@ -1030,6 +1042,23 @@ export async function runImplementationForModel(options: {
     selected: EffectiveProvider
   ): Promise<ImplementationRunResult & { runnerId: string }> => {
     const prompt = options.prompt;
+    try {
+      const candidateStoredModelId = selected.kind === "cli"
+        ? normalizeQualifiedModelId(`${selected.def.id}:${selected.model ?? "default"}`) ?? `${selected.def.id}:default`
+        : selected.model ?? "(Copilot default)";
+      const configuredPrimary = options.configuredPrimaryModelId ?? options.modelId;
+      await options.onCandidateInvokedV1?.({
+        storedModelId: candidateStoredModelId,
+        providerLabel: selected.kind === "cli" ? selected.def.label : "Copilot",
+        runnerId: selected.kind === "cli" ? selected.def.id : "copilot-lm",
+        ...(options.dispatchOperationId ? { operationId: options.dispatchOperationId } : {}),
+        attemptId: allocateHex128IdV1(),
+        backup: configuredPrimary !== undefined &&
+          normalizeQualifiedModelId(configuredPrimary) !== normalizeQualifiedModelId(candidateStoredModelId),
+      });
+    } catch {
+      // Observability must never alter the selected provider or stop dispatch.
+    }
     if (selected.kind === "cli") {
       const result = await runImplementationWithCli({
         def: selected.def,
@@ -2288,6 +2317,8 @@ export function openV1RunnerSelection(options: {
    * of ever reserving an unqualified provider under a summary-only mandate.
    */
   requireSummaryOnlyCapableText?: boolean;
+  /** Do not fall back to another configured model for a same-model report correction. */
+  restrictToPrimaryModel?: boolean;
 }): V1RunnerSelectionV1 {
   const { session, mode, workspaceCwd, requireSummaryOnlyCapableText = false } = options;
 
@@ -2400,7 +2431,9 @@ export function openV1RunnerSelection(options: {
   // `resolveEffectiveProvider` throws for a disabled or unconfigured primary
   // (the same fail-closed behavior as the legacy entry points), and
   // `backupModelsForStage` already excludes disabled providers.
-  const rankedStoredIds = rankedStageChainStoredIdsV1(options.stage, options.modelId);
+  const rankedStoredIds = options.restrictToPrimaryModel
+    ? [options.modelId].filter((id): id is string => id !== undefined)
+    : rankedStageChainStoredIdsV1(options.stage, options.modelId);
 
   const ranked = rankedStoredIds.map(toRankedEntry);
   const anySupported = ranked.some((entry) => entry.supported);
@@ -2560,6 +2593,8 @@ export function createV1RunnerSelectionOpener(options: {
   };
   /** Forwarded verbatim to every `openV1RunnerSelection` call — see its doc comment. */
   requireSummaryOnlyCapableText?: boolean;
+  /** Do not use a backup candidate; used when correction must use the original model. */
+  restrictToPrimaryModel?: boolean;
 }): (request: {
   readonly session: ProviderSelectionSessionV1;
   readonly mode: AgentExecutionModeV1;
@@ -2574,6 +2609,7 @@ export function createV1RunnerSelectionOpener(options: {
       stage: resolved.stage,
       workspaceCwd: options.workspaceCwd,
       requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
+      restrictToPrimaryModel: options.restrictToPrimaryModel,
     });
   };
 }

@@ -522,9 +522,13 @@ void describe("handleReviewOutcomeV1 silent-failure regression", () => {
     // `handleReviewRoutingOutcome`'s terminalization, previously left that
     // row open forever. Pinned alongside the run-log call for the same
     // reason: an early return must not be able to skip it either.
+    const handler = source.slice(
+      source.indexOf("export async function handleReviewOutcomeV1("),
+      source.indexOf("export async function finalizeReviewOutcomeV1(")
+    );
     assert.match(
-      source,
-      /try\s*\{\s*await routeReviewOutcomeV1\(outcome, ctx\);\s*\}\s*finally\s*\{\s*await finalizeReviewOutcomeV1\(outcome, ctx\);\s*\}/,
+      handler,
+      /try\s*\{[\s\S]*?await routeReviewOutcomeV1\(outcome, ctx\);\s*\}\s*finally\s*\{\s*await finalizeReviewOutcomeV1\(outcome, ctx\);\s*\}/,
       "handleReviewOutcomeV1 must run the run log AND the round-ledger safety-net terminalizer in a finally around the routing body"
     );
     assert.match(

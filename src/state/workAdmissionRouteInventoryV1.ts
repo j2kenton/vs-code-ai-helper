@@ -95,6 +95,7 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   archiveTask: { kind: "notWatchdogSusceptible", reason: "deterministic status write; no provider dispatch" },
   unarchiveTask: { kind: "notWatchdogSusceptible", reason: "deterministic status write; no provider dispatch" },
   reconcilePlanChecklist: { kind: "notWatchdogSusceptible", reason: "deterministic checklist reconciliation; no coordinator/provider call" },
+  resolveRoundGitInterference: { kind: "notWatchdogSusceptible", reason: "deterministic Git-state recovery; no provider dispatch" },
   applyReviewerVerifiedTicks: { kind: "notWatchdogSusceptible", reason: "deterministic tick application; no provider dispatch" },
   pinTask: { kind: "notWatchdogSusceptible", reason: "deterministic; no provider dispatch" },
   unpinTask: { kind: "notWatchdogSusceptible", reason: "deterministic; no provider dispatch" },

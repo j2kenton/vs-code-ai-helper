@@ -23,10 +23,13 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { runLintingFixes } from "../commands/runLintingFixes";
+import { offerLintFixRecoveryInChatV1, runLintingFixes } from "../commands/runLintingFixes";
+import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { TaskInventory } from "../state/taskInventory";
 import { TaskProgress } from "../types/taskProgress";
 import { taskOperations, TaskOperationSnapshot } from "../utils/taskOperations";
+import { terminalEntryFor } from "../utils/operationNotificationBridge";
 import { fixtureOwnershipFor } from "./taskFolderFixture";
 import { copyPromptResources } from "./helpers/copyPromptResources";
 import {
@@ -37,6 +40,7 @@ import {
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
 const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
+const completionLintModule = require("../utils/completionLint") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 // One level below its own temp directory: the task-state store takes its
@@ -52,6 +56,19 @@ function makeTaskFolder(name: string): string {
   const dir = path.join(REAL_ROOT, name);
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function makeMemento(): vscode.Memento {
+  const backing = new Map<string, unknown>();
+  return {
+    keys: (): readonly string[] => [...backing.keys()],
+    get: <T>(key: string, defaultValue?: T): T | undefined => backing.has(key) ? backing.get(key) as T : defaultValue,
+    update: (key: string, value: unknown): Thenable<void> => {
+      if (value === undefined) backing.delete(key);
+      else backing.set(key, value);
+      return Promise.resolve();
+    },
+  } as vscode.Memento;
 }
 
 function writeProgress(folderPath: string, progress: TaskProgress): void {
@@ -112,6 +129,102 @@ function fixtureProgress(taskFolderPath: string, currentStage: TaskProgress["cur
 }
 
 void describe("runLintingFixes tracked-operation outcome (RC3 item 11 / Step 9)", () => {
+  void it("renders the lint-fix recovery reason, recommended retry, implementation alternative and one stable card", async () => {
+    const taskFolderPath = makeTaskFolder("outcome-lint-fix-recovery-card");
+    const progress = fixtureProgress(taskFolderPath, "publish");
+    writeProgress(taskFolderPath, progress);
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
+    const rf = installReadFileBridge();
+    try {
+      const reason = "Publish Checks have not run yet. Run them first.";
+      await offerLintFixRecoveryInChatV1(taskFolderPath, "lint fix recovery", reason);
+      await offerLintFixRecoveryInChatV1(taskFolderPath, "lint fix recovery", reason);
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending(taskFolderPath)
+        .filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks");
+      assert.equal(decisions.length, 1);
+      const decision = decisions[0];
+      assert.ok(decision);
+      assert.equal(decision.whatHappened, reason);
+      assert.deepEqual(decision.options.map((option) => option.label), [
+        "Run Publish Checks", "Back to Implementation", "Not now",
+      ]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(decision.options[0]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.runPublishChecks",
+        args: [{ taskFolderPath }],
+      });
+      assert.deepEqual(decision.options[1]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.setTaskStage",
+        args: [{ taskFolderPath, stage: "implementation" }],
+      });
+    } finally {
+      rf.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("cancels during the first check through the tracked operation and records no success", async () => {
+    const taskFolderPath = makeTaskFolder("outcome-cancel-during-check");
+    const progress: TaskProgress = {
+      ...fixtureProgress(taskFolderPath, "publish"),
+      lintPayload: {
+        runAt: "2026-01-01T00:00:00.000Z",
+        passed: false,
+        summary: "1 check failed",
+        issueCount: 1,
+        failedChecks: [],
+      },
+    };
+    writeProgress(taskFolderPath, progress);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const endedSnapshots: TaskOperationSnapshot[] = [];
+    const sub = taskOperations.onDidEnd((snap) => {
+      if (snap.label === "Linting Fixes") endedSnapshots.push(snap);
+    });
+    const originalEnsure = modelSelectionModule.ensureStageModelConfigured;
+    const originalResolveFresh = modelSelectionModule.resolveFreshModelForStage;
+    const originalRunCompletionLint = completionLintModule.runCompletionLint;
+    modelSelectionModule.ensureStageModelConfigured = () => Promise.resolve(true);
+    modelSelectionModule.resolveFreshModelForStage = () =>
+      Promise.resolve({ modelId: "stub-publish-model", source: "workspace" });
+    completionLintModule.runCompletionLint = () => {
+      const operation = taskOperations.getLocalTaskOperations(taskFolderPath).find((item) => item.label === "Linting Fixes");
+      assert.ok(operation, "the outer fix operation must be live during checks");
+      assert.equal(operation.cancellable, true, "the Notifications row must expose cancellation");
+      assert.equal(taskOperations.cancelOperation(operation.id, "notifications"), true);
+      const ErrorCtor = completionLintModule.PublishChecksCancelledError as new () => Error;
+      throw new ErrorCtor();
+    };
+
+    try {
+      await runLintingFixes(makeInventory(taskFolderPath, progress), vscode.Uri.file(REAL_ROOT), { taskFolderPath });
+      assert.equal(endedSnapshots.length, 1);
+      assert.equal(endedSnapshots[0]?.state, "cancelled");
+      assert.match(endedSnapshots[0]?.cancelReasonV1 ?? "", /cancelled/i);
+      assert.match(terminalEntryFor(endedSnapshots[0])?.message ?? "", /cancelled/i);
+      assert.ok(surface.entries.every((entry) => !/passed|completed/i.test(entry.message)));
+    } finally {
+      sub.dispose();
+      modelSelectionModule.ensureStageModelConfigured = originalEnsure;
+      modelSelectionModule.resolveFreshModelForStage = originalResolveFresh;
+      completionLintModule.runCompletionLint = originalRunCompletionLint;
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
   void it("ends the tracked operation as 'failed', never 'succeeded', when AI final fixes are unavailable and checks still fail", async () => {
     const taskFolderPath = makeTaskFolder("outcome-ai-fixes-unavailable");
     const progress: TaskProgress = {
@@ -125,6 +238,13 @@ void describe("runLintingFixes tracked-operation outcome (RC3 item 11 / Step 9)"
       },
     };
     writeProgress(taskFolderPath, progress);
+    const memento = makeMemento();
+    __extensionContextV1TestOnly.set({
+      subscriptions: [],
+      extensionUri: vscode.Uri.file(REAL_ROOT),
+      workspaceState: memento,
+      globalState: memento,
+    } as unknown as vscode.ExtensionContext);
     const packageJsonPath = path.join(REAL_ROOT, "package.json");
     fs.writeFileSync(
       packageJsonPath,
@@ -177,8 +297,11 @@ void describe("runLintingFixes tracked-operation outcome (RC3 item 11 / Step 9)"
       await runLintingFixes(inventory, vscode.Uri.file(REAL_ROOT), { taskFolderPath });
 
       const warnings = surface.entries.filter((e) => e.level === "warning");
-      assert.equal(warnings.length, 1);
-      assert.match(warnings[0]?.message ?? "", /AI final fixes are unavailable/);
+      // Unavailable Git evidence (this fixture folder is not a repository) is
+      // logged, not raised: only the failed AI hand-back is a notice.
+      assert.equal(warnings.length, 1, "only the failed AI hand-back is a notice");
+      assert.ok(warnings.some((entry) => /AI final fixes are unavailable/.test(entry.message)));
+      assert.ok(!warnings.some((entry) => /Git state evidence unavailable/.test(entry.message)));
 
       assert.equal(
         endedSnapshots.length,
@@ -189,8 +312,30 @@ void describe("runLintingFixes tracked-operation outcome (RC3 item 11 / Step 9)"
         endedSnapshots[0]?.state,
         "failed",
         "checks are still failing after this run — the operation must not settle as 'succeeded' " +
-          "(which operationNotificationBridge.ts renders as 'completed')"
+        "(which operationNotificationBridge.ts renders as 'completed')"
       );
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending(taskFolderPath)
+        .filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks");
+      assert.equal(decisions.length, 1, "the failed-AI branch offers one stable task-chat recovery decision");
+      const decision = decisions[0];
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /AI final fixes are unavailable: No Copilot language models are available/);
+      assert.match(decision.whatHappened, /Checks summary: unrun\/untested: npm run test\./);
+      assert.match(decision.whatHappened, /Fix the remaining issues, then run Publish Checks\./);
+      assert.deepEqual(decision.options.map((option) => option.label), [
+        "Run Publish Checks", "Back to Implementation", "Not now",
+      ]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+      assert.deepEqual(decision.options[0]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.runPublishChecks",
+        args: [{ taskFolderPath }],
+      });
+      assert.deepEqual(decision.options[1]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.setTaskStage",
+        args: [{ taskFolderPath, stage: "implementation" }],
+      });
       assert.notEqual(
         endedSnapshots[0]?.state,
         "succeeded",
@@ -205,6 +350,7 @@ void describe("runLintingFixes tracked-operation outcome (RC3 item 11 / Step 9)"
       rf.restore();
       ws.restore();
       deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
     }
   });
 });

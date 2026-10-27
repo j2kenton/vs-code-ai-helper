@@ -182,11 +182,10 @@ export function isPlanIncomplete(
  * checklist held 47 items, the task auto-advanced out of implementation with
  * 41 items untouched, and only Publish noticed (task "1.8", 2026-08-10).
  *
- * So when the plan still lists unchecked items, THOSE numbers win, and no
- * reported marker can advance the stage. Deliberately asymmetric: a checklist
- * with nothing left unchecked does NOT override a review still reporting
- * itself mid-plan — either source may say "not finished", neither may
- * unilaterally say "finished".
+ * The authoritative checklist count wins over the review's self-reported
+ * marker in both directions. In particular, reviewer verification that settles
+ * the final provisional items must not remain blocked by the older marker
+ * written before that verification was applied.
  *
  * A plan with no checklist at all reconciles to the review's own marker
  * unchanged, so tasks that never generated one behave exactly as before.
@@ -208,7 +207,7 @@ export function reconcileProgressWithChecklistV1(
   progress: ReviewProgress | null,
   checklist: { total: number; settled: number; remaining: number } | undefined
 ): ReviewProgress | null {
-  if (!checklist || checklist.remaining <= 0) {
+  if (!checklist) {
     return progress;
   }
   return { complete: checklist.settled, total: checklist.total };

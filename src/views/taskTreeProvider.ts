@@ -40,6 +40,7 @@ import {
 import { describeTaskFixableBlockersV1 } from "../utils/reviewRouting";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { isWaitingForHumanV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
+import { readPendingUserInputEvidenceV1 } from "../utils/pendingUserInputV1";
 import { TaskInventory, TaskWithProgress, compareTasksNewestFirst } from "../state/taskInventory";
 import { TaskProgressRecoveryEntryV1 } from "../services/taskProgressDiscoveryV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
@@ -707,8 +708,11 @@ export class TaskNode extends vscode.TreeItem {
       isMetaManaged,
       // The same flag the tooltip branch above reads: carrying it into the
       // context value is what scopes the reconcilePlanChecklist menu entry to
-      // latched tasks only (package.json matches /-checklistUnreliable/).
-      checklistProgressUnreliable: task.progress.checklistProgressUnreliable === true,
+      // latched tasks only (package.json matches /-checklistUnreliable/),
+      // offered only when the task is idle (Step 9).
+      checklistProgressUnreliable:
+        task.progress.checklistProgressUnreliable === true &&
+        !taskOperations.hasRootOperationForTask(task.canonicalId ?? task.folderUri.fsPath),
       isPinned: task.progress.pinnedAt !== undefined,
       hasPendingDecision: sortedPendingDecisions.length > 0,
       // The exact `_prev`-pair condition, resolved by the caller and passed
@@ -760,6 +764,8 @@ export class StageNode extends vscode.TreeItem {
     implementationProgress?: {
       complete: number;
       total: number;
+      verified?: number;
+      provisional?: number;
       unverified?: boolean;
       /** Items closed without doing before Implementation first started,
        * already left out of `complete`/`total` (RC8 item 6) — named in the tooltip. */
@@ -1150,6 +1156,10 @@ export class StageNode extends vscode.TreeItem {
         `\n\n${closedBefore} item${closedBefore === 1 ? "" : "s"} closed before Implementation started — ` +
         "not counted in the percentage.";
     }
+    if (stage === "impl" && (implementationProgress?.provisional ?? 0) > 0) {
+      tooltipStr += `\n\n${implementationProgress!.verified ?? 0} reviewer-verified, ` +
+        `${implementationProgress!.provisional} provisional checklist item${implementationProgress!.provisional === 1 ? "" : "s"}.`;
+    }
     if (missingPrerequisite) {
       tooltipStr +=
         `\n\n⚠ This stage needs ${missingPrerequisite.requirementLabel}, produced by the ` +
@@ -1440,7 +1450,9 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   // Collapse/expand state management
   private mode: "autoFirstActive" | "allExpanded" | "allCollapsed" = "autoFirstActive";
   private readonly explicitlyExpanded = new Set<string>();
+  private readonly retainedExpanded = new Set<string>();
   private readonly explicitlyCollapsed = new Set<string>();
+  private readonly lastReadableTasks = new Map<string, IncompleteTask>();
   // Bumped on every collapseAll() so TaskNode ids change and VS Code can't
   // reuse its own memorized (already-expanded) UI state for the same node.
   private collapseEpoch = 0;
@@ -1605,6 +1617,10 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     // reflects this render's push rather than a stale prior value.
     await this.schedulingIntentStore.recordOwedContinuation(taskId, owedSource);
     const ledgerOwedSource = this.schedulingIntentStore.getOwedContinuation(taskId);
+    const pendingEvidence = await readPendingUserInputEvidenceV1(
+      task.folderUri.fsPath,
+      task.canonicalId ?? taskId
+    );
     return withWaitingForHumanFallbackV1(
       deriveSchedulingPostureV1({
         entries: this.schedulingIntentStore.listForTask(taskId),
@@ -1612,7 +1628,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         hasCoverage: this.schedulingIntentStore.hasCoverage(taskId),
         inFlight: taskOperations.hasRootOperationForTask(task.canonicalId ?? task.folderUri.fsPath),
       }),
-      task.progress
+      task.progress,
+      pendingEvidence
     );
   }
 
@@ -1742,6 +1759,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   async expandAll(treeView: vscode.TreeView<TaskTreeNode>): Promise<void> {
     this.mode = 'allExpanded';
     this.explicitlyExpanded.clear();
+    this.retainedExpanded.clear();
     this.explicitlyCollapsed.clear();
     this.scheduleTreeRefreshV1();
 
@@ -1765,6 +1783,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   collapseAll(): void {
     this.mode = 'allCollapsed';
     this.explicitlyExpanded.clear();
+    this.retainedExpanded.clear();
     this.explicitlyCollapsed.clear();
     // VS Code's TreeView remembers expand/collapse state per item id across
     // refreshes, so simply re-rendering with Collapsed items isn't enough for
@@ -1787,6 +1806,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
   notifyExpanded(task: IncompleteTask): void {
     const id = taskIdentityKey(task);
     this.explicitlyExpanded.add(id);
+    this.retainedExpanded.add(id);
     this.explicitlyCollapsed.delete(id);
   }
 
@@ -1798,6 +1818,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     const id = taskIdentityKey(task);
     this.explicitlyCollapsed.add(id);
     this.explicitlyExpanded.delete(id);
+    this.retainedExpanded.delete(id);
   }
 
   /**
@@ -1911,7 +1932,18 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
     try {
       // Use the shared inventory as the source of truth
       const inventoryTasks = this.inventory.getTasks();
-      const tasks: IncompleteTask[] = inventoryTasks.map(toIncompleteTask);
+      const readableTasks: IncompleteTask[] = inventoryTasks.map(toIncompleteTask);
+      const readableIds = new Set(readableTasks.map(taskIdentityKey));
+      for (const task of readableTasks) this.lastReadableTasks.set(taskIdentityKey(task), task);
+      const retainedTasks = [...this.lastReadableTasks.values()].filter((task) => {
+        const id = taskIdentityKey(task);
+        if (readableIds.has(id)) return false;
+        if (fs.existsSync(task.folderUri.fsPath)) return true;
+        this.lastReadableTasks.delete(id);
+        this.retainedExpanded.delete(id);
+        return false;
+      });
+      const tasks = [...readableTasks, ...retainedTasks];
 
       const hasTasks = tasks.length > 0;
       void vscode.commands.executeCommand(
@@ -1930,7 +1962,13 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       return tasks;
     } catch (error) {
       console.error('Failed to load tasks:', error);
-      this._onDidLoadTasks.fire([]);
+      // An inventory read failure is not evidence that previously readable
+      // task folders were deleted. Keep their last presentation snapshot for
+      // this refresh, but callers still perform their own strict progress
+      // read before any action can run.
+      const retainedTasks = [...this.lastReadableTasks.values()];
+      this._onDidLoadTasks.fire(retainedTasks);
+      if (retainedTasks.length > 0) return retainedTasks;
       throw error;
     }
   }
@@ -1957,15 +1995,21 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         return false;
       }
 
+      if (this.retainedExpanded.has(id)) {
+        return true;
+      }
+
       // Otherwise follow the global mode
       if (this.mode === 'allExpanded') {
+        this.retainedExpanded.add(id);
         return true;
       }
       if (this.mode === 'allCollapsed') {
         return false;
       }
-      // autoFirstActive mode: expand only the first active task in display order
-      return firstActiveId !== undefined && id === firstActiveId;
+      const expandAsFirstActive = firstActiveId !== undefined && id === firstActiveId;
+      if (expandAsFirstActive) this.retainedExpanded.add(id);
+      return expandAsFirstActive;
     };
 
     // Get current task ID from the store (canonical normalized path).
@@ -2123,7 +2167,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // task's count, flagged `unverified`, so the tree qualifies the number
       // instead of hiding it (merge of `ui 12` into `v1 f2`, 2026-09-21).
       let implementationProgress:
-        | { complete: number; total: number; unverified?: boolean; closedBeforeImplementation?: number }
+        | { complete: number; total: number; verified?: number; provisional?: number; unverified?: boolean; closedBeforeImplementation?: number }
         | undefined;
       if (stage === "impl") {
         const display = await readDisplayPlanChecklistProgressV1(task.folderUri);
@@ -2138,6 +2182,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           implementationProgress = {
             complete: shown.complete,
             total: shown.total,
+            verified: display.verified,
+            provisional: display.provisional,
             ...(display.unverified ? { unverified: true } : {}),
             ...(shown.closedBeforeImplementation > 0
               ? { closedBeforeImplementation: shown.closedBeforeImplementation }

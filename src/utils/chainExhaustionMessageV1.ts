@@ -28,7 +28,6 @@ export function describeChainExhaustionTailV1(
       ? `Models tried, in order: ${describeChainCandidatesV1(candidates)}. `
       : "No model is configured for this stage. ";
   return (
-    `${tried}To change the list, open Ensemble Settings and edit the model and backup models for ${stageName}` +
-    " (the \"Adjust provider settings\" option opens them)."
+    `${tried}To change the list, choose "Change the model in AI Models"; it opens AI Models focused on ${stageName}.`
   );
 }

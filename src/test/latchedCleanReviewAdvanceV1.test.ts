@@ -1,9 +1,8 @@
 /**
- * RC8 item 4: while the checklist is flagged unreliable (the under-recording
- * latch), a review that meets the auto-advance threshold with zero blockers
- * advances; the count the review echoes does not hold it. The reviewer's
- * verified-complete ticks are applied before the decision. Without the latch,
- * an open checklist still holds the stage as before.
+ * bugs2 Step 20: the unreliable-checklist latch no longer bypasses the
+ * reviewer-verified completeness gate. A clean review can offer the owner an
+ * explicit Move on decision, and reviewer-verified ticks are applied before
+ * the decision, but provisional self-claims never advance automatically.
  *
  * Drives `handleReviewOutcomeV1` over a temp directory (the plan write is
  * atomic and needs a real disk), like `reviewNoTrackedFileSetV1.test.ts`
@@ -312,19 +311,19 @@ void describe("RC8 item 4: a clean review advances while the checklist is flagge
     assert.equal(recommendation.kind === "option" ? recommendation.optionId : undefined, "moveOn");
   });
 
-  void it("(a3) latched, clean, no open items after the ticks: advances as today, with no card", async () => {
+  void it("(a3) latched self-ticks do not advance without reviewer verification", async () => {
     const plan = ["<!-- ensemble:implementation-checklist -->", "", "- [x] 1. Item one", "- [x] 2. Item two", ""].join("\n");
-    const { entries, stage, latchedCards } = await route("latched-nothing-open", { latched: true, review: CLEAN, plan });
-    assert.equal(stage, "impl-low-review", "the task advanced to Low-Level Code Review");
-    assert.equal(latchedCards.length, 0, "no card when nothing is open");
-    assert.ok(entries.some((e) => e.message.includes("Auto-advancing stage")));
+    const { entries, stage } = await route("latched-nothing-open", { latched: true, review: CLEAN, plan });
+    assert.equal(stage, "impl-high-review");
+    assert.ok(!entries.some((e) => e.message.includes("Auto-advancing stage")));
   });
 
-  void it("(a4) latched, review ticks every open item as verified complete: advances, no card", async () => {
+  void it("(a4) latched, exclusions plus reviewer ticks settle every item: advances, no card", async () => {
+    const plan = PLAN_FINAL.replace("- [x] 1. Item one", "- [ ] 1. Item one <!-- ensemble:excluded -->");
     const review = reviewText({ verified: ["2. Item two", "3. Item three", "4. Item four"] });
-    const { stage, latchedCards } = await route("latched-ticked-all", { latched: true, review });
+    const { stage, latchedCards, entries, planFinal } = await route("latched-ticked-all", { latched: true, review, plan });
     assert.equal(latchedCards.length, 0);
-    assert.equal(stage, "impl-low-review");
+    assert.equal(stage, "impl-low-review", JSON.stringify({ entries, planFinal }));
   });
 
   void it("(f) item 10: a clean-scoring review whose verdict says steps remain to be built, with no completion blocker, is held with a chat card", async () => {
@@ -339,14 +338,15 @@ void describe("RC8 item 4: a clean review advances while the checklist is flagge
     assert.ok(decisionKeys.includes("reviewNamesUnbuiltSteps"), "the card says why the stage was held");
   });
 
-  void it("(f2) item 10: built-but-unticked wording is not a contradiction; the stage advances", async () => {
+  void it("(f2) built-but-unticked wording is not a contradiction, but self-ticks still need verification", async () => {
     const plan = ["<!-- ensemble:implementation-checklist -->", "", "- [x] 1. Item one", "- [x] 2. Item two", ""].join("\n");
     const review = reviewText({
       verdict: "Ready — Steps 3 and 4 are built but not ticked and are listed under Verified Complete.",
       progress: "2/2",
     });
     const { stage, entries, decisionKeys } = await route("built-not-ticked", { latched: false, review, plan });
-    assert.equal(stage, "impl-low-review", JSON.stringify({ entries, decisionKeys }));
+    assert.equal(stage, "impl-high-review", JSON.stringify({ entries, decisionKeys }));
+    assert.ok(!decisionKeys.includes("reviewNamesUnbuiltSteps"));
   });
 
   void it("(b) not latched, same input: an open checklist still holds the stage", async () => {

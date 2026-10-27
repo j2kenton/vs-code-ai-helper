@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -14,10 +15,8 @@ import {
 import { readTextIfExists, statIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import {
   listUncheckedChecklistItemTextsV1,
-  filterUncheckedPlanItemsV1,
   filterAlreadyCheckedPlanItemsV1,
   normalizeChecklistItemTextV1,
-  mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
@@ -39,8 +38,9 @@ import {
 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
+import { taskOperations } from "../utils/taskOperations";
 import { ChatTarget } from "../views/chatView";
-import { buildSyntheticVerifiedCompleteSummaryV1 } from "./applyReviewerVerifiedTicks";
+import { deriveApplicableVerifiedTicksV1, writeVerifiedTicksToPlanV1 } from "./applyReviewerVerifiedTicks";
 import {
   filterSupersededBlockersV1,
   normalizeReviewEvidenceV1,
@@ -256,7 +256,8 @@ async function computeReviewVerifiedCoverageV1(
     }
     const readiness = parseReadiness(content);
     const verified = parseReviewVerifiedCompleteV1(content);
-    const matches = filterUncheckedPlanItemsV1(planOfRecord, verified.items);
+    const derived = await deriveApplicableVerifiedTicksV1(folderUri, stage);
+    const matches = derived.kind === "ok" ? [...derived.derivation.applicable] : [];
     for (const item of matches) {
       const key = normalizeChecklistItemTextV1(item);
       if (!coveredKeys.has(key)) {
@@ -1630,23 +1631,29 @@ export async function postReconcilePlanChecklistDecisionV1(
   // not silently picking that option as the recommendation.
   const recommendation: WorkflowDecisionRecommendationV1 =
     coveredItemsCount > 0
-      ? {
-          kind: "option",
-          optionId: "notYet",
-          reasoning:
-            `The review-verified check fails: ${coveredItemsCount} unticked item(s) are named verified ` +
-            "complete by an implementation review already on file, so the checklist does not yet match the " +
-            `work. Next action: use "Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"}" ` +
-            "above instead of marking reconciled — it records that verification as ticks and cannot untick or " +
-            "misapply anything." +
-            (pendingFilesCount > 0
-              ? ` Separately, ${pendingFilesCount} changed file(s) are also unrecorded: run Apply Review first ` +
-                "so the round's changes are captured in the checklist."
-              : allUncheckedCovered
-                ? " This covers every currently outstanding item, so applying the tick(s) will leave the " +
-                  "checklist fully accounted for."
-                : ""),
-        }
+      ? (allUncheckedCovered && pendingFilesCount === 0
+          ? {
+              kind: "option",
+              optionId: "reconcile",
+              reasoning:
+                "Fresh review evidence accounts for the checklist: every currently outstanding item is verified complete " +
+                "or accounted for by the review on file. Marking reconciled confirms the checklist is trustworthy without " +
+                "automatically verifying provisional claims.",
+            }
+          : {
+              kind: "option",
+              optionId: "notYet",
+              reasoning:
+                `The review-verified check fails: ${coveredItemsCount} unticked item(s) are named verified ` +
+                "complete by an implementation review already on file, so the checklist does not yet match the " +
+                `work. Next action: use "Apply ${coveredItemsCount} Reviewer-Verified Tick${coveredItemsCount === 1 ? "" : "s"}" ` +
+                "above instead of marking reconciled — it records that verification as ticks and cannot untick or " +
+                "misapply anything." +
+                (pendingFilesCount > 0
+                  ? ` Separately, ${pendingFilesCount} changed file(s) are also unrecorded: run Apply Review first ` +
+                    "so the round's changes are captured in the checklist."
+                  : ""),
+            })
       : noUncheckedItemsRemain
         ? hasUnresolvedNoMatchClaim
           ? {
@@ -2020,17 +2027,29 @@ export async function postReconcilePlanChecklistDecisionV1(
           : []),
         {
           optionId: "reconcile",
-          label: `Mark reconciled${ffResume.labelSuffix}`,
-          resumeKind: "continue",
+          label: "Mark reconciled",
+          resumeKind: "unpause",
           consequence:
-            "Clears the unreliable-checklist flag, then dispatches this stage's next action. Plan completeness " +
+            "Clears the unreliable-checklist flag without dispatching a stage action. Plan completeness " +
             "will gate stage advancement again from these counts, so an item left unticked will hold the task " +
-            "open, and one ticked in error can let unfinished work advance." +
-            ffResume.consequenceSuffix,
+            "open, and one ticked in error can let unfinished work advance.",
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
-            args: [{ taskFolderPath, canonicalId, decisionId, ...ffResume.extraArgs }],
+            args: [{ taskFolderPath, canonicalId, decisionId }],
+          },
+        },
+        {
+          optionId: "continueStage",
+          label: `Resume and continue stage${ffResume.labelSuffix}`,
+          resumeKind: "continue",
+          consequence:
+            "Dispatches this stage's next action without clearing the unreliable-checklist flag." +
+            ffResume.consequenceSuffix,
+          effect: {
+            kind: "command",
+            command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+            args: [{ taskFolderPath, ...ffResume.extraArgs }],
           },
         },
         {
@@ -2087,6 +2106,12 @@ export async function reconcilePlanChecklist(
     );
     return;
   }
+  if (taskOperations.hasRootOperationForTask(resolved.taskFolderPath)) {
+    NotificationRouter.showWarning(
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Cannot reconcile the checklist while an operation is running. Wait for the active operation to finish.`
+    );
+    return;
+  }
 
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
   const result = await postReconcilePlanChecklistDecisionV1(
@@ -2125,7 +2150,7 @@ export async function reconcilePlanChecklistConfirmedV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ReconcileArg
-): Promise<void> {
+): Promise<boolean> {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
   const normalized = normalizeArg(explicitArg);
   const resolved = await resolveTaskContext(
@@ -2138,13 +2163,19 @@ export async function reconcilePlanChecklistConfirmedV1(
     NotificationRouter.showError(
       "The task could not be found. Refresh the Tasks panel and try again."
     );
-    return;
+    return false;
   }
   if (!resolved.progress.checklistProgressUnreliable) {
     NotificationRouter.showInformation(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — This task's plan checklist is already treated as a complete record.`
     );
-    return;
+    return false;
+  }
+  if (taskOperations.hasRootOperationForTask(resolved.taskFolderPath)) {
+    NotificationRouter.showWarning(
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Cannot reconcile the checklist while an operation is running. Wait for the active operation to finish.`
+    );
+    return false;
   }
 
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
@@ -2154,7 +2185,7 @@ export async function reconcilePlanChecklistConfirmedV1(
     NotificationRouter.showWarning(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md could not be read, so there is nothing to reconcile against.`
     );
-    return;
+    return false;
   }
 
   if (normalized?.decisionId) {
@@ -2167,7 +2198,7 @@ export async function reconcilePlanChecklistConfirmedV1(
           `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md changed since this decision was posted, so the evidence it showed may be stale. ` +
             "Re-check plan-final.md and run this again."
         );
-        return;
+        return false;
       }
     }
   }
@@ -2206,7 +2237,7 @@ export async function reconcilePlanChecklistConfirmedV1(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — The task changed while this was being applied — a round may have landed work the checklist ` +
         "does not record. Re-check plan-final.md and run this again."
     );
-    return;
+    return false;
   }
   // 1.0.0 gate, Part 5 (B2, item 131): this command is reachable directly
   // (Command Palette / tree context menu "Mark Plan Checklist Reconciled"),
@@ -2227,16 +2258,10 @@ export async function reconcilePlanChecklistConfirmedV1(
   NotificationRouter.showInformation(
     `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Plan checklist marked as reconciled — completeness now gates advancement again.`
   );
-  // Part 3, Step 5 (owner's ruling: "Ensemble performs it -> say so and do
-  // it"): the option that clears the latch is the only reason to clear it, so
-  // it also tries the stage's next action again rather than leaving the task
-  // sitting on the now-cleared gate with nothing running.
-  // RC3 item 4, Step 3: forwards the provenance baked into this card at post
-  // time — present only when Fast Forward was genuinely active then.
-  await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
-    taskFolderPath: folderUri.fsPath,
-    resumeFastForwardV1: normalized?.resumeFastForwardV1,
-  });
+  // Finding 17 / Step 9: Reconciling the checklist is an idle action that
+  // clears the flag and acknowledges it without resuming or dispatching another
+  // action (continuation is a separate option).
+  return true;
 }
 
 export type ApplyReconciliationTicksResultV1 =
@@ -2332,23 +2357,17 @@ export async function applyReconciliationReviewVerifiedTicksV1(
       ? { kind: "alreadyTicked", count: verifiedItemCount }
       : { kind: "noCandidates" };
   }
-  const evidence =
-    "verified complete by an implementation review already on file — applied via explicit operator " +
-    "selection (Ensemble: Apply Reviewer-Verified Ticks)";
-  const synthetic = buildSyntheticVerifiedCompleteSummaryV1(coveredItems, evidence);
-  const merged = mergeChecklistProgressV1(plan.text, synthetic);
-  if (merged.kind !== "merged") {
-    return { kind: "noCandidates" };
+  let applied = 0;
+  for (const stage of IMPL_REVIEW_STAGES) {
+    const derived = await deriveApplicableVerifiedTicksV1(folderUri, stage, coveredItems);
+    if (derived.kind !== "ok") continue;
+    const result = await writeVerifiedTicksToPlanV1(folderUri, derived.derivation);
+    if (result.kind === "refused") {
+      return { kind: "changedUnderneath" };
+    }
+    if (result.kind === "applied") applied += result.count;
   }
-  const written = await writeTextFileIfUnchangedV1(
-    getCanonicalImplementationUri(folderUri),
-    plan.text,
-    merged.content
-  );
-  if (!written) {
-    return { kind: "changedUnderneath" };
-  }
-  return { kind: "applied", count: coveredItems.length };
+  return applied > 0 ? { kind: "applied", count: applied } : { kind: "noCandidates" };
 }
 
 /**
@@ -2710,7 +2729,9 @@ export function registerReconcilePlanChecklistCommands(
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
-      (arg?: ReconcileArg) => reconcilePlanChecklistConfirmedV1(inventory, currentTaskStore, arg)
+      forwardInViewerV1("vs-code-ai-helper.reconcilePlanChecklistConfirmed", (arg?: ReconcileArg) =>
+        reconcilePlanChecklistConfirmedV1(inventory, currentTaskStore, arg)
+      )
     ),
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",

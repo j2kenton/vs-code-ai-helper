@@ -8,8 +8,8 @@
  *   2. Other review stages reconcile against the plan of record's checklist:
  *      a marker claiming 5/5 with checklist items remaining yields the
  *      checklist's counts, never the false completion.
- *   3. A fully-checked (or absent) checklist leaves the marker unchanged.
- *   4. The checklistProgressUnreliable latch stands reconciliation down.
+ *   3. Fully-checked self-claims remain provisional without reviewer evidence.
+ *   4. The checklistProgressUnreliable latch does not bypass the evidence gate.
  *   5. Policy split on a corrupt progress file: strict throws and notifies;
  *      lenient stands down (marker unchanged, no notification).
  */
@@ -31,6 +31,7 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { readyToAdvanceStage } from "../utils/reviewReadiness";
+import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import { safeRemoveDir } from "./testFsUtils";
 
 // ---------------------------------------------------------------------------
@@ -168,14 +169,14 @@ void describe("effectiveReviewProgressV1 — marker handling", () => {
     });
     const fsStub = installRealFs();
     try {
-      // The reviewer narrowed its denominator and declared 5/5 done, but the
-      // plan of record still lists three unchecked items — those counts win.
+      // The reviewer narrowed its denominator and declared 5/5 done, while
+      // both checked items lack reviewer evidence and remain provisional.
       const progress = await effectiveReviewProgressV1(
         uri,
         "impl-high-review",
         reviewText("5/5")
       );
-      assert.deepEqual(progress, { complete: 2, total: 5 });
+      assert.deepEqual(progress, { complete: 0, total: 5 });
     } finally {
       fsStub.restore();
     }
@@ -210,7 +211,7 @@ void describe("effectiveReviewProgressV1 — marker handling", () => {
     }
   });
 
-  void it("leaves the marker unchanged when the checklist has nothing remaining", async () => {
+  void it("uses the evidence count when the checklist has nothing remaining", async () => {
     const uri = makeTask("checklist-done", {
       plan: PLAN_ALL_CHECKED,
       progressRaw: validProgressRaw("checklist-done"),
@@ -222,7 +223,7 @@ void describe("effectiveReviewProgressV1 — marker handling", () => {
         "impl-high-review",
         reviewText("3/5")
       );
-      assert.deepEqual(progress, { complete: 3, total: 5 });
+      assert.deepEqual(progress, { complete: 0, total: 2 });
     } finally {
       fsStub.restore();
     }
@@ -264,7 +265,7 @@ void describe("effectiveReviewProgressV1 — marker handling", () => {
     }
   });
 
-  void it("stands reconciliation down while the checklistProgressUnreliable latch is set", async () => {
+  void it("keeps the evidence gate active while the checklistProgressUnreliable latch is set", async () => {
     const uri = makeTask("latched", {
       plan: PLAN_TWO_OF_FIVE,
       progressRaw: validProgressRaw("latched", { checklistProgressUnreliable: true }),
@@ -278,8 +279,8 @@ void describe("effectiveReviewProgressV1 — marker handling", () => {
       );
       assert.deepEqual(
         progress,
-        { complete: 5, total: 5 },
-        "a latched task must not present the frozen checklist counts as live"
+        { complete: 0, total: 5 },
+        "the latch must not bypass reviewer-verified completion or trust provisional ticks"
       );
     } finally {
       fsStub.restore();
@@ -364,7 +365,7 @@ void describe("effectiveReviewProgressV1 — strict vs lenient policy", () => {
 // ---------------------------------------------------------------------------
 
 void describe("readEffectivePlanChecklistProgressV1", () => {
-  void it("returns the checklist counts for a maintained checklist", async () => {
+  void it("counts self-checked boxes as provisional, not gate-complete", async () => {
     const uri = makeTask("counts", {
       plan: PLAN_TWO_OF_FIVE,
       progressRaw: validProgressRaw("counts"),
@@ -374,12 +375,64 @@ void describe("readEffectivePlanChecklistProgressV1", () => {
       const counts = await readEffectivePlanChecklistProgressV1(uri);
       assert.deepEqual(counts, {
         total: 5,
-        checked: 2,
+        checked: 0,
         closedWithoutDoing: 0,
-        settled: 2,
-        remaining: 3,
+        settled: 0,
+        remaining: 5,
         excluded: 0,
       });
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  void it("counts only reviewer-verified items and explicit exclusions toward the gate", async () => {
+    const planText = PLAN_TWO_OF_FIVE.replace("- [ ] Five", "- [ ] Five <!-- ensemble:excluded -->");
+    const revision = getPlanRevisionV1(planText);
+    const uri = makeTask("counts-verified", {
+      plan: planText,
+      progressRaw: validProgressRaw("counts-verified", {
+        planItemEvidence: ["One"].map((item) => ({
+          planRevision: revision, itemKey: normalizeChecklistItemTextV1(item), itemText: item, claims: [],
+          verifications: [{ at: "2026-08-11T00:00:00.000Z", evidence: "reviewed" }],
+        })),
+      }),
+    });
+    const fsStub = installRealFs();
+    try {
+      const counts = await readEffectivePlanChecklistProgressV1(uri);
+      assert.equal(counts?.checked, 1);
+      assert.equal(counts?.closedWithoutDoing, 1);
+      assert.equal(counts?.settled, 2);
+      assert.equal(counts?.remaining, 3);
+    } finally {
+      fsStub.restore();
+    }
+  });
+
+  void it("allows stage progression after reviewer evidence settles the remaining checked items", async () => {
+    const planText = PLAN_TWO_OF_FIVE
+      .replace("- [ ] Three", "- [ ] Three <!-- ensemble:excluded -->")
+      .replace("- [ ] Four", "- [ ] Four <!-- ensemble:excluded -->")
+      .replace("- [ ] Five", "- [ ] Five <!-- ensemble:excluded -->");
+    const revision = getPlanRevisionV1(planText);
+    const uri = makeTask("counts-gate-after-verification", {
+      plan: planText,
+      progressRaw: validProgressRaw("counts-gate-after-verification", {
+        planItemEvidence: ["One", "Two"].map((item) => ({
+          planRevision: revision,
+          itemKey: normalizeChecklistItemTextV1(item),
+          itemText: item,
+          claims: [],
+          verifications: [{ at: "2026-08-11T00:00:00.000Z", evidence: "review accepted passing editing-round report" }],
+        })),
+      }),
+    });
+    const fsStub = installRealFs();
+    try {
+      const counts = await readEffectivePlanChecklistProgressV1(uri);
+      assert.equal(counts?.remaining, 0);
+      assert.equal(readyToAdvanceStage(10, 8, counts ? { complete: counts.settled, total: counts.total } : null), true);
     } finally {
       fsStub.restore();
     }
@@ -415,12 +468,15 @@ void describe("readDisplayPlanChecklistProgressV1", () => {
       assert.equal(display?.unverified, false);
       assert.equal(display?.counts.settled, 2);
       assert.equal(display?.counts.total, 5);
+      assert.equal(display?.verified, 0);
+      assert.equal(display?.provisional, 2);
+      assert.equal(display?.verifiedCounts.settled, 0);
     } finally {
       fsStub.restore();
     }
   });
 
-  void it("returns the same counts flagged unverified while latched, and gating still stands down", async () => {
+  void it("returns the same counts flagged unverified while latched without weakening the gate", async () => {
     const uri = makeTask("display-latched", {
       plan: PLAN_TWO_OF_FIVE,
       progressRaw: validProgressRaw("display-latched", { checklistProgressUnreliable: true }),
@@ -431,7 +487,7 @@ void describe("readDisplayPlanChecklistProgressV1", () => {
       assert.equal(display?.unverified, true);
       assert.equal(display?.counts.settled, 2);
       assert.equal(display?.counts.total, 5);
-      assert.equal(await readEffectivePlanChecklistProgressV1(uri), undefined);
+      assert.equal((await readEffectivePlanChecklistProgressV1(uri))?.settled, 0);
     } finally {
       fsStub.restore();
     }
@@ -607,4 +663,3 @@ void describe("round-progress.md — no non-display caller reads it (source scan
     );
   });
 });
-

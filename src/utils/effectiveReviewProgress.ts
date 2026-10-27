@@ -12,7 +12,7 @@ import * as vscode from "vscode";
 
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { isPlanReviewStage, TaskProgress, TaskStage } from "../types/taskProgress";
-import { ChecklistProgressV1, countChecklistProgressV1, mergeChecklistProgressV1 } from "./implementationChecklist";
+import { ChecklistProgressV1, countChecklistEvidenceProgressV1, countChecklistProgressV1, mergeChecklistProgressV1 } from "./implementationChecklist";
 import { readPlanOfRecordForDisplayV1, readPlanOfRecordV1 } from "./implementationArtifactResolver";
 import { NotificationRouter } from "./notificationRouter";
 import { readTextIfExists } from "./fileUtils";
@@ -113,16 +113,17 @@ async function readTaskProgressForChecklistV1(
  * The plan of record's checklist state, for reconciling against a review's
  * self-reported progress marker (see reconcileProgressWithChecklistV1).
  * `undefined` whenever there is nothing authoritative to reconcile against:
- * no plan-final.md, one that never had a checklist generated, or a latched
- * `checklistProgressUnreliable` stand-down — and, under the lenient policy,
- * a progress file that could not be read at all.
+ * no plan-final.md, one that never had a checklist generated, or — under the
+ * lenient policy — a progress file that could not be read at all.
  *
- * The checklist is only authoritative while something is maintaining it.
- * When the last round could not report checkbox state — any runner whose
- * result is runner-authored rather than model-authored — its counts are a
- * snapshot from some earlier round, not a live record of remaining work.
- * Presenting a frozen number as live is worse than presenting none: it would
- * block advancement forever on evidence that stopped updating.
+ * bugs2 Step 20 (review, 2026-10-26): the `checklistProgressUnreliable`
+ * latch no longer stands this gate value down. The returned count is the
+ * EVIDENCE gate — reviewer-verified completion plus explicit exclusions —
+ * which never reads the checkbox ticks the latch distrusts, so a latched
+ * task reconciles exactly like an unlatched one and a clean review can no
+ * longer advance a plan whose every tick is an unverified self-claim. The
+ * latch survives as a display qualifier and as the under-recording signal
+ * that offers reconciliation, never as a completeness-gate bypass.
  */
 export async function readEffectivePlanChecklistProgressV1(
   folderUri: vscode.Uri,
@@ -130,14 +131,40 @@ export async function readEffectivePlanChecklistProgressV1(
 ): Promise<ChecklistProgressV1 | undefined> {
   const plan = await readPlanOfRecordV1(folderUri);
   const counted = plan.counts;
-  if (!plan.hasChecklist || !counted) {
+  if (!plan.hasChecklist || !counted || plan.text === undefined) {
+    return undefined;
+  }
+  const advisory = await readTaskProgressForChecklistV1(folderUri, policy);
+  if (advisory.kind === "unreadable") {
+    return undefined;
+  }
+  return countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? [])?.gate ?? counted;
+}
+
+/**
+ * The plan of record's TICK counts, for implementation-side questions ("is
+ * there unbuilt work left for a round to do?") rather than completeness
+ * gating. A ticked item is built even while it is still provisional — no
+ * implementation round can verify it, only a review — so counting
+ * provisional ticks as remaining here would refuse or misclassify rounds on
+ * a plan with nothing left to build. Stands down (`undefined`) while the
+ * `checklistProgressUnreliable` latch is set, since the ticks themselves are
+ * then in doubt; advance gates keep using the evidence reader above, which
+ * never stands down.
+ */
+export async function readPlanChecklistTickProgressV1(
+  folderUri: vscode.Uri,
+  policy: EffectiveReviewProgressPolicyV1 = "lenient"
+): Promise<ChecklistProgressV1 | undefined> {
+  const plan = await readPlanOfRecordV1(folderUri);
+  if (!plan.hasChecklist || !plan.counts) {
     return undefined;
   }
   const advisory = await readTaskProgressForChecklistV1(folderUri, policy);
   if (advisory.kind === "unreadable" || advisory.progress?.checklistProgressUnreliable) {
     return undefined;
   }
-  return counted;
+  return plan.counts;
 }
 
 /**
@@ -145,7 +172,7 @@ export async function readEffectivePlanChecklistProgressV1(
  * plan-of-record counts, but a latched (`checklistProgressUnreliable`) task
  * still yields its figure, flagged `unverified`, so the tree can qualify the
  * number instead of hiding it. NEVER feed this to an advance gate — gating
- * stays on the strict reader above, which stands down when latched.
+ * stays on the strict evidence reader above, including while latched.
  *
  * Genuine no-value cases (no plan, no checklist, unreadable progress file)
  * still return `undefined`: those are "not applicable", not "unverified".
@@ -157,10 +184,10 @@ export async function readEffectivePlanChecklistProgressV1(
 export async function readDisplayPlanChecklistProgressV1(
   folderUri: vscode.Uri,
   policy: EffectiveReviewProgressPolicyV1 = "lenient"
-): Promise<{ counts: ChecklistProgressV1; unverified: boolean } | undefined> {
+): Promise<{ counts: ChecklistProgressV1; verifiedCounts: ChecklistProgressV1; verified: number; provisional: number; unverified: boolean } | undefined> {
   const plan = await readPlanOfRecordForDisplayV1(folderUri);
   const counted = plan.counts;
-  if (!plan.hasChecklist || !counted) {
+  if (!plan.hasChecklist || !counted || plan.text === undefined) {
     return undefined;
   }
   const advisory = await readTaskProgressForChecklistV1(folderUri, policy);
@@ -168,33 +195,51 @@ export async function readDisplayPlanChecklistProgressV1(
     return undefined;
   }
   const withRoundProgress = await applyRoundProgressBestEffortV1(folderUri, plan.text, counted);
-  return { counts: withRoundProgress, unverified: advisory.progress?.checklistProgressUnreliable === true };
+  const evidence = countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? []);
+  return {
+    counts: withRoundProgress,
+    verifiedCounts: evidence?.gate ?? withRoundProgress,
+    verified: evidence?.verified ?? 0,
+    provisional: Math.max(0, withRoundProgress.checked - (evidence?.verified ?? 0)),
+    unverified: advisory.progress?.checklistProgressUnreliable === true,
+  };
 }
 
 /**
- * Display-only twin of `readEffectivePlanChecklistProgressV1` (lenient policy,
- * same `checklistProgressUnreliable` / unreadable-file stand-down) built on
- * `readPlanOfRecordForDisplayV1`, so refreshing a percentage while a run is
- * ticking boxes never saves an open `plan-final.md` editor. Read-only end to
- * end: the advisory task-progress read decodes and never writes.
+ * Display-only twin of `readEffectivePlanChecklistProgressV1` (lenient policy)
+ * built on `readPlanOfRecordForDisplayV1`, so refreshing a percentage while a
+ * run is ticking boxes never saves an open `plan-final.md` editor. Read-only
+ * end to end: the advisory task-progress read decodes and never writes.
  *
- * Kept alongside `readDisplayPlanChecklistProgressV1` above: this one stands
- * down entirely when latched, that one reports the count flagged unverified.
+ * Unlike the gate reader — which since bugs2 Step 20 never stands down on the
+ * latch — this DISPLAY reader still hides its figure while
+ * `checklistProgressUnreliable` is set or the progress file is unreadable, so
+ * a status-bar percentage is never rendered from a record the latch marked
+ * untrustworthy. Gating never flows through here.
+ *
+ * Kept alongside `readDisplayPlanChecklistProgressV1` above: that one reports
+ * the count flagged unverified, this one stands down entirely when latched.
  * Both are pinned by tests; neither replaces the other.
  */
 export async function readEffectivePlanChecklistProgressForDisplayV1(
   folderUri: vscode.Uri
-): Promise<ChecklistProgressV1 | undefined> {
+): Promise<(ChecklistProgressV1 & { readonly verified: number; readonly provisional: number }) | undefined> {
   const plan = await readPlanOfRecordForDisplayV1(folderUri);
   const counted = plan.counts;
-  if (!plan.hasChecklist || !counted) {
+  if (!plan.hasChecklist || !counted || plan.text === undefined) {
     return undefined;
   }
   const advisory = await readTaskProgressForChecklistV1(folderUri, "lenient");
   if (advisory.kind === "unreadable" || advisory.progress?.checklistProgressUnreliable) {
     return undefined;
   }
-  return applyRoundProgressBestEffortV1(folderUri, plan.text, counted);
+  const display = await applyRoundProgressBestEffortV1(folderUri, plan.text, counted);
+  const evidence = countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? []);
+  return {
+    ...display,
+    verified: evidence?.verified ?? 0,
+    provisional: evidence?.provisional ?? display.checked,
+  };
 }
 
 /**

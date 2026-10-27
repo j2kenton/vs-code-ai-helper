@@ -5,10 +5,12 @@
  */
 import * as vscode from "vscode";
 import { createHash } from "crypto";
+import * as path from "node:path";
 import {
   ChecklistChangeProposalV1,
   IMPLEMENTATION_FILENAME,
   IMPLEMENTATION_SUMMARY_FILENAME,
+  isPlanReviewStage,
   isReviewStage,
   LEGACY_IMPLEMENTATION_FILENAME,
   PlanRevisionStateV1,
@@ -925,6 +927,61 @@ export function getImplementationSummaryUri(
   taskFolderUri: vscode.Uri
 ): vscode.Uri {
   return vscode.Uri.joinPath(taskFolderUri, IMPLEMENTATION_SUMMARY_FILENAME);
+}
+
+/**
+ * Authoritative on-disk absolute paths for task artifacts (Step 10 / finding 3).
+ * Prompts use these exact paths so agents never write or search outside their
+ * bound task folder.
+ */
+export interface AuthoritativeTaskArtifactPathsV1 {
+  readonly taskFolderPath: string;
+  readonly planPath: string;
+  readonly planFinalPath: string;
+  readonly roundProgressPath: string;
+  readonly implSummaryPath: string;
+  readonly legacyImplementationPath: string;
+}
+
+/**
+ * Derives authoritative on-disk absolute paths for task artifacts from the bound task folder.
+ */
+export function resolveAuthoritativeTaskArtifactPathsV1(
+  taskFolderUri: vscode.Uri,
+  stage?: string
+): AuthoritativeTaskArtifactPathsV1 {
+  const taskFolderPath = taskFolderUri.fsPath;
+  const isPlan = stage ? isPlanReviewStage(stage as TaskStage) || stage === "plan" : false;
+  const planPath = path.join(taskFolderPath, STAGE_ARTIFACT_FILENAMES.plan ?? "plan.md");
+  const planFinalPath = isPlan ? planPath : getCanonicalImplementationUri(taskFolderUri).fsPath;
+  return {
+    taskFolderPath,
+    planPath,
+    planFinalPath,
+    roundProgressPath: path.join(taskFolderPath, "round-progress.md"),
+    implSummaryPath: getImplementationSummaryUri(taskFolderUri).fsPath,
+    legacyImplementationPath: getLegacyImplementationUri(taskFolderUri).fsPath,
+  };
+}
+
+/**
+ * Produces structured task artifact guidance distinguishing files read,
+ * files written, and summaries returned for Ensemble to persist.
+ */
+export function formatAuthoritativeTaskArtifactGuidanceV1(
+  paths: AuthoritativeTaskArtifactPathsV1,
+  stage?: string
+): string {
+  const isPlan = stage ? isPlanReviewStage(stage as TaskStage) || stage === "plan" : false;
+  const planLabel = isPlan ? "Plan (plan.md)" : "Plan of record (read-only)";
+  const planTarget = paths.planFinalPath;
+  return [
+    "## Authoritative Task Artifact Guidance",
+    `- ${planLabel}: ${planTarget}`,
+    `- In-round progress (in-round bookkeeping write): ${paths.roundProgressPath}`,
+    `- Implementation summary: do NOT write directly to disk; return markdown summary as plain response text, which Ensemble persists to ${paths.implSummaryPath}`,
+    `Do not create or edit plan-final.md or implementation.md at the repository root.`,
+  ].join("\n");
 }
 
 /**

@@ -513,6 +513,12 @@
         "title": "Rename Task with AI",
         "category": "Ensemble",
         "icon": "$(sparkle)"
+      },
+      {
+        "command": "vs-code-ai-helper.resolveRoundGitInterference",
+        "title": "Resolve Round Git Interference",
+        "category": "Ensemble",
+        "icon": "$(warning)"
       }
     ],
     "keybindings": [

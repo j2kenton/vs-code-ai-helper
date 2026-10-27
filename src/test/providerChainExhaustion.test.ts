@@ -301,7 +301,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
         `the message must name ${candidate.storedModelId} and its reason`
       );
     }
-    assert.match(reason, /open Ensemble Settings and edit the model and backup models for/);
+    assert.match(reason, /Change the model in AI Models/);
     assert.doesNotMatch(reason, /See the run log/);
   });
 
@@ -548,20 +548,68 @@ void describe("provider chain exhaustion (stage owner)", () => {
         "none",
         "no quota/entitlement signal means the system has no basis to recommend one option over another"
       );
-      // Pre-1.0.0 fixes register, Part 3 Step 2 inventory: "adjustSettings"
-      // is classified `resumeKind: "unpause"` because opening Settings does
-      // not itself resume or continue the task's automation — the option's
-      // own consequence text says so ("choose \"Retry now\" ... to try
-      // again"). Assert its effect directly: it dispatches
-      // setStageBackupModel (opens Settings), never a task-resuming command.
+      // Opening AI Models does not itself resume or continue automation.
       const adjustSettings = decision.options.find((o) => o.optionId === "adjustSettings");
       assert.ok(adjustSettings, "expected an adjustSettings option");
+      assert.equal(adjustSettings?.label, "Change the model in AI Models");
       assert.equal(adjustSettings?.resumeKind, "unpause");
       assert.deepEqual(adjustSettings?.effect, {
         kind: "command",
-        command: "vs-code-ai-helper.setStageBackupModel",
-        args: [{ stage: "impl-high-review" }],
+        command: "vs-code-ai-helper.openAiModels",
+        args: ["impl-high-review"],
       });
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("offers stage-specific AI Models recovery for an exhausted Antigravity model-not-found chain", async () => {
+    const { folderUri } = makeTaskFolder("exhausted_antigravity_model_not_found");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const missingModel = "antigravity-cli:gemini-retired-model";
+    const exhaustion: ProviderChainExhaustionV1 = {
+      stage: "impl-high-review",
+      candidates: [{
+        storedModelId: missingModel,
+        providerLabel: "Antigravity CLI",
+        runnerId: "antigravity-cli",
+        reason: `${missingModel} was not found for this account or CLI version (NOT_FOUND 404)`,
+        deferredFailureKind: "model-entitlement",
+      }],
+    };
+    try {
+      await withHarness(async () => {
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", exhaustion, "candidatesExhausted");
+        await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", exhaustion, "candidatesExhausted");
+      });
+      const decisions = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending(folderUri.fsPath)
+        .filter((d) => d.decisionKey === "providerChainExhausted");
+      assert.equal(decisions.length, 1, "repeated terminal reporting updates one recovery card");
+      const decision = decisions[0];
+      assert.ok(decision);
+      assert.match(decision.whatHappened, /gemini-retired-model/);
+      assert.match(decision.whatHappened, /NOT_FOUND 404/);
+      assert.match(decision.whatHappened, /not found for this account or CLI version/);
+      assert.match(decision.whatHappened, /AI Models/);
+      assert.deepEqual(decision.options.map((option) => option.optionId), ["adjustSettings", "retry", "stay"]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "adjustSettings");
+      const settings = decision.options[0];
+      assert.ok(settings);
+      assert.equal(settings.label, "Change the model in AI Models");
+      assert.match(settings.consequence, /does not|opens AI Models/i);
+      assert.deepEqual(settings.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.openAiModels",
+        args: ["impl-high-review"],
+      });
+      assert.deepEqual(decision.options[1]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndRerunReview",
+        args: [{ taskFolderPath: folderUri.fsPath }],
+      });
+      assert.deepEqual(decision.options[2]?.effect, { kind: "doNothing" });
     } finally {
       __extensionContextV1TestOnly.reset();
     }

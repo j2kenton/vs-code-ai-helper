@@ -20,6 +20,9 @@ import {
   TaskActionScheduler,
 } from "../commands/scheduleTaskResume";
 import { TaskProgress } from "../types/taskProgress";
+import { createWorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { setPendingUserInputReaderForTestV1 } from "../utils/pendingUserInputV1";
+import { classifyPendingUserInputV1 } from "../utils/taskWatchdogV1";
 import { initNotificationRouter, deactivateNotificationRouter, StatusSurface } from "../utils/notificationRouter";
 import { resetAutomationChainGuards } from "../utils/automationChain";
 import { recordStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
@@ -50,8 +53,10 @@ import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmission
 import { resolveEffectivePauseStatusV1 } from "../state/effectivePauseStatusV1";
 import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { readChatHistory } from "../utils/chatHistoryStore";
 import { setProcessStartTimeIoOverrideForTestV1 } from "../state/processStartTimeProbeV1";
 import { safeRemoveDir } from "./testFsUtils";
+import { bindingIdForOwnedFolder, fixtureOwnershipFor } from "./taskFolderFixture";
 
 /**
  * `probeWorkAdmissionOwnerLivenessV1`'s process-start-time cross-check (Part
@@ -69,6 +74,19 @@ import { safeRemoveDir } from "./testFsUtils";
 setProcessStartTimeIoOverrideForTestV1({ readFileUtf8Sync: () => undefined, execFileCapture: () => Promise.resolve(undefined) });
 after(() => {
   setProcessStartTimeIoOverrideForTestV1(undefined);
+});
+
+/**
+ * The watchdog sweep now also reads each task's durable question state (bugs2
+ * finding 1). This file's placeholder task folders have no registered
+ * ownership, which the real chat store refuses to read (and a refused read is
+ * deliberately treated as "cannot judge", never as "quiet"). Default every
+ * sweep here to "no questions"; the tests that cover the question state
+ * override it explicitly.
+ */
+setPendingUserInputReaderForTestV1(() => Promise.resolve(classifyPendingUserInputV1([])));
+after(() => {
+  setPendingUserInputReaderForTestV1(undefined);
 });
 
 /**
@@ -968,6 +986,7 @@ void test("armAll does NOT reclaim a stale dispatched implRecovery that has lost
 });
 
 void test("armAll's watchdog pauses a task that is active with nothing running, owed, or scheduled, and posts an escalation (A1, 1.0.0 gate)", async () => {
+  setPendingUserInputReaderForTestV1(() => Promise.resolve(classifyPendingUserInputV1([])));
   const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
   const progress = baseStalledProgress();
   const state = memoryStore(progress);
@@ -1018,6 +1037,64 @@ void test("armAll's watchdog pauses a task that is active with nothing running, 
     assert.equal(watchdogDecision?.gating?.unblocksProgress, false);
     assert.equal(watchdogDecision?.gating?.holdsTaskPaused, true);
   } finally {
+    fakeContext.restore();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+  }
+});
+
+void test("armAll's watchdog does not pause a task that is waiting on an unanswered question, however long it has waited (bugs2 finding 1)", async () => {
+  // 2026-10-22: the round posted its question at 14:32:14Z and the watchdog
+  // paused the task at 14:46:59Z — 14 minutes of waiting for the owner.
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const progress = baseStalledProgress();
+  const state = memoryStore(progress);
+  const inventory = {
+    getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", canonicalId: "task-binding-123", progress }],
+  } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  const surface = new RecordingSurfaceV1();
+  initNotificationRouter(surface);
+  const fakeContext = installFakeExtensionContextV1();
+  const observedTasks: { folder: string; canonicalId: string }[] = [];
+
+  try {
+    setPendingUserInputReaderForTestV1((folder, canonicalId) => {
+      observedTasks.push({ folder, canonicalId });
+      return Promise.resolve(classifyPendingUserInputV1([{ state: "unresolved" }]));
+    });
+    await scheduler.armAll();
+    await scheduler.armAll();
+
+    assert.equal(state.current().status, "active", "an open question is the task's next step, not silence");
+    assert.equal(surface.entries.filter((e) => /was stalled|went quiet/.test(e.message)).length, 0);
+    assert.ok(
+      observedTasks.some((task) => task.folder === "C:\\tasks\\task" && task.canonicalId === "task-binding-123"),
+      "the sweep must read question state with this task's canonical ownership binding"
+    );
+
+    // A stored answer whose Resume has not run is owed work, not quiet.
+    setPendingUserInputReaderForTestV1(() =>
+      Promise.resolve(classifyPendingUserInputV1([{ state: "unresolved", answers: [{}] }]))
+    );
+    await scheduler.armAll();
+    assert.equal(state.current().status, "active");
+
+    // Unreadable question state fails open (the watchdog never guesses).
+    setPendingUserInputReaderForTestV1(() =>
+      Promise.resolve({ state: "unreadable", unansweredQuestions: 0, submittedAwaitingResume: 0 })
+    );
+    await scheduler.armAll();
+    assert.equal(state.current().status, "active");
+
+    // Once the question is settled the task really is quiet and is paused.
+    setPendingUserInputReaderForTestV1(() =>
+      Promise.resolve(classifyPendingUserInputV1([{ state: "resumed", answers: [{}] }]))
+    );
+    await scheduler.armAll();
+    assert.equal(state.current().status, "paused");
+  } finally {
+    setPendingUserInputReaderForTestV1(() => Promise.resolve(classifyPendingUserInputV1([])));
     fakeContext.restore();
     deactivateNotificationRouter();
     scheduler.dispose();
@@ -3076,4 +3153,165 @@ void test("the timer path runs fire() with automatic origin and Run now does not
   const runNowAt = source.indexOf("async runNow(");
   assert.ok(runNowAt > 0);
   assert.doesNotMatch(source.slice(runNowAt, runNowAt + 1500), /runWithAutomaticOriginV1/, "the owner's Run now is not automatic");
+});
+
+void test("Step 8 / Finding 9: buildOwedContinuationDecisionV1 surfaces failed provider/model and offers Change the model", () => {
+  const decision = buildOwedContinuationDecisionV1(
+    { canonicalId: "task-id", taskFolderPath: "C:\\tasks\\owed", stage: "impl", taskName: "Owed" },
+    undefined,
+    "an earlier attempt claimed it and has not started a round",
+    undefined,
+    {
+      failedProvider: "OpenCode",
+      failedModel: "opencode/gpt-4o",
+    }
+  );
+
+  assert.match(decision.whatHappened, /OpenCode \(opencode\/gpt-4o\) failed/);
+  const changeModel = decision.options.find((opt) => opt.optionId === "changeModel");
+  assert.ok(changeModel, "Change the model option must be present");
+  assert.deepEqual(changeModel?.effect, {
+    kind: "command",
+    command: "vs-code-ai-helper.openAiModels",
+    args: ["impl"],
+  });
+  assert.equal(decision.recommendation?.kind, "option");
+  assert.equal(decision.recommendation?.kind === "option" ? decision.recommendation.optionId : undefined, "changeModel");
+
+  const normalized = createWorkflowDecisionV1({
+    ...decision,
+    decisionId: "owed-continuation-review-matrix",
+    createdAt: "2026-10-27T00:00:00.000Z",
+  });
+  assert.equal(normalized.ok, true);
+  if (normalized.ok) {
+    assert.equal(normalized.decision.options[0]?.optionId, "changeModel",
+      "the actionable model recovery is first in the card");
+    assert.deepEqual(
+      normalized.decision.options.map((option) => option.optionId),
+      ["changeModel", "waitForRetry", "runNow"],
+      "realistic alternatives remain available without duplicate options"
+    );
+  }
+});
+
+void test("Step 8 / Finding 9: buildOwedContinuationDecisionV1 disables Run now when a live operation holds it", () => {
+  const decision = buildOwedContinuationDecisionV1(
+    { canonicalId: "task-id", taskFolderPath: "C:\\tasks\\owed", stage: "impl", taskName: "Owed" },
+    undefined,
+    "an earlier attempt claimed it and has not started a round",
+    undefined,
+    {
+      liveHolder: "Running implementation",
+    }
+  );
+
+  const runNow = decision.options.find((opt) => opt.optionId === "runNow");
+  assert.equal(runNow?.disabled, true);
+  assert.equal(runNow?.disabledReason, "held by Running implementation");
+});
+
+void test("Step 31: continuation recovery refreshes one persisted card and one chat anchor", async () => {
+  const fakeContext = installFakeExtensionContextV1();
+  const folder = createRealTaskFolderV1("impl");
+  const realFs = installRealWorkspaceFsV1();
+  const progress: TaskProgress = {
+    ...readPersistedProgress(folder.progressPath),
+    displayName: "Recover me",
+    ownership: fixtureOwnershipFor(folder.taskFolderPath),
+    implRecovery: {
+      sourceAttemptId: "attempt-1",
+      reason: "provider quota limit",
+      trigger: "providerFailedMidRound",
+      mode: "unconstrained",
+      dispatch: "pending",
+      at: "2026-01-01T00:00:00.000Z",
+      failedProvider: "OpenCode",
+      failedModel: "opencode/model-a",
+    },
+  };
+  fs.writeFileSync(folder.progressPath, JSON.stringify(progress, null, 2), "utf8");
+  const canonicalId = bindingIdForOwnedFolder(folder.taskFolderPath);
+  const inventory = stubInventory(folder.taskFolderPath, canonicalId, progress);
+  const scheduler = new TaskActionScheduler(inventory, new FakeClock(Date.parse("2026-01-01T03:00:00.000Z")), undefined, "test-owner");
+  const announce = (scheduler as unknown as {
+    announceOwedContinuationWaitV1: (
+      task: { taskFolderPath: string; canonicalId: string; progress: TaskProgress },
+      waitKey: string,
+      dueAt: Date | undefined,
+      waitingOn: string,
+      claimedUntil?: Date
+    ) => Promise<void>;
+  }).announceOwedContinuationWaitV1.bind(scheduler);
+  const task = { taskFolderPath: folder.taskFolderPath, canonicalId, progress };
+
+  try {
+    await announce(task, "attempt-1:live-lease", undefined, "the previous attempt still holds its claim");
+    const first = new WorkflowDecisionStoreV1(fakeContext.memento).listPending(canonicalId)
+      .find((decision) => decision.decisionKey === "owedContinuationRunNow");
+    assert.ok(first, "first continuation wait is persisted");
+
+    await announce(task, "attempt-1:lease-expired", new Date("2026-01-01T04:00:00.000Z"), "the prior lease expired");
+    const pending = new WorkflowDecisionStoreV1(fakeContext.memento).listPending(canonicalId)
+      .filter((decision) => decision.decisionKey === "owedContinuationRunNow");
+    assert.equal(pending.length, 1, "the refreshed state remains one pending decision");
+    assert.equal(pending[0]?.decisionId, first.decisionId, "refresh preserves the persisted card identity");
+    assert.match(pending[0]?.whatHappened ?? "", /the prior lease expired/);
+    const anchors = (await readChatHistory(folder.taskFolderPath, canonicalId))
+      .filter((message) => message.kind === "decision" && message.decisionId === first.decisionId);
+    assert.equal(anchors.length, 1, "refresh does not append a duplicate chat card anchor");
+    assert.deepEqual(pending[0]?.options.map((option) => option.optionId), ["changeModel", "waitForRetry", "runNow"]);
+    assert.equal(pending[0]?.recommendation.kind === "option" ? pending[0].recommendation.optionId : undefined, "changeModel");
+  } finally {
+    scheduler.dispose();
+    realFs.restore();
+    fakeContext.restore();
+    folder.cleanup();
+  }
+});
+
+void test("Step 8 / Finding 9: runOwedContinuationNow clears stage fallback reservation for impl before dispatching", async () => {
+  const clock = new FakeClock(Date.parse("2026-01-01T03:00:00.000Z"));
+  const fakeContext = installFakeExtensionContextV1();
+  const progress: TaskProgress = {
+    ...baseStalledProgress({}),
+    fallbackActive: { impl: true },
+    fallbackModelId: { impl: "fallback-model" },
+    implRecovery: {
+      sourceAttemptId: "x",
+      reason: "x",
+      trigger: "roundIncomplete",
+      mode: "unconstrained",
+      dispatch: "pending",
+      at: "2026-01-01T00:00:00.000Z",
+    },
+  };
+  const state = memoryStore(progress);
+  const inventory = { getTasks: () => [{ taskFolderPath: "C:\\tasks\\task", progress }] } as unknown as TaskInventory;
+  const scheduler = new TaskActionScheduler(inventory, clock, state.store, "test-owner");
+  initNotificationRouter(new RecordingSurfaceV1());
+  const commands = vscode.commands as unknown as { executeCommand: typeof vscode.commands.executeCommand };
+  const originalExecute = commands.executeCommand;
+  let dispatched = 0;
+  commands.executeCommand = (() => {
+    dispatched += 1;
+    return Promise.resolve(undefined);
+  }) as typeof commands.executeCommand;
+  resetAutomationChainGuards();
+  try {
+    const outcome = await scheduler.runOwedContinuationNow("C:\\tasks\\task");
+    assert.equal(outcome.kind, "started");
+    assert.equal(state.current().fallbackActive?.impl, undefined, "fallback reservation for impl must be cleared");
+    assert.equal(state.current().fallbackModelId?.impl, undefined);
+    for (let waited = 0; dispatched === 0 && waited < 3000; waited += 20) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(dispatched > 0, "the continuation chain dispatches before the stub is restored");
+  } finally {
+    commands.executeCommand = originalExecute;
+    resetAutomationChainGuards();
+    deactivateNotificationRouter();
+    scheduler.dispose();
+    fakeContext.restore();
+  }
 });

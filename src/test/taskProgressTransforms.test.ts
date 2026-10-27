@@ -1,8 +1,20 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, handBackToHumanAfterCompletedRoundV1, handBackToHumanAfterPublishChecksV1, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, shouldRecordHumanNextActorAfterAdvanceRefusalV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, handBackToHumanAfterCompletedRoundV1, handBackToHumanAfterPublishChecksV1, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordPlanItemClaimEvidenceV1, recordPlanItemReviewerVerificationV1, recordPlanItemTestReportV1, invalidatePlanItemEvidenceForChangedFilesV1, invalidatePlanItemEvidenceForPlanRevisionV1, invalidatePlanItemEvidenceContradictedByFailuresV1, updateLintPayload, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, shouldRecordHumanNextActorAfterAdvanceRefusalV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 import { isReviewPassCurrentV1, parseReviewPass } from "../utils/reviewReadiness";
+import { getPlanRevisionV1 } from "../utils/implementationChecklist";
+
+void test("plan revision identity ignores checklist ticks but changes when acceptance text changes", () => {
+  const initial = "# Plan\n- [ ] Step 1: Keep behavior\n- [ ] Step 2: Add tests\n";
+  const ticked = "# Plan\n- [x] Step 1: Keep behavior\n- [X] Step 2: Add tests\n";
+  assert.equal(getPlanRevisionV1(initial), getPlanRevisionV1(ticked));
+  assert.notEqual(getPlanRevisionV1(initial), getPlanRevisionV1(ticked.replace("Add tests", "Add coverage")));
+  assert.notEqual(
+    getPlanRevisionV1(initial),
+    getPlanRevisionV1("# Plan\n- [ ] Step 2: Add tests\n- [ ] Step 1: Keep behavior\n")
+  );
+});
 
 function makeProgress(implReviewFiles?: string[]): TaskProgress {
   return {
@@ -13,6 +25,155 @@ function makeProgress(implReviewFiles?: string[]): TaskProgress {
     ...(implReviewFiles !== undefined ? { implReviewFiles } : {}),
   };
 }
+
+void test("recordPlanItemClaimEvidenceV1 keeps source provenance distinct and deduplicates same-round writes", () => {
+  const input = {
+    planRevision: "a".repeat(64), itemText: "Step 1: Keep evidence", source: "retroactive" as const,
+    at: "2026-10-26T00:00:00.000Z", roundId: "round-1", evidence: "prior report",
+  };
+  const first = recordPlanItemClaimEvidenceV1(makeProgress(), input);
+  assert.equal(first.planItemEvidence?.length, 1);
+  assert.equal(first.planItemEvidence?.[0]?.claims[0]?.source, "retroactive");
+  assert.equal(recordPlanItemClaimEvidenceV1(first, input), first);
+});
+
+void test("plan item test reports and reviewer verification persist independently and deduplicate", () => {
+  const base = makeProgress();
+  const identity = { planRevision: "b".repeat(64), itemText: "Step 2: Add tests" };
+  const report = {
+    at: "2026-10-26T00:00:00.000Z", roundId: "round-2", testIdentity: "case.test.ts",
+    command: "pnpm test case.test.ts", workingDirectory: "/workspace", passed: 1, failed: 0,
+    sourceState: "post-edit source state",
+  };
+  const withReport = recordPlanItemTestReportV1(base, { ...identity, report });
+  assert.equal(recordPlanItemTestReportV1(withReport, { ...identity, report }), withReport);
+  const withVerification = recordPlanItemReviewerVerificationV1(withReport, {
+    ...identity, at: "2026-10-26T00:01:00.000Z", roundId: "review-1", evidence: "test report accepted",
+  });
+  assert.equal(withVerification.planItemEvidence?.[0]?.testReports?.[0]?.command, report.command);
+  assert.equal(withVerification.planItemEvidence?.[0]?.verifications?.[0]?.roundId, "review-1");
+  assert.equal(withVerification.planItemEvidence?.[0]?.claims.length, 0, "review evidence is not an implementation claim");
+});
+
+void test("later edits invalidate only verification evidence that names the changed file", () => {
+  const base = makeProgress();
+  const revision = "c".repeat(64);
+  const withEvidence = recordPlanItemReviewerVerificationV1(
+    recordPlanItemTestReportV1(base, {
+      planRevision: revision,
+      itemText: "Step 3: Test the dispatch route",
+      report: {
+        at: "2026-10-26T00:00:00.000Z", roundId: "edit-1", testIdentity: "src/test/dispatch.test.ts",
+        command: "node src/test/dispatch.test.ts", workingDirectory: "/workspace", passed: 4, failed: 0,
+        sourceState: "post-edit source state", sourceFiles: ["src/commands/dispatch.ts"],
+      },
+    }),
+    {
+      planRevision: revision, itemText: "Step 3: Test the dispatch route",
+      at: "2026-10-26T00:01:00.000Z", roundId: "review-1",
+      evidence: "Accepted src/commands/dispatch.ts based on edit-1 test report",
+      testReportRoundIds: ["edit-1"],
+    }
+  );
+  const updated = invalidatePlanItemEvidenceForChangedFilesV1(withEvidence, {
+    changedFiles: ["src\\commands\\dispatch.ts"],
+  });
+  assert.deepEqual(updated.planItemEvidence?.[0]?.testReports, [], "the affected report is no longer applicable");
+  assert.deepEqual(updated.planItemEvidence?.[0]?.verifications, [], "verification relying on that path is invalidated");
+  assert.equal(updated.planItemEvidence?.[0]?.claims.length, 0, "invalidation does not rewrite claim provenance");
+  assert.equal(
+    invalidatePlanItemEvidenceForChangedFilesV1(withEvidence, { changedFiles: ["src/other/unrelated.ts"] }),
+    withEvidence,
+    "unrelated edits preserve the evidence object and its records"
+  );
+});
+
+void test("changed-file invalidation uses exact paths and preserves unrelated reviewer evidence", () => {
+  const revision = "d".repeat(64);
+  const withEvidence = recordPlanItemReviewerVerificationV1(
+    recordPlanItemTestReportV1(makeProgress(), {
+      planRevision: revision,
+      itemText: "Step 4: Keep adjacent sources independent",
+      report: {
+        at: "2026-10-26T00:00:00.000Z", roundId: "edit-4", testIdentity: "src/test/a.test.ts",
+        command: "node src/test/a.test.ts", passed: 1, failed: 0, sourceState: "post-edit", sourceFiles: ["src/a.ts"],
+      },
+    }),
+    {
+      planRevision: revision, itemText: "Step 4: Keep adjacent sources independent",
+      at: "2026-10-26T00:01:00.000Z", roundId: "review-4", evidence: "Code inspection; test/report wording is incidental.",
+    }
+  );
+  const sibling = invalidatePlanItemEvidenceForChangedFilesV1(withEvidence, { changedFiles: ["src/a.tsx"] });
+  assert.equal(sibling.planItemEvidence?.[0]?.testReports?.length, 1, "a.tsx does not substring-match a.ts");
+  assert.equal(sibling.planItemEvidence?.[0]?.verifications?.length, 1, "unlinked code-only review evidence survives");
+  const exact = invalidatePlanItemEvidenceForChangedFilesV1(withEvidence, { changedFiles: ["src\\a.ts"] });
+  assert.deepEqual(exact.planItemEvidence?.[0]?.testReports, []);
+  assert.equal(exact.planItemEvidence?.[0]?.verifications?.length, 1, "only explicitly linked test evidence is invalidated");
+});
+
+void test("a truncated tested-source list conservatively invalidates on any later edit", () => {
+  const report = recordPlanItemTestReportV1(makeProgress(), {
+    planRevision: "e".repeat(64), itemText: "Step 5: Test a broad change",
+    report: {
+      at: "2026-10-26T00:00:00.000Z", roundId: "edit-5", testIdentity: "broad.test.ts",
+      command: "node broad.test.ts", passed: 2, failed: 0, sourceState: "post-edit", sourceFiles: ["src/a.ts"], sourceFilesTruncated: true,
+    },
+  });
+  const updated = invalidatePlanItemEvidenceForChangedFilesV1(report, { changedFiles: ["unlisted/other.ts"] });
+  assert.deepEqual(updated.planItemEvidence?.[0]?.testReports, []);
+});
+
+void test("plan acceptance revision changes clear stale reports and verifications but retain claims", () => {
+  const revision = "f".repeat(64);
+  const evidence = recordPlanItemReviewerVerificationV1(
+    recordPlanItemTestReportV1(
+      recordPlanItemClaimEvidenceV1(makeProgress(), {
+        planRevision: revision, itemText: "Step 6: Original acceptance", source: "implementation",
+        at: "2026-10-26T00:00:00.000Z", roundId: "edit-6",
+      }),
+      { planRevision: revision, itemText: "Step 6: Original acceptance", report: {
+        at: "2026-10-26T00:00:01.000Z", roundId: "edit-6", testIdentity: "step.test.ts",
+        command: "node step.test.ts", passed: 1, failed: 0, sourceState: "post-edit",
+      } }
+    ),
+    { planRevision: revision, itemText: "Step 6: Original acceptance", at: "2026-10-26T00:01:00.000Z", evidence: "review accepted" }
+  );
+  const revised = invalidatePlanItemEvidenceForPlanRevisionV1(evidence, "0".repeat(64));
+  assert.equal(revised.planItemEvidence?.[0]?.claims.length, 1);
+  assert.deepEqual(revised.planItemEvidence?.[0]?.testReports, []);
+  assert.deepEqual(revised.planItemEvidence?.[0]?.verifications, []);
+});
+
+void test("Publish evidence invalidation requires an exact failing acceptance-test identity", () => {
+  const revision = "1".repeat(64);
+  const base = recordPlanItemReviewerVerificationV1(
+    recordPlanItemTestReportV1(makeProgress(), {
+      planRevision: revision, itemText: "Step 7: Cover the delivery path",
+      report: {
+        at: "2026-10-26T00:00:00.000Z", roundId: "edit-7", testIdentity: "src/test/delivery.test.ts",
+        command: "node src/test/delivery.test.ts", passed: 1, failed: 0, sourceState: "post-edit",
+        sourceFiles: ["src/commands/delivery.ts"],
+      },
+    }),
+    { planRevision: revision, itemText: "Step 7: Cover the delivery path", at: "2026-10-26T00:01:00.000Z", evidence: "passing report accepted", testReportRoundIds: ["edit-7"] }
+  );
+  const unchanged = invalidatePlanItemEvidenceContradictedByFailuresV1(base, [
+    { command: "pnpm test", output: "FAIL src/commands/delivery.ts:20 unexpected value" },
+  ]);
+  assert.equal(unchanged.planItemEvidence?.[0]?.testReports?.length, 1, "a source-path failure is only a candidate, not proof the acceptance test failed");
+  const invalidated = invalidatePlanItemEvidenceContradictedByFailuresV1(base, [
+    { command: "pnpm test", output: "PASS src/test/other.test.ts\nFAIL src/test/delivery.test.ts:20 expected true" },
+  ]);
+  assert.deepEqual(invalidated.planItemEvidence?.[0]?.testReports, []);
+  assert.deepEqual(invalidated.planItemEvidence?.[0]?.verifications, []);
+  const contradicted = updateLintPayload(base, {
+    runAt: "2026-10-26T00:02:00.000Z", passed: false, issueCount: 1,
+    failedChecks: [{ command: "pnpm test", exitCode: 1, output: "FAIL src/test/delivery.test.ts:20 expected true" }],
+  });
+  assert.equal(contradicted.planItemEvidence?.[0]?.testReports?.length, 1, "persisting check output preserves provenance until associations are computed");
+  assert.equal(contradicted.lintPayload?.passed, false);
+});
 
 // ---------------------------------------------------------------------------
 // updateImplReviewFiles: union across runs, not overwrite

@@ -905,15 +905,15 @@ export function isPlanIncompleteV1(
  * Reconcile a round's self-reported `N/M` against the plan of record's own
  * checklist, which is the authority on how much of the plan remains (port of
  * `reconcileProgressWithChecklistV1`). When the plan still lists unchecked
- * items, THOSE numbers win and no reported marker can advance the stage;
- * deliberately asymmetric — a fully ticked checklist does NOT override a
- * marker still reporting work left.
+ * items, THOSE numbers win and no reported marker can advance the stage. The
+ * checklist remains authoritative when fully settled as well, matching the
+ * extension's reconciliation behavior.
  */
 export function reconcileProgressWithChecklistV1(
   progress: ReviewProgressV1 | null,
   checklist: { total: number; settled: number; remaining: number } | undefined
 ): ReviewProgressV1 | null {
-  if (!checklist || checklist.remaining <= 0) {
+  if (!checklist) {
     return progress;
   }
   return { complete: checklist.settled, total: checklist.total };

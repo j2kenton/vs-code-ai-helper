@@ -111,16 +111,28 @@ void describe("AI consent under automation", () => {
     } as unknown as vscode.ExtensionContext);
     try {
       assert.equal(await withFsBridge(() => runAsAutomationDispatchV1(() => ensureAiConsent(context))), false);
-      const decision = new WorkflowDecisionStoreV1(memento).listPending().find((item) =>
+      assert.equal(await withFsBridge(() => runAsAutomationDispatchV1(() => ensureAiConsent(context))), false);
+      const decisions = new WorkflowDecisionStoreV1(memento).listPending(taskFolderPath).filter((item) =>
         item.decisionKey === "chatActionOffer:applyCurrentStageAction"
       );
+      assert.equal(decisions.length, 1, "repeated hand-backs update one stable decision");
+      const decision = decisions[0];
       assert.ok(decision, "the stop is explained in task chat");
       assert.match(decision.whatHappened, /AI consent has not been given/);
+      assert.deepEqual(decision.options.map((item) => item.label), [
+        "Apply Current Stage Action", "View Disclaimer", "Not now",
+      ]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
       assert.equal(decision.options.find((item) => item.optionId === "runAction")?.label, "Apply Current Stage Action");
       assert.deepEqual(decision.options.find((item) => item.optionId === "runAction")?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.applyCurrentStageAction",
         args: [{ taskFolderPath }],
+      });
+      assert.deepEqual(decision.options[1]?.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.viewDisclaimer",
+        args: [],
       });
     } finally {
       __extensionContextV1TestOnly.reset();

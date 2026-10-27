@@ -9,15 +9,18 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
   PublishChecksCancelledError,
+  describeCurrentPackageManagerV1,
+  resolveCurrentPublishCommandPlanV1,
   resolvePublishScopeFolder,
   runCompletionLint,
+  persistCompletionLintResultV1,
   throwIfPublishChecksCancelledV1,
 } from "../utils/completionLint";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { handBackToHumanAfterPublishChecksV1 } from "../utils/taskProgressTransforms";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
-import { safeOpenTextDocument } from "../utils/fileUtils";
+import { safeOpenTextDocument, writeTextFile, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import { COMMIT_AND_PUSH_COMMAND_V1, publishNextStepOfferV1 } from "../utils/publishStageActionsV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
@@ -31,6 +34,10 @@ import {
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
+import {
+  clearStageActionTerminalOutcomeV1,
+  recordStageActionTerminalOutcomeV1,
+} from "../utils/stageActionRefusalV1";
 import {
   computePublishScopeId,
   computeTreeFingerprintV1,
@@ -50,6 +57,18 @@ import {
 } from "../state/workAdmissionV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
+import { listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
+import { invalidatePlanItemEvidenceContradictedByFailuresV1 } from "../utils/taskProgressTransforms";
+import { associatePublishFailuresWithPlanItemsV1, formatPublishFailurePlanAssociationsV1, ownerHandOffCoverageFromTaskMdV1 } from "../utils/publishFailurePlanAssociationV1";
+import {
+  buildFailedPublishFirstTargetsV1,
+  buildFailedPublishRunSnapshotV1,
+  clearFailedPublishRunSnapshotV1,
+  isFailedPublishRunCompatibleV1,
+  readFailedPublishRunSnapshotV1,
+  writeFailedPublishRunSnapshotV1,
+} from "../utils/failedPublishRunV1";
 
 /**
  * Per-task queue for `runPublishChecks` invocations (plan PART 2, step 6): a
@@ -547,6 +566,8 @@ export async function runPublishChecks(
       },
       async (operation): Promise<true> => {
         const cancelToken = operation.token;
+        // A terminal outcome left by an earlier run must not be read as this run's.
+        clearStageActionTerminalOutcomeV1(taskFolderUri.fsPath);
         await vscode.window.withProgress(
           {
             location: vscode.ProgressLocation.Window,
@@ -583,16 +604,108 @@ export async function runPublishChecks(
               // Cancellation kills the check process trees and rejects with
               // PublishChecksCancelledError BEFORE any result is persisted;
               // the invalidation above stands, so no stale stamp survives.
-              const result = await runCompletionLint(
+              const priorFailure = await readFailedPublishRunSnapshotV1(taskFolderUri.fsPath);
+              let failedFirstResult: Awaited<ReturnType<typeof runCompletionLint>> | undefined;
+              let failedFirstPassNote: string | undefined;
+              if (priorFailure && priorFailure.failures.length > 0 && priorFailure.runner.packageManager) {
+                const currentCommands = resolveCurrentPublishCommandPlanV1(scopeGuess);
+                const priorCommands = priorFailure.commands.map(({ command }) => command);
+                const configuredPlanMatches = currentCommands !== null &&
+                  currentCommands.length === priorCommands.length &&
+                  currentCommands.every((command, index) => command.trim() === priorCommands[index]?.trim());
+                // Rebuild the compatibility evidence using today's bound task,
+                // scope, HEAD, environment and execution inputs. The old
+                // command plan is accepted only when the current explicit
+                // override still agrees; default plans are revalidated by
+                // current package scripts/configuration in the fingerprint.
+                const currentProbe = buildFailedPublishRunSnapshotV1({
+                  taskFolder: taskFolderUri.fsPath,
+                  repositoryRoot: scopeGuess,
+                  verificationScopeId: computePublishScopeId(scopeGuess),
+                  headCommit: beforeSha ?? undefined,
+                  result: {
+                    runAt: new Date().toISOString(),
+                    passed: false,
+                    summary: "compatibility probe",
+                    issueCount: 0,
+                    missingScripts: [],
+                    commandsRun: currentCommands ?? [],
+                    verifiedFolder: scopeGuess,
+                    verificationEnvironment: {
+                      cwd: scopeGuess,
+                      packageManager: describeCurrentPackageManagerV1(scopeGuess),
+                      envVarNames: Object.keys(process.env).sort(),
+                    },
+                    failedChecks: [],
+                  },
+                });
+                if (configuredPlanMatches && isFailedPublishRunCompatibleV1(priorFailure, currentProbe)) {
+                  const targets = buildFailedPublishFirstTargetsV1(priorFailure);
+                  const targetChecks = targets.map((target) => target.kind === "test-files"
+                    ? {
+                        command: `${target.prepareCommand} && ${target.command}`,
+                        executableCommand: `${target.prepareCommand} && ${target.command}`,
+                        cwd: target.cwd,
+                      }
+                    : {
+                        command: target.command,
+                        executableCommand: target.executableCommand,
+                        cwd: target.cwd,
+                      });
+                  if (targetChecks.length > 0) {
+                    const elapsedStart = Date.now();
+                    const failedFirst = await runCompletionLint(
+                      taskFolderUri,
+                      resolvedTask.progress.implReviewFiles,
+                      {
+                        token: cancelToken,
+                        explicitChecks: targetChecks,
+                        persist: false,
+                        rawReportLocation: `runs/failed-first-source-${priorFailure.failedAt.replace(/[^0-9TZ]/g, "-")}-attempt-${new Date().toISOString().replace(/[^0-9TZ]/g, "-")}.log`,
+                      }
+                    );
+                    if (!failedFirst.passed) {
+                      failedFirst.passed = false;
+                      failedFirst.passedModuloKnownFlakes = false;
+                      failedFirst.summary = `Rechecked ${targetChecks.length} previously failing check(s) from ${priorFailure.failedAt}; they still fail after ${Math.max(0, Date.now() - elapsedStart)} ms. Remaining Publish checks were not run. ${failedFirst.summary}`;
+                      await persistCompletionLintResultV1(taskFolderUri, failedFirst);
+                      failedFirstResult = failedFirst;
+                    } else {
+                      failedFirstPassNote = `Rechecked ${targetChecks.length} previously failing check(s) from ${priorFailure.failedAt}; they passed in ${Math.max(0, Date.now() - elapsedStart)} ms. Running the complete selected Publish check set now.`;
+                    }
+                  }
+                }
+              }
+              const result = failedFirstResult ?? await runCompletionLint(
                 taskFolderUri,
                 resolvedTask.progress.implReviewFiles,
                 { token: cancelToken }
               );
+              if (failedFirstPassNote && !failedFirstResult) {
+                result.summary = `${failedFirstPassNote} ${result.summary}`;
+                await persistCompletionLintResultV1(taskFolderUri, result);
+              }
               throwIfPublishChecksCancelledV1(cancelToken);
-              await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+              if (!failedFirstResult) await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
               throwIfPublishChecksCancelledV1(cancelToken);
 
               const verifiedFolder = result.verifiedFolder ?? scopeGuess;
+              if (!failedFirstResult && (!result.passed || (result.failedChecks?.length ?? 0) > 0)) {
+                const failedRun = buildFailedPublishRunSnapshotV1({
+                  taskFolder: taskFolderUri.fsPath,
+                  repositoryRoot: verifiedFolder,
+                  verificationScopeId: computePublishScopeId(verifiedFolder),
+                  headCommit: beforeSha,
+                  result,
+                });
+                await writeFailedPublishRunSnapshotV1(taskFolderUri.fsPath, failedRun).catch((error) => {
+                  console.warn("[runPublishChecks] Could not persist failed-check identities", error);
+                });
+              } else if (!failedFirstResult && result.passed && (result.failedChecks?.length ?? 0) === 0) {
+                await clearFailedPublishRunSnapshotV1(taskFolderUri.fsPath).catch((error) => {
+                  console.warn("[runPublishChecks] Could not clear resolved failed-check identities", error);
+                });
+              }
               const afterSha = await resolveHeadCommitSha(verifiedFolder);
               const afterFingerprint = await computeTreeFingerprintV1(verifiedFolder);
               const checksPassed = Boolean(result.passedModuloKnownFlakes ?? result.passed);
@@ -682,22 +795,175 @@ export async function runPublishChecks(
                   );
                 }
               } else {
+                const failedChecks = result.failedChecks ?? [];
+                let associationReport = "";
+                let hasContradictedPlanWork = false;
+                if (failedChecks.length > 0) {
+                  const [plan, progressRead, ownerTaskMd] = await Promise.all([
+                    readPlanOfRecordV1(taskFolderUri),
+                    readTaskProgressStrictV1(taskFolderUri),
+                    (async (): Promise<string> => {
+                      try {
+                        return new TextDecoder().decode(await vscode.workspace.fs.readFile(vscode.Uri.joinPath(taskFolderUri, "task.md")));
+                      } catch {
+                        return "";
+                      }
+                    })(),
+                  ]);
+                  if (plan.hasChecklist && plan.text && progressRead.ok) {
+                    const checkedItems = listCheckedChecklistItemTextsV1(plan.text);
+                    const associations = associatePublishFailuresWithPlanItemsV1({
+                      checkedItems,
+                      evidence: progressRead.decoded.progress.planItemEvidence ?? [],
+                      failures: failedChecks.map(({ command, output }) => ({ command, output })),
+                      ownerHandOffCoverage: ownerHandOffCoverageFromTaskMdV1(ownerTaskMd, checkedItems),
+                    });
+                    associationReport = formatPublishFailurePlanAssociationsV1(associations);
+                    hasContradictedPlanWork = associations.some((row) => row.disposition === "contradicted");
+                    if (associationReport) {
+                      // Keep machine-readable association evidence outside
+                      // publish-review.md's managed sections, which later
+                      // check runs may replace. The failure identity and the
+                      // item relationship must remain available to the next
+                      // implementation/review round.
+                      const associationsUri = vscode.Uri.joinPath(taskFolderUri, "publish-failure-associations-v1.json");
+                      const associationPayload = JSON.stringify({
+                        schemaVersion: 1,
+                        recordedAt: new Date().toISOString(),
+                        taskFolder: taskFolderUri.fsPath,
+                        associations,
+                      }, null, 2) + "\n";
+                      try {
+                        let previous: string | undefined;
+                        try {
+                          previous = new TextDecoder().decode(await vscode.workspace.fs.readFile(associationsUri));
+                        } catch (error) {
+                          const code = (error as { code?: string }).code;
+                          if (code !== "FileNotFound" && code !== "ENOENT") throw error;
+                        }
+                        let history: unknown[] = [];
+                        try {
+                          const decoded = JSON.parse(previous ?? "") as { schemaVersion?: number; records?: unknown[]; associations?: unknown[] };
+                          if (decoded.schemaVersion === 1) history = [...(decoded.records ?? []), ...(decoded.associations ? [{ associations: decoded.associations }] : [])];
+                        } catch { /* replace malformed supplemental evidence with a valid record */ }
+                        const durablePayload = JSON.stringify({
+                          schemaVersion: 1,
+                          records: [...history, JSON.parse(associationPayload)],
+                        }, null, 2) + "\n";
+                        if (previous === undefined) {
+                          await writeTextFile(associationsUri, durablePayload, { skipBackup: true });
+                        } else {
+                          await writeTextFileIfUnchangedV1(associationsUri, previous, durablePayload);
+                        }
+                      } catch {
+                        // Existing evidence is retained if another writer won
+                        // the create race; the readable report below is still
+                        // recorded in the Publish artifact.
+                      }
+                      // Keep the failure-to-plan relationship in the task's
+                      // Publish artifact for the next editing/review round.
+                      const artifactUri = vscode.Uri.joinPath(taskFolderUri, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME);
+                      let existing: string | undefined;
+                      try {
+                        existing = new TextDecoder().decode(await vscode.workspace.fs.readFile(artifactUri));
+                      } catch (error) {
+                        const code = (error as { code?: string }).code;
+                        if (code !== "FileNotFound" && code !== "ENOENT") throw error;
+                      }
+                      const start = "<!-- publish-plan-failure-associations:start -->";
+                      const end = "<!-- publish-plan-failure-associations:end -->";
+                      const section = `${start}\n${associationReport}${end}`;
+                      const currentArtifact = existing ?? "";
+                      const markerAt = currentArtifact.indexOf(start);
+                      const endAt = markerAt >= 0 ? currentArtifact.indexOf(end, markerAt + start.length) : -1;
+                      const updated = markerAt >= 0 && endAt >= 0
+                        ? `${currentArtifact.slice(0, markerAt)}${section}${currentArtifact.slice(endAt + end.length)}`
+                        : `${currentArtifact.trimEnd()}\n\n${section}\n`;
+                      try {
+                        if (existing === undefined) {
+                          await writeTextFile(artifactUri, updated, { skipBackup: true });
+                        } else {
+                          await writeTextFileIfUnchangedV1(artifactUri, existing, updated);
+                        }
+                      } catch {
+                        // Keep the chat outcome and progress invalidation even
+                        // if the supplementary artifact update is unavailable.
+                      }
+                    }
+                    // The association was computed while its provenance was
+                    // still present. Invalidate only test reports whose
+                    // acceptance-test identity is an actual failing identity;
+                    // source-path overlap remains a candidate and is retained.
+                    await patchTaskProgressStrictV1(taskFolderUri, (current) =>
+                      invalidatePlanItemEvidenceContradictedByFailuresV1(
+                        current,
+                        failedChecks.map(({ command, output }) => ({ command, output }))
+                      )
+                    ).catch(() => undefined);
+                  }
+                }
                 const failureNotice =
                   `Publish checks found issues: ${result.summary} ` +
-                  'Use "Fix Linting & Code Errors" to address the report.';
+                  (hasContradictedPlanWork
+                    ? 'A checked plan item is contradicted by a failing check; return to Implementation to address the missing behavior.'
+                    : 'Choose the next action based on the failing check type.') +
+                  (associationReport ? `\n\n${associationReport}` : "");
+                recordStageActionTerminalOutcomeV1(taskFolderUri.fsPath, {
+                  kind: "failed",
+                  actionLabel: "Publish Checks",
+                  reason: `Publish checks found issues: ${result.summary}`,
+                  operationId: operation.id,
+                });
+                operation.settleAs("failed", `Publish checks found issues: ${result.summary}`);
+                const hasLintOrTypeFailure = failedChecks.some((check) =>
+                  /lint|type(?:check| checking)?/i.test(check.command) || /\beslint\b|\bTS\d{3,5}\b|lint(?:ing)? error|type error/i.test(check.output)
+                );
+                const recommendedAction = hasContradictedPlanWork || !hasLintOrTypeFailure
+                  ? {
+                      label: "Back to Implementation",
+                      command: "vs-code-ai-helper.setTaskStage",
+                      args: [{ taskFolderPath: taskFolderUri.fsPath, stage: "implementation" }],
+                    }
+                  : {
+                      label: "Fix Linting & Code Errors",
+                      command: "vs-code-ai-helper.runLintingFixes",
+                      args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                    };
+                const recoveryCard = await offerActionInChatV1({
+                  taskFolderPath: taskFolderUri.fsPath,
+                  taskLabel: resolvedTask.progress.displayName,
+                  actionLabel: recommendedAction.label,
+                  command: recommendedAction.command,
+                  args: recommendedAction.args,
+                  noticeText: failureNotice,
+                  alternatives: [
+                    ...(hasLintOrTypeFailure
+                      ? [recommendedAction.command === "vs-code-ai-helper.runLintingFixes"
+                          ? {
+                              label: "Back to Implementation",
+                              command: "vs-code-ai-helper.setTaskStage",
+                              args: [{ taskFolderPath: taskFolderUri.fsPath, stage: "implementation" }],
+                            }
+                          : {
+                              label: "Fix Linting & Code Errors",
+                              command: "vs-code-ai-helper.runLintingFixes",
+                              args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                            }]
+                      : []),
+                    {
+                      label: "Run Publish Checks",
+                      command: "vs-code-ai-helper.runPublishChecks",
+                      args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                      consequence: "Runs the current Publish Checks again without changing the implementation.",
+                    },
+                  ],
+                });
                 NotificationRouter.showWarning(
                   failureNotice,
                   undefined,
                   undefined,
                   undefined,
-                  await offerActionInChatV1({
-                    taskFolderPath: taskFolderUri.fsPath,
-                    taskLabel: resolvedTask.progress.displayName,
-                    actionLabel: "Fix Linting & Code Errors",
-                    command: "vs-code-ai-helper.runLintingFixes",
-                    args: [{ taskFolderPath: taskFolderUri.fsPath }],
-                    noticeText: failureNotice,
-                  })
+                  recoveryCard
                 );
               }
               // RC9 item 2: a "Run Publish Checks" card asks for work that has
@@ -727,6 +993,16 @@ export async function runPublishChecks(
                 // was written and nothing was persisted for this run.
                 const cancelledNotice =
                   "Publish checks were cancelled. Nothing was recorded for this run — run the checks again when you're ready.";
+                // The checks STARTED and were stopped: tell the caller that
+                // dispatched them (Fast Forward) so it reports "cancelled"
+                // (and by whom) instead of reading the missing result as a
+                // refusal to start (bugs2 finding 5).
+                recordStageActionTerminalOutcomeV1(taskFolderUri.fsPath, {
+                  kind: "cancelled",
+                  actionLabel: "Publish Checks",
+                  source: operation.cancelSource?.(),
+                  operationId: operation.id,
+                });
                 NotificationRouter.showInformation(
                   cancelledNotice,
                   undefined,
@@ -744,6 +1020,14 @@ export async function runPublishChecks(
                 );
                 return;
               }
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              recordStageActionTerminalOutcomeV1(taskFolderUri.fsPath, {
+                kind: "failed",
+                actionLabel: "Publish Checks",
+                reason: errorMessage,
+                operationId: operation.id,
+              });
+              operation.settleAs("failed", `Publish Checks failed: ${errorMessage}`);
               await offerPublishChecksRetryAfterExecutionFailureV1(
                 taskFolderUri,
                 resolvedTask.progress.displayName,

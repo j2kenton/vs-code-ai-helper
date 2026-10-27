@@ -122,6 +122,19 @@ void describe("viewerForwardingV1", () => {
       }),
       { message: "why?", stage: "impl-low-review", taskName: "Spacing" }
     );
+    // bugs2 finding 8: a viewer's send identity crosses the boundary — and only
+    // when it is a well-formed 128-bit hex id.
+    assert.deepEqual(
+      decodeRelayedCommandArgV1("vs-code-ai-helper.chatWithStage", {
+        message: "why?",
+        sendId: "0123456789abcdef0123456789abcdef",
+      }),
+      { message: "why?", sendId: "0123456789abcdef0123456789abcdef" }
+    );
+    assert.deepEqual(
+      decodeRelayedCommandArgV1("vs-code-ai-helper.chatWithStage", { message: "why?", sendId: "../../etc/passwd" }),
+      { message: "why?" }
+    );
     assert.deepEqual(decodeRelayedCommandArgV1("vs-code-ai-helper.chatWithStage", { stage: "not-a-stage", message: "" }), {});
     assert.deepEqual(
       decodeRelayedCommandArgV1("vs-code-ai-helper.runImplementationWithAI", { automationDispatch: true, message: "x" }),
@@ -142,6 +155,35 @@ void describe("viewerForwardingV1", () => {
       false,
       "workflow work stays on the runner"
     );
+  });
+
+  void it("forwardInViewerV1 preserves forwarder boolean result and returns false when disconnected or indeterminate", async () => {
+    configureEnsembleHostRoleForTestV1("viewer");
+    const warnings: string[] = [];
+    initNotificationRouter({ addEntry: (message) => void warnings.push(message) });
+    try {
+      const wrapped = forwardInViewerV1(
+        "vs-code-ai-helper.runReviewWithAI",
+        (_arg?: { taskFolderPath?: string }) => "ran"
+      );
+      // Disconnected: returns false
+      assert.equal(await wrapped({ taskFolderPath: "/w/.ensemble/t1" }), false);
+      assert.match(warnings[0] ?? "", /no connection to the runner/);
+
+      // Connected with ok: true -> returns true
+      configureViewerCommandForwarderV1(() => Promise.resolve({ ok: true }));
+      assert.equal(await wrapped({ taskFolderPath: "/w/.ensemble/t1" }), true);
+
+      // Connected with ok: false -> returns false
+      configureViewerCommandForwarderV1(() => Promise.resolve({ ok: false }));
+      assert.equal(await wrapped({ taskFolderPath: "/w/.ensemble/t1" }), false);
+
+      // Connected with indeterminate: true -> returns false
+      configureViewerCommandForwarderV1(() => Promise.resolve({ ok: true, indeterminate: true }));
+      assert.equal(await wrapped({ taskFolderPath: "/w/.ensemble/t1" }), false);
+    } finally {
+      deactivateNotificationRouter();
+    }
   });
 
   void it("refuses to wrap a command the runner would not run", () => {

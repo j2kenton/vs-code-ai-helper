@@ -71,6 +71,7 @@ import {
   recordActiveFallbackModel,
   resolveEffectiveProvider,
   runImplementationForModel,
+  CandidateInvocationInfoV1,
 } from "../runners/runnerRegistry";
 import { isAuthenticationFailure } from "../utils/quota";
 import { attachCoordinatorIdentityToRoundV1 } from "../utils/roundLedgerV1";
@@ -78,7 +79,8 @@ import { resolveEffectiveStageChainV1, resolveFreshModelForStage } from "../util
 import { getResilienceSettings } from "../config/settings";
 import { writeRunLog } from "../utils/runLog";
 import { NotificationRouter } from "../utils/notificationRouter";
-import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
+import { candidateInvocationMessageV1, dispatchCorrelationFromOutcomeV1, persistCandidateDispatchModelChainV1 } from "../utils/dispatchModelChainV1";
+import { formatNotificationTaskLabelV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
 import {
   acquireOrAdoptWorkAdmissionV1,
   createSafeAdmissionReleaseStateV1,
@@ -566,6 +568,7 @@ export interface RunTwoPhaseEditOptionsV1 {
    */
   readonly taskFolderUri?: vscode.Uri;
   readonly roundId?: string;
+  readonly onCandidateInvokedV1?: (info: CandidateInvocationInfoV1) => void | Promise<void>;
   /** The task's display name, for notification labels — see `taskFolderUri`. */
   readonly taskDisplayName?: string;
   /**
@@ -645,6 +648,7 @@ export async function runTwoPhaseEditActionV1(
     taskStage: options.taskStage,
     rawInput: preflightInput as unknown as Record<string, unknown>,
     cancellationToken: options.cancellationToken,
+    onCandidateInvokedV1: options.onCandidateInvokedV1,
     onAttemptAllocated: async (info) => {
       capturedAllocatedAttemptIds.push(info.attemptId);
       // No round identity is claimed for lint.v1; all implementation paths
@@ -753,7 +757,7 @@ export async function continueSealedEditExecutionV1(
   preflightOperationId: string,
   options: Pick<
     RunTwoPhaseEditOptionsV1,
-    "taskBinding" | "taskStatus" | "taskStage" | "cancellationToken"
+    "taskBinding" | "taskStatus" | "taskStage" | "cancellationToken" | "onCandidateInvokedV1"
   >,
   /**
    * Item 2 / Step 57a: an out-param a caller that manages its own admission
@@ -795,6 +799,7 @@ export async function continueSealedEditExecutionV1(
     taskStage: options.taskStage,
     rawInput: { executionId: sealed.executionId },
     cancellationToken: options.cancellationToken,
+    onCandidateInvokedV1: options.onCandidateInvokedV1,
   });
   if (dispatchProbe) {
     dispatchProbe.coordinatorOutcome = editOutcome;
@@ -1015,6 +1020,8 @@ export interface RunSealedImplementationOptionsV1 {
    * Forwarded unchanged into the sealed pipeline's `onPromptAssembled`
    * attachment; has no effect without `taskFolderUri` also set. */
   readonly roundId?: string;
+  readonly dispatchOperationId?: string;
+  readonly onCandidateInvokedV1?: (info: CandidateInvocationInfoV1) => void | Promise<void>;
   /** Mirrors the retired runner option: false lets a no-op plan complete. */
   readonly requireFileChange?: boolean;
   /**
@@ -1208,6 +1215,7 @@ export async function runSealedImplementationV1(
     roundId: options.roundId,
     taskDisplayName: options.taskDisplayName,
     dispatchProbe: options.dispatchProbe,
+    onCandidateInvokedV1: options.onCandidateInvokedV1,
   });
 
   const runnerId = "copilot-lm";
@@ -1239,6 +1247,7 @@ export async function runSealedImplementationV1(
               token: options.token,
               onProgress: options.onProgress,
               taskDisplayName: options.taskDisplayName,
+              onCandidateInvokedV1: options.onCandidateInvokedV1,
             })
           : undefined;
       const completionResult = resolveSealedEditCompletionResultV1(
@@ -1634,6 +1643,8 @@ export async function runImplementationOrSealedV1(
       // active fallback. configuredPrimaryModelId tells that function the
       // TRUE primary so it can record correctly (see its own header).
       configuredPrimaryModelId: options.modelId,
+      dispatchOperationId: options.dispatchOperationId,
+      onCandidateInvokedV1: options.onCandidateInvokedV1,
       configuredFailingCommands: options.configuredFailingCommands,
       hostCheckRunner: options.hostCheckRunner,
     });
@@ -2040,7 +2051,29 @@ export async function resumeEditPreflightInteractionV1(
         taskStage: ownedTask.progress.currentStage,
         resumeIdempotencyId,
         cancellationToken: linked.token,
-        onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+        onCandidateInvokedV1: async (info) => {
+          op.setModel?.(info.storedModelId);
+          const message = candidateInvocationMessageV1(
+            `resumed ${actionKey}`,
+            info.storedModelId,
+            info.providerLabel,
+            info.backup
+          );
+          op.report?.(message);
+          await runWithNotificationTaskContextV1(ownedTask.progress.displayName, ownedTask.taskFolderPath, () => {
+            NotificationRouter.showInformation(message);
+            return Promise.resolve();
+          });
+          await persistCandidateDispatchModelChainV1({
+            taskFolderUri,
+            stage: modelStage,
+            operationId: info.operationId ?? op.id,
+            attemptId: info.attemptId,
+            runnerId: info.runnerId,
+            storedModelId: info.storedModelId,
+            providerLabel: info.providerLabel,
+          }).catch(() => undefined);
+        },
       });
     } finally {
       linked.dispose();
@@ -2118,7 +2151,16 @@ export async function resumeEditPreflightInteractionV1(
       (resumedSealedReasoning !== undefined
         ? `\n\nThe model's own account of the round:\n\n${resumedSealedReasoning}`
         : "");
-    const logUri = await writeRunLog(taskFolderUri, "copilot-lm", modelStage, logContent);
+    const resumeCorrelation = dispatchCorrelationFromOutcomeV1(capturedResumeOutcomeV1);
+    const logUri = await writeRunLog(
+      taskFolderUri,
+      "copilot-lm",
+      modelStage,
+      logContent,
+      resumeCorrelation
+        ? { operationId: resumeCorrelation.operationId, attemptIds: resumeCorrelation.attemptId ? [resumeCorrelation.attemptId] : [] }
+        : undefined
+    );
     if (execution.kind === "completed") {
       NotificationRouter.showInformation(
         `${formatNotificationTaskLabelV1(ownedTask.progress.displayName, ownedTask.taskFolderPath)} — ` +

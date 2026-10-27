@@ -42,6 +42,8 @@ import {
   OwnerEvidenceSubmissionErrorV1,
 } from "../utils/ownerEvidenceV1";
 import { settleChatFreeTextQuestionV1 } from "../utils/chatFreeTextV1";
+import { describeResumeFailureWithStoredAnswerV1 } from "../utils/storedAnswerResumeV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
 import {
@@ -59,9 +61,10 @@ import {
 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import {
-  acquireWorkAdmissionV1,
+  acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   describeWorkAdmissionRefusalV1,
+  hasLiveWorkAdmissionBestEffortV1,
   revokeWorkAdmissionHandoffV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
   WorkAdmissionHandleV1,
@@ -1163,6 +1166,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await vscode.commands.executeCommand("vs-code-ai-helper.chatWithStage", {
           ...target,
           message: text,
+          // One identity per typed send: if the task turns out to be paused,
+          // the message is kept under it and "Resume and send" never writes
+          // or sends it twice (bugs2 finding 8).
+          sendId: crypto.randomBytes(16).toString("hex"),
         });
       } else {
         // The global assistant has its own send path — it is not a task or
@@ -1455,7 +1462,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     text: string,
     stage: TaskStage,
     identity: ChatIdentity | undefined = this.target,
-    pending = false
+    pending = false,
+    /**
+     * Stable identity for a user message whose send may be retried after the
+     * task was paused (bugs2 finding 8): a retained message is written once
+     * with this id, and a later "Resume and send" finds it by id instead of
+     * writing the same text twice.
+     */
+    messageId?: string
   ): Promise<void> {
     if (!identity) return;
     const message: ChatMessage = {
@@ -1467,7 +1481,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // A question gets a stable id at creation so a reply can bind to THIS
       // question even if another one shares the same millisecond `at` (see
       // `ChatMessage.id`) — every other role has no reply channel to bind.
-      ...(role === "question" ? { id: crypto.randomBytes(16).toString("hex") } : {}),
+      ...(role === "question"
+        ? { id: crypto.randomBytes(16).toString("hex") }
+        : messageId !== undefined
+          ? { id: messageId }
+          : {}),
     };
     const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
@@ -2030,10 +2048,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    */
   private async resumeInteraction(
     clientRef: ChatInteractionClientRefV1,
-    successMessage = "Recorded: your answer was submitted and the action is resuming."
-  ): Promise<void> {
-    if (!this.target) return;
-    const unavailableIdentity = this.target;
+    successMessage = "Recorded: your answer was submitted and the action is resuming.",
+    explicitTarget?: ChatTarget,
+    admissionHandoffTokenV1?: string
+  ): Promise<boolean> {
+    const unavailableIdentity = explicitTarget ?? this.target;
+    if (!unavailableIdentity) return false;
 
     // ── Early work admission (2026-09-09 review completion blocker) ────────
     // The review found that no admission covered chatView.ts's own awaits
@@ -2072,17 +2092,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // "busy, held by another host".
     const admission = isViewerHostV1()
       ? undefined
-      : await acquireWorkAdmissionV1({
+      : await acquireOrAdoptWorkAdmissionV1({
           taskFolderPath: unavailableIdentity.taskFolderPath,
           purpose: "admission",
           commandId: "chatResumeInteractionV1",
+          handoffToken: admissionHandoffTokenV1,
         });
     if (admission !== undefined && admission.outcome !== "acquired") {
       const unavailableDisplayName = await resolveChatTaskDisplayNameV1(unavailableIdentity.taskFolderPath);
       const taskLabel = formatNotificationTaskLabelV1(unavailableDisplayName, unavailableIdentity.taskFolderPath);
-      const declineMessage = `Could not resume: ${describeWorkAdmissionRefusalV1(
-        admission,
-        notificationTaskDisplayNameV1(unavailableDisplayName, unavailableIdentity.taskFolderPath)
+      const declineMessage = `Could not resume: ${describeResumeFailureWithStoredAnswerV1(
+        describeWorkAdmissionRefusalV1(
+          admission,
+          notificationTaskDisplayNameV1(unavailableDisplayName, unavailableIdentity.taskFolderPath)
+        )
       )}`;
       NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
       const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
@@ -2090,7 +2113,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (sameIdentity(this.target, unavailableIdentity)) {
         await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
       }
-      return;
+      return false;
     }
     const admissionHandle: WorkAdmissionHandleV1 | undefined =
       admission?.outcome === "acquired" ? admission.handle : undefined;
@@ -2136,7 +2159,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (localRecord?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1) {
         // Fully settled inside `settleLocalOnlyInteractionAnswersV1` — there is
         // no coordinator action to resume, and no second acknowledgement to add.
-        return;
+        return true;
       }
       if (!this.interactionServices?.resume) {
         NotificationRouter.showWarning(
@@ -2148,9 +2171,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           unavailableIdentity.stage,
           unavailableIdentity
         );
-        return;
+        return false;
       }
-      const identity = this.target;
+      const identity = unavailableIdentity;
       const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
       const services = this.interactionServices;
       const resume = (
@@ -2190,8 +2213,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             }
           }
           if (!result.ok) {
-            declineMessage = `Could not resume: ${result.reason}`;
+            // The answer was submitted before this Resume ran and is stored
+            // durably; say so, and that pressing Confirm again re-uses it
+            // (bugs2 finding 1), instead of leaving a dead-looking card.
+            declineMessage = `Could not resume: ${describeResumeFailureWithStoredAnswerV1(result.reason)}`;
             NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
+            void offerActionInChatV1({
+              taskFolderPath: unavailableIdentity.taskFolderPath,
+              actionLabel: "Resume with stored answer",
+              command: "vs-code-ai-helper.resumeStoredInteraction",
+              args: [
+                {
+                  taskFolderPath: unavailableIdentity.taskFolderPath,
+                  canonicalId: unavailableIdentity.canonicalId,
+                  interactionId: clientRef.interactionId,
+                  operationId: clientRef.operationId,
+                },
+              ],
+              noticeText: declineMessage,
+              optional: true,
+              taskLabel: identity.taskName,
+            });
           } else {
             // A viewer's Resume ran on the runner, which settles the shared
             // mirror itself (extension.ts's relay executor) — so the record
@@ -2217,6 +2259,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (sameIdentity(this.target, identity)) {
         await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
       }
+      return resumed;
     } finally {
       recordAdmissionReleaseTriggerV1(admissionSafeReleaseStateV1, coordinatorOutcomeV1);
       await requestSafeAdmissionReleaseV1(admissionSafeReleaseStateV1, admissionHandle, onAdmissionHeldV1, onAdmissionReleasedV1);
@@ -2532,6 +2575,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     optionId: string,
     ctx?: RelayedResolutionContextV1
   ): Promise<RelayedResolutionOutcomeV1> {
+    if (decisionId.startsWith("idle-reconcile:") || decisionId.startsWith("idle-reconcile-")) {
+      let targetTaskFolderPath: string | undefined;
+      let targetCanonicalId: string | undefined;
+      if (decisionId.startsWith("idle-reconcile:")) {
+        const parts = decisionId.split(":");
+        targetTaskFolderPath = parts[1] ? decodeURIComponent(parts[1]) : undefined;
+        targetCanonicalId = parts[2] ? decodeURIComponent(parts[2]) : undefined;
+      }
+      if (!targetTaskFolderPath) {
+        const panelTarget = this.target && this.target.kind !== "global" ? this.target : undefined;
+        const clickIdentity = ctx?.identity ?? panelTarget;
+        targetTaskFolderPath = clickIdentity?.taskFolderPath;
+        targetCanonicalId = clickIdentity?.canonicalId;
+      }
+      let outcomeOk = false;
+      if (optionId === "reconcile" && targetTaskFolderPath) {
+        const commandResult = await vscode.commands.executeCommand("vs-code-ai-helper.reconcilePlanChecklistConfirmed", {
+          taskFolderPath: targetTaskFolderPath,
+          canonicalId: targetCanonicalId,
+        });
+        outcomeOk = commandResult === true;
+      }
+      await this.render();
+      return { ok: outcomeOk, transitioned: outcomeOk };
+    }
     if (this.interactionServices?.resolveWorkflowDecision && this.isRemoteDecisionV1?.(decisionId) !== false) {
       // The runner raised it, so the runner resolves it and runs its effect
       // (hostDecisionMirrorV1.ts). A decision this window raised itself
@@ -2917,6 +2985,47 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
+   * Resume an unresolved chat interaction that has stored answers for a task (bugs2 finding 1).
+   */
+  public async resumeStoredInteractionForTaskV1(
+    taskFolderPath: string,
+    canonicalId?: string,
+    interactionRef?: { interactionId: string; operationId: string },
+    admissionHandoffTokenV1?: string
+  ): Promise<boolean> {
+    const interactions = await readChatInteractions(taskFolderPath, canonicalId ?? taskFolderPath);
+    const candidate = interactionRef
+      ? interactions.find(
+          (i) => i.interactionId === interactionRef.interactionId && i.operationId === interactionRef.operationId
+        )
+      : interactions.find(
+          (i) =>
+            (i.state === "unresolved" || i.state === "orphanedTransaction") &&
+            (i.answers?.length ?? 0) > 0
+        );
+    if (!candidate) {
+      return false;
+    }
+    const target: ChatTarget = (this.target && this.target.taskFolderPath === taskFolderPath)
+      ? this.target
+      : {
+          taskFolderPath,
+          canonicalId: canonicalId ?? taskFolderPath,
+          taskName: await resolveChatTaskDisplayNameV1(taskFolderPath),
+          stage: candidate.stage ?? "impl",
+        };
+    return await this.resumeInteraction(
+      {
+        interactionId: candidate.interactionId,
+        operationId: candidate.operationId,
+      },
+      undefined,
+      target,
+      admissionHandoffTokenV1
+    );
+  }
+
+  /**
    * Paint the panel. Whatever happens, the webview gets a state message.
    *
    * Everything this method reads beyond the transcript is a secondary detail
@@ -3222,7 +3331,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ).catch(() => undefined);
       if (!sameRenderTarget(target, this.target)) return;
       if (implCounted) {
-        label = `${label} — ${formatChecklistPercentV1(implCounted.settled, implCounted.total)}%`;
+        label = `${label} — ${formatChecklistPercentV1(implCounted.settled, implCounted.total)}%` +
+          ` (${implCounted.verified} verified, ${implCounted.provisional} provisional)`;
       }
     } else if (target && target.kind !== "global" && isReviewStage(target.stage)) {
       const reviewScoreLabel = await describeReviewStageScoreV1(
@@ -3296,7 +3406,56 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     for (const entry of entries) {
       if (entry.decisionId) decisionAnchorAt.set(entry.decisionId, entry.at);
     }
-    const displayDecisions = pendingDecisions.map((decision) => {
+    const activeDecisions: WorkflowDecisionV1[] = [...pendingDecisions];
+    if (
+      target &&
+      target.kind !== "global" &&
+      !activeDecisions.some((d) => d.decisionKey === "reconcilePlanChecklist")
+    ) {
+      const isTaskIdle =
+        targetOps.length === 0 &&
+        !taskOperations.hasRootOperationForTask(target.taskFolderPath) &&
+        !hasLiveWorkAdmissionBestEffortV1(target.taskFolderPath);
+      if (isTaskIdle) {
+        const progressRead = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath)).catch(
+          () => undefined
+        );
+        if (progressRead?.ok && progressRead.decoded.progress.checklistProgressUnreliable) {
+          activeDecisions.push({
+            decisionId: `idle-reconcile:${encodeURIComponent(target.taskFolderPath)}:${encodeURIComponent(target.canonicalId)}`,
+            decisionKey: "reconcilePlanChecklist",
+            taskCanonicalId: target.canonicalId,
+            stage: target.stage,
+            state: "pending",
+            createdAt: new Date().toISOString(),
+            recommendation: { kind: "none", reasoning: "Marking reconciled restores plan completeness gating." },
+            whatHappened:
+              "This task's plan checklist is flagged unreliable, and the task is currently idle with no active reconciliation card.",
+            whyUserNeeded:
+              "Completeness gating is suspended. Mark the checklist reconciled to restore gating for stage advancement.",
+            gating: {
+              holdsTaskPaused: false,
+              unblocksProgress: true,
+              detail: "Marking reconciled clears the unreliable-checklist flag without dispatching a stage action.",
+            },
+            options: [
+              {
+                optionId: "reconcile",
+                label: "Mark checklist reconciled",
+                resumeKind: "unpause",
+                consequence: "Clears the unreliable-checklist flag without dispatching a stage action.",
+                effect: {
+                  kind: "command",
+                  command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
+                  args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
+                },
+              },
+            ],
+          });
+        }
+      }
+    }
+    const displayDecisions = activeDecisions.map((decision) => {
       const gatingLine = renderHandoffFieldLineV1(
         "decisionRecord",
         "gating",

@@ -16,6 +16,8 @@ import {
   type ImplReviewLedgerRowV1,
   isImplReviewOnZeroFilesV1,
   resolveLedgerImplReviewFilesV1,
+  resolveImplementationReviewScopeV1,
+  applyResumedReviewScopeRoutingV1,
   REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1,
   shouldClearImplReviewFilesAfterReviewV1,
 } from "../utils/implReviewFileSelection";
@@ -287,5 +289,111 @@ void describe("resolveLedgerImplReviewFilesV1", () => {
       200
     );
     assert.deepEqual(result, { established: true, files: [] });
+  });
+});
+
+void describe("resolveImplementationReviewScopeV1", () => {
+  const row = (roundId: string, files: string[]): ImplReviewLedgerRowV1 => ({
+    roundId,
+    mode: "implementation",
+    state: "completed",
+    outcome: { filesChanged: files },
+  });
+
+  void it("rebuilds a missing or partial tracked set from task-owned ledger changes", () => {
+    const result = resolveImplementationReviewScopeV1(
+      ["src/older.ts"],
+      [row("r1", ["src/older.ts"]), row("r2", ["src/newer.ts"])],
+      200
+    );
+    assert.equal(result.kind, "established");
+    if (result.kind === "established") {
+      assert.equal(result.source, "ledger");
+      assert.deepEqual(result.files, ["src/newer.ts", "src/older.ts"]);
+      assert.deepEqual(result.ledgerFiles, ["src/newer.ts", "src/older.ts"]);
+    }
+  });
+
+  void it("does not promote rejected, failed, cancelled, or interrupted round changes out of quarantine", () => {
+    const completed = row("accepted", ["src/accepted.ts"]);
+    const quarantined = ["rejected", "failed", "cancelled", "interrupted"].map((state, index) => ({
+      roundId: `q${index}`,
+      mode: "implementation" as const,
+      state: state as "rejected" | "failed" | "cancelled" | "interrupted",
+      outcome: { filesChanged: [`src/quarantined-${state}.ts`] },
+    }));
+    const result = resolveLedgerImplReviewFilesV1([completed, ...quarantined], 200);
+    assert.deepEqual(result, { established: true, files: ["src/accepted.ts"] });
+  });
+
+  void it("keeps a proven empty scope distinct from unavailable ledger evidence", () => {
+    const empty = resolveImplementationReviewScopeV1([], [row("r1", [])], 200);
+    assert.deepEqual(empty, {
+      kind: "established",
+      files: [],
+      ledgerFiles: [],
+      source: "ledger",
+    });
+    const unavailable = resolveImplementationReviewScopeV1(undefined, [], 200);
+    assert.equal(unavailable.kind, "unavailable");
+  });
+
+  void it("drops absolute and parent-traversing ledger paths", () => {
+    const result = resolveImplementationReviewScopeV1(
+      [],
+      [row("r1", ["src/good.ts", "../outside.ts", "/tmp/outside.ts", "C:\\outside.ts"])],
+      200
+    );
+    assert.equal(result.kind, "established");
+    if (result.kind === "established") {
+      assert.deepEqual(result.files, ["src/good.ts"]);
+      assert.equal(result.omittedPaths, 3);
+    }
+  });
+});
+
+void describe("resumed implementation review scope wiring (Step 14)", () => {
+  const source = fs.readFileSync(path.join(process.cwd(), "src", "commands", "reviewActions.ts"), "utf8");
+  const resumeStart = source.indexOf("export async function buildReviewResumeVariablesV1(");
+  const resumeEnd = source.indexOf("export async function resumeReviewInteractionV1(", resumeStart);
+  const resumeBuilder = source.slice(resumeStart, resumeEnd);
+
+  void it("rebuilds task-owned scope before constructing and appending resumed review context", () => {
+    assert.match(resumeBuilder, /resolveImplementationReviewScopeV1\(/);
+    assert.match(resumeBuilder, /scope\.files,/);
+    assert.match(resumeBuilder, /Refreshed implementation review scope/);
+    assert.match(source.slice(resumeEnd), /promptAppendix: variablesResult\.resumePromptAppendix/);
+  });
+
+  void it("routes a resumed review using its refreshed tracked scope, not the original fallback", () => {
+    const resume = source.slice(resumeEnd, source.indexOf("export async function resumeApplyReviewInteractionV1(", resumeEnd));
+    assert.match(resume, /applyResumedReviewScopeRoutingV1\(variablesResult\.variables/);
+    assert.doesNotMatch(resume, /originalScope === "open-editors"/);
+    assert.match(resumeBuilder, /Refreshed implementation review scope/);
+  });
+
+  void it("rebuilds accepted ledger changes after an open-editor question and makes that resumed review eligible", () => {
+    const progressFiles: string[] = [];
+    const acceptedLedgerChanges: ImplReviewLedgerRowV1[] = [{
+      roundId: "round-after-question",
+      mode: "implementation",
+      state: "completed",
+      outcome: { filesChanged: ["src/accepted-change.ts"] },
+    }];
+    const scope = resolveImplementationReviewScopeV1(progressFiles, acceptedLedgerChanges, 200);
+    assert.equal(scope.kind, "established");
+    if (scope.kind !== "established") { return; }
+    assert.deepEqual(scope.files, ["src/accepted-change.ts"]);
+
+    // This is the same value consumed by the resumed outcome router after the
+    // refreshed tracked context pack was appended to the original question.
+    const originalPromptWasFallbackScoped = true;
+    const variables: Record<string, string> = { reviewScopeFallback: "true" };
+    const refreshedContextPackWasAppended = scope.files.length > 0;
+    const eligible = applyResumedReviewScopeRoutingV1(variables, { isPlanReview: false, trackedScopeApplied: refreshedContextPackWasAppended });
+    assert.equal(originalPromptWasFallbackScoped, true);
+    assert.equal(variables["reviewScopeFallback"], undefined);
+    assert.equal(eligible, true);
+    assert.equal(applyResumedReviewScopeRoutingV1({ reviewScopeFallback: "true" }, { isPlanReview: true, trackedScopeApplied: refreshedContextPackWasAppended }), false);
   });
 });

@@ -8,6 +8,7 @@ import {
 } from "../runners/providers";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
+import { cancelLocalModelSettingsWriteV1, markLocalModelSettingsWriteV1 } from "../utils/modelSettingsChangeV1";
 
 /** Settings displayed to users. Command and extension identifiers deliberately
  * retain their historical `vs-code-ai-helper` prefix for compatibility. */
@@ -1317,9 +1318,15 @@ export async function setModelSettings(settings: ModelSettings): Promise<void> {
       clean[stage] = entry;
     }
   }
-  await config.update(
-    MODEL_SETTINGS_KEY,
-    clean,
-    targetFor(MODEL_SETTINGS_KEY)
-  );
+  const localWrite = markLocalModelSettingsWriteV1(clean);
+  try {
+    await config.update(
+      MODEL_SETTINGS_KEY,
+      clean,
+      targetFor(MODEL_SETTINGS_KEY)
+    );
+  } catch (error) {
+    cancelLocalModelSettingsWriteV1(localWrite);
+    throw error;
+  }
 }

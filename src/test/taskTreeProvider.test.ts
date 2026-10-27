@@ -1,7 +1,10 @@
 import * as assert from "node:assert/strict";
+import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
+import { setPendingUserInputReaderForTestV1 } from "../utils/pendingUserInputV1";
+import { classifyPendingUserInputV1 } from "../utils/taskWatchdogV1";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import * as vscode from "vscode";
 import { describeOwedContinuationRowIndicatorV1, firstActiveInDisplayOrder, getStageNodeContextValue, orderTasksForDisplay, StageNode, TaskNode, TaskTreeProvider, tryReadReadiness } from "../views/taskTreeProvider";
 import type { IncompleteTask } from "../types/incompleteTask";
@@ -1214,6 +1217,19 @@ void describe("StageNode — review score and step progress", () => {
     updatedAt: "2026-08-11T00:00:00.000Z",
   });
 
+  // The two ticked items reviewer-verified: only verified ticks count as
+  // complete (Part 3), so this is the progress that reads as "2 of 5".
+  const PROGRESS_JSON_TWO_VERIFIED = JSON.stringify({
+    ...(JSON.parse(PROGRESS_JSON) as Record<string, unknown>),
+    planItemEvidence: ["One", "Two"].map((itemText) => ({
+      planRevision: getPlanRevisionV1(PLAN_TWO_OF_FIVE),
+      itemKey: normalizeChecklistItemTextV1(itemText),
+      itemText,
+      claims: [{ source: "implementation", at: "2026-08-11T00:00:00.000Z" }],
+      verifications: [{ at: "2026-08-11T00:00:00.000Z", evidence: "verified by review" }],
+    })),
+  });
+
   function reviewContent(score: string, marker?: string): string {
     return [
       "# Implementation Review",
@@ -1299,7 +1315,7 @@ void describe("StageNode — review score and step progress", () => {
       new Map([
         [reviewUri.fsPath, reviewContent("9", "5/5")],
         [planUri.fsPath, PLAN_TWO_OF_FIVE],
-        [progressUri.fsPath, PROGRESS_JSON],
+        [progressUri.fsPath, PROGRESS_JSON_TWO_VERIFIED],
       ])
     );
     try {
@@ -1404,6 +1420,15 @@ void describe("StageNode — implementation row percentage", () => {
       { complete: 0, total: 16, closedBeforeImplementation: 2 }
     );
     assert.strictEqual(node.description, "0%");
+  });
+
+  void it("distinguishes reviewer-verified from provisional checklist ticks", () => {
+    const task = makeTask("impl");
+    const node = new StageNode(
+      task, "impl", "current", undefined, undefined, false, false, false, false, undefined,
+      { complete: 6, total: 10, verified: 4, provisional: 2 }
+    );
+    assert.match((node.tooltip as vscode.MarkdownString).value, /4 reviewer-verified, 2 provisional checklist items/);
   });
 
   void it("renders nothing when the impl stage has no checklist yet", () => {
@@ -2223,11 +2248,18 @@ void describe("TaskTreeProvider — scheduling posture reads back from the ledge
 
   const TASK_FS_PATH = "/workspace/tasks/owed-continuation-task";
 
+  // This folder is not on disk, so its chat history would read as
+  // "unreadable" and override every posture with "unknown"; these tests are
+  // about the owed-continuation posture, so the chat holds no questions.
+  before(() => setPendingUserInputReaderForTestV1(() => Promise.resolve(classifyPendingUserInputV1([]))));
+  after(() => setPendingUserInputReaderForTestV1(undefined));
+
   function makeOwedTaskInventory(): import("../state/taskInventory").TaskInventory {
     return {
       getTasks: () => [
         {
           taskFolderPath: TASK_FS_PATH,
+          folderUri: vscode.Uri.file(TASK_FS_PATH),
           folderName: "owed-continuation-task",
           progress: {
             currentStage: "impl" as TaskStage,
@@ -2585,5 +2617,4 @@ void describe("StageNode — waiting for you on the current stage row (v1 fixes 
     }
   });
 });
-
 

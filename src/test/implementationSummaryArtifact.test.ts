@@ -47,8 +47,10 @@ import {
   AcceptedNonGoalItemV1,
   appendAcceptedNonGoalV1,
   areAllUnmatchedChecklistClaimsAlreadySettledV1,
+  accountImplementationReportCorrectionClaimsV1,
   CLOSED_BEFORE_IMPLEMENTATION_MARKER_V1,
   collectCheckedChecklistCountsV1,
+  collectPlainDoneChecklistCountsV1,
   collectChecklistItemKeysV1,
   collectPlanItemReasonsV1,
   collectRetroactiveTickClaimsV1,
@@ -56,10 +58,14 @@ import {
   detectChecklistItemSetMutationV1,
   EXCLUDED_CHECKLIST_ITEM_MARKER_V1,
   filterUncheckedPlanItemsV1,
+  formatOpenPlanItemsForRoundV1,
   formatChecklistPercentV1,
   hasContradictoryNoChecklistChangeClaimV1,
+  hasApplicablePassingTestReportForItemV1,
   hasImplementationChecklistV1,
   listOutstandingManualVerificationItemsV1,
+  listProvisionalTestDependentChecklistItemsV1,
+  listNewlyCheckedChecklistItemsV1,
   listUncheckedChecklistItemTextsV1,
   mergeChecklistProgressV1,
   MergeChecklistProgressResultV1,
@@ -72,6 +78,10 @@ import {
   splitSummaryAtEchoV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
+import {
+  buildImplementationReportCorrectionPromptV1,
+  isImplementationReportCorrectionEvidenceGroundedV1,
+} from "../commands/implContinuationTextDispatchV1";
 import {
   isPlanIncomplete,
   parseReviewProgress,
@@ -429,15 +439,13 @@ void describe("a narrowed denominator cannot declare the plan finished", () => {
     );
   });
 
-  void it("lets a review still report itself mid-plan even when every box is ticked", () => {
-    // Asymmetric on purpose: either source may say "not finished";
-    // neither may unilaterally say "finished".
+  void it("uses the authoritative settled count instead of an older mid-plan review marker", () => {
     const reconciled = reconcileProgressWithChecklistV1(
       { complete: 13, total: 25 },
       { total: 25, settled: 25, remaining: 0 }
     );
-    assert.deepEqual(reconciled, { complete: 13, total: 25 });
-    assert.equal(isPlanIncomplete(reconciled), true);
+    assert.deepEqual(reconciled, { complete: 25, total: 25 });
+    assert.equal(isPlanIncomplete(reconciled), false);
   });
 
   void it("advances normally once both the checklist and the review agree", () => {
@@ -1459,11 +1467,11 @@ void describe("checklist item identity", () => {
     "<!-- ensemble:implementation-checklist -->",
     "",
     "## Part 1",
-    "- [ ] Add a regression test",
+    "- [ ] Add an item twice",
     "- [ ] Wire the gate",
     "",
     "## Part 2",
-    "- [ ] Add a regression test",
+    "- [ ] Add an item twice",
   ].join("\n");
 
   void it("counts two same-worded items as two, not one", () => {
@@ -1480,13 +1488,13 @@ void describe("checklist item identity", () => {
   void it("ticking one same-worded item does not tick the other", () => {
     const echo = [
       "<!-- ensemble:implementation-checklist -->",
-      "- [x] Add a regression test",
+      "- [x] Add an item twice",
       "- [ ] Wire the gate",
       "- [ ] Add a regression test",
     ].join("\n");
     const merged = mergedContent(mergeChecklistProgressV1(DUPLICATE_WORDING, echo));
-    const lines = merged.split("\n").filter((l) => l.includes("Add a regression test"));
-    assert.deepEqual(lines, ["- [x] Add a regression test", "- [ ] Add a regression test"]);
+    const lines = merged.split("\n").filter((l) => l.includes("Add an item twice"));
+    assert.deepEqual(lines, ["- [x] Add an item twice", "- [ ] Add an item twice"]);
     // The unfinished second copy still holds the denominator open.
     assert.deepEqual(countChecklistProgressV1(merged), {
       total: 3,
@@ -1761,9 +1769,9 @@ void describe("checklist item identity", () => {
 void describe("the echoed checklist is separated from the summary's own sections", () => {
   const PLAN_WITH_DUPES = [
     "<!-- ensemble:implementation-checklist -->",
-    "- [ ] Run the full test suite",
+    "- [ ] Run the acceptance workflow",
     "- [ ] Wire the gate",
-    "- [ ] Run the full test suite",
+    "- [ ] Run the acceptance workflow",
   ].join("\n");
 
   void it("verification checkboxes do not add to the echo's reported progress", () => {
@@ -1772,9 +1780,9 @@ void describe("the echoed checklist is separated from the summary's own sections
     // duplicated item than the round actually reported done.
     const response = [
       "<!-- ensemble:implementation-checklist -->",
-      "- [x] Run the full test suite",
+      "- [x] Run the acceptance workflow",
       "- [ ] Wire the gate",
-      "- [ ] Run the full test suite",
+      "- [ ] Run the acceptance workflow",
       "",
       "## Files Changed",
       "",
@@ -1782,7 +1790,7 @@ void describe("the echoed checklist is separated from the summary's own sections
       "",
       "## Verification",
       "",
-      "- [x] Run the full test suite",
+      "- [x] Run the acceptance workflow",
     ].join("\n");
     const merged = mergedContent(mergeChecklistProgressV1(PLAN_WITH_DUPES, response));
     assert.deepEqual(
@@ -2302,8 +2310,8 @@ void describe("mergeChecklistProgressV1 matches a unique item without its step l
     "",
     "- [ ] Step 4: On the continuation row path, close the row as failed.",
     "- [ ] Step 5 — Wire the gate.",
-    "- [ ] 6. Update the caller test.",
-    "- [ ] **Step 7** Add the ambiguity regression.",
+    "- [ ] 6. Update the caller path.",
+    "- [ ] **Step 7** Resolve duplicate numbering.",
     "- [ ] Keep this open.",
   ].join("\n");
 
@@ -2312,14 +2320,14 @@ void describe("mergeChecklistProgressV1 matches a unique item without its step l
       "<!-- ensemble:implementation-checklist -->",
       "- [x] On the continuation row path, close the row as failed.",
       "- [x] Wire the gate.",
-      "- [x] Update the caller test.",
-      "- [x] Add the ambiguity regression.",
+      "- [x] Update the caller path.",
+      "- [x] Resolve duplicate numbering.",
     ].join("\n");
     const merged = mergedContent(mergeChecklistProgressV1(PLAN, echo));
     assert.ok(merged.includes("- [x] Step 4: On the continuation row path, close the row as failed."));
     assert.ok(merged.includes("- [x] Step 5 — Wire the gate."));
-    assert.ok(merged.includes("- [x] 6. Update the caller test."));
-    assert.ok(merged.includes("- [x] **Step 7** Add the ambiguity regression."));
+    assert.ok(merged.includes("- [x] 6. Update the caller path."));
+    assert.ok(merged.includes("- [x] **Step 7** Resolve duplicate numbering."));
     assert.ok(merged.includes("- [ ] Keep this open."));
     assert.deepEqual(countChecklistProgressV1(merged), {
       total: 5,
@@ -2856,10 +2864,11 @@ void describe("Part 4: asserted completions land without a file diff", () => {
     assert.equal(result.kind, "merged");
     if (result.kind === "merged") {
       const tickedCount = (result.content.match(/- \[x\]/g) ?? []).length;
-      assert.equal(tickedCount, 6, "exactly the 6 items under Part 7 must be ticked");
+      assert.equal(tickedCount, 4, "only code-observable items without test-dependent acceptance can be ticked without a report");
       assert.ok(result.content.includes("- [ ] an item that belongs to Part 6, not Part 7"));
       assert.ok(result.content.includes("- [ ] an item that belongs to Part 8, not Part 7"));
-      assert.equal(result.retroactiveTicks?.length, 6);
+      assert.equal(result.retroactiveTicks?.length, 4);
+      assert.equal(result.unverifiedTestItems?.length, 2);
       for (const tick of result.retroactiveTicks ?? []) {
         assert.match(tick.evidence, /composeCliTimeoutOutcomeV1/);
       }
@@ -3090,6 +3099,214 @@ void describe("Part 5: naming and resolving outstanding checklist items", () => 
 
       const uncapped = listUncheckedChecklistItemTextsV1(longPlan);
       assert.equal(uncapped.items[0]?.length, 200, "default call site behaviour is unchanged");
+    });
+  });
+
+  void describe("formatOpenPlanItemsForRoundV1 (Step 17)", () => {
+    void it("keeps the exact open item identifiers and order and skips checked/excluded branches", () => {
+      const plan = [
+        "<!-- ensemble:implementation-checklist -->",
+        "- [x] **Step 1: Already built.**",
+        "- [ ] **Step 2: First open item.** Keep this exact text.",
+        "- [ ] **Step 3: Excluded branch.** <!-- ensemble:excluded -->",
+        "- [ ] **Step 4: Next open item.**",
+      ].join("\n");
+      const result = formatOpenPlanItemsForRoundV1(plan);
+      assert.match(result, /Start with item 1/);
+      assert.match(result, /1\. \*\*Step 2: First open item\.\*\* Keep this exact text\./);
+      assert.match(result, /2\. \*\*Step 4: Next open item\.\*\*/);
+      assert.ok(result.endsWith("First item to work on: **Step 2: First open item.** Keep this exact text."));
+      assert.doesNotMatch(result, /Step 1: Already built|Step 3: Excluded branch/);
+    });
+
+    void it("retains long plan items without a prompt-side truncation", () => {
+      const item = `**Step 19: ${"acceptance detail ".repeat(80)}**`;
+      const plan = `<!-- ensemble:implementation-checklist -->\n- [ ] ${item}`;
+      assert.ok(formatOpenPlanItemsForRoundV1(plan).includes(item));
+    });
+
+    void it("keeps similar item texts as separate numbered entries", () => {
+      const plan = [
+        "<!-- ensemble:implementation-checklist -->",
+        "- [ ] **Step 2: Add retries.**",
+        "- [ ] **Step 3: Add retries and preserve the retry cause.**",
+      ].join("\n");
+      const result = formatOpenPlanItemsForRoundV1(plan);
+      assert.match(result, /1\. \*\*Step 2: Add retries\.\*\*/);
+      assert.match(result, /2\. \*\*Step 3: Add retries and preserve the retry cause\.\*\*/);
+      assert.match(result, /Do not invent, renumber, combine, paraphrase/);
+    });
+
+    void it("reopens checked test-dependent items as provisional and keeps plan order", () => {
+      const plan = [
+        "<!-- ensemble:implementation-checklist -->",
+        "- [x] **Step 1: Add regression tests.** Preserve this exact text.",
+        "- [x] **Step 2: Update documentation.**",
+        "- [ ] **Step 3: Add failure cases.**",
+        "- [x] **Step 4: Excluded tests.** <!-- ensemble:excluded -->",
+      ].join("\n");
+      const result = formatOpenPlanItemsForRoundV1(plan);
+      assert.match(result, /checked item marked PROVISIONAL is not verified/);
+      assert.match(result, /1\. \[PROVISIONAL — evidence missing\] \*\*Step 1: Add regression tests\./);
+      assert.match(result, /2\. \*\*Step 3: Add failure cases\./);
+      assert.doesNotMatch(result, /Step 2: Update documentation|Step 4: Excluded tests/);
+      assert.ok(result.endsWith("First item to work on: **Step 1: Add regression tests.** Preserve this exact text."));
+    });
+
+    void it("accepts a checked test item only with an item claim and a passing post-edit report", () => {
+      const item = "**Step 1: Add regression tests.**";
+      const plan = `<!-- ensemble:implementation-checklist -->\n- [x] ${item}`;
+      const validReport = [
+        "## Files Changed",
+        "- src/test/publishChecksCancellationV1.test.ts",
+        "## Plan Item Checklist",
+        `- ${item} — done — test: publishChecksCancellationV1.test.ts`,
+        "## Verification",
+        "- `pnpm test -- publishChecksCancellationV1.test.ts` — 4 passed, 0 failed; post-edit source state: working tree after this round.",
+      ].join("\n");
+      assert.equal(hasApplicablePassingTestReportForItemV1(plan, item, validReport), true);
+      assert.equal(listProvisionalTestDependentChecklistItemsV1(plan, validReport).length, 0);
+      assert.doesNotMatch(formatOpenPlanItemsForRoundV1(plan, validReport), /PROVISIONAL/);
+    });
+
+    void it("associates the claimed test with its command and allows source-state evidence on a separate line", () => {
+      const item = "**Step 1: Add regression tests.**";
+      const plan = `<!-- ensemble:implementation-checklist -->\n- [x] ${item}`;
+      const report = [
+        "## Files Changed",
+        "- src/test/required.test.ts",
+        "## Plan Item Checklist",
+        `- ${item} — done — test: required.test.ts`,
+        "## Verification",
+        "- `pnpm test -- required.test.ts` — 4 passed, 0 failed.",
+        "- Post-edit source state: current working tree after this round.",
+      ].join("\n");
+      assert.equal(hasApplicablePassingTestReportForItemV1(plan, item, report), true);
+    });
+
+    void it("does not borrow an unrelated command's passing result from nearby prose", () => {
+      const item = "**Step 1: Add regression tests.**";
+      const plan = `<!-- ensemble:implementation-checklist -->\n- [x] ${item}`;
+      const report = [
+        "## Files Changed",
+        "- src/test/required.test.ts",
+        "## Plan Item Checklist",
+        `- ${item} — done — test: required.test.ts`,
+        "## Verification",
+        "- `pnpm test -- unrelated.test.ts` — 4 passed, 0 failed.",
+        "- required.test.ts was not run; post-edit source state: current working tree.",
+      ].join("\n");
+      assert.equal(hasApplicablePassingTestReportForItemV1(plan, item, report), false);
+    });
+
+    void it("keeps checked test items provisional when counts, pass status, item linkage, or source state are missing", () => {
+      const item = "**Step 1: Add regression tests.**";
+      const plan = `<!-- ensemble:implementation-checklist -->\n- [x] ${item}`;
+      const report = (verification: string, claimEvidence = "test: publishChecksCancellationV1.test.ts") => [
+        "## Files Changed",
+        "- src/test/publishChecksCancellationV1.test.ts",
+        "## Plan Item Checklist",
+        `- ${item} — done — ${claimEvidence}`,
+        "## Verification",
+        `- ${verification}`,
+      ].join("\n");
+      for (const candidate of [
+        report("`pnpm test` — 4 passed, 1 failed; post-edit source state: current tree."),
+        report("`pnpm test` — 4 passed, 0 failed; source state: current tree."),
+        report("`pnpm test` — 4 passed, 0 failed; post-edit source state: current tree.", "file: src/test/foo.test.ts"),
+        "## Files Changed\n- src/test/publishChecksCancellationV1.test.ts\n## Plan Item Checklist\n- " + item + " — done — test: unrelated.test.ts\n## Verification\n- `pnpm test -- publishChecksCancellationV1.test.ts` — 4 passed, 0 failed; post-edit source state: current tree.",
+      ]) {
+        assert.equal(hasApplicablePassingTestReportForItemV1(plan, item, candidate), false);
+        assert.deepEqual(listProvisionalTestDependentChecklistItemsV1(plan, candidate), [item]);
+      }
+    });
+
+    void it("does not merge a test-dependent claim without a qualified editing-round report", () => {
+      const item = "**Step 1: Add regression tests.**";
+      const plan = `<!-- ensemble:implementation-checklist -->\n- [ ] ${item}`;
+      const summary = `## Files Changed\n- src/test/publishChecksCancellationV1.test.ts\n## Plan Item Checklist\n- ${item} — done — test: publishChecksCancellationV1.test.ts\n## Verification\n- Not run.`;
+      const result = mergeChecklistProgressV1(plan, summary);
+      assert.deepEqual(result, { kind: "unverified-test-evidence", unverifiedSample: [item], unverifiedAll: [item] });
+    });
+
+    void it("names the empty state without creating a replacement list", () => {
+      assert.equal(formatOpenPlanItemsForRoundV1("# No checklist"), "The plan of record has no unchecked, non-excluded top-level checklist items.");
+    });
+  });
+
+  void describe("implementation report correction prompt (Step 18)", () => {
+    void it("binds the one report-only correction to the canonical plan and original evidence", () => {
+      const prompt = buildImplementationReportCorrectionPromptV1({
+        planPath: "/tasks/task-a/plan-final.md",
+        planOfRecord: "- [ ] **Step 1: Keep this item verbatim.**",
+        originalReport: "Ran `pnpm test` — 2 passed, 0 failed.",
+        changedPaths: ["src/a.ts"],
+      });
+      assert.match(prompt, /report correction only/i);
+      assert.match(prompt, /no project edits or test execution/i);
+      assert.match(prompt, /\/tasks\/task-a\/plan-final\.md/);
+      assert.match(prompt, /Step 1: Keep this item verbatim/);
+      assert.match(prompt, /2 passed, 0 failed/);
+      assert.match(prompt, /src\/a\.ts/);
+    });
+
+    void it("allows a correction to reorganize existing test evidence but rejects invented runs", () => {
+      const original = "Ran `pnpm test -- focused.test.ts` — 3 passed, 0 failed after edits.";
+      assert.equal(
+        isImplementationReportCorrectionEvidenceGroundedV1(
+          original,
+          "## Verification\n- `pnpm test -- focused.test.ts` — 3 passed, 0 failed; post-edit source state: this round."
+        ),
+        true
+      );
+      assert.equal(
+        isImplementationReportCorrectionEvidenceGroundedV1(
+          original,
+          "## Verification\n- `pnpm test -- other.test.ts` — 3 passed, 0 failed; post-edit source state: this round."
+        ),
+        false
+      );
+      assert.equal(
+        isImplementationReportCorrectionEvidenceGroundedV1(
+          "## Verification\n- `pnpm test -- focused.test.ts` — 3 passed, 0 failed after edits.",
+          "## Verification\n- Results follow:\n- `pnpm test -- other.test.ts` — 3 passed, 0 failed."
+        ),
+        false,
+        "evidence later in Verification must not escape validation"
+      );
+      assert.equal(
+        isImplementationReportCorrectionEvidenceGroundedV1(
+          "## Verification\n- `pnpm test -- focused.test.ts` — 3 passed, 0 failed after edits.",
+          "## Verification\n- `pnpm test -- focused.test.ts` — 4 passed, 0 failed."
+        ),
+        false,
+        "the command and its exact result counts must remain associated"
+      );
+    });
+
+    void it("counts plain done claims so correction accounting matches mergeable reports", () => {
+      const claims = collectPlainDoneChecklistCountsV1([
+        "## Plan Item Checklist",
+        "- **Step 1: Preserve this item.** — done — src/a.ts:4",
+        "- **Step 2: Not completed.** — deferred — reason",
+        "## Remaining Blockers",
+        "- **Step 3: Outside the checklist section.** — done — src/b.ts:2",
+      ].join("\n"));
+      assert.deepEqual([...claims], [["**step 1: preserve this item.**", 1]]);
+      const accounting = accountImplementationReportCorrectionClaimsV1(
+        "<!-- ensemble:implementation-checklist -->\n- [ ] **Step 1: Preserve this item.**\n- [ ] **Step 2: Another item.**",
+        "## Plan Item Checklist\n- **Step 1: Preserve this item.** — done — src/a.ts:4\n- **Step 99: Invented claim.** — done — src/z.ts:1",
+        "<!-- ensemble:implementation-checklist -->\n- [x] **Step 1: Preserve this item.**\n- [ ] **Step 2: Another item.**"
+      );
+      assert.deepEqual(accounting, { claimed: 2, matched: 1, unmatched: 1, newlyRecorded: 1 });
+    });
+  });
+
+  void describe("plan item claim provenance support (Step 19)", () => {
+    void it("finds only newly checked non-excluded items and preserves duplicate text counts", () => {
+      const before = "<!-- ensemble:implementation-checklist -->\n- [x] A\n- [ ] A\n- [ ] B <!-- ensemble:excluded -->";
+      const after = "<!-- ensemble:implementation-checklist -->\n- [x] A\n- [x] A\n- [x] B <!-- ensemble:excluded -->";
+      assert.deepEqual(listNewlyCheckedChecklistItemsV1(before, after), ["A"]);
     });
   });
 

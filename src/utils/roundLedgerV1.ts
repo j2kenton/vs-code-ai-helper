@@ -239,6 +239,8 @@
  * path's rows.
  */
 import * as vscode from "vscode";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import {
   ImplementationDispatchModeV1,
   RoundLedgerEntryV1,
@@ -255,6 +257,33 @@ import { appendRoundOutcome, handBackToHumanAfterCompletedRoundV1, pauseTaskWith
 import { appendChatMessageV1 } from "./chatHistoryStore";
 import { stepOutcomeNameV1 } from "./stepLabelsV1";
 import { completedRoundAttributionV1 } from "./completedRoundAttributionV1";
+import {
+  captureForeignTaskArtifactSnapshotV1,
+  containForeignTaskArtifactChangesV1,
+  detectForeignTaskArtifactChangesV1,
+  type ForeignTaskArtifactSnapshotV1,
+} from "./foreignTaskArtifactContainmentV1";
+
+const roundArtifactSnapshotsV1 = new Map<string, ForeignTaskArtifactSnapshotV1>();
+
+function roundArtifactSnapshotKeyV1(taskFolderPath: string, roundIdentity: string): string {
+  return `${path.resolve(taskFolderPath)}\0${roundIdentity}`;
+}
+
+/** Capture the neighboring task artifacts before a round dispatch. */
+export async function captureRoundArtifactSnapshotV1(
+  taskFolderUri: vscode.Uri,
+  identities: readonly string[]
+): Promise<void> {
+  try {
+    const snapshot = await captureForeignTaskArtifactSnapshotV1(taskFolderUri.fsPath);
+    for (const identity of identities) {
+      roundArtifactSnapshotsV1.set(roundArtifactSnapshotKeyV1(taskFolderUri.fsPath, identity), snapshot);
+    }
+  } catch (error) {
+    console.warn("captureRoundArtifactSnapshotV1: could not snapshot neighboring task artifacts", error);
+  }
+}
 
 /** `RoundLedgerEntryV1.state` values `terminalizeRoundV1` may set — every
  * value except the two live states. */
@@ -568,7 +597,7 @@ export function formatRoundOutcomeMessageV1(
       `model ${attribution.providerLabel ? `${attribution.providerLabel} (${attribution.modelId})` : attribution.providerId ? `${attribution.providerId} (${attribution.modelId})` : attribution.modelId}`
     );
   }
-  if (chatAttributionNote) parts.push(chatAttributionNote.slice(0, 300));
+  if (chatAttributionNote) parts.push(chatAttributionNote.slice(0, 4000));
   if (outcome?.runLogPath) {
     parts.push(outcome.runLogPath);
   }
@@ -754,6 +783,63 @@ export async function terminalizeRoundV1(
   }
 
   const entry = finalEntry as RoundLedgerEntryV1;
+  let foreignArtifactNote = "";
+  const artifactSnapshot = [entry.roundId, ...entry.attemptIds]
+    .map((identity) => roundArtifactSnapshotsV1.get(roundArtifactSnapshotKeyV1(options.taskFolderUri.fsPath, identity)))
+    .find((snapshot) => snapshot !== undefined);
+  for (const identity of [entry.roundId, ...entry.attemptIds]) {
+    roundArtifactSnapshotsV1.delete(roundArtifactSnapshotKeyV1(options.taskFolderUri.fsPath, identity));
+  }
+  if (artifactSnapshot) {
+    try {
+      const changes = await detectForeignTaskArtifactChangesV1(artifactSnapshot);
+      if (changes.length > 0) {
+        const currentTaskFolderPath = path.resolve(options.taskFolderUri.fsPath);
+        const foreignFolders = new Set(changes.map((change) => change.foreignFolderPath));
+        const currentPlan = await fs.promises.readFile(path.join(currentTaskFolderPath, "plan-final.md"), "utf8").catch(() => "");
+        const planItems = new Set(
+          currentPlan.split(/\r?\n/)
+            .filter((line) => /^\s*-\s*\[[ xX]\]\s+/.test(line))
+            .map((line) => line.replace(/^\s*-\s*\[[ xX]\]\s+/, "").replace(/^\*\*(.*?)\*\*$/, "$1").trim())
+            .filter(Boolean)
+        );
+        const result = await containForeignTaskArtifactChangesV1(changes, currentTaskFolderPath, {
+          isConcurrentForeignUpdate: [...foreignFolders].some((folder) => {
+            try {
+              const state = JSON.parse(fs.readFileSync(path.join(folder, "task-progress.json"), "utf8")) as { status?: unknown };
+              return state.status === "active";
+            } catch {
+              return false;
+            }
+          }),
+          isTaskOwned: (artifactName, content) => {
+            // A modified artifact may contain another task's established
+            // history. Even one exact item match cannot establish ownership
+            // of that whole file, so only a newly-created, exclusively
+            // checklist-shaped round-progress file can be relocated.
+            if (artifactName !== "round-progress.md" || planItems.size === 0) return false;
+            const matchingProgressLines = content.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+            if (matchingProgressLines.length === 0) return false;
+            return matchingProgressLines.every((line) => {
+              const item = line.replace(/^\s*-\s*\[[ xX]\]\s+/, "").replace(/^\*\*(.*?)\*\*$/, "$1").trim();
+              return /^-\s*\[[ xX]\]\s+/.test(line) && item.length > 0 && planItems.has(item);
+            }) && changes.every((change) =>
+              change.artifactName !== artifactName || change.kind === "created"
+            );
+          },
+        });
+        foreignArtifactNote = result.chatNotices.length > 0
+          ? [
+              "Task-artifact changes were detected under another task folder. Recovery was limited to artifacts whose ownership could be established:",
+              ...result.chatNotices,
+              ...result.actions.filter((action) => action.outcome !== "moved").map((action) => `${action.reason} Source: ${action.foreignPath}; destination: ${action.destPath}.`),
+            ].join("\n")
+          : "";
+      }
+    } catch (error) {
+      foreignArtifactNote = `Task-artifact comparison could not be completed after this round: ${error instanceof Error ? error.message : String(error)}.`;
+    }
+  }
   try {
     await appendChatMessageV1(
       options.taskFolderUri.fsPath,
@@ -765,7 +851,7 @@ export async function terminalizeRoundV1(
             ? patched.roundLedger?.find((candidate) => candidate.roundId === entry.continuationOf)?.startedAt
             : undefined,
           patched,
-          options.chatAttributionNote
+          [options.chatAttributionNote, foreignArtifactNote].filter(Boolean).join("\n\n") || undefined
         ),
         stage: entry.stage,
         at: entry.endedAt ?? new Date().toISOString(),
@@ -1128,6 +1214,7 @@ export async function claimImplementationRoundLedgerV1(
     finalRoundId = openRow.roundId;
     return upsertRoundLedgerEntryV1(current, openRow);
   });
+  await captureRoundArtifactSnapshotV1(folderUri, [candidateRoundId, finalRoundId]);
   return { roundId: finalRoundId };
 }
 

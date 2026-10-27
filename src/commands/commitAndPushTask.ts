@@ -74,6 +74,7 @@ import {
   trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
+import { describeResumeNotSettledV1 } from "../utils/storedAnswerResumeV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import {
   reconcileWatchdogPauseAgainstAdmissionV1,
@@ -727,7 +728,7 @@ async function resumeCommitMessage(
       : undefined;
 
   if (settlement === undefined) {
-    onSettled({ ok: false, reason: "Resume failed to settle the interaction" });
+    onSettled({ ok: false, reason: `Resume did not settle the interaction: ${describeResumeNotSettledV1(outcome)}` });
     return outcome.kind === "questions"
       ? { kind: "questionsPosted", interactionId: outcome.interactionId, correlation: outcome.correlation }
       : { kind: "message", text: fallback };

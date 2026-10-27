@@ -33,7 +33,9 @@ Read the final plan below and produce an implementation checklist in Markdown:
 - End with a "Verification" section listing how to confirm the work is done (behaviours to check; test runs appear only as "Verified by Publish Checks:" items or manual hand-off items). Evidence for a manual-verification item (a run log line, a file/line, a query result) is written below its guidance once it exists, never instead of the five elements above.
 - Items under "Behaviour to confirm" describe what a person can observe (a screen, a message, a file's contents). They never contain a claim that a test, build, lint or type-check was run or passed; those claims belong only to "Verified by Publish Checks:" items. A "Behaviour to confirm" item must be checkable by reading the code. Any part that needs a test, lint, type-check or build run goes into the excluded "Verified by Publish Checks:" item, or into an excluded owner step when Publish Checks do not cover it, never into a behaviour item.
 
-Do not add work the plan does not call for. Do not create, write, or edit any file yourself — output ONLY the complete checklist document as your response text; it replaces the current plan-final.md content in place.
+Do not add work the plan does not call for. Do not create, write, or edit any file yourself — output ONLY the complete checklist document as your response text; Ensemble replaces the authoritative plan-of-record file at {{planFinalPath}} in place.
+
+{{taskArtifactGuidance}}
 
 ## Context Pack
 

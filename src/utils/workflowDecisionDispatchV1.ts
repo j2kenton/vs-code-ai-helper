@@ -196,6 +196,14 @@ export type PostWorkflowDecisionInputV1 = Omit<CreateWorkflowDecisionInputV1, "d
    */
   readonly decisionId?: string;
   readonly suppressNotification?: boolean;
+  /**
+   * For a standing condition that is re-posted while it persists (a refused
+   * scheduled action retrying with back-off, bugs2 finding 13): when a pending
+   * decision with the same key already exists it is refreshed in place and
+   * NOTHING new is announced — no second chat anchor, no second notification.
+   * The first post still announces itself normally.
+   */
+  readonly quietRepost?: boolean;
 };
 
 /**
@@ -247,6 +255,11 @@ export async function postWorkflowDecisionV1(
     // card, no chat anchor, no announcing notification. The earlier resolved
     // record is returned so the caller still sees "a decision exists" rather
     // than the no-extension-context `undefined`.
+    return result.decision;
+  }
+  if (input.quietRepost === true && result.updatedInPlace === true) {
+    // The standing card was refreshed where it already sits (same decision id,
+    // so its existing chat anchor still points at it): announce nothing again.
     return result.decision;
   }
   // The card itself lives in workspaceState, while the transcript is a
