@@ -50,6 +50,7 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vm from "node:vm";
 import * as vscode from "vscode";
+import { configureEnsembleHostRoleForTestV1 } from "../state/hostRoleV1";
 
 import {
   ChatInteractionServiceResultV1,
@@ -60,6 +61,7 @@ import {
 } from "../views/chatView";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { TASK_PROGRESS_FILENAME, TaskProgress } from "../types/taskProgress";
+import { acquireWorkAdmissionV1 } from "../state/workAdmissionV1";
 import { taskOperations } from "../utils/taskOperations";
 import {
   applyReviewerVerifiedTicksConfirmedV1,
@@ -1196,6 +1198,102 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
   });
 
   /**
+   * bugs3 Step 12: a decision-dispatched action holds the task (admission claim) before it
+   * registers an operation. The chat says it started preparing, and when the claim is
+   * released with no operation ever registered (a preflight refusal) it closes that line,
+   * instead of leaving a Started line with no outcome.
+   */
+  void it("closes a 'preparing' line with an Ended line when the dispatched action releases the task without ever running a command", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const commandsObj = vscode.commands as unknown as {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const originalCommand = commandsObj._executeCommandOverride;
+    commandsObj._executeCommandOverride = async () => {
+      const held = await acquireWorkAdmissionV1({ taskFolderPath: folder, purpose: "admission", commandId: "runPublishChecks" });
+      assert.equal(held.outcome, "acquired");
+      // Longer than the announcer's poll interval, so the claim-only state is observed.
+      await new Promise((resolve) => setTimeout(resolve, 2600));
+      if (held.outcome === "acquired") {
+        await held.handle.release();
+      }
+      return undefined;
+    };
+    try {
+      await provider.workflowDecisionStore.post(decisionInput(folder));
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
+      let texts: string[] = [];
+      for (let retry = 0; retry < 40; retry++) {
+        texts = (await readChatHistory(folder)).map((entry) => entry.text);
+        if (texts.some((text) => text.startsWith("Ended — the action released the task"))) break;
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const started = texts.findIndex((text) => text.startsWith("Started — the action holds this task and is preparing"));
+      const ended = texts.findIndex((text) => text.startsWith("Ended — the action released the task before any command started"));
+      assert.ok(started >= 0, "the preparing line is said once the claim is observed");
+      assert.ok(ended > started, "and closed by an Ended line after it");
+      assert.equal(texts.filter((text) => text.startsWith("Started — the action holds this task")).length, 1);
+    } finally {
+      commandsObj._executeCommandOverride = originalCommand;
+      notify.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("does not add its own Ended line when the dispatched action registers an operation, which the operation mirror closes", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const commandsObj = vscode.commands as unknown as {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const originalCommand = commandsObj._executeCommandOverride;
+    commandsObj._executeCommandOverride = async () => {
+      const held = await acquireWorkAdmissionV1({ taskFolderPath: folder, purpose: "admission", commandId: "runPublishChecks" });
+      assert.equal(held.outcome, "acquired");
+      await new Promise((resolve) => setTimeout(resolve, 2600));
+      const operation = taskOperations.begin(folder, { label: "Publish Checks", stage: "publish", taskName: "mirror", exclusive: false });
+      assert.ok(operation);
+      operation.reportActivity("test");
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      taskOperations.end(operation, "succeeded");
+      if (held.outcome === "acquired") {
+        await held.handle.release();
+      }
+      return undefined;
+    };
+    try {
+      await provider.workflowDecisionStore.post(decisionInput(folder));
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
+      let texts: string[] = [];
+      for (let retry = 0; retry < 60 && !texts.some((text) => text.includes("Ended Publish Checks")); retry++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        texts = (await readChatHistory(folder)).map((entry) => entry.text);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2300));
+      texts = (await readChatHistory(folder)).map((entry) => entry.text);
+      assert.ok(texts.some((text) => text.includes("Ended Publish Checks — succeeded")));
+      assert.ok(!texts.some((text) => text.startsWith("Ended — the action released the task")), "an action that ran is not reported as never started");
+    } finally {
+      commandsObj._executeCommandOverride = originalCommand;
+      notify.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  /**
    * Review-flagged (2026-08-23): `goToReviewAndApplyV1` reports a failed
    * multi-step sequence by resolving `false` rather than throwing
    * (`setTaskStage` already reports its own failure by notification and
@@ -1525,6 +1623,73 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       assert.ok(ack, "expected a transcript entry acknowledging the resolved decision");
       assert.match(ack.text, /does nothing further/i);
       assert.doesNotMatch(ack.text, /did not complete/i);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("refuses an answer to a missing question without saving or dispatching it", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForStateMessage(fake);
+      cmds.calls.length = 0;
+      await provider.answerQuestion(target, "missing-question", "must not be saved", "impl");
+      const messages = await readChatHistory(folder);
+      assert.equal(messages.some((message) => message.text === "must not be saved"), false);
+      assert.equal(cmds.calls.length, 0);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("a viewer refuses an answer to a command-bound question: the waiter lives in the runner, so nothing would act on it (bugs3 Step 8)", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      const target: ChatTarget = { canonicalId: folder, taskFolderPath: folder, stage: "impl" };
+      await provider.open(target);
+      await waitForStateMessage(fake);
+      // Asked by some other activation (the runner), so no waiter is registered in this process.
+      await provider.ask(
+        { ...target, question: "Which folder?\n<!-- ensemble:chat-answer:abc123 -->\n<!-- ensemble:chat-owner:11111111-1111-1111-1111-111111111111 -->" },
+        true,
+        false
+      );
+      const asked = (await readChatHistory(folder)).find((entry) => entry.role === "question");
+      assert.ok(asked);
+      const key = asked.id ?? asked.at;
+      cmds.calls.length = 0;
+      configureEnsembleHostRoleForTestV1("viewer");
+      try {
+        await provider.answerQuestion(target, key, "an answer nothing can receive", "impl");
+      } finally {
+        configureEnsembleHostRoleForTestV1(undefined);
+      }
+      const after = await readChatHistory(folder);
+      assert.equal(after.some((message) => message.text === "an answer nothing can receive"), false, "the answer is not saved");
+      assert.equal(cmds.calls.length, 0);
+      assert.ok(
+        notify.entries.some((entry) => /runner window/i.test(entry.message)),
+        "the viewer says to answer in the runner window"
+      );
+      // The same answer in the runner (or standalone) host still goes through the ordinary path.
     } finally {
       notify.restore();
       cmds.restore();
@@ -2272,12 +2437,56 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
     }
   });
 
+  void it("an answer submitted with no runner connected is refused in the transcript, never saved", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.askInteraction(
+        {
+          canonicalId: folder,
+          taskFolderPath: folder,
+          stage: "impl",
+          interactionId: "1".repeat(32),
+          operationId: "2".repeat(32),
+          actionKey: "generatePlan.v1",
+          sourceAttemptId: "c".repeat(32),
+          questions: QUESTIONS,
+          binding: { taskBindingId: bindingIdForOwnedFolder(folder), chatDocumentId: "chat-document-id" },
+        },
+        true,
+        false
+      );
+      await fake.send({
+        type: "submitInteractionAnswers",
+        operationId: "2".repeat(32),
+        interactionId: "1".repeat(32),
+        answers: VALID_ANSWERS,
+      });
+      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      assert.ok(entries.some((e) => e.role === "assistant" && /operation is unavailable/.test(e.text)));
+      assert.ok(!entries.some((e) => /Recorded: your answer was submitted/.test(e.text)));
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
   void it("an answer-only submission (not confirmInteraction) is acknowledged in the transcript", async () => {
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
     const fake = makeFakeWebviewView();
     const notify = installNotificationRouterCapture();
     const cmds = installExecuteCommandCapture();
+    provider.setInteractionServices({
+      submitAnswers: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+      cancel: (): Promise<ChatInteractionServiceResultV1> => Promise.resolve({ ok: true }),
+    });
     try {
       provider.resolveWebviewView(fake.view);
       await provider.askInteraction(

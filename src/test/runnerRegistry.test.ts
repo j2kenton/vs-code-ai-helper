@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
   backupModelsForStage,
@@ -20,7 +20,10 @@ import {
   resolveModelForStage,
 } from "../utils/modelSelection";
 import { __quotaTestOnly, isAuthenticationFailure, recordQuotaObservation } from "../utils/quota";
-import { resetCliCommandLookupCacheForTest } from "../runners/cliAgentRunner";
+import {
+  resetCliCommandLookupCacheForTest,
+  setClineEditableBarrierVerifiedForTestsV1,
+} from "../runners/cliAgentRunner";
 import {
   LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0,
   LegacyAiActionSafetyGateErrorV0,
@@ -1474,6 +1477,19 @@ void describe("resolveRunnerForModel", () => {
 });
 
 void describe("runImplementationForModel", () => {
+  // These tests drive Cline as a stand-in CLI through the failure/backup paths.
+  // The production gate refuses editable Cline launches while the pre-edit
+  // receipt barrier is unverified (bugs3 Step 17), so the barrier is treated as
+  // verified here; the gate itself is covered in clinePromptReceiptV1.test.ts.
+  let restoreClineBarrier: (() => void) | undefined;
+  beforeEach(() => {
+    restoreClineBarrier = setClineEditableBarrierVerifiedForTestsV1(true);
+  });
+  afterEach(() => {
+    restoreClineBarrier?.();
+    restoreClineBarrier = undefined;
+  });
+
   // wf10 item 3 / Part 5 step 13: a Copilot-resolved backup (here the bare
   // legacy id "auto") must NEVER be selected by this automatic availability
   // walk — Copilot implementation runs go through the sealed two-phase

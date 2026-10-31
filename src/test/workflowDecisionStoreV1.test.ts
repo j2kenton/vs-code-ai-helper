@@ -69,6 +69,48 @@ function decisionInput(overrides: Partial<CreateWorkflowDecisionInputV1> = {}): 
 }
 
 void describe("WorkflowDecisionStoreV1", () => {
+  void it("serializes dismissal and answer across store instances sharing a delayed Memento", async () => {
+    class DelayedMemento extends FakeMemento {
+      override async update(key: string, value: unknown): Promise<void> {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        await super.update(key, value);
+      }
+    }
+    const state = new DelayedMemento() as unknown as import("vscode").Memento;
+    const first = new WorkflowDecisionStoreV1(state);
+    const second = new WorkflowDecisionStoreV1(state);
+    const posted = await first.post(decisionInput());
+    assert.equal(posted.ok, true);
+    if (!posted.ok) return;
+    const [dismissed, answered] = await Promise.all([
+      first.dismiss(posted.decision.decisionId, "owner"),
+      second.resolve(posted.decision.decisionId, "doIt"),
+    ]);
+    assert.equal(dismissed.kind, "dismissed");
+    assert.equal(answered.kind, "alreadySettled");
+    const stored = second.get(posted.decision.decisionId);
+    assert.equal(stored?.state, "dismissed");
+    assert.equal(stored?.dismissedBy, "owner");
+    assert.ok(stored?.dismissedAt);
+  });
+
+  void it("does not lose concurrent posts from different store instances", async () => {
+    class DelayedMemento extends FakeMemento {
+      override async update(key: string, value: unknown): Promise<void> {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        await super.update(key, value);
+      }
+    }
+    const state = new DelayedMemento() as unknown as import("vscode").Memento;
+    const first = new WorkflowDecisionStoreV1(state);
+    const second = new WorkflowDecisionStoreV1(state);
+    await Promise.all([
+      first.post(decisionInput({ decisionKey: "first" })),
+      second.post(decisionInput({ decisionKey: "second" })),
+    ]);
+    assert.equal(first.listPending().length, 2);
+  });
+
   void it("posts a valid decision and lists it as pending", async () => {
     const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
     const posted = await store.post(decisionInput());

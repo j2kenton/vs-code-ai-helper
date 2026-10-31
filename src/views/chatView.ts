@@ -16,6 +16,8 @@ import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGa
 import {
   appendChatInteraction,
   appendChatMessageV1,
+  appendChatAnswerToPendingQuestionV1,
+  AppendChatAnswerResultV1,
   CHAT_HISTORY_FILENAME,
   ChatDocumentInteractionV1,
   ChatHistoryRecoveryErrorV1,
@@ -32,7 +34,7 @@ import {
   resolveOrPrepareChatDocumentIdentityV1,
   settleChatInteraction,
 } from "../utils/chatHistoryStore";
-import { applyOpenPlanItemsFormSubmissionV1 } from "../commands/decideOpenPlanItemsV1";
+import { applyOpenPlanItemsFormSubmissionV1, dismissOpenPlanItemsFormV1 } from "../commands/decideOpenPlanItemsV1";
 import { stripAttributionHeaders } from "../utils/fileUtils";
 import { writeRunLog } from "../utils/runLog";
 import { formatDisplayTimestampPairV1, formatTimestampForDisplay } from "../utils/timeFormat";
@@ -41,7 +43,7 @@ import {
   OWNER_EVIDENCE_ANSWER_MARKER_V1,
   OwnerEvidenceSubmissionErrorV1,
 } from "../utils/ownerEvidenceV1";
-import { settleChatFreeTextQuestionV1 } from "../utils/chatFreeTextV1";
+import { isChatFreeTextQuestionV1, settleChatFreeTextQuestionV1 } from "../utils/chatFreeTextV1";
 import { describeResumeFailureWithStoredAnswerV1 } from "../utils/storedAnswerResumeV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
@@ -59,10 +61,13 @@ import {
   isWorkflowDecisionCommandResultV1,
 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { OperationEndedLineTrackerV1 } from "../utils/operationEndedLineV1";
+import { releaseOperationTerminalLineV1 } from "../utils/terminalLineEmitterV1";
+import { liveOperationBlockingOptionV1 } from "../commands/fastForwardResumeSuffixV1";
+import { describeLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
 import {
   acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
-  describeWorkAdmissionRefusalV1,
   hasLiveWorkAdmissionBestEffortV1,
   revokeWorkAdmissionHandoffV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
@@ -72,10 +77,20 @@ import {
   trySafeAdmissionReleaseV1,
   recordAdmissionReleaseTriggerV1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { offerBusyRefusalChoicesInChatV1 } from "../utils/busyRefusalChoicesV1";
 import { createAdmissionHeldNotifierV1 } from "../commands/releaseStuckAdmissionMarkers";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
+import {
+  currentActorNameV1,
+  describeCardDismissalV1,
+  describeQuestionSettlementV1,
+  describeSettledDecisionRefusalV1,
+  dismissPendingQuestionV1,
+  retireQuestionIfWaiterGoneV1,
+} from "../utils/cardLifecycleV1";
 import {
   readEffectivePlanChecklistProgressForDisplayV1,
   readEffectivePlanChecklistProgressV1,
@@ -114,6 +129,16 @@ export interface ChatInteractionRefV1 {
   readonly taskBindingId: string;
   readonly chatDocumentId: string;
   readonly sourceAttemptId: string;
+}
+
+/** How often a dispatched action's "still preparing" state is checked. */
+const STARTUP_ANNOUNCER_POLL_MS_V1 = 2_000;
+
+/** Reports a decision-dispatched action that holds the task before it has registered an operation. */
+interface StartupAnnouncerV1 {
+  start(): void;
+  tick(): void;
+  stop(): void;
 }
 
 /** The bare client-supplied selector a webview interaction message carries — see `resolveInteractionRef`. */
@@ -295,6 +320,26 @@ function isAnswerQuestionMessage(value: unknown): value is AnswerQuestionMessage
     typeof v.text === "string"
   );
 }
+
+/** Dismiss one pending question card (bugs3 Step 8); records the dismissal, runs nothing. */
+interface DismissQuestionMessage {
+  type: "dismissQuestion";
+  questionAt: string;
+}
+
+function isDismissQuestionMessage(value: unknown): value is DismissQuestionMessage {
+  if (!value || typeof value !== "object") return false;
+  const v = value as Record<string, unknown>;
+  return v.type === "dismissQuestion" && typeof v.questionAt === "string" && v.questionAt.length > 0;
+}
+
+/**
+ * The option id a decision card's Dismiss button resolves with. It is not one
+ * of the card's own options: `resolveWorkflowDecision` recognises it before
+ * any option lookup, so it relays to the runner like any other answer and
+ * dispatches nothing.
+ */
+export const DISMISS_DECISION_OPTION_ID_V1 = "__dismiss__";
 
 interface InteractionActionMessage {
   /**
@@ -1073,6 +1118,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         return;
       }
+      if (isDismissQuestionMessage(message)) {
+        if (this.target) {
+          await this.dismissQuestionCard(this.target, message.questionAt, this.target.stage);
+        }
+        return;
+      }
+      if (message && typeof message === "object" && (message as { type?: unknown }).type === "dismissOpenPlanItemsForm" && typeof (message as { formId?: unknown }).formId === "string") {
+        await this.dismissOpenPlanItemsForm((message as { formId: string }).formId);
+        return;
+      }
       if (isSubmitOpenPlanItemsFormMessage(message)) {
         await this.submitOpenPlanItemsForm(message.formId, message.answers);
         return;
@@ -1453,7 +1508,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
      * with this id, and a later "Resume and send" finds it by id instead of
      * writing the same text twice.
      */
-    messageId?: string
+    messageId?: string,
+    /**
+     * Marks this message as the terminal "Ended …" line of a tracked operation
+     * (bugs3 Step 3), so reconciliation can recognise it after a reload.
+     */
+    endedOperationId?: string
   ): Promise<void> {
     if (!identity) return;
     const message: ChatMessage = {
@@ -1462,6 +1522,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       stage,
       at: new Date().toISOString(),
       pending,
+      ...(endedOperationId !== undefined ? { endedOperationId } : {}),
       // A question gets a stable id at creation so a reply can bind to THIS
       // question even if another one shares the same millisecond `at` (see
       // `ChatMessage.id`) — every other role has no reply channel to bind.
@@ -1472,7 +1533,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           : {}),
     };
     const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
-    await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
+    const saved = await this.runQueued(identity.taskFolderPath, () => this.persistAppend(identity, message));
+    if (!saved && endedOperationId !== undefined) {
+      // The observer claimed this operation's terminal line before the save;
+      // give the claim back so the round ledger can still post it once
+      // storage recovers (bugs3 Step 3).
+      releaseOperationTerminalLineV1(endedOperationId);
+    }
 
     if (sameIdentity(this.target, identity)) {
       await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
@@ -1497,6 +1564,95 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * interaction (see `LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`), not this
    * method, so there is no option/effect lookup here to race.
    */
+  /**
+   * Dismiss ONE pending question card (bugs3 Step 8): record who and when,
+   * dispatch nothing and write nothing to `task.md`. When the task is paused
+   * on the card, the transcript line names what will move it instead.
+   */
+  async dismissQuestionCard(identity: ChatIdentity | undefined, questionKey: string, stage: TaskStage): Promise<void> {
+    if (!identity) return;
+    const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
+    const taskLabel = formatNotificationTaskLabelV1(
+      await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+      identity.taskFolderPath
+    );
+    let closed: ChatMessage | undefined;
+    try {
+      closed = await dismissPendingQuestionV1(
+        identity.taskFolderPath,
+        identity.canonicalId,
+        questionKey,
+        currentActorNameV1()
+      );
+    } catch (error) {
+      NotificationRouter.showWarning(
+        `${taskLabel} — Could not dismiss the question (${error instanceof Error ? error.message : String(error)}). It is still open.`
+      );
+      return;
+    }
+    if (!closed) {
+      NotificationRouter.showInformation(`${taskLabel} — That question is no longer open, so there is nothing to dismiss.`);
+    } else {
+      const read = await readTaskProgressStrictV1(vscode.Uri.file(identity.taskFolderPath)).catch(() => undefined);
+      const status = read && read.ok ? read.decoded.progress.status : undefined;
+      await this.append(
+        "assistant",
+        describeCardDismissalV1("the question", {
+          holdsTask: status === "paused",
+          ...(status !== undefined ? { taskStatus: status } : {}),
+          stage,
+        }),
+        stage,
+        identity
+      );
+    }
+    if (sameIdentity(this.target, identity)) {
+      await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
+    }
+  }
+
+  /**
+   * Dismiss a pending decision card on the owner's behalf (the Dismiss button).
+   * Dispatches nothing, writes nothing to `task.md`, and — when the card was
+   * what a paused task waited on — says what will move the task instead.
+   */
+  private async dismissWorkflowDecisionV1(
+    decisionId: string,
+    ctx: RelayedResolutionContextV1 | undefined
+  ): Promise<RelayedResolutionOutcomeV1> {
+    const decision = this.workflowDecisionStore.get(decisionId);
+    if (!decision) {
+      const message = "This decision is no longer pending, so there is nothing to dismiss.";
+      NotificationRouter.showInformation(message);
+      return { ok: false, message };
+    }
+    if (decision.state !== "pending") {
+      const message = describeSettledDecisionRefusalV1(decision);
+      return { ok: true, message };
+    }
+    const result = await this.workflowDecisionStore.dismiss(decisionId, currentActorNameV1());
+    if (result.kind !== "dismissed") {
+      return { ok: true, message: "This decision was already closed." };
+    }
+    const read = await readTaskProgressStrictV1(vscode.Uri.file(decision.taskCanonicalId)).catch(() => undefined);
+    const status = read && read.ok ? read.decoded.progress.status : undefined;
+    const identity = this.identityForDecision(decision, ctx);
+    if (identity) {
+      await this.append(
+        "assistant",
+        describeCardDismissalV1(`"${truncateChecklistItemTextV1(decision.whatHappened, 80)}"`, {
+          holdsTask: decision.gating?.holdsTaskPaused === true && status === "paused",
+          ...(status !== undefined ? { taskStatus: status } : {}),
+          stage: decision.stage,
+        }),
+        decision.stage,
+        identity
+      );
+    }
+    await this.render();
+    return { ok: true, transitioned: false };
+  }
+
   async answerQuestion(
     identity: ChatIdentity | undefined,
     questionAt: string,
@@ -1520,6 +1676,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (alreadyAnswered) {
         return { kind: "alreadyAnswered" as const };
       }
+      // A command-bound free-text question whose waiter is gone (reload or its
+      // own timeout) would save the answer and do nothing with it: close it
+      // with the reason instead. A viewer owns no waiters (the runner does).
+      const askedQuestion = transcript.find((m) => m.role === "question" && (m.id ?? m.at) === questionAt);
+      if (askedQuestion !== undefined && isViewerHostV1() && isChatFreeTextQuestionV1(askedQuestion.text)) {
+        // The waiter behind a command-bound question lives in the runner's
+        // process; a viewer cannot see whether it is still alive, and settling
+        // it here reaches nobody. Saving the answer would look accepted and do
+        // nothing, so the viewer refuses and points at the runner window.
+        return { kind: "runnerOwned" as const };
+      }
+      if (askedQuestion !== undefined && !isViewerHostV1()) {
+        try {
+          const orphaned = await retireQuestionIfWaiterGoneV1(identity.taskFolderPath, identity.canonicalId, askedQuestion);
+          if (orphaned !== undefined) {
+            return { kind: "settled" as const, settlement: orphaned };
+          }
+        } catch {
+          // Fall through to the guarded save, which refuses if the card closed meanwhile.
+        }
+      }
       const message: ChatMessage = {
         role: "user",
         text: transcript.some((m) => m.role === "question" && (m.id ?? m.at) === questionAt && m.text.includes(OWNER_EVIDENCE_ANSWER_MARKER_V1))
@@ -1529,7 +1706,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         at: new Date().toISOString(),
         answersQuestionAt: questionAt,
       };
-      await this.persistAppend(identity, message);
+      // bugs3 Step 8: the answer is saved only if the card is still pending,
+      // in the same serialized update retirement and dismissal use, so a card
+      // closed first always refuses the answer instead of saving it.
+      let guarded: AppendChatAnswerResultV1;
+      try {
+        guarded = await appendChatAnswerToPendingQuestionV1(
+          identity.taskFolderPath,
+          identity.canonicalId,
+          questionAt,
+          message
+        );
+      } catch (error) {
+        return { kind: "saveFailed" as const, detail: error instanceof Error ? error.message : String(error) };
+      }
+      if (guarded.kind === "settled") {
+        return { kind: "settled" as const, settlement: guarded.settlement };
+      }
+      if (guarded.kind === "alreadyAnswered") {
+        return { kind: "alreadyAnswered" as const };
+      }
+      if (guarded.kind === "missing") {
+        return { kind: "missing" as const };
+      }
       const matchedQuestion = transcript.find(
         (m) => m.role === "question" && (m.id ?? m.at) === questionAt
       );
@@ -1544,6 +1743,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         ...(blockerAt >= 0 ? { ownerEvidenceBlocker: sourceQuestion!.text.slice(blockerAt + blockerMarker.length).trim() } : {}),
       };
     });
+
+    if (outcome.kind === "runnerOwned") {
+      const viewerTaskLabel = formatNotificationTaskLabelV1(
+        await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+        identity.taskFolderPath
+      );
+      NotificationRouter.showInformation(
+        `${viewerTaskLabel} — This question is waiting on an action running in the runner window, which this viewer cannot reach, so your answer was not saved. Answer it in the runner window.`
+      );
+      return;
+    }
+
+    if (outcome.kind === "settled" || outcome.kind === "saveFailed" || outcome.kind === "missing") {
+      const taskLabel = formatNotificationTaskLabelV1(
+        await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
+        identity.taskFolderPath
+      );
+      if (outcome.kind === "settled") {
+        NotificationRouter.showInformation(
+          `${taskLabel} — That question is no longer open (${outcome.settlement.reason}), so your answer was not saved.`
+        );
+      } else if (outcome.kind === "missing") {
+        NotificationRouter.showInformation(`${taskLabel} — That question is no longer available, so your answer was not saved.`);
+      } else {
+        NotificationRouter.showWarning(
+          `${taskLabel} — Could not save your answer to the chat history (${outcome.detail}). Nothing was changed; try again.`
+        );
+      }
+      if (sameIdentity(this.target, identity)) {
+        await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
+      }
+      return;
+    }
 
     if (outcome.kind === "answered" && outcome.questionText) {
       settleChatFreeTextQuestionV1(outcome.questionText, trimmed);
@@ -1731,6 +1963,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * run inside `runQueued`: applying can dispatch the stage's next action, and
    * holding the chat write queue for that would block every chat append.
    */
+  private async dismissOpenPlanItemsForm(formId: string): Promise<void> {
+    const identity = this.target;
+    if (!identity || identity.kind === "global") return;
+    const closed = await dismissOpenPlanItemsFormV1(identity.taskFolderPath, identity.canonicalId, formId, currentActorNameV1());
+    if (closed) {
+      const read = await readTaskProgressStrictV1(vscode.Uri.file(identity.taskFolderPath));
+      const status = read.ok ? read.decoded.progress.status : undefined;
+      await this.append("assistant", describeCardDismissalV1("the open plan items form", {
+        holdsTask: status === "paused", ...(status ? { taskStatus: status } : {}), stage: closed.stage,
+      }), closed.stage, identity);
+    } else {
+      NotificationRouter.showInformation("This form is no longer open; nothing was dismissed.");
+    }
+    if (sameIdentity(this.target, identity)) await this.render();
+  }
+
   private async submitOpenPlanItemsForm(formId: string, answers: unknown): Promise<void> {
     const identity = this.target;
     if (!identity || identity.kind === "global" || this.openFormsInFlightV1.has(formId)) return;
@@ -1749,6 +1997,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await this.append("assistant", `Could not apply: ${result.message} Your selections are kept.`, identity.stage, identity);
       } else if (result.kind === "applied") {
         await this.append("assistant", `Recorded: ${result.message}`, identity.stage, identity);
+      } else {
+        NotificationRouter.showInformation(`${taskLabel} — ${result.message}`);
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1822,8 +2072,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const localRecord = interactions.find(
       (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
     );
+    if (!localRecord || localRecord.state !== "unresolved") {
+      return { ok: false, message: `Could not submit answers: ${localRecord?.retirementReason ?? (localRecord?.dismissedBy ? `dismissed by ${localRecord.dismissedBy} at ${localRecord.dismissedAt}` : "this question is no longer open")}.` };
+    }
     if (localRecord?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1) {
       return this.settleLocalOnlyInteractionAnswersV1(identity, localRecord, answers);
+    }
+    if (!this.interactionServices) {
+      return { ok: false, message: "Could not submit answers: the question's operation is unavailable. Try again when the runner is connected." };
     }
     if (this.interactionServices) {
       const ref = await this.resolveInteractionRef(identity, clientRef);
@@ -1861,6 +2117,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       NotificationRouter.showWarning(
         `${taskLabel} — Could not save your answers. (${error instanceof Error ? error.message : String(error)})`
       );
+      const current = (await readChatInteractions(identity.taskFolderPath, identity.canonicalId)).find(
+        (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
+      );
+      if (current && current.state !== "unresolved") {
+        return { ok: false, message: `Could not submit answers: ${current.retirementReason ?? (current.dismissedBy ? `dismissed by ${current.dismissedBy} at ${current.dismissedAt}` : `question is ${current.state}`)}.` };
+      }
       // The transcript record failed, but the answer WAS accepted by the
       // interaction service above — so this is not a submission failure and
       // must not stop a combined Confirm from resuming. Reporting false here
@@ -1910,7 +2172,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     | { readonly ok: false; readonly message: string }
   > {
     if (record.state !== "unresolved") {
-      return { ok: true };
+      return { ok: false, message: `Could not submit answers: ${record.retirementReason ?? (record.dismissedBy ? `dismissed by ${record.dismissedBy} at ${record.dismissedAt}` : `question is ${record.state}`)}.` };
     }
     const taskLabel = formatNotificationTaskLabelV1(
       await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
@@ -1923,8 +2185,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       return { ok: false, message };
     }
     try {
-      await recordChatInteractionAnswers(identity.taskFolderPath, identity.canonicalId, record.interactionId, answers);
-      await settleChatInteraction(identity.taskFolderPath, identity.canonicalId, record.interactionId, "resumed");
+      await recordChatInteractionAnswers(identity.taskFolderPath, identity.canonicalId, record.interactionId, answers, true);
     } catch (error) {
       const message = `Could not save your answers. (${error instanceof Error ? error.message : String(error)})`;
       NotificationRouter.showWarning(`${taskLabel} — ${message}`);
@@ -1970,6 +2231,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           (i) => i.interactionId === clientRef.interactionId && i.operationId === clientRef.operationId
         );
         const isLocalOnly = record?.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1;
+        if (!record || record.state !== "unresolved") {
+          declineMessage = `Could not dismiss: ${record?.retirementReason ?? (record?.dismissedBy ? `dismissed by ${record.dismissedBy} at ${record.dismissedAt}` : "this question is no longer open")}.`;
+          return;
+        }
+        if (!isLocalOnly && !this.interactionServices) {
+          declineMessage = "Could not dismiss: the question's operation is unavailable. Try again when the runner is connected.";
+          return;
+        }
         if (this.interactionServices && !isLocalOnly) {
           const ref = await this.resolveInteractionRef(identity, clientRef);
           if (!ref) {
@@ -1988,7 +2257,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           identity.taskFolderPath,
           identity.canonicalId,
           clientRef.interactionId,
-          "cancelled"
+          "cancelled",
+          { by: currentActorNameV1(), at: new Date().toISOString() }
         );
         cancelled = true;
       } catch (error) {
@@ -1997,9 +2267,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     });
     if (cancelled) {
+      const read = await readTaskProgressStrictV1(vscode.Uri.file(identity.taskFolderPath)).catch(() => undefined);
+      const status = read && read.ok ? read.decoded.progress.status : undefined;
       await this.append(
         "assistant",
-        "Recorded: question cancelled — the action that asked it will not continue.",
+        `${describeCardDismissalV1("the question", { holdsTask: status === "paused", ...(status !== undefined ? { taskStatus: status } : {}), stage: identity.stage })} The action that asked it will not continue.`,
         identity.stage,
         identity
       );
@@ -2086,7 +2358,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const unavailableDisplayName = await resolveChatTaskDisplayNameV1(unavailableIdentity.taskFolderPath);
       const taskLabel = formatNotificationTaskLabelV1(unavailableDisplayName, unavailableIdentity.taskFolderPath);
       const declineMessage = `Could not resume: ${describeResumeFailureWithStoredAnswerV1(
-        describeWorkAdmissionRefusalV1(
+        describeWorkAdmissionRefusalForUserV1(
           admission,
           notificationTaskDisplayNameV1(unavailableDisplayName, unavailableIdentity.taskFolderPath)
         )
@@ -2094,6 +2366,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
       const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
       await this.append("assistant", declineMessage, unavailableIdentity.stage, unavailableIdentity);
+      // bugs3 Step 12: Cancel and Wait as real choices on a chat card when a live
+      // operation holds the task; the owner's rule keeps these buttons out of notifications.
+      if (admission.outcome === "busy") {
+        await offerBusyRefusalChoicesInChatV1(
+          unavailableIdentity.taskFolderPath,
+          admission,
+          notificationTaskDisplayNameV1(unavailableDisplayName, unavailableIdentity.taskFolderPath)
+        ).catch(() => false);
+      }
       if (sameIdentity(this.target, unavailableIdentity)) {
         await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
       }
@@ -2627,6 +2908,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await this.render();
       }
     }
+    // bugs3 Step 8: Dismiss is not one of the card's options and never runs an
+    // effect; a viewer reaches this through the relay above like any answer.
+    if (optionId === DISMISS_DECISION_OPTION_ID_V1) {
+      return this.dismissWorkflowDecisionV1(decisionId, ctx);
+    }
     // On a relayed resolution the decision's own record is the identity for
     // EVERY branch, including the refusals: the runner's panel is not what
     // the user clicked in, and on a headless runner there is no panel at all.
@@ -2656,7 +2942,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       NotificationRouter.showWarning(clickTaskLabel ? `${clickTaskLabel} — ${message}` : message);
       if (clickIdentity && refusalStage) await this.append("assistant", message, refusalStage, clickIdentity);
     } else if (result.kind === "alreadySettled") {
-      const message = "This decision was already submitted.";
+      // bugs3 Step 8: a retired or dismissed card refuses the answer with the
+      // reason on record; only a card that was really answered says "submitted".
+      const message = describeSettledDecisionRefusalV1(result.decision);
       outcome = { ok: true, message };
       const settledTaskLabel = formatNotificationTaskLabelV1(
         await resolveChatTaskDisplayNameV1(result.decision.taskCanonicalId),
@@ -2671,7 +2959,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // blocker round 3. Refuse before dispatching anything, and say so
       // rather than leaving the click looking lost.
       const message =
-        "This decision's operation has already ended, so this answer can no longer be applied. It will clear on its own.";
+        "This decision's operation has already ended, so this answer can no longer be applied. " +
+        (result.restartGuidance ?? "It will clear on its own.");
       outcome = { ok: false, message };
       NotificationRouter.showInformation(clickTaskLabel ? `${clickTaskLabel} — ${message}` : message);
       if (clickIdentity && refusalStage) await this.append("assistant", message, refusalStage, clickIdentity);
@@ -2733,7 +3022,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         await this.append("assistant", ackText, decision.stage, identity);
       }
       if (option.effect.kind === "command" && ctx?.skipEffect !== true) {
+        // bugs3 Step 2: the answer was accepted a few awaits ago. Read the live
+        // operations state again with nothing awaited between this check and the
+        // dispatch; if an operation started in the gap, put the card back
+        // instead of running an effect that would collide with it.
+        const collidingNow = liveOperationBlockingOptionV1({ ...decision, state: "pending" }, option);
+        if (collidingNow) {
+          await this.workflowDecisionStore.reopenResolved(decisionId, option.optionId);
+          const heldMessage =
+            `${describeLiveTaskOperationV1(collidingNow)} started just now, so "${option.label}" was not run. ` +
+            "The card is back; choose it again when that ends.";
+          outcome = { ok: false, message: heldMessage };
+          NotificationRouter.showWarning(clickTaskLabel ? `${clickTaskLabel} — ${heldMessage}` : heldMessage);
+          if (identity) await this.append("assistant", heldMessage, decision.stage, identity);
+          await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
+          return outcome;
+        }
         const operationTrace = identity ? this.traceDecisionOperationV1(identity, decision.stage) : undefined;
+        // The dispatched command is awaited, and the action it arranges can sit in
+        // admission and preflight for minutes before it registers an operation (the
+        // reported four silent minutes). Watch for that gap while the command is in
+        // flight, not only after it returns.
+        const startupAnnouncer = identity ? this.createStartupAnnouncerV1(identity, decision.stage, clickTaskLabel) : undefined;
+        startupAnnouncer?.start();
         try {
           // Some dispatched commands (e.g. goToReviewAndApplyV1) report a
           // failed multi-step sequence by resolving `false` rather than
@@ -2762,6 +3073,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             if (result.outcome !== "done" && result.message) {
               await this.append("assistant", result.message, decision.stage, identity);
             }
+            // bugs3 Step 2: the command declined because an operation holds
+            // the task (it took admission itself, so this covers a run that
+            // started after the check above). The answer was recorded before
+            // it ran; put the card back so the choice is offered again.
+            if (result.outcome === "refused" && result.reopenCard === true) {
+              await this.workflowDecisionStore.reopenResolved(decisionId, option.optionId);
+              outcome = { ok: false, message: result.message ?? `"${option.label}" was not run.` };
+            }
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
@@ -2779,12 +3098,135 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             );
           }
         } finally {
-          operationTrace?.dispose();
+          if (operationTrace && identity && startupAnnouncer) {
+            this.releaseDecisionTraceWhenTaskIdleV1(operationTrace, identity, startupAnnouncer);
+          } else {
+            startupAnnouncer?.stop();
+            operationTrace?.dispose();
+          }
         }
       }
     }
     await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     return outcome;
+  }
+
+  /**
+   * bugs3 Step 12: a decision's dispatch (Move on → Publish Checks) can return
+   * before the action it arranged has registered its operation: the task still
+   * holds the admission claim the dispatch took, and the checks start after the
+   * command resolves. Dropping the operation mirror at that moment left the run
+   * with no "Started / Progress / Ended" lines in the chat. Keep it attached
+   * until the task holds no admission claim and has no live operation (two
+   * quiet polls in a row, so the gap between the claim and the operation does
+   * not end it early), bounded so a stuck claim cannot hold it forever.
+   */
+  private releaseDecisionTraceWhenTaskIdleV1(
+    trace: vscode.Disposable,
+    identity: ChatIdentity,
+    announcer: StartupAnnouncerV1
+  ): void {
+    const busy = (): boolean =>
+      taskOperations.getTaskOperations(identity.canonicalId).length > 0 ||
+      hasLiveWorkAdmissionBestEffortV1(identity.taskFolderPath);
+    // The announcer that watched the awaited command carries on: its "preparing" state is
+    // shared, so the same line is never said twice across the command's return.
+    announcer.tick();
+    if (!busy()) {
+      announcer.stop();
+      trace.dispose();
+      return;
+    }
+    const maxMs = 6 * 60 * 60 * 1000;
+    const startedAt = Date.now();
+    let quietPolls = 0;
+    const timer = setInterval(() => {
+      announcer.tick();
+      quietPolls = busy() ? 0 : quietPolls + 1;
+      if (quietPolls >= 2 || Date.now() - startedAt > maxMs) {
+        clearInterval(timer);
+        announcer.stop();
+        trace.dispose();
+      }
+    }, STARTUP_ANNOUNCER_POLL_MS_V1);
+    timer.unref?.();
+  }
+
+  /**
+   * bugs3 Step 12: says, in the chat and as one notification, that a decision's
+   * dispatched action holds the task and is still preparing, from the moment the
+   * claim exists and without waiting for the dispatched command to return. The
+   * task holds the claim but the action has not registered its operation, so the
+   * operation mirror has nothing to print; this fills that gap (the reported four
+   * minutes between the claim and the first command), then a second line after 90 s.
+   */
+  private createStartupAnnouncerV1(identity: ChatIdentity, stage: TaskStage, taskLabel: string | undefined): StartupAnnouncerV1 {
+    const startedAt = Date.now();
+    let preparingLineSaid = false;
+    let stillPreparingLineSaid = false;
+    let preparingSince: number | undefined;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const say = (text: string): void => {
+      void this.append("assistant", text, stage, identity).catch(() => undefined);
+    };
+    const claimOnly = (): boolean =>
+      taskOperations.getTaskOperations(identity.canonicalId).length === 0 && hasLiveWorkAdmissionBestEffortV1(identity.taskFolderPath);
+    // Whether the action ever registered an operation: once it has, the operation mirror owns
+    // the Started / Progress / Ended lines. An action that said "preparing" and then released
+    // the task without ever registering one (a preflight refusal) is closed here, so the chat
+    // never ends on a Started line with no outcome.
+    let operationSeen = false;
+    let endedWithoutStartSaid = false;
+    const noteOperation = (): void => {
+      if (taskOperations.getTaskOperations(identity.canonicalId).length > 0) {
+        operationSeen = true;
+      }
+    };
+    const changeListener = taskOperations.onDidChange(noteOperation);
+    const tick = (): void => {
+      noteOperation();
+      if (!claimOnly()) {
+        preparingSince = undefined;
+        if (
+          preparingLineSaid &&
+          !operationSeen &&
+          !endedWithoutStartSaid &&
+          taskOperations.getTaskOperations(identity.canonicalId).length === 0 &&
+          !hasLiveWorkAdmissionBestEffortV1(identity.taskFolderPath)
+        ) {
+          endedWithoutStartSaid = true;
+          say(
+            "Ended — the action released the task before any command started, so nothing ran. " +
+              "The notification above says why; choose the action again when that is resolved."
+          );
+        }
+        return;
+      }
+      preparingSince ??= Date.now();
+      if (!preparingLineSaid) {
+        preparingLineSaid = true;
+        const text = "Started — the action holds this task and is preparing to run; its progress lines appear here as soon as it begins.";
+        say(text);
+        NotificationRouter.showInformation(taskLabel ? `${taskLabel} — ${text}` : text);
+      } else if (!stillPreparingLineSaid && Date.now() - preparingSince >= 90_000) {
+        stillPreparingLineSaid = true;
+        say(`Still preparing — ${Math.round(((Date.now() - startedAt) / 60_000) * 10) / 10} min since it took the task; no command has started yet.`);
+      }
+    };
+    return {
+      start: () => {
+        timer = setInterval(tick, STARTUP_ANNOUNCER_POLL_MS_V1);
+        timer.unref?.();
+      },
+      tick,
+      stop: () => {
+        changeListener.dispose();
+        if (timer !== undefined) {
+          clearInterval(timer);
+          timer = undefined;
+        }
+      },
+    };
   }
 
   /**
@@ -2833,7 +3275,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
   }
 
-  private async persistAppend(identity: ChatIdentity, message: ChatMessage): Promise<void> {
+  /** Resolves true when the message reached disk, false when persistence failed (contained). */
+  private async persistAppend(identity: ChatIdentity, message: ChatMessage): Promise<boolean> {
     try {
       // Review-flagged (2026-08-23): this used to read a full transcript
       // snapshot via `loadTranscriptWithMigration` and then call
@@ -2850,6 +3293,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await loadTranscriptWithMigration(identity.taskFolderPath, identity.canonicalId, this.state);
       await appendChatMessageV1(identity.taskFolderPath, message, identity.canonicalId);
       this.warnedTasks.delete(identity.taskFolderPath);
+      return true;
     } catch (error) {
       // A persistence failure must not surface as a chat-send failure, and
       // must not stop later messages for this (or any other) task from
@@ -2864,15 +3308,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           `${taskLabel} — Could not save chat history to disk for this task. (${error instanceof Error ? error.message : String(error)})`
         );
       }
+      return false;
     }
   }
 
   /** Mirror live operation events into the conversation that started them. */
   private traceDecisionOperationV1(identity: ChatIdentity, fallbackStage: TaskStage): vscode.Disposable {
     const known = new Map<string, { signature: string; snapshot: TaskOperationSnapshot; waiting: boolean }>();
-    const queueMessage = (text: string, stage: TaskStage): void => {
+    const queueMessage = (text: string, stage: TaskStage, endedOperationId?: string): void => {
       this.operationTraceWriteQueueV1 = this.operationTraceWriteQueueV1
-        .then(() => this.append("assistant", text, stage, identity))
+        .then(() => this.append("assistant", text, stage, identity, false, undefined, endedOperationId))
         .catch((error) => console.warn("Could not append operation progress to Chat:", error));
     };
     const signatureOf = (operation: TaskOperationSnapshot): string =>
@@ -2882,7 +3327,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const detail = operation.detail ?? operation.activity;
       return `${operation.label} — ${stage}${detail ? `: ${detail}` : ""}`;
     };
+    // One "Ended" line per logical operation, carrying its settled outcome
+    // (bugs3 Step 3); nested same-label operations do not each post their own.
+    const endedLines = new OperationEndedLineTrackerV1();
     for (const operation of taskOperations.getTaskOperations(identity.canonicalId)) {
+      endedLines.register(operation);
       if (operation.waitingForUser) {
         known.set(operation.id, { signature: signatureOf(operation), snapshot: operation, waiting: true });
       } else {
@@ -2895,6 +3344,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const signature = signatureOf(operation);
         const stage = operation.stage ?? fallbackStage;
         if (!prior) {
+          endedLines.register(operation);
           known.set(operation.id, { signature, snapshot: operation, waiting: false });
           queueMessage(
             `Started ${labelFor(operation)} at ${formatTimestampForDisplay(new Date(operation.startedAt))}.`,
@@ -2913,7 +3363,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     });
     const onEnd = taskOperations.onDidEnd((operation) => {
       if (!known.has(operation.id)) return;
-      queueMessage(`Ended ${operation.label} — ${operation.state}.`, operation.stage ?? fallbackStage);
+      const endedLine = endedLines.ended(operation);
+      if (endedLine !== undefined) {
+        queueMessage(endedLine, operation.stage ?? fallbackStage, operation.id);
+      }
       known.delete(operation.id);
     });
     return {
@@ -3360,6 +3813,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         atLabel: formatTimestampForDisplay(date),
         atTitle: date.toLocaleString(),
         awaitingAnswer: awaitingQuestionIndices.has(index),
+        ...(entry.settlement !== undefined ? { settlementLine: describeQuestionSettlementV1(entry.settlement) } : {}),
         endingPendingReconciliation:
           entry.kind === "activity" && entry.intentId !== undefined && !outcomeIntentIds.has(entry.intentId),
       };
@@ -4028,7 +4482,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         chatBtn.textContent='Answer in chat instead';
         chatBtn.title='Leaves the question open and puts the cursor in the message box, so you can reply in your own words.';
         chatBtn.addEventListener('click',()=>{ const box=document.getElementById('message'); if(box){ box.focus(); } });
-        const cancelBtn=document.createElement('button'); cancelBtn.type='button'; cancelBtn.className='secondary'; cancelBtn.textContent='Cancel';
+        const cancelBtn=document.createElement('button'); cancelBtn.type='button'; cancelBtn.className='secondary'; cancelBtn.textContent='Dismiss';
         // The label alone never said what it discards; the handler settles the
         // interaction as cancelled, so the action that asked does not proceed.
         cancelBtn.title='Dismisses this question without answering. The action that asked it will not continue.';
@@ -4100,7 +4554,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             const answers=rows.map((r)=>({itemId:r.itemId,choice:r.radios.exclude.checked?'exclude':(r.radios.tick.checked?'tick':'leave'),note:r.ta.value}));
             v.postMessage({type:'submitOpenPlanItemsForm',formId:form.formId,answers});
           });
-          actions.appendChild(apply); box.appendChild(actions);
+          const dismiss=document.createElement('button'); dismiss.type='button'; dismiss.textContent='Dismiss';
+          dismiss.title='Close without applying answers; nothing runs and task.md is unchanged.';
+          dismiss.addEventListener('click',()=>{ apply.disabled=true; dismiss.disabled=true; v.postMessage({type:'dismissOpenPlanItemsForm',formId:form.formId}); });
+          actions.appendChild(apply); actions.appendChild(dismiss); box.appendChild(actions);
           ic.appendChild(box);
         }
       }
@@ -4177,6 +4634,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             const evTitle=document.createElement('div'); evTitle.className='decision-evidence-title'; evTitle.textContent='Evidence';
             evWrap.appendChild(evTitle);
             for(const ev of dcs.evidence){
+              if(ev.label==='Details'){
+                // Technical identifiers (pids, host ids, claim paths) stay behind a collapsed toggle.
+                const tech=document.createElement('details');
+                const techSummary=document.createElement('summary'); techSummary.textContent='Details';
+                tech.appendChild(techSummary);
+                const techText=document.createElement('div'); techText.textContent=ev.detail;
+                tech.appendChild(techText);
+                evWrap.appendChild(tech);
+                continue;
+              }
               const line=document.createElement('div'); line.textContent=ev.label+': '+ev.detail;
               if(ev.openFilePath){ const open=document.createElement('button'); open.type='button'; open.textContent='Open run log'; open.addEventListener('click',()=>vscode.postMessage({type:'openDecisionEvidence',filePath:ev.openFilePath})); line.appendChild(open); }
               evWrap.appendChild(line);
@@ -4254,6 +4721,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             v.postMessage({type:'resolveWorkflowDecision',decisionId:dcs.decisionId,optionId:checked.value});
           });
           actions.appendChild(confirmBtn);
+          // bugs3 Step 8: every pending card can be dismissed as a fallback.
+          // It records who and when, dispatches nothing and leaves task.md alone.
+          const dismissBtn=document.createElement('button'); dismissBtn.type='button'; dismissBtn.textContent='Dismiss';
+          dismissBtn.title='Close this card without choosing. Nothing runs and task.md is not changed.';
+          dismissBtn.addEventListener('click',()=>{
+            confirmBtn.disabled=true; dismissBtn.disabled=true;
+            for(const r of radios){ r.disabled=true; }
+            v.postMessage({type:'resolveWorkflowDecision',decisionId:dcs.decisionId,optionId:'__dismiss__'});
+          });
+          actions.appendChild(dismissBtn);
           card.appendChild(actions);
           card.appendChild(buildMsgMeta(dcs.copyText||'',dcs.atLabel,dcs.atTitle));
           root.appendChild(card);
@@ -4351,8 +4828,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               sendBtn.disabled=true;sendBtn.textContent='Sent';ta.disabled=true;
               v.postMessage({type:'answerQuestion',questionAt:x.id??x.at,text:val});
             });
-            actions.appendChild(sendBtn);replyWrap.appendChild(actions);
+            actions.appendChild(sendBtn);
+            // bugs3 Step 8: every pending card can be dismissed. Dismissing
+            // records the dismissal, runs nothing and writes nothing to task.md.
+            const dismissBtn=document.createElement('button');dismissBtn.type='button';dismissBtn.textContent='Dismiss';
+            dismissBtn.title='Close this question without answering. Nothing runs and task.md is not changed.';
+            dismissBtn.addEventListener('click',()=>{
+              dismissBtn.disabled=true;sendBtn.disabled=true;ta.disabled=true;
+              v.postMessage({type:'dismissQuestion',questionAt:x.id??x.at});
+            });
+            actions.appendChild(dismissBtn);
+            replyWrap.appendChild(actions);
             row.appendChild(replyWrap);
+          }
+          if(x.role==='question'&&x.settlementLine){
+            const closedNote=document.createElement('p');closedNote.className='msg-agent';closedNote.textContent=x.settlementLine;
+            row.appendChild(closedNote);
           }
           return row;
         }

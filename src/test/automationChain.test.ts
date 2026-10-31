@@ -21,6 +21,7 @@ import {
   type AutomationChainEndSnapshot,
 } from "../utils/automationChain";
 import { hasAutomaticOriginV1 } from "../state/automationDispatchContextV1";
+import { reportAutomationCommandOutcomeV1 } from "../utils/automationCommandOutcomeV1";
 import { resolveRoundV1 } from "../utils/taskProgressTransforms";
 import { TaskProgress } from "../types/taskProgress";
 import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
@@ -642,6 +643,119 @@ void test("a failing automation dispatch closes its round-ledger row as failed, 
     assert.ok(row, "must resolve the opened row");
     assert.equal(row?.state, "failed");
     assert.equal(row?.outcome?.rejectionReason, "provider exploded");
+  } finally {
+    __extensionContextV1TestOnly.reset();
+    fsBridge.restore();
+    safeRemoveDir(fixture.folder);
+  }
+});
+
+// bugs3 Step 3: Plan generation whose every candidate failed RETURNS normally;
+// its round used to be recorded `completed` with `attemptIds: []` although two
+// providers had been invoked. A command that reports its failed outcome gets
+// that state, reason and every attempt recorded instead.
+void test("a command that returns normally after reporting a failed round closes its row as failed with every attempt", async () => {
+  const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-reported-fail-");
+  const fsBridge = installFsBridgeV1();
+  __extensionContextV1TestOnly.set({
+    workspaceState: new FakeMementoV1(),
+  } as unknown as vscode.ExtensionContext);
+  try {
+    const reportingDeps: AutomationChainDeps = {
+      onDidEnd: () => ({ dispose: () => undefined }),
+      execute: () => {
+        reportAutomationCommandOutcomeV1(fixture.folder, {
+          state: "failed",
+          reason: "every model failed: Kimi — 429; devpass — Unauthorized",
+          attemptIds: ["attempt-kimi", "attempt-devpass"],
+        });
+        return Promise.resolve(undefined);
+      },
+    };
+    const result = await scheduleAutomationChain(
+      {
+        command: "vs-code-ai-helper.generatePlanWithAI",
+        taskKey: fixture.folder,
+        chainId: "plan-ledger-reported-fail",
+      },
+      undefined,
+      reportingDeps
+    );
+    assert.equal(result, true, "the command was dispatched");
+
+    const raw = await waitUntilRowTerminalV1(fixture.folder);
+    const row = raw.roundLedger?.[0];
+    assert.ok(row, "must resolve the opened row");
+    assert.equal(row?.state, "failed", "a reported failure must never be recorded as completed");
+    assert.equal(row?.outcome?.rejectionReason, "every model failed: Kimi — 429; devpass — Unauthorized");
+    assert.deepEqual(row?.attemptIds, ["attempt-kimi", "attempt-devpass"]);
+  } finally {
+    __extensionContextV1TestOnly.reset();
+    fsBridge.restore();
+    safeRemoveDir(fixture.folder);
+  }
+});
+
+void test("a command learns from its report whether the chain's ledger row will post the round's Ended line", async () => {
+  const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-report-armed-");
+  const fsBridge = installFsBridgeV1();
+  __extensionContextV1TestOnly.set({
+    workspaceState: new FakeMementoV1(),
+  } as unknown as vscode.ExtensionContext);
+  try {
+    // Outside a chain dispatch nobody is waiting: the operation observer must still speak.
+    assert.equal(
+      reportAutomationCommandOutcomeV1(fixture.folder, { state: "failed", reason: "manual run", attemptIds: [] }),
+      false
+    );
+    let ledgerSpoke: boolean | undefined;
+    const armedDeps: AutomationChainDeps = {
+      onDidEnd: () => ({ dispose: () => undefined }),
+      execute: () => {
+        ledgerSpoke = reportAutomationCommandOutcomeV1(fixture.folder, {
+          state: "failed",
+          reason: "every model failed",
+          attemptIds: ["a1"],
+        });
+        return Promise.resolve(undefined);
+      },
+    };
+    await scheduleAutomationChain(
+      { command: "vs-code-ai-helper.generatePlanWithAI", taskKey: fixture.folder, chainId: "plan-report-armed" },
+      undefined,
+      armedDeps
+    );
+    await waitUntilRowTerminalV1(fixture.folder);
+    assert.equal(ledgerSpoke, true, "a dispatched command's report is consumed by the chain");
+    // Taking the report disarms the slot again.
+    assert.equal(
+      reportAutomationCommandOutcomeV1(fixture.folder, { state: "failed", reason: "later manual run", attemptIds: [] }),
+      false
+    );
+  } finally {
+    __extensionContextV1TestOnly.reset();
+    fsBridge.restore();
+    safeRemoveDir(fixture.folder);
+  }
+});
+
+void test("a stale reported failure from an earlier command never decides a later round", async () => {
+  const fixture = makeOwnedTaskFolder("ensemble-automation-chain-ledger-stale-report-");
+  const fsBridge = installFsBridgeV1();
+  __extensionContextV1TestOnly.set({
+    workspaceState: new FakeMementoV1(),
+  } as unknown as vscode.ExtensionContext);
+  try {
+    reportAutomationCommandOutcomeV1(fixture.folder, { state: "failed", reason: "an earlier command", attemptIds: ["old"] });
+    const chain = makeFakeChain();
+    await scheduleAutomationChain(
+      { command: "vs-code-ai-helper.runImplementationWithAI", taskKey: fixture.folder, chainId: "stale-report" },
+      undefined,
+      chain.deps
+    );
+    const raw = await waitUntilRowTerminalV1(fixture.folder);
+    assert.equal(raw.roundLedger?.[0]?.state, "completed");
+    assert.deepEqual(raw.roundLedger?.[0]?.attemptIds, []);
   } finally {
     __extensionContextV1TestOnly.reset();
     fsBridge.restore();

@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import {
   __testOnly,
+  getSeededCatalogForAudit,
   describeStageSubstitutesV1,
   findStagesSharingBlockedPrimaryV1,
   getAvailableCopilotModels,
@@ -2078,5 +2079,16 @@ void describe("GPT-6 / Opus 5.5 listed entries validate against the provider lad
     for (const id of discovered) {
       assert.doesNotThrow(() => parseOpencodeModelSelection(id), id);
     }
+  });
+});
+
+void describe("OpenCode seeded catalog (bugs3 item 10)", () => {
+  void it("offers opencode-go/kimi-k3.1-pro with the low, high and max levels the CLI lists", () => {
+    const ids = (getSeededCatalogForAudit().seeded["opencode-cli"] ?? []).map((m) => m.model);
+    assert.ok(ids.includes("opencode-go/kimi-k3.1-pro"));
+    for (const level of ["low", "high", "max"]) {
+      assert.ok(ids.includes(`opencode-go/kimi-k3.1-pro@${level}`), level);
+    }
+    assert.ok(!ids.includes("opencode-go/kimi-k3.1-pro@medium"));
   });
 });

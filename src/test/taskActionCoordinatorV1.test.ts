@@ -2483,11 +2483,17 @@ void describe("taskActionCoordinatorV1", () => {
     };
     const harness = makeHarness([], {}, [], undefined, exhaustion);
     const outcome = await harness.coordinator.executeAction(baseRequest());
-    assert.deepEqual(outcome, {
-      kind: "unavailable",
-      code: "providerModeUnavailable",
-      chainExhaustion: exhaustion,
-    });
+    // bugs3 Step 3: the evidence arrives intact, and additionally names the
+    // attempt allocated for this round that no candidate claimed, so the round
+    // ledger records every attempt rather than none.
+    assert.equal(outcome.kind, "unavailable");
+    const { unclaimedAttemptIds, ...evidence } = (
+      outcome as unknown as { chainExhaustion: typeof exhaustion & { unclaimedAttemptIds?: string[] } }
+    ).chainExhaustion;
+    assert.deepEqual(evidence, exhaustion);
+    assert.equal(unclaimedAttemptIds?.length, 1);
+    assert.equal(typeof unclaimedAttemptIds?.[0], "string");
+    assert.equal((outcome as { code: string }).code, "providerModeUnavailable");
     assert.equal(
       harness.leaseStore.heldLease(TASK_BINDING.taskBindingId),
       undefined,

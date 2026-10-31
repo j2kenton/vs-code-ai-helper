@@ -15,6 +15,8 @@ import { runWithRoundProcessTaskFolderV1 } from "../state/roundProcessContextV1"
 import type { TaskProgress } from "../types/taskProgress";
 import { inspectRoundGitInterferenceV1, withRoundGitStateObservationV1 } from "./roundGitStateV1";
 import { offerRoundGitInterferenceDecisionV1 } from "./roundGitInterferenceDecisionV1";
+import { describeIndexLockSettlementV1 } from "./gitIndexLockV1";
+import { setLiveTaskOperationLookupV1, setOperationLiveByIdLookupV1 } from "./liveTaskOperationLookupV1";
 
 const ROUND_GIT_OBSERVED_KINDS_V1 = new Set<OperationKind>([
   "draft-task", "generate-plan", "review", "apply-review", "generate-implementation",
@@ -30,15 +32,23 @@ function describeRoundGitDeltaV1(record: import("./roundGitStateV1").RoundGitObs
     if (record.unavailableReason) {
       console.warn(`Round Git state evidence unavailable for ${record.operationId}: ${record.unavailableReason}`);
     }
-    return undefined;
   }
   const parts: string[] = [];
-  if (delta.newUnmergedPaths.length) parts.push(`new unmerged paths: ${delta.newUnmergedPaths.join(", ")}`);
-  if (delta.changedIndexEntries.length) parts.push(`changed index paths: ${delta.changedIndexEntries.join(", ")}`);
-  if (delta.addedStashes.length) parts.push(`added stashes: ${delta.addedStashes.map((entry) => entry.selector).join(", ")}`);
-  if (delta.removedStashes.length) parts.push(`removed stashes: ${delta.removedStashes.map((entry) => entry.selector).join(", ")}`);
+  if (delta) {
+    if (delta.newUnmergedPaths.length) parts.push(`new unmerged paths: ${delta.newUnmergedPaths.join(", ")}`);
+    if (delta.changedIndexEntries.length) parts.push(`changed index paths: ${delta.changedIndexEntries.join(", ")}`);
+    if (delta.addedStashes.length) parts.push(`added stashes: ${delta.addedStashes.map((entry) => entry.selector).join(", ")}`);
+    if (delta.removedStashes.length) parts.push(`removed stashes: ${delta.removedStashes.map((entry) => entry.selector).join(", ")}`);
+  }
+  if (record.indexLockSettlement) {
+    const lockText = describeIndexLockSettlementV1(record.indexLockSettlement);
+    if (lockText) parts.push(lockText);
+  }
   if (!parts.length) return undefined;
-  return `Git state changed during this round (${delta.attribution}): ${parts.join("; ")}. Evidence: round-git-state-v1/${record.operationId}.json`;
+  const prefix = delta
+    ? `Git state changed during this round (${delta.attribution}): `
+    : "Git state after this round: ";
+  return `${prefix}${parts.join("; ")}. Evidence: round-git-state-v1/${record.operationId}.json`;
 }
 
 /**
@@ -322,6 +332,12 @@ export interface TaskOperationSnapshot {
    * behind. Shown on the terminal row in place of the bare word "cancelled".
    */
   readonly cancelReasonV1?: string;
+  /**
+   * Why the operation settled as it did, as stated by its owner through
+   * `settleAs` (failure or refusal reason). Lets the chat's "Ended …" line
+   * report the round's own outcome rather than only that a command returned.
+   */
+  readonly endReasonV1?: string;
 }
 
 /**
@@ -357,6 +373,8 @@ interface MutableOperation {
   forcedEndV1?: boolean;
   /** See TaskOperationSnapshot.cancelReasonV1. */
   cancelReasonV1?: string;
+  /** See TaskOperationSnapshot.endReasonV1. */
+  endReasonV1?: string;
   /** Set via TaskOperationHandle.settleAs; read back by runTrackedOperation before end() removes this row. */
   explicitOutcome?: { readonly state: "refused" | "failed" | "cancelled" | "interrupted"; readonly reason?: string };
   /** Who requested the cancellation — see `CancelSourceV1`. */
@@ -1106,7 +1124,8 @@ export class TaskOperationRegistry implements vscode.Disposable {
 
   end(
     handle: TaskOperationHandle | null | undefined,
-    state?: Exclude<TaskOperationState, "running">
+    state?: Exclude<TaskOperationState, "running">,
+    reason?: string
   ): void {
     if (!handle) {return;}
     const keyMap = this.operations.get(handle.key);
@@ -1121,6 +1140,9 @@ export class TaskOperationRegistry implements vscode.Disposable {
     // cancelled and then unwound normally still ended by cancellation.
     op.state = state ?? (cts?.token.isCancellationRequested ? "cancelled" : "succeeded");
     op.finishedAt = Date.now();
+    if (reason !== undefined) {
+      op.endReasonV1 = reason;
+    }
     if (cts) {
       this.tokenSources.delete(handle.id);
       cts.dispose();
@@ -1328,6 +1350,32 @@ export const MIRRORED_OPERATION_ID_PREFIX = "runner:";
 
 export const taskOperations = new TaskOperationRegistry();
 
+// bugs3 Step 2: cards state what is running from this registry (local and
+// runner-mirrored), at render and answer time — see liveTaskOperationLookupV1.
+setLiveTaskOperationLookupV1((taskFolderPath) => {
+  const ops = taskOperations.getTaskOperations(taskFolderPath);
+  const root = ops.find((op) => op.parentId === undefined);
+  if (!root) {
+    return undefined;
+  }
+  // The most recent running operation that reported something names the current phase.
+  const reporting = [...ops].reverse().find((op) => op.state === "running" && (op.detail ?? op.activity));
+  const activity = reporting?.detail ?? reporting?.activity;
+  return { label: root.label, operationId: root.id, startedAt: root.startedAt, ...(activity ? { activity } : {}) };
+});
+
+// bugs3 Step 19: a card that refers to one running operation asks about that
+// exact id (a viewer sees the runner's operation under a prefixed id).
+setOperationLiveByIdLookupV1((taskFolderPath, operationId) =>
+  taskOperations
+    .getTaskOperations(taskFolderPath)
+    .some(
+      (op) =>
+        op.state === "running" &&
+        (op.id === operationId || op.id === `${MIRRORED_OPERATION_ID_PREFIX}${operationId}`)
+    )
+);
+
 /**
  * Runs an async operation as a TrackedOperation (contract C1): registers it
  * synchronously at entry (optimistic UI — the spinner and Notifications row
@@ -1379,6 +1427,13 @@ export async function runTrackedOperation<T>(
           : operation.id
       ));
       const interference = await inspectRoundGitInterferenceV1(taskPath, { liveOperationIds });
+      // An interrupted round's index lock is settled during this inspection;
+      // say what happened to it (removed, or left with its age and guidance).
+      if (interference.indexLockNotices?.length) {
+        NotificationRouter.showWarning(
+          `${formatTaskNameForDisplay(notificationTaskDisplayNameV1(spec.taskName, taskPath))} — ${interference.indexLockNotices.join(" ")}`
+        );
+      }
       const reasons = [
         ...(interference.unmergedPaths.length ? [`unmerged paths: ${interference.unmergedPaths.join(", ")}`] : []),
         ...(interference.stashOperationIds.length ? [`unacknowledged stash changes in operations ${interference.stashOperationIds.join(", ")}`] : []),
@@ -1453,7 +1508,7 @@ export async function runTrackedOperation<T>(
           console.warn("[taskOperations] onSettled observer threw", observerError);
         }
       }
-      taskOperations.end(handle, finalState);
+      taskOperations.end(handle, finalState, finalReason);
       return result;
     } catch (error) {
       const cancelled =

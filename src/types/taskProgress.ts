@@ -1048,6 +1048,16 @@ export interface ReviewScoreHistoryEntry {
    */
   reviewPass?: number;
   /**
+   * bugs3 Step 9: the `roundId`s of the real fix rounds (Implementation, Apply
+   * Review, continuation) the round ledger shows between the stage's previous
+   * scored review and this one, recorded when this entry was written. The
+   * plateau check reads the separation from these ids, so it keeps its answer
+   * after the ledger is trimmed. `[]` means no fix round separated the two
+   * reviews; absent on entries written before this field existed (the check
+   * then falls back to the ledger's timestamps).
+   */
+  fixRoundIds?: string[];
+  /**
    * `"open-editors"` when this review fell back to the files open in the
    * editor because the task had no tracked implementation file set (v1 fixes
    * 2, item 21). Recorded durably here so a high score can never be read as a

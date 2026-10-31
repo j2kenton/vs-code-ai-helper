@@ -416,7 +416,8 @@ void describe("the rerun scheduled for a quota reset (bugs2 finding 13)", () => 
     try {
       assert.equal(await runOnce(scheduler, task.folder), "refused");
       const card = await cardWhenPosted(env.memento, task.folder);
-      assert.match(card?.whatHappened ?? "", /runReviewWithAI/);
+      assert.match(card?.whatHappened ?? "", /already has a stage action in progress/);
+      assert.doesNotMatch(card?.whatHappened ?? "", /runReviewWithAI/, "command ids stay out of the plain text");
       assert.match(card?.whyUserNeeded ?? "", /Another operation holds this task/);
       assert.equal(card?.options.some((o) => o.optionId === "resumeTask"), false, "an active task is not offered Resume");
     } finally {

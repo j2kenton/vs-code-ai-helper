@@ -681,6 +681,12 @@ void describe("resumeCommitPushMetadataInteractionV1 — production Resume deleg
     // <task-folder>/runs/commit-metadata-<ts>.json via the real
     // WorkflowFileStoreV1 (see the identical seeding above).
     fs.mkdirSync(path.join(harness.taskFolderPath, "runs"), { recursive: true });
+    // Real task folders live under `.ensemble/`, which the Commit & Push
+    // tree fingerprint excludes. This fixture's folder is `plans/task_1`, so
+    // the resumed attempt's own run artifact would count as a file changed
+    // after the checks passed (bugs3 Step 17) and stop the commit. Keep it
+    // out of the fingerprint without adding a file to the committed tree.
+    fs.appendFileSync(path.join(harness.repoRoot, ".git", "info", "exclude"), "\nplans/task_1/runs/\n");
 
     const chatViewProvider = new ChatViewProvider(makeMemento());
     const execCapture = installExecuteCommandCapture();

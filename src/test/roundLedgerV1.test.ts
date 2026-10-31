@@ -1533,10 +1533,11 @@ void describe("formatRoundOutcomeMessageV1", () => {
     assert.ok(text.includes("score 8"));
     assert.ok(text.includes("1 reviewer"));
     assert.ok(text.includes("2 mechanical"));
-    assert.ok(text.includes("mode implementation"));
+    assert.ok(text.includes("builds the plan's open items in code"));
+    assert.ok(!text.includes("mode implementation"));
   });
 
-  void it("renders the dispatch mode before the run-log path", () => {
+  void it("renders what the round did, for its stage, before the run-log path", () => {
     const entry = makeBaseEntry({
       mode: "apply-review",
       state: "completed",
@@ -1544,7 +1545,24 @@ void describe("formatRoundOutcomeMessageV1", () => {
       outcome: { filesChanged: [], runLogPath: "runs/attempt-1.md" },
     });
     const text = formatRoundOutcomeMessageV1(entry);
-    assert.match(text, /mode apply-review — runs\/attempt-1\.md_/);
+    assert.match(text, /edits code to address the review's findings — runs\/attempt-1\.md_/);
+  });
+
+  // bugs3 Step 4: the "mode implementation" an owner read at Plan.
+  void it("names a plan-stage round as a plan.md revision, never the raw internal mode", () => {
+    const plan = formatRoundOutcomeMessageV1(
+      makeBaseEntry({ stage: "plan", mode: "implementation", state: "completed", endedAt: "2026-01-01T00:05:00.000Z" })
+    );
+    assert.match(plan, /writes or revises plan\.md; it does not edit code/);
+    assert.doesNotMatch(plan, /mode implementation|mode apply-review/);
+    const planFix = formatRoundOutcomeMessageV1(
+      makeBaseEntry({ stage: "plan-high-review", mode: "apply-review", state: "completed", endedAt: "2026-01-01T00:05:00.000Z" })
+    );
+    assert.match(planFix, /revises plan\.md; it does not edit code/);
+    const codeFix = formatRoundOutcomeMessageV1(
+      makeBaseEntry({ stage: "impl-high-review", mode: "apply-review", state: "completed", endedAt: "2026-01-01T00:05:00.000Z" })
+    );
+    assert.match(codeFix, /edits code to address the review's findings/);
   });
 
   void it("adds successful-backup attribution to Chat without changing the persisted outcome", () => {

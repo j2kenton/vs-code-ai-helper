@@ -487,8 +487,8 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       );
       assert.deepEqual(
         ended.map((e) => e.state),
-        ["succeeded", "succeeded"],
-        "(plan-fix child + wrapping operation) the coordinator classifies the transport failure into a normal, non-completed outcome that applyReviewWithAI's runApply handles internally and returns from — the wrapping operation therefore still ends through the ordinary success path, never leaving a stale live row"
+        ["failed", "succeeded"],
+        "(plan-fix child + wrapping operation) bugs3 Step 3: the round's own outcome is authoritative, so the plan-fix child ends 'failed' (it used to read 'succeeded' because the command merely returned); the wrapping operation's command still returns normally and ends through the ordinary path, never leaving a stale live row"
       );
 
       assert.ok(capturedOp);

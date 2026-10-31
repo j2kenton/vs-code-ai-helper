@@ -858,6 +858,7 @@ function validateReviewScoreHistory(
       "declinedBlockerReclassifications",
       "reviewerChallengedNonGoal",
       "reviewPass",
+      "fixRoundIds",
       "scope",
     ]);
     for (const key of Object.keys(entry)) {
@@ -935,6 +936,15 @@ function validateReviewScoreHistory(
     const reviewPass = entry["reviewPass"];
     if (reviewPass !== undefined && !isNonNegativeInteger(reviewPass)) {
       return "reviewScoreHistory entry reviewPass must be a non-negative integer";
+    }
+    const fixRoundIds = entry["fixRoundIds"];
+    if (
+      fixRoundIds !== undefined &&
+      (!Array.isArray(fixRoundIds) ||
+        fixRoundIds.length > 200 ||
+        !fixRoundIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= MAX_ID_LENGTH))
+    ) {
+      return "reviewScoreHistory entry fixRoundIds must be a bounded list of non-empty ids";
     }
     const historyScope = entry["scope"];
     if (historyScope !== undefined && historyScope !== "open-editors") {

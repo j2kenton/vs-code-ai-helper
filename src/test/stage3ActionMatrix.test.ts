@@ -248,8 +248,8 @@ void describe("Stage 3 action matrix contracts", () => {
     );
     assert.match(
       checksSource,
-      /runCompletionLint\(\s*taskFolderUri/,
-      "The first Publish action must run the completion checks (lint/tests + plan verification)"
+      /runChecksFailedFirstV1\(\{\s*taskFolderUri/,
+      "The first Publish action must run the completion checks (lint/tests + plan verification) through the shared failed-first runner"
     );
     assert.match(
       checksSource,

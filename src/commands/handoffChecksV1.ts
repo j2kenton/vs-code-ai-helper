@@ -348,6 +348,7 @@ export function registerHandoffChecksCommandsV1(context: vscode.ExtensionContext
         title: "Tick this check",
         prompt: `What did you see? Recorded beside the check: ${truncateChecklistItemTextV1(itemText, 100)}`,
         placeHolder: "e.g. clicked through the card in a live window; it read correctly",
+        restartGuidance: "choose Tick on that check in the task's hand-off list again.",
       }),
     refresh: () => inventory.refresh(),
     repost: async (arg, remaining) => {

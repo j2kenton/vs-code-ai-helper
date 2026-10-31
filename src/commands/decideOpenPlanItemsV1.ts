@@ -10,6 +10,7 @@ import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils
 import { createHash, randomBytes } from "crypto";
 import {
   appendOpenPlanItemsFormV1,
+  closeOpenPlanItemsFormsV1,
   OpenPlanItemsFormItemV1,
   readOpenPlanItemsFormsV1,
   setOpenPlanItemsFormStateV1,
@@ -30,6 +31,7 @@ import { resolveConfiguredReviewStages } from "../utils/modelSelection";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { withTaskLock } from "../state/taskStateStore";
 
 const COMMAND = "vs-code-ai-helper.decideOpenPlanItems";
 
@@ -103,20 +105,29 @@ export async function decideOpenPlanItemsV1(
     NotificationRouter.showInformation(`${taskName}: none of these items is still open in the plan.`);
     return { outcome: "done" };
   }
-  await appendOpenPlanItemsFormV1(arg.taskFolderPath, arg.taskFolderPath, {
-    formId: randomBytes(16).toString("hex"),
-    stage: arg.stage,
-    items: formItems,
-    planFingerprint: fingerprintPlanV1(plan),
-    ...(arg.resumeFastForwardV1
-      ? {
-          resumeFastForwardV1: {
-            attemptNumber: arg.resumeFastForwardV1.attemptNumber,
-            maxAttempts: arg.resumeFastForwardV1.maxAttempts,
-          },
-        }
-      : {}),
+  const posted = await withTaskLock(arg.taskFolderPath, async () => {
+    const progress = await readTaskProgressStrictV1(vscode.Uri.file(arg.taskFolderPath));
+    if (!progress.ok || progress.decoded.progress.currentStage !== arg.stage) return false;
+    await appendOpenPlanItemsFormV1(arg.taskFolderPath, arg.taskFolderPath, {
+      formId: randomBytes(16).toString("hex"),
+      stage: arg.stage,
+      items: formItems,
+      planFingerprint: fingerprintPlanV1(plan),
+      ...(arg.resumeFastForwardV1
+        ? {
+            resumeFastForwardV1: {
+              attemptNumber: arg.resumeFastForwardV1.attemptNumber,
+              maxAttempts: arg.resumeFastForwardV1.maxAttempts,
+            },
+          }
+        : {}),
+    });
+    return true;
   });
+  if (!posted) {
+    NotificationRouter.showWarning(`${taskName}: the stage changed or could not be verified, so no form was posted.`);
+    return false;
+  }
   return { outcome: "done" };
 }
 
@@ -170,23 +181,38 @@ export async function applyOpenPlanItemsFormSubmissionV1(input: {
   readonly formId: string;
   readonly answers: unknown;
 }): Promise<OpenPlanItemsFormSubmissionResultV1> {
+  const result = await withTaskLock(input.taskFolderPath, async () => applyOpenPlanItemsFormLockedV1(input));
+  if (result.continuation) {
+    await continueAfterOpenPlanItemDecisionsV1(result.continuation, formatNotificationTaskLabelV1(input.displayName, input.taskFolderPath));
+  }
+  return result.result;
+}
+
+async function applyOpenPlanItemsFormLockedV1(input: {
+  readonly taskFolderPath: string; readonly canonicalId: string; readonly displayName?: string;
+  readonly formId: string; readonly answers: unknown;
+}): Promise<{ result: OpenPlanItemsFormSubmissionResultV1; continuation?: DecideOpenPlanItemsArgV1 }> {
   const forms = await readOpenPlanItemsFormsV1(input.taskFolderPath, input.canonicalId);
   const form = forms.find((f) => f.formId === input.formId);
   if (!form) {
-    return { kind: "ignored", message: "This form is no longer available." };
+    return { result: { kind: "ignored", message: "This form is no longer available." } };
   }
   if (form.state !== "open") {
-    return { kind: "ignored", message: "This form was already applied." };
+    return { result: { kind: "ignored", message: `This form is no longer open (${form.closedReason ?? form.state}); your answers were not applied.` } };
+  }
+  const progress = await readTaskProgressStrictV1(vscode.Uri.file(input.taskFolderPath));
+  if (!progress.ok || progress.decoded.progress.currentStage !== form.stage) {
+    return { result: { kind: "ignored", message: "This form's stage is no longer current, or could not be verified; your answers were not applied." } };
   }
   const answers = decodeFormAnswersV1(input.answers);
   if (!answers) {
-    return { kind: "rejected", message: "Could not apply: the submitted answers were malformed." };
+    return { result: { kind: "rejected", message: "Could not apply: the submitted answers were malformed." } };
   }
   const taskName = formatNotificationTaskLabelV1(input.displayName, input.taskFolderPath);
   const planUri = getCanonicalImplementationUri(vscode.Uri.file(input.taskFolderPath));
   const plan = await readTextIfExists(planUri);
   if (plan === undefined) {
-    return { kind: "rejected", message: "plan-final.md could not be read, so nothing was applied. Try Apply again." };
+    return { result: { kind: "rejected", message: "plan-final.md could not be read, so nothing was applied. Try Apply again." } };
   }
   const applied = applyOpenPlanItemsFormV1(
     plan,
@@ -195,11 +221,11 @@ export async function applyOpenPlanItemsFormSubmissionV1(input: {
     new Date().toISOString().slice(0, 10)
   );
   if (!applied.ok) {
-    return { kind: "rejected", message: applied.rejectionReason };
+    return { result: { kind: "rejected", message: applied.rejectionReason } };
   }
   const changed = applied.ticked.length + applied.excluded.length > 0;
   if (changed && !(await writeTextFileIfUnchangedV1(planUri, plan, applied.content))) {
-    return { kind: "rejected", message: "plan changed, try Apply again." };
+    return { result: { kind: "rejected", message: "plan changed, try Apply again." } };
   }
   await setOpenPlanItemsFormStateV1(input.taskFolderPath, input.canonicalId, form.formId, "applied");
   const textById = new Map(form.items.map((item) => [item.itemId, item.itemText]));
@@ -217,22 +243,17 @@ export async function applyOpenPlanItemsFormSubmissionV1(input: {
     (parts.length > 0 ? `${parts.join(", ")} in plan-final.md.` : "No items were changed. Nothing will run; the items stay open. Fix what blocks them, then use Fast Forward or Apply Review.") +
     (skippedLines.length > 0 ? ` ${skippedLines.join("; ")}.` : "");
   NotificationRouter.showInformation(`${taskName}: ${summary}`);
-  if (changed) {
-    // RC2 item 13, Step 52: arrange whatever comes next (Fast Forward's own
-    // remaining budget when it raised this round, an ordinary dispatch
-    // otherwise, or the Advance offer once nothing is left open).
-    await continueAfterOpenPlanItemDecisionsV1(
-      {
-        taskFolderPath: input.taskFolderPath,
-        displayName: input.displayName,
-        items: [],
-        stage: form.stage,
-        ...(form.resumeFastForwardV1 ? { resumeFastForwardV1: form.resumeFastForwardV1 } : {}),
-      },
-      taskName
-    );
-  }
-  return { kind: "applied", message: summary };
+  return { result: { kind: "applied", message: summary }, ...(changed ? { continuation: {
+    taskFolderPath: input.taskFolderPath, displayName: input.displayName, items: [], stage: form.stage,
+    ...(form.resumeFastForwardV1 ? { resumeFastForwardV1: form.resumeFastForwardV1 } : {}),
+  } } : {}) };
+}
+
+/** Dismissal shares the task lease with submission and stage transitions. */
+export async function dismissOpenPlanItemsFormV1(taskFolderPath: string, canonicalId: string, formId: string, by: string) {
+  return withTaskLock(taskFolderPath, async () => (await closeOpenPlanItemsFormsV1(
+    taskFolderPath, canonicalId, { formId }, { state: "dismissed", reason: "dismissed by the owner, not answered", by }
+  ))[0]);
 }
 
 /**
@@ -267,6 +288,9 @@ async function continueAfterOpenPlanItemDecisionsInnerV1(
   const remaining = freshPlan === undefined || !progressRead.ok
     ? undefined
     : countChecklistEvidenceProgressV1(freshPlan, progressRead.decoded.progress.planItemEvidence ?? [])?.gate.remaining;
+  if (!progressRead.ok || progressRead.decoded.progress.currentStage !== arg.stage) {
+    return;
+  }
   if (remaining === undefined) {
     return;
   }

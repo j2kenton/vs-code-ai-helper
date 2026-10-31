@@ -653,6 +653,13 @@ void describe("path dispositions for the GPT-6 / Opus 5.5 task", () => {
       "opencode/gpt-6-luna",
       "opencode/gpt-6-sol",
     ]);
+    // The regenerated devpass seed (2026-10-28 capture of devpass-code 1.18.11) carries both families.
+    assert.deepEqual(disposition("devpass-cli", "default", "opus-5.5")?.entryIds, [
+      "llmgateway-devpass/claude-opus-5-5",
+    ]);
+    assert.ok(
+      (disposition("devpass-cli", "default", "gpt-6")?.entryIds ?? []).includes("llmgateway-devpass/gpt-6.1-sol")
+    );
   });
 
   void it("gives not-added dispositions only where nothing is seeded for the family", () => {
@@ -681,7 +688,6 @@ void describe("path dispositions for the GPT-6 / Opus 5.5 task", () => {
       ["antigravity-cli", "default", true],
       ["kiro-cli", "default", true],
       ["cline-cli", "default", false],
-      ["devpass-cli", "default", true],
     ];
     for (const [provider, block, discovers] of noEvidence) {
       for (const family of ["gpt-6", "opus-5.5"] as const) {

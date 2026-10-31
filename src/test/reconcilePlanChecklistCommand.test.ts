@@ -4671,11 +4671,25 @@ void describe("linkManualChecksToBlockerConfirmedV1 — write races", () => {
       const successCount = win.captured.filter(
         (m) => m.method === "info" && /Linked \d+ outstanding check\(s\)/.test(m.message)
       ).length;
-      const refusedCount = win.captured.filter(
+      // bugs3 Step 2: the task's admission now serializes the two calls, so the
+      // loser is refused up front with a live-operation result (card reopened)
+      // instead of reaching the TOCTOU guard; either way it must not write.
+      const toctouRefusedCount = win.captured.filter(
         (m) => m.method === "warning" && /changed while this link was being applied/.test(m.message)
       ).length;
+      const admissionRefusals = [resultA, resultB].filter(
+        (r) =>
+          r.status === "fulfilled" &&
+          typeof r.value === "object" &&
+          r.value !== null &&
+          (r.value as { outcome?: string }).outcome === "refused"
+      ).length;
       assert.equal(successCount, 1, "exactly one concurrent call must succeed in writing");
-      assert.equal(refusedCount, 1, "the other must be refused with the TOCTOU warning, not silently no-op");
+      assert.equal(
+        toctouRefusedCount + admissionRefusals,
+        1,
+        "the other must be refused (admission or the TOCTOU warning), not silently no-op"
+      );
 
       const updatedPlan = nodeFs.readFileSync(planPath, "utf8");
       const coversMatches = updatedPlan.match(/Covers: Step 26/g) ?? [];
@@ -5162,6 +5176,95 @@ void describe("Step 9 / Finding 17: reconcilePlanChecklist idle action", () => {
       assert.equal(readProgress(folder).checklistProgressUnreliable, true, "latch must remain set");
     } finally {
       taskOperations.end(op);
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("reports a live-operation refusal as a structured result that reopens the card (bugs3 Step 2)", async () => {
+    const { folder, progress } = makeTask("busy-structured-refusal-task", { latched: true });
+    const canonicalId = folder;
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const store = makeStore(canonicalId);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    __extensionContextV1TestOnly.set(makeExtensionContext());
+    const op = taskOperations.begin(folder, { label: "Fast Forward Review", stage: "impl-high-review" });
+    assert.ok(op, "operation must begin");
+    try {
+      const result = await reconcilePlanChecklistConfirmedV1(inventory, store, { taskFolderPath: folder });
+      assert.deepEqual(
+        { outcome: (result as { outcome?: string }).outcome, reopenCard: (result as { reopenCard?: boolean }).reopenCard },
+        { outcome: "refused", reopenCard: true }
+      );
+      assert.match((result as { message?: string }).message ?? "", /Fast Forward Review/);
+
+      const ticks = await applyReconciliationReviewVerifiedTicksConfirmedV1(inventory, store, { taskFolderPath: folder });
+      assert.equal((ticks as { reopenCard?: boolean } | undefined)?.reopenCard, true);
+    } finally {
+      taskOperations.end(op);
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("holds the task's admission while it writes: a competing operation is refused, and admitted after (bugs3 Step 2)", async () => {
+    const { folder, progress } = makeTask("held-admission-task", { latched: true });
+    const canonicalId = folder;
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    let competingDuringWrite: unknown = "not attempted";
+    inventory.refresh = (): Promise<void> => {
+      // Runs inside the command, after its write and before it returns.
+      competingDuringWrite = taskOperations.begin(folder, { label: "Run Implementation", stage: "impl" });
+      return Promise.resolve();
+    };
+    const store = makeStore(canonicalId);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    __extensionContextV1TestOnly.set(makeExtensionContext());
+    try {
+      const result = await reconcilePlanChecklistConfirmedV1(inventory, store, { taskFolderPath: folder });
+      assert.equal(result, true);
+      assert.equal(competingDuringWrite, null, "a competing operation must be refused while the write holds the task");
+      const after = taskOperations.begin(folder, { label: "Run Implementation", stage: "impl" });
+      assert.ok(after, "the hold is released once the command returns");
+      taskOperations.end(after);
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("ends its admission hold as refused, not succeeded, when the guarded action refuses (bugs3 Step 2)", async () => {
+    const { folder, progress } = makeTask("held-admission-refused-task", { latched: true });
+    nodeFs.rmSync(nodePath.join(folder, "plan-final.md"));
+    const canonicalId = folder;
+    const { inventory } = makeInventory(canonicalId, folder, progress);
+    const store = makeStore(canonicalId);
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    __extensionContextV1TestOnly.set(makeExtensionContext());
+    const ended: string[] = [];
+    const sub = taskOperations.onDidEnd((operation) => {
+      if (operation.label === "Reconcile plan checklist") {
+        ended.push(operation.state);
+      }
+    });
+    try {
+      const result = await reconcilePlanChecklistConfirmedV1(inventory, store, { taskFolderPath: folder });
+      assert.equal(result, false);
+      assert.deepEqual(ended, ["refused"], "a refusal must not publish a succeeded settlement");
+    } finally {
+      sub.dispose();
       win.restore();
       fs.restore();
       workspace.restore();

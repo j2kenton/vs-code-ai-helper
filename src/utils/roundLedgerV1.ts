@@ -254,8 +254,10 @@ import {
 import { PersistedTaskProgressV1 } from "../services/taskProgressDecoderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { appendRoundOutcome, handBackToHumanAfterCompletedRoundV1, pauseTaskWithReason, pauseTaskWithReasonForClaimV1, resolveRoundV1, upsertRoundLedgerEntryV1 } from "./taskProgressTransforms";
-import { appendChatMessageV1 } from "./chatHistoryStore";
+import { appendChatMessageV1, readChatHistory } from "./chatHistoryStore";
+import { claimTerminalLineV1, releaseLedgerTerminalLineV1, terminalLineKeyForRoundV1 } from "./terminalLineEmitterV1";
 import { stepOutcomeNameV1 } from "./stepLabelsV1";
+import { describeRoundActionV1 } from "./stageActionWordingV1";
 import { completedRoundAttributionV1 } from "./completedRoundAttributionV1";
 import {
   captureForeignTaskArtifactSnapshotV1,
@@ -585,10 +587,13 @@ export function formatRoundOutcomeMessageV1(
         : "Review the changes or run another Implementation round if automatic review does not start."
     );
   }
-  // The dispatch mode is part of the terminal record, not merely metadata in
+  // What the round did is part of the terminal record, not merely metadata in
   // task-progress.json.  A reader needs it to distinguish checklist-driven
-  // Implementation from Apply Review and a continuation after the fact.
-  parts.push(`mode ${entry.mode}`);
+  // Implementation from Apply Review and a continuation after the fact —
+  // stated for the stage the round ran at (bugs3 Step 4), because the internal
+  // mode name alone ("implementation") reads as "edits code" even at Plan,
+  // where the round writes plan.md. The raw mode stays in task-progress.json.
+  parts.push(describeRoundActionV1(entry.mode, entry.stage));
   const attribution = progress
     ? completedRoundAttributionV1(progress, entry.stage, entry.attemptIds)
     : undefined;
@@ -840,7 +845,30 @@ export async function terminalizeRoundV1(
       foreignArtifactNote = `Task-artifact comparison could not be completed after this round: ${error instanceof Error ? error.message : String(error)}.`;
     }
   }
+  // The ledger's line is this round's terminal line; the shared emitter
+  // registry arbitrates it against the operation observer. When the observer
+  // already posted this operation's "Ended" line, the ledger row is still
+  // written (above) but no second line is appended; reconciliation pass (b)
+  // consults the same registry so it does not add one either.
+  // Reconciliation repair claims the same key, so a repair sweep that saw this
+  // row before its message landed cannot add a second line.
+  const terminalLineKey = terminalLineKeyForRoundV1(entry, options.taskFolderUri.fsPath);
+  // After a window reload the registry is empty, so also look for an
+  // observer-posted line persisted for this operation in the transcript.
+  let observerLinePersisted = false;
+  if (entry.operationId !== undefined) {
+    try {
+      const existing = await readChatHistory(options.taskFolderUri.fsPath, options.canonicalId ?? options.taskFolderUri.fsPath);
+      observerLinePersisted = existing.some((m) => m.endedOperationId === entry.operationId);
+    } catch {
+      // An unreadable transcript cannot show a line; fall back to the registry.
+    }
+  }
+  const mayPostOutcomeLine = claimTerminalLineV1(terminalLineKey, "ledger") && !observerLinePersisted;
   try {
+    if (!mayPostOutcomeLine) {
+      return { ok: true, alreadyTerminal: false, entry, progress: patched };
+    }
     await appendChatMessageV1(
       options.taskFolderUri.fsPath,
       {
@@ -858,12 +886,15 @@ export async function terminalizeRoundV1(
         kind: "outcome",
         roundId: entry.roundId,
         ...(entry.intentId !== undefined ? { intentId: entry.intentId } : {}),
+        ...(entry.operationId !== undefined ? { endedOperationId: entry.operationId } : {}),
       },
       options.canonicalId ?? options.taskFolderUri.fsPath
     );
   } catch {
     // Best-effort only — the ledger write above is authoritative and already
     // landed; reconciliation pass (b) repairs a missing outcome message.
+    // Give the claim back so that repair is not suppressed by the registry.
+    releaseLedgerTerminalLineV1(terminalLineKey);
   }
 
   return { ok: true, alreadyTerminal: false, entry, progress: patched };

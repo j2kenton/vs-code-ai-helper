@@ -23,8 +23,11 @@
 import {
   ImplRecoveryV1,
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
+  STAGE_DISPLAY_NAMES,
   TaskProgress,
+  TaskStage,
 } from "../types/taskProgress";
+import { describeLastRoundV1 } from "./stageActionWordingV1";
 import { hasLiveSchedulingIntentBestEffortV1, SchedulingPostureV1 } from "../state/schedulingIntentV1";
 import { hasLiveWorkAdmissionBestEffortV1, hasLiveWorkAdmissionExcludingOwnerV1 } from "../state/workAdmissionV1";
 
@@ -610,7 +613,11 @@ export function describeStalledActiveTaskEscalationV1(
         ? ` (score ${reading.score}/10${reading.blockers !== undefined ? `, ${reading.blockers} blocker${reading.blockers === 1 ? "" : "s"}` : ""})`
         : "";
     return (
-      `⚠️ "${displayName}" went quiet — its last round (${reading.mode} at ${reading.stage}) finished${verdict} ` +
+      `⚠️ "${displayName}" went quiet — its last round (${describeLastRoundV1(
+        reading.mode,
+        STAGE_DISPLAY_NAMES[reading.stage as TaskStage] ?? reading.stage,
+        reading.stage as TaskStage
+      )}) finished${verdict} ` +
       `and nothing was scheduled after it. Nothing broke; the task was left with no next step queued.${next} ${tail}`
     );
   }

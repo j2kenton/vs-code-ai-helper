@@ -113,6 +113,7 @@ import {
   CommitAndPushTaskArg,
   confirmCommitPushScopeV1,
   generateCommitPushPrDescriptionV1,
+  isReusedCommitPushChecksStillCurrentV1,
   pushCommitPushV1,
   resolveCommitPushStagingScopeV1,
   reviewCommitPushMessageV1,
@@ -120,6 +121,7 @@ import {
   saveCommitPushDocumentsV1,
   stageAndCommitCommitPushV1,
 } from "../../commands/commitAndPushTask";
+import { takeCommitPushStopTextV1 } from "../../utils/commitPushStopCauseV1";
 import { TaskInventory } from "../../state/taskInventory";
 import {
   TaskOperationHandle,
@@ -309,6 +311,7 @@ const COMMIT_PUSH_NOT_COMPLETED_LEVEL_V1: Readonly<
   privateContentStaged: "error",
   gitNotReady: "error",
   checksDeclined: "information",
+  checksNoLongerCurrent: "warning",
   fixWithAiUnavailable: "warning",
   taskFolderChangesDeclined: "information",
   runArtifactsDeclined: "information",
@@ -340,6 +343,9 @@ const COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1: Readonly<Record<CommitAndPushNo
     "See 'Ensemble: Commit Preview' for the list — unstage them and retry.",
   gitNotReady: "Commit and push failed: the repository is not ready to push.",
   checksDeclined: "Commit and push cancelled.",
+  checksNoLongerCurrent:
+    "Commit and push stopped: the recorded Publish Checks result no longer covers what would be committed. " +
+    "Nothing was committed or pushed; choose Commit & Push again — the checks will run again.",
   fixWithAiUnavailable:
     'Fix with AI is unavailable here — run "Linting Fixes" from the task\'s Publish actions, then retry Commit and Push.',
   taskFolderChangesDeclined: "Commit and push cancelled.",
@@ -352,6 +358,15 @@ const COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1: Readonly<Record<CommitAndPushNo
   pushFailed: "Push failed. Your local commit was kept — it has NOT been rolled back automatically.",
   unexpectedError: "Commit and push failed.",
 };
+
+/** Reasons a run ends when the owner (or a timeout standing in for them) did not go on. */
+const COMMIT_PUSH_DECLINE_REASONS_V1: ReadonlySet<CommitAndPushNotCompletedReasonV1> = new Set([
+  "checksDeclined",
+  "taskFolderChangesDeclined",
+  "runArtifactsDeclined",
+  "userCancelled",
+  "commitMessageCancelled",
+]);
 
 /**
  * Coordinator-owned terminal presentation for `commitPush.v1` (plan §3.8:
@@ -558,7 +573,7 @@ export async function executeCommitPushV1(
       } else {
         // §10.2's "staging-scope decisions" step, run directly by this
         // coordinator, before any of the remaining steps below.
-        const scopeResult = await resolveCommitPushStagingScopeV1(services.resolvedTask);
+        const scopeResult = await resolveCommitPushStagingScopeV1(services.resolvedTask, op.token);
         if (scopeResult.kind === "noChanges") {
           result = { kind: "noChanges" };
         } else if (scopeResult.kind === "notCompleted") {
@@ -573,7 +588,8 @@ export async function executeCommitPushV1(
           const confirmResult = await confirmCommitPushScopeV1(
             services.resolvedTask,
             repoRoot,
-            scopeResult.scope
+            scopeResult.scope,
+            op.token
           );
           if (confirmResult.kind === "notCompleted") {
             result = { kind: "notCompleted", reason: confirmResult.reason, detail: confirmResult.detail };
@@ -670,6 +686,16 @@ export async function executeCommitPushV1(
     // `"userCancelled"` keeps `presentCommitPushCoreResultV1` from now
     // showing a misleading generic failure message for it.
     result = { kind: "notCompleted", reason: "userCancelled" };
+  }
+
+  // bugs3 Step 17: a confirmation that timed out, was dropped by a reload or was
+  // dismissed ended the run; the owner did not cancel it. Say what stopped it.
+  // The promise that the checks will not re-run is made from what the recorded
+  // result shows now, not from the flag set when this attempt skipped them.
+  const checksStillReusable = await isReusedCommitPushChecksStillCurrentV1(services.resolvedTask).catch(() => false);
+  const stopText = takeCommitPushStopTextV1(services.resolvedTask.taskFolderPath, { checksStillReusable });
+  if (stopText !== undefined && result.kind === "notCompleted" && COMMIT_PUSH_DECLINE_REASONS_V1.has(result.reason)) {
+    result = { kind: "notCompleted", reason: result.reason, detail: stopText };
   }
 
   taskOperations.end(op, deriveCommitPushOperationEndStateV1(op, result));

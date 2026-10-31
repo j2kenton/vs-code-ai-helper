@@ -34,7 +34,8 @@ import {
   TaskActionOutcomeV1,
 } from "../types/taskActionOutcomeV1";
 import { attributionModelLabel } from "./fileUtils";
-import { describeChainCandidatesV1 } from "./chainExhaustionMessageV1";
+import { describeChainCandidatesV1, describeChainRecoveryV1 } from "./chainExhaustionMessageV1";
+import { STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
 
 /**
  * Render the same provider/model identity artifact attribution headers use,
@@ -233,7 +234,9 @@ export function describeTaskActionOutcomeForLogV1(
         ? `Status: unavailable (${outcome.code}) — each deferred candidate: ` +
           `${unavailableCandidateReasonsV1(outcome) || "candidate details are unavailable in this record"}. ` +
           "The task is parked with the earliest known reset time rather than treated as exhausted."
-        : `Status: unavailable (${outcome.code})`;
+        : outcome.code === "candidatesExhausted" && unavailableCandidateReasonsV1(outcome)
+          ? `Status: unavailable (${outcome.code}) — every model failed: ${unavailableCandidateReasonsV1(outcome)}.`
+          : `Status: unavailable (${outcome.code})`;
     case "recoveryRequired":
       return `Status: recovery required (${outcome.code})`;
     case "duplicateRejected":
@@ -276,10 +279,29 @@ export function describeTaskActionFailureV1(outcome: TaskActionOutcomeV1): strin
       const allReasons = summarizeRejectedAttemptChainV1(finalReason, outcome.priorRejectedAttemptsV1);
       return `the model's response was malformed (${allReasons})${providerLogSuffix(outcome.provider)}`;
     }
-    case "unavailable":
-      return outcome.code === "candidatesDeferred"
-        ? `every remaining candidate is deferred: ${unavailableCandidateReasonsV1(outcome) || "candidate details are unavailable in this record"}`
+    case "unavailable": {
+      // bugs3 Step 3: an exhausted chain reads "every model failed" with each
+      // candidate's own reason and the cheapest next step for those reasons;
+      // the internal code (`candidatesDeferred` / `candidatesExhausted`) stays
+      // in the run log's status line, not in this user-facing clause.
+      const reasons = unavailableCandidateReasonsV1(outcome);
+      const recovery = describeChainRecoveryV1(
+        outcome.chainExhaustion?.candidates ?? [],
+        outcome.chainExhaustion?.stage
+      );
+      const recoverySuffix = recovery ? ` ${recovery}` : "";
+      if (outcome.code === "candidatesDeferred") {
+        const stage = outcome.chainExhaustion?.stage;
+        const stageName = stage !== undefined ? (STAGE_DISPLAY_NAMES[stage as TaskStage] ?? stage) : undefined;
+        return (
+          `every model failed — ${stageName !== undefined ? `${stageName}'s models are` : "the models are"} ` +
+          `out of quota or otherwise unavailable: ${reasons || "candidate details are unavailable in this record"}.${recoverySuffix}`
+        );
+      }
+      return outcome.code === "candidatesExhausted" && reasons
+        ? `every model failed: ${reasons}.${recoverySuffix}`
         : outcome.code;
+    }
     case "recoveryRequired":
       return outcome.code;
     case "duplicateRejected":
@@ -291,4 +313,36 @@ export function describeTaskActionFailureV1(outcome: TaskActionOutcomeV1): strin
     default:
       return outcome.kind;
   }
+}
+
+/**
+ * bugs3 Step 3: every attempt id an outcome knows about — the final attempt,
+ * each earlier rejected attempt, and every attempt of every invoked candidate
+ * in an exhausted chain — in first-seen order without duplicates. The round
+ * ledger records these on terminalization so a round whose providers were all
+ * invoked and all failed no longer ends with `attemptIds: []`.
+ */
+export function collectAttemptIdsFromOutcomeV1(outcome: TaskActionOutcomeV1): string[] {
+  const ids: string[] = [];
+  const add = (id: string | undefined): void => {
+    if (id && !ids.includes(id)) {
+      ids.push(id);
+    }
+  };
+  if (outcome.kind === "failed" || outcome.kind === "malformedResult") {
+    for (const prior of outcome.priorRejectedAttemptsV1 ?? []) {
+      add(prior.attemptId);
+    }
+    add(outcome.attemptId);
+  } else if (outcome.kind === "unavailable") {
+    for (const candidate of outcome.chainExhaustion?.candidates ?? []) {
+      for (const id of candidate.attemptIds ?? []) {
+        add(id);
+      }
+    }
+    for (const id of outcome.chainExhaustion?.unclaimedAttemptIds ?? []) {
+      add(id);
+    }
+  }
+  return ids;
 }

@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { TaskInventory } from "../state/taskInventory";
-import { resolveTaskContext } from "../utils/resolveTaskContext";
+import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { NotificationRouter } from "../utils/notificationRouter";
@@ -38,7 +38,7 @@ import {
 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
-import { taskOperations } from "../utils/taskOperations";
+import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
 import { ChatTarget } from "../views/chatView";
 import { deriveApplicableVerifiedTicksV1, writeVerifiedTicksToPlanV1 } from "./applyReviewerVerifiedTicks";
 import {
@@ -58,6 +58,101 @@ import {
 import { ReviewBlocker } from "../utils/reviewReadiness";
 import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
 import { fastForwardResumeSuffixV1, FastForwardResumeStateV1 } from "./fastForwardResumeSuffixV1";
+import {
+  describeLiveTaskOperationV1,
+  getLiveTaskOperationV1,
+  LiveTaskOperationV1,
+} from "../utils/liveTaskOperationLookupV1";
+
+/**
+ * bugs3 Step 2: refuses a checklist action while an operation holds the task,
+ * read from the live operations state (local, runner-mirrored or an in-process
+ * Fast Forward run) at the moment the action is taken — never from how the
+ * card was raised. Says what is running and that the card offers the choice
+ * again when it ends.
+ */
+function findLiveTaskOperationV1(taskFolderPath: string): LiveTaskOperationV1 | undefined {
+  return (
+    getLiveTaskOperationV1(taskFolderPath) ??
+    (taskOperations.hasRootOperationForTask(taskFolderPath) ? { label: "another operation" } : undefined)
+  );
+}
+
+function refuseWhileTaskOperationLiveV1(
+  resolved: {
+    readonly taskFolderPath: string;
+    readonly progress: { readonly displayName?: string };
+    readonly folderName: string;
+  },
+  action: string,
+  /** An operation already found by the caller. */
+  alreadyFound?: LiveTaskOperationV1
+): boolean {
+  const live = alreadyFound ?? findLiveTaskOperationV1(resolved.taskFolderPath);
+  if (!live) {
+    return false;
+  }
+  NotificationRouter.showWarning(
+    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Cannot ${action} while an operation is running: ` +
+      `${describeLiveTaskOperationV1(live)}. Wait for it to finish; the card offers this again then.`
+  );
+  return true;
+}
+
+type TaskAdmissionV1 = { readonly held: TaskOperationHandle } | { readonly refusedBy: LiveTaskOperationV1 };
+
+/**
+ * bugs3 Step 2: takes the task's exclusive admission for the duration of a
+ * checklist write. Reading the live state and registering are one synchronous
+ * step, so nothing can start between them; once held, an operation that tries
+ * to begin on the task is refused at ITS admission instead of racing the
+ * awaited reads and writes that follow. Callers release it in a `finally`.
+ */
+function acquireTaskAdmissionV1(taskFolderPath: string, label: string, taskName: string): TaskAdmissionV1 {
+  const live = findLiveTaskOperationV1(taskFolderPath);
+  if (live) {
+    return { refusedBy: live };
+  }
+  const held = taskOperations.begin(taskFolderPath, { label, taskName, exclusive: true });
+  return held ? { held } : { refusedBy: findLiveTaskOperationV1(taskFolderPath) ?? { label: "another operation" } };
+}
+
+/**
+ * Ends a held admission with what the guarded action actually did. A hold that
+ * always ended "succeeded" published a false "Ended … — succeeded" line beside
+ * a refusal or a thrown write. A throw leaves the caller's default (`failed`).
+ */
+function endTaskAdmissionV1(
+  held: TaskOperationHandle,
+  state: "succeeded" | "refused" | "failed",
+  reason?: string
+): void {
+  taskOperations.end(held, state, reason);
+}
+
+/**
+ * The structured refusal for a command that found the task held. The answer
+ * was recorded before the command ran, so `reopenCard` puts the card back and
+ * the choice is offered again when the operation ends.
+ */
+function liveOperationRefusalV1(
+  resolved: {
+    readonly taskFolderPath: string;
+    readonly progress: { readonly displayName?: string };
+    readonly folderName: string;
+  },
+  action: string,
+  live: LiveTaskOperationV1
+): WorkflowDecisionCommandResultV1 {
+  refuseWhileTaskOperationLiveV1(resolved, action, live);
+  return {
+    outcome: "refused",
+    reopenCard: true,
+    message:
+      `${describeLiveTaskOperationV1(live)} is running for this task, so I could not ${action}. ` +
+      "The card is back; choose it again when that ends.",
+  };
+}
 
 /** Glyph for a genuinely open (unticked, non-excluded) checklist item — every
  * item this file's evidence blocks name is drawn from an unticked-items list,
@@ -2106,10 +2201,7 @@ export async function reconcilePlanChecklist(
     );
     return;
   }
-  if (taskOperations.hasRootOperationForTask(resolved.taskFolderPath)) {
-    NotificationRouter.showWarning(
-      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Cannot reconcile the checklist while an operation is running. Wait for the active operation to finish.`
-    );
+  if (refuseWhileTaskOperationLiveV1(resolved, "reconcile the checklist")) {
     return;
   }
 
@@ -2150,7 +2242,7 @@ export async function reconcilePlanChecklistConfirmedV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ReconcileArg
-): Promise<boolean> {
+): Promise<boolean | WorkflowDecisionCommandResultV1> {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
   const normalized = normalizeArg(explicitArg);
   const resolved = await resolveTaskContext(
@@ -2171,13 +2263,30 @@ export async function reconcilePlanChecklistConfirmedV1(
     );
     return false;
   }
-  if (taskOperations.hasRootOperationForTask(resolved.taskFolderPath)) {
-    NotificationRouter.showWarning(
-      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Cannot reconcile the checklist while an operation is running. Wait for the active operation to finish.`
-    );
-    return false;
+  const admission = acquireTaskAdmissionV1(
+    resolved.taskFolderPath,
+    "Reconcile plan checklist",
+    resolved.progress.displayName ?? resolved.folderName
+  );
+  if ("refusedBy" in admission) {
+    return liveOperationRefusalV1(resolved, "reconcile the checklist", admission.refusedBy);
   }
+  let settled: "succeeded" | "refused" | "failed" = "failed";
+  try {
+    const reconciled = await reconcileChecklistHeldV1(inventory, resolved, normalized);
+    settled = reconciled ? "succeeded" : "refused";
+    return reconciled;
+  } finally {
+    endTaskAdmissionV1(admission.held, settled, settled === "refused" ? "nothing was reconciled" : undefined);
+  }
+}
 
+/** The reconciliation proper, run with the task's admission held (see above). */
+async function reconcileChecklistHeldV1(
+  inventory: TaskInventory,
+  resolved: ResolvedTaskContext,
+  normalized: ReturnType<typeof normalizeArg>
+): Promise<boolean> {
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
   const planUri = getCanonicalImplementationUri(folderUri);
   const plan = await readTextIfExists(planUri);
@@ -2398,8 +2507,26 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     return;
   }
 
+  // bugs3 Step 2: the task's admission is held for the reads and plan writes
+  // only; it is released before the follow-up dispatch at the end, which
+  // starts its own operation.
+  const admission = acquireTaskAdmissionV1(
+    resolved.taskFolderPath,
+    "Apply reviewer-verified ticks",
+    resolved.progress.displayName ?? resolved.folderName
+  );
+  if ("refusedBy" in admission) {
+    return liveOperationRefusalV1(resolved, "apply the reviewer-verified ticks", admission.refusedBy);
+  }
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
-  const result = await applyReconciliationReviewVerifiedTicksV1(folderUri, normalized?.offeredItems);
+  let result: ApplyReconciliationTicksResultV1;
+  let settled: "succeeded" | "refused" | "failed" = "failed";
+  try {
+    result = await applyReconciliationReviewVerifiedTicksV1(folderUri, normalized?.offeredItems);
+    settled = result.kind === "applied" || result.kind === "alreadyTicked" ? "succeeded" : "refused";
+  } finally {
+    endTaskAdmissionV1(admission.held, settled, settled === "refused" ? "no ticks were written" : undefined);
+  }
   if (result.kind === "noChecklist") {
     NotificationRouter.showWarning(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md has no implementation checklist to tick, so there is nothing to apply.`
@@ -2580,7 +2707,7 @@ export async function linkManualChecksToBlockerConfirmedV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: LinkManualChecksArg
-): Promise<void> {
+): Promise<WorkflowDecisionCommandResultV1 | void> {
   await TaskCreationStartupReconcilerV1.waitUntilReady();
   const resolved = await resolveTaskContext(
     inventory,
@@ -2595,6 +2722,51 @@ export async function linkManualChecksToBlockerConfirmedV1(
     return;
   }
 
+  // bugs3 Step 2: held for the reads and the plan write only; released before
+  // the follow-up dispatch at the end, which starts its own operation.
+  const admission = acquireTaskAdmissionV1(
+    resolved.taskFolderPath,
+    "Link outstanding checks",
+    resolved.progress.displayName ?? resolved.folderName
+  );
+  if ("refusedBy" in admission) {
+    return liveOperationRefusalV1(resolved, "link the outstanding checks", admission.refusedBy);
+  }
+  let appliedCount: number | undefined;
+  let settled: "succeeded" | "refused" | "failed" = "failed";
+  try {
+    appliedCount = await linkChecksHeldV1(resolved, explicitArg);
+    settled = appliedCount === undefined ? "refused" : "succeeded";
+  } finally {
+    endTaskAdmissionV1(admission.held, settled, settled === "refused" ? "no checks were linked" : undefined);
+  }
+  if (appliedCount === undefined) {
+    return;
+  }
+  await inventory.refresh();
+  NotificationRouter.showInformation(
+    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Linked ${appliedCount} outstanding check(s) to Step ${explicitArg?.stepNumber} in plan-final.md via a Covers: annotation.`
+  );
+  // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
+  // Linking alone does not resolve the blocker (a human still has to do the
+  // checks and tick/reconcile), but "try again" is honest either way: a
+  // dispatch that finds the same blocker still open changes nothing new.
+  // RC3 item 4, Step 3 — see that same note.
+  await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+    taskFolderPath: resolved.taskFolderPath,
+    resumeFastForwardV1: explicitArg?.resumeFastForwardV1,
+  });
+}
+
+/**
+ * The guarded link write, run with the task's admission held. Resolves to the
+ * number of checks annotated, or `undefined` when a guard refused (already
+ * reported to the user).
+ */
+async function linkChecksHeldV1(
+  resolved: ResolvedTaskContext,
+  explicitArg: LinkManualChecksArg | undefined
+): Promise<number | undefined> {
   const stepNumber = explicitArg?.stepNumber;
   const itemTexts = explicitArg?.itemTexts ?? [];
   if (stepNumber === undefined || itemTexts.length === 0) {
@@ -2699,22 +2871,9 @@ export async function linkManualChecksToBlockerConfirmedV1(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — plan-final.md changed while this link was being applied — nothing was written. Re-open the reconcile ` +
         "decision and try again."
     );
-    return;
+    return undefined;
   }
-
-  await inventory.refresh();
-  NotificationRouter.showInformation(
-    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Linked ${appliedCount} outstanding check(s) to Step ${stepNumber} in plan-final.md via a Covers: annotation.`
-  );
-  // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
-  // Linking alone does not resolve the blocker (a human still has to do the
-  // checks and tick/reconcile), but "try again" is honest either way: a
-  // dispatch that finds the same blocker still open changes nothing new.
-  // RC3 item 4, Step 3 — see that same note.
-  await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
-    taskFolderPath: folderUri.fsPath,
-    resumeFastForwardV1: explicitArg?.resumeFastForwardV1,
-  });
+  return appliedCount;
 }
 
 export function registerReconcilePlanChecklistCommands(

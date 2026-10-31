@@ -12,6 +12,7 @@
  * Built-but-unticked items are NOT unbuilt work (reviewers list those under
  * `## Verified Complete`), so a sentence that says so never counts.
  */
+import { listStepNumbersNamedInTextV1 } from "./implementationChecklist";
 import { parseReviewBlockersDetailed } from "./reviewReadiness";
 
 export interface UnbuiltStepsContradictionV1 {
@@ -79,7 +80,13 @@ function verdictAndNextSegments(content: string): string[] {
  * `undefined` when the review is consistent (or says nothing about open steps).
  */
 export function findUnbuiltStepsWithoutCompletionBlockerV1(
-  content: string
+  content: string,
+  /**
+   * bugs3 Step 7: steps the task description or the plan defers or gates
+   * (`deferredOrGatedStepNumbersV1`). A sentence naming only these is not a
+   * contradiction. Review prose never contributes to this set.
+   */
+  deferredSteps?: ReadonlySet<number>
 ): UnbuiltStepsContradictionV1 | undefined {
   const evidence = parseReviewBlockersDetailed(content);
   if (evidence.blockers.some((blocker) => blocker.category === "completion")) {
@@ -90,11 +97,22 @@ export function findUnbuiltStepsWithoutCompletionBlockerV1(
       if (
         NAMES_PLAN_STEPS_RE.test(sentence) &&
         STILL_TO_BUILD_RE.test(sentence) &&
-        !BUILT_BUT_NOT_TICKED_RE.test(sentence)
+        !BUILT_BUT_NOT_TICKED_RE.test(sentence) &&
+        !namesOnlyDeferredSteps(sentence, deferredSteps)
       ) {
         return { sentence: sentence.trim() };
       }
     }
   }
   return undefined;
+}
+
+/** True when the sentence names plan steps and every one of them is deferred or gated. */
+function namesOnlyDeferredSteps(sentence: string, deferredSteps: ReadonlySet<number> | undefined): boolean {
+  if (deferredSteps === undefined || deferredSteps.size === 0) {
+    return false;
+  }
+  const named = listStepNumbersNamedInTextV1(sentence);
+  // An unreadable reference stays conservative: it is not known to be deferred.
+  return named.unreadable.length === 0 && named.steps.length > 0 && named.steps.every((step) => deferredSteps.has(step));
 }

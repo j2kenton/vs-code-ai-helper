@@ -21,6 +21,7 @@ import * as vscode from "vscode";
 import {
   applyOpenPlanItemsFormSubmissionV1,
   decideOpenPlanItemsV1,
+  dismissOpenPlanItemsFormV1,
   buildOpenPlanItemsNeedDecisionCardInputV1,
 } from "../commands/decideOpenPlanItemsV1";
 import {
@@ -29,6 +30,7 @@ import {
   readOpenPlanItemsFormsV1,
 } from "../utils/chatHistoryStore";
 import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { retirePendingQuestionsV1, CARD_RETIRED_BY_TASK_MOVING_ON_REASON_V1 } from "../utils/cardLifecycleV1";
 import {
   applyOpenPlanItemDecisionsV1,
   applyOpenPlanItemsFormV1,
@@ -483,6 +485,47 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
   function readPlan(folder: string): string {
     return nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
   }
+
+  void it("retires a departed-stage form and refuses a previously rendered submission", async () => {
+    const folder = makeTaskFolder("departure", "<!-- ensemble:implementation-checklist -->\n- [ ] Work\n");
+    const form = await postForm(folder, [{ itemText: "Work", reason: "" }]);
+    const before = readPlan(folder);
+    await retirePendingQuestionsV1(folder, folder, CARD_RETIRED_BY_TASK_MOVING_ON_REASON_V1, { stage: "impl" });
+    const result = await submit(folder, form, [{ itemId: form.items[0]!.itemId, choice: "tick" }]);
+    assert.equal(result.kind, "ignored");
+    assert.match(result.message, /retired by the task moving on/);
+    assert.equal(readPlan(folder), before);
+    const stored = (await readOpenPlanItemsFormsV1(folder, folder))[0]!;
+    assert.equal(stored.state, "stale");
+    assert.equal(stored.closedReason, CARD_RETIRED_BY_TASK_MOVING_ON_REASON_V1);
+  });
+
+  void it("dismisses a form with actor and time, and refuses its later answers", async () => {
+    const folder = makeTaskFolder("dismiss", "<!-- ensemble:implementation-checklist -->\n- [ ] Work\n");
+    const form = await postForm(folder, [{ itemText: "Work", reason: "" }]);
+    const before = readPlan(folder);
+    const closed = await dismissOpenPlanItemsFormV1(folder, folder, form.formId, "owner");
+    assert.equal(closed?.closedBy, "owner");
+    assert.ok(closed?.closedAt);
+    const result = await submit(folder, form, [{ itemId: form.items[0]!.itemId, choice: "tick" }]);
+    assert.equal(result.kind, "ignored");
+    assert.match(result.message, /dismissed by the owner/);
+    assert.equal(readPlan(folder), before);
+  });
+
+  void it("refuses a submission after the task stage changes before retirement runs", async () => {
+    const folder = makeTaskFolder("stage-race", "<!-- ensemble:implementation-checklist -->\n- [ ] Work\n");
+    const form = await postForm(folder, [{ itemText: "Work", reason: "" }]);
+    const progressPath = nodePath.join(folder, "task-progress.json");
+    const progress = JSON.parse(nodeFs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+    progress.currentStage = "impl-high-review";
+    nodeFs.writeFileSync(progressPath, JSON.stringify(progress));
+    const before = readPlan(folder);
+    const result = await submit(folder, form, [{ itemId: form.items[0]!.itemId, choice: "tick" }]);
+    assert.equal(result.kind, "ignored");
+    assert.match(result.message, /stage is no longer current/);
+    assert.equal(readPlan(folder), before);
+  });
 
   const captured: { level: string; message: string }[] = [];
   const surface: StatusSurface = {

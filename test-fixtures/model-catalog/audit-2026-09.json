@@ -72,6 +72,68 @@
   "humanScopeWaivers": [],
   "records": [
     {
+      "provider": "devpass-cli",
+      "scope": "picker",
+      "defaultAuthPath": "LLM Gateway DevPass credential (`devpass-code providers login`)",
+      "supportedPathClasses": [
+        "devpass"
+      ],
+      "evidence": {
+        "authContext": "Existing LLM Gateway DevPass sign-in referenced from isolated temporary state; no credential was recorded",
+        "cliVersion": "devpass-code 1.18.11",
+        "source": "`devpass-code models --verbose` on the dev box (Linux aarch64), sanitized: .ensemble/2026-10-25_task_1/evidence/devpass-1.18.11-models-verbose.txt",
+        "date": "2026-10-28"
+      },
+      "coverage": "snapshot",
+      "snapshot": {
+        "command": "devpass-code models --verbose",
+        "cliVersion": "devpass-code 1.18.11",
+        "capturedAt": "2026-10-28",
+        "authContext": "LLM Gateway DevPass account sign-in",
+        "catalogAuthority": "context-only"
+      },
+      "freeLabelsAudited": false,
+      "notes": "Seed regenerated 2026-10-31 from the 2026-10-28 capture (241 devpass models; the 170 with tool calling, minus five realtime-audio models, are seeded) with each model's own variant ladder. This is the 1.x ladder: do not copy the 2.0.29 `api --standalone model.list` ladders (Opus 5.5 also lists xhigh and max there) into the 1.x seed.",
+      "entries": [
+        {
+          "id": "llmgateway-devpass/claude-opus-5-5",
+          "status": "added",
+          "checkedAt": "2026-10-28",
+          "source": "`devpass-code models --verbose` (devpass-code 1.18.11) owner capture, 2026-10-28: llmgateway-devpass/claude-opus-5-5 listed with variants low, medium, high"
+        },
+        {
+          "id": "llmgateway-devpass/gpt-6-astra",
+          "status": "added",
+          "checkedAt": "2026-10-28",
+          "source": "`devpass-code models --verbose` (devpass-code 1.18.11) owner capture, 2026-10-28: llmgateway-devpass/gpt-6-astra listed"
+        },
+        {
+          "id": "llmgateway-devpass/gpt-6-luna",
+          "status": "added",
+          "checkedAt": "2026-10-28",
+          "source": "`devpass-code models --verbose` (devpass-code 1.18.11) owner capture, 2026-10-28: llmgateway-devpass/gpt-6-luna listed"
+        },
+        {
+          "id": "llmgateway-devpass/gpt-6-sol",
+          "status": "added",
+          "checkedAt": "2026-10-28",
+          "source": "`devpass-code models --verbose` (devpass-code 1.18.11) owner capture, 2026-10-28: llmgateway-devpass/gpt-6-sol listed"
+        },
+        {
+          "id": "llmgateway-devpass/gpt-6.1-sol",
+          "status": "added",
+          "checkedAt": "2026-10-28",
+          "source": "`devpass-code models --verbose` (devpass-code 1.18.11) owner capture, 2026-10-28: llmgateway-devpass/gpt-6.1-sol listed"
+        },
+        {
+          "id": "llmgateway-devpass/gpt-6.1-terra",
+          "status": "added",
+          "checkedAt": "2026-10-28",
+          "source": "`devpass-code models --verbose` (devpass-code 1.18.11) owner capture, 2026-10-28: llmgateway-devpass/gpt-6.1-terra listed"
+        }
+      ]
+    },
+    {
       "provider": "claude-cli",
       "scope": "picker",
       "defaultAuthPath": "Claude Pro/Max subscription login (`claude`)",
@@ -463,15 +525,27 @@
       "provider": "devpass-cli",
       "block": "default",
       "family": "gpt-6",
-      "status": "not-added",
-      "reason": "No evidence the provider offers GPT-6 or Opus 5.5; devpass-code is not installed on the dev box. Discovery is wired for this path and will surface such a model once the provider offers it, so no seed is needed. Gathering evidence is not part of this task (owner decision recorded 2026-09-27); this is not a claim the provider cannot offer it."
+      "status": "added",
+      "checkedAt": "2026-10-28",
+      "source": "`devpass-code models --verbose` (devpass-code 1.18.11), owner capture 2026-10-28 (.ensemble/2026-10-25_task_1/evidence/devpass-1.18.11-models-verbose.txt, 241 models); see the llmgateway-devpass/gpt-6-* and gpt-6.1-* entries",
+      "entryIds": [
+        "llmgateway-devpass/gpt-6-astra",
+        "llmgateway-devpass/gpt-6-luna",
+        "llmgateway-devpass/gpt-6-sol",
+        "llmgateway-devpass/gpt-6.1-sol",
+        "llmgateway-devpass/gpt-6.1-terra"
+      ]
     },
     {
       "provider": "devpass-cli",
       "block": "default",
       "family": "opus-5.5",
-      "status": "not-added",
-      "reason": "No evidence the provider offers GPT-6 or Opus 5.5; devpass-code is not installed on the dev box. Discovery is wired for this path and will surface such a model once the provider offers it, so no seed is needed. Gathering evidence is not part of this task (owner decision recorded 2026-09-27); this is not a claim the provider cannot offer it."
+      "status": "added",
+      "checkedAt": "2026-10-28",
+      "source": "`devpass-code models --verbose` (devpass-code 1.18.11), owner capture 2026-10-28 (.ensemble/2026-10-25_task_1/evidence/devpass-1.18.11-models-verbose.txt, 241 models); see the llmgateway-devpass/claude-opus-5-5 entry",
+      "entryIds": [
+        "llmgateway-devpass/claude-opus-5-5"
+      ]
     }
   ]
 }

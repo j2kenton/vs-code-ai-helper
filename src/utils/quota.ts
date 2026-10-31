@@ -145,6 +145,43 @@ export function isAuthenticationFailure(message: string | undefined): boolean {
 }
 
 /**
+ * bugs3 Step 11: a provider's own usage-limit reply — an HTTP 429 and quota or
+ * usage-limit wording on the SAME line ("429 You've reached your 5-hour usage
+ * limit…"). Such a line is a quota failure whatever else the scanned text
+ * mentions: a round that edited auth tests carries "login" and "401" in its
+ * output, and reading the limit as a sign-in problem both sends the owner to a
+ * useless re-login and bars the backup cascade a quota failure is meant to reach.
+ */
+export function isExplicitProviderUsageLimitV1(text: string | undefined): boolean {
+  return explicitProviderUsageLimitLineV1(text) !== undefined;
+}
+
+/** The first line that is an explicit usage-limit reply, trimmed, or undefined. */
+export function explicitProviderUsageLimitLineV1(text: string | undefined): string | undefined {
+  for (const rawLine of (text ?? "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (/\b429\b/.test(line) && /usage[\s-]*limit|quota|rate[\s-]*limit|limit\s+(?:reached|exceeded)/i.test(line)) {
+      return line;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * A plain-words statement of a usage limit for the failure message, naming the
+ * window when the provider did ("Kimi Code CLI's 5-hour usage limit is used up;
+ * it resets when the window ends."). Never mentions signing in.
+ */
+export function describeExplicitUsageLimitV1(providerLabel: string, limitLine: string): string {
+  const windowMatch = /(\d+)[\s-]*(hour|minute|day|week)/i.exec(limitLine);
+  const windowWord = windowMatch ? `${windowMatch[1]}-${windowMatch[2]!.toLowerCase()} ` : "";
+  const resets = /reset/i.test(limitLine) && windowMatch
+    ? "it resets when the window ends"
+    : "check the provider for when it resets";
+  return `${providerLabel}'s ${windowWord}usage limit is used up; ${resets}.`;
+}
+
+/**
  * `structuredSignal` is an OR'd-in, provider-scoped structural verdict (e.g.
  * claude-cli's stream-json `result` event carrying `error: "rate_limit"` —
  * see extractClaudeCliStructuredDiagnostics in cliAgentRunner.ts) that a
@@ -590,7 +627,9 @@ export function classifyFailure<T extends { errorMessage?: string; authDiagnosti
   // let an appended hint re-confirm the very auth verdict that produced it.
   // authDiagnosticText is absent for non-CLI callers (e.g. Copilot), which
   // fall back to errorMessage exactly as before.
-  const isAuth = isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
+  const isAuth =
+    !isExplicitProviderUsageLimitV1(result.authDiagnosticText ?? result.errorMessage) &&
+    isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
   // Checked before the auth gate (isAuth above already excludes entitlement
   // phrasing itself — see isAuthenticationFailure) so a Bedrock/Vertex-style
   // "not available for this account" message classifies as its own kind
@@ -600,7 +639,7 @@ export function classifyFailure<T extends { errorMessage?: string; authDiagnosti
   const isEntitlement = isModelEntitlementFailure(result.authDiagnosticText ?? result.errorMessage);
   const failureKind = isPaymentRequiredFailureV1(result.errorMessage)
     ? "payment-required" as const
-    : isQuotaError(result.errorMessage, result.structuredQuotaSignal)
+    : isQuotaError(result.errorMessage, result.structuredQuotaSignal || isExplicitProviderUsageLimitV1(result.errorMessage))
     ? "quota" as const
     : isEntitlement
       ? "model-entitlement" as const

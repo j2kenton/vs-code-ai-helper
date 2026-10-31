@@ -40,6 +40,7 @@ import {
 import { withTaskLock } from "../state/taskStateStore";
 import { normalizePath } from "./taskRoot";
 import { retirePendingWorkflowDecisionsForTaskV1 } from "./workflowDecisionDispatchV1";
+import { CARD_RETIRED_BY_TASK_MOVING_ON_REASON_V1 } from "./cardLifecycleV1";
 import {
   beginStageEntryJournalV1,
   deleteStageEntryJournalV1,
@@ -628,7 +629,7 @@ export interface StageEntryPostCommitPayloadV1 {
 }
 
 /** The reason recorded on a decision retired because its stage was left. */
-export const DEPARTED_STAGE_DECISION_RETIRED_REASON_V1 = "retired by the task moving on, not answered";
+export const DEPARTED_STAGE_DECISION_RETIRED_REASON_V1 = CARD_RETIRED_BY_TASK_MOVING_ON_REASON_V1;
 
 /** Result of {@link enterStageV1}. */
 export type StageEntryResultV1 =

@@ -1,0 +1,220 @@
+/**
+ * bugs3 Step 9: have the review's non-code inputs changed since it was dispatched?
+ *
+ * The commit and working-tree fingerprint say whether the CODE moved. A review
+ * also read the task description (owner scope and evidence live in `task.md`)
+ * and the plan, and the task folder is not part of the tree fingerprint, so an
+ * owner edit there leaves "the tree is unchanged" true while the review no
+ * longer describes what it was asked. A resumed "Keep iterating … from Apply
+ * Review" that took such a review as current would fix against stale scope.
+ *
+ * At dispatch the review records a digest of each input ({@link recordReviewInputsV1}),
+ * so an edit made while the review was running is seen too. The record belongs to
+ * the artifact only when it is no newer than the artifact: a dispatch that failed
+ * leaves the previous artifact in place, and its record must not vouch for it. With
+ * no usable record, a file newer than the artifact counts as changed.
+ *
+ * `plan-final.md` carries checklist ticks and a round summary that change after
+ * every review, so only its normalized text is compared (an edit to the plan's own
+ * wording counts; a tick does not), and only against a recorded digest. One that
+ * cannot be inspected counts as changed (unknown is not "the same"), and a missing
+ * file is simply not an input.
+ */
+import * as crypto from "node:crypto";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+
+/**
+ * `plan-final.md` is the plan of record: its substantive text (items, their
+ * wording, scope notes) is a review input, but its tick state and the round
+ * summary appended after each round change after every review. It is therefore
+ * digested in a normalized form (see {@link normalizePlanOfRecordForDigestV1}) and has no
+ * modification-time fallback, since a bare mtime cannot tell a tick from an edit.
+ */
+export const PLAN_OF_RECORD_FILENAME_V1 = "plan-final.md";
+
+export const REVIEW_INPUT_FILENAMES_V1: readonly string[] = ["task.md", "plan.md", PLAN_OF_RECORD_FILENAME_V1];
+
+export const REVIEW_INPUTS_RECORD_FILENAME_V1 = "review-inputs-v1.json";
+
+const ABSENT_DIGEST_V1 = "absent";
+const UNREADABLE_DIGEST_V1 = "unreadable";
+
+const LATEST_ROUND_SUMMARY_HEADING_V1 = "\n---\n\n## Latest implementation round summary";
+
+/**
+ * The plan of record without what rounds rewrite: every checkbox reads as unticked
+ * and the appended latest-round summary is dropped, so only an edit to the plan's
+ * own text changes the digest.
+ */
+export function normalizePlanOfRecordForDigestV1(text: string): string {
+  const summaryAt = text.indexOf(LATEST_ROUND_SUMMARY_HEADING_V1);
+  const body = summaryAt >= 0 ? text.slice(0, summaryAt) : text;
+  return body.replace(/^(\s*(?:[-*]|\d+\.)\s+)\[[xX ]\]/gm, "$1[ ]").replace(/\r\n/g, "\n");
+}
+
+/**
+ * The workspace a review was dispatched against. `null` records "no repository, or
+ * git could not say" so that is told apart from a record that predates the field.
+ */
+export interface ReviewWorkspaceIdentityV1 {
+  readonly headSha: string | null;
+  readonly treeFingerprint: string | null;
+}
+
+interface ReviewInputsRecordEntryV1 {
+  readonly recordedAtMs: number;
+  readonly digests: Readonly<Record<string, string>>;
+  readonly workspace?: ReviewWorkspaceIdentityV1;
+}
+
+type ReviewInputsRecordV1 = Readonly<Record<string, ReviewInputsRecordEntryV1>>;
+
+async function digestInputV1(taskFolderPath: string, name: string): Promise<string> {
+  try {
+    const bytes = await fs.readFile(path.join(taskFolderPath, name));
+    const hashed = name === PLAN_OF_RECORD_FILENAME_V1 ? normalizePlanOfRecordForDigestV1(bytes.toString("utf8")) : bytes;
+    return crypto.createHash("sha256").update(hashed).digest("hex");
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? ABSENT_DIGEST_V1 : UNREADABLE_DIGEST_V1;
+  }
+}
+
+async function readRecordV1(taskFolderPath: string): Promise<ReviewInputsRecordV1> {
+  try {
+    const parsed: unknown = JSON.parse(await fs.readFile(path.join(taskFolderPath, REVIEW_INPUTS_RECORD_FILENAME_V1), "utf8"));
+    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed) ? (parsed as ReviewInputsRecordV1) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Records the inputs a review of `reviewArtifactPath` is dispatched against.
+ * Best-effort: a courtesy record must never block the review itself.
+ */
+export async function recordReviewInputsV1(
+  taskFolderPath: string,
+  reviewArtifactPath: string,
+  workspace?: ReviewWorkspaceIdentityV1
+): Promise<void> {
+  try {
+    const digests: Record<string, string> = {};
+    for (const name of REVIEW_INPUT_FILENAMES_V1) {
+      digests[name] = await digestInputV1(taskFolderPath, name);
+    }
+    const record = await readRecordV1(taskFolderPath);
+    const next: ReviewInputsRecordV1 = {
+      ...record,
+      [path.basename(reviewArtifactPath)]: {
+        recordedAtMs: Date.now(),
+        digests,
+        ...(workspace !== undefined ? { workspace } : {}),
+      },
+    };
+    await fs.writeFile(path.join(taskFolderPath, REVIEW_INPUTS_RECORD_FILENAME_V1), JSON.stringify(next, null, 2), "utf8");
+  } catch {
+    // Unrecorded inputs fall back to the modification-time comparison.
+  }
+}
+
+export async function reviewInputsChangedSinceV1(
+  taskFolderPath: string,
+  reviewArtifactPath: string
+): Promise<{ readonly changed: boolean; readonly changedFiles: readonly string[] }> {
+  let reviewedAtMs: number;
+  try {
+    reviewedAtMs = (await fs.stat(reviewArtifactPath)).mtimeMs;
+  } catch {
+    // No artifact to compare against: nothing is known to be current.
+    return { changed: true, changedFiles: [] };
+  }
+  const entry = (await readRecordV1(taskFolderPath))[path.basename(reviewArtifactPath)];
+  const recorded =
+    entry !== undefined &&
+    typeof entry.recordedAtMs === "number" &&
+    entry.recordedAtMs <= reviewedAtMs &&
+    entry.digests !== null &&
+    typeof entry.digests === "object"
+      ? entry.digests
+      : undefined;
+  const changedFiles: string[] = [];
+  for (const name of REVIEW_INPUT_FILENAMES_V1) {
+    if (recorded !== undefined) {
+      // A record written before the plan of record was an input vouches for nothing about
+      // it: "unknown" is not "the same", so an existing plan of record counts as changed.
+      const was = recorded[name] ?? (name === PLAN_OF_RECORD_FILENAME_V1 ? "unrecorded" : undefined);
+      const now = await digestInputV1(taskFolderPath, name);
+      if (was === "unrecorded" && now === ABSENT_DIGEST_V1) {
+        continue;
+      }
+      if (was !== now || now === UNREADABLE_DIGEST_V1) {
+        changedFiles.push(name);
+      }
+      continue;
+    }
+    if (name === PLAN_OF_RECORD_FILENAME_V1) {
+      // Nothing recorded to compare against, and a bare mtime cannot tell a tick from an
+      // edit: an existing plan of record cannot be shown unchanged.
+      if ((await digestInputV1(taskFolderPath, name)) !== ABSENT_DIGEST_V1) {
+        changedFiles.push(name);
+      }
+      continue;
+    }
+    try {
+      const { mtimeMs } = await fs.stat(path.join(taskFolderPath, name));
+      if (mtimeMs > reviewedAtMs) {
+        changedFiles.push(name);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        changedFiles.push(name);
+      }
+    }
+  }
+  return { changed: changedFiles.length > 0, changedFiles };
+}
+
+/**
+ * Has the workspace moved since the review was dispatched? Used for review stages whose
+ * artifact carries no reviewed-commit stamp (plan reviews read the repository too), so
+ * the dispatch-time identity in the inputs record is the only evidence. A review with no
+ * usable record, a record that predates the field, or an identity git could not give on
+ * either side cannot be shown unchanged and reads as changed — including two identities
+ * that are both empty, since "no repository" and "git unreadable" are not told apart.
+ */
+export async function reviewWorkspaceChangedSinceV1(
+  taskFolderPath: string,
+  reviewArtifactPath: string,
+  current: ReviewWorkspaceIdentityV1
+): Promise<boolean> {
+  let reviewedAtMs: number;
+  try {
+    reviewedAtMs = (await fs.stat(reviewArtifactPath)).mtimeMs;
+  } catch {
+    return true;
+  }
+  const entry = (await readRecordV1(taskFolderPath))[path.basename(reviewArtifactPath)];
+  const was = entry?.workspace;
+  if (
+    entry === undefined ||
+    typeof entry.recordedAtMs !== "number" ||
+    entry.recordedAtMs > reviewedAtMs ||
+    was === undefined ||
+    was === null ||
+    typeof was !== "object"
+  ) {
+    return true;
+  }
+  // `null` records "no repository, or git could not say" — the two are not told apart, so a
+  // missing identity on either side cannot be shown unchanged (two unavailable reads would
+  // otherwise bypass the re-review every time git is unreadable).
+  return (
+    was.headSha === null ||
+    was.treeFingerprint === null ||
+    current.headSha === null ||
+    current.treeFingerprint === null ||
+    was.headSha !== current.headSha ||
+    was.treeFingerprint !== current.treeFingerprint
+  );
+}

@@ -234,6 +234,17 @@ export interface CompletionLintResult {
    */
   commandsRun?: string[];
   /**
+   * What each PASSING command executed, read from its own output: the runner
+   * closing summaries it printed, the tests they counted and a fingerprint of
+   * which tests ran. A re-run that passes leaves no failing-test list, so without
+   * this a fix round's progress report could not tell "these tests now pass" from
+   * "a reduced suite ran". Only commands whose output held a runner summary appear.
+   */
+  passedExecutions?: Array<{
+    command: string;
+    execution: import("./failingTestsV1").FailingTestSummaryV1;
+  }>;
+  /**
    * True when the verified workspace root was detected as a monorepo (a
    * `workspaces` field in the root package.json, or a pnpm-workspace.yaml
    * file present) — regardless of whether any member package actually had
@@ -1294,7 +1305,8 @@ export interface CollectCompletionLintOptions {
    */
   onCheckEvent?: {
     started(descriptor: CompletionCheckDescriptor): void;
-    settled(descriptor: CompletionCheckDescriptor): void;
+    /** `result` carries the exit code when the check ran to an exit; absent when it threw. */
+    settled(descriptor: CompletionCheckDescriptor, result?: { readonly exitCode: number }): void;
     /**
      * Fires exactly once, synchronously, before the root/explicit batch's
      * `Promise.all` is kicked off — i.e. before any `started` call — with
@@ -1450,13 +1462,13 @@ export async function collectCompletionLint(
       checksToRun.map(async ({ command, executableCommand, cwd }) => {
         const descriptor: CompletionCheckDescriptor = { command };
         options?.onCheckEvent?.started(descriptor);
+        let exitCode: number | undefined;
         try {
-          return {
-            command,
-            ...(await runWithRetry((extraEnv) => runExplicitCheck(cwd, executableCommand, guard, extraEnv), guard.token)),
-          };
+          const run = await runWithRetry((extraEnv) => runExplicitCheck(cwd, executableCommand, guard, extraEnv), guard.token);
+          exitCode = run.code;
+          return { command, ...run };
         } finally {
-          options?.onCheckEvent?.settled(descriptor);
+          options?.onCheckEvent?.settled(descriptor, exitCode === undefined ? undefined : { exitCode });
         }
       })
     );
@@ -1465,13 +1477,13 @@ export async function collectCompletionLint(
       runnableChecks.map(async ([command, args]) => {
         const descriptor: CompletionCheckDescriptor = { command };
         options?.onCheckEvent?.started(descriptor);
+        let exitCode: number | undefined;
         try {
-          return {
-            command,
-            ...(await runWithRetry((extraEnv) => runCheck(folder, [...args], guard, extraEnv), guard.token)),
-          };
+          const run = await runWithRetry((extraEnv) => runCheck(folder, [...args], guard, extraEnv), guard.token);
+          exitCode = run.code;
+          return { command, ...run };
         } finally {
-          options?.onCheckEvent?.settled(descriptor);
+          options?.onCheckEvent?.settled(descriptor, exitCode === undefined ? undefined : { exitCode });
         }
       })
     );
@@ -1504,14 +1516,13 @@ export async function collectCompletionLint(
       memberCommands.map(async ({ packageDir, command, memberFolder, args }) => {
         const descriptor: CompletionCheckDescriptor = { command };
         options?.onCheckEvent?.started(descriptor);
+        let exitCode: number | undefined;
         try {
-          return {
-            packageDir,
-            command,
-            ...(await runWithRetry((extraEnv) => runCheck(memberFolder, args, guard, extraEnv), guard.token)),
-          };
+          const run = await runWithRetry((extraEnv) => runCheck(memberFolder, args, guard, extraEnv), guard.token);
+          exitCode = run.code;
+          return { packageDir, command, ...run };
         } finally {
-          options?.onCheckEvent?.settled(descriptor);
+          options?.onCheckEvent?.settled(descriptor, exitCode === undefined ? undefined : { exitCode });
         }
       })
     );
@@ -1553,6 +1564,12 @@ export async function collectCompletionLint(
   // (see runWithRetry) — not a "real" failure (its final exit code was 0),
   // but never rendered as silently clean either: the retry itself is the
   // signal that the first attempt could not be trusted.
+  const passedExecutions = checks
+    .filter((check) => check.code === 0)
+    .flatMap((check) => {
+      const execution = extractFailingTestsV1(check.output);
+      return execution.closingSummaries !== undefined ? [{ command: check.command, execution }] : [];
+    });
   const retriedPasses = checks
     .filter((check) => check.code === 0 && check.retryCount > 0)
     .map((check) => ({ command: check.command, retryCount: check.retryCount }));
@@ -1651,6 +1668,7 @@ export async function collectCompletionLint(
       envVarNames: Object.keys(process.env).sort(),
     },
     commandsRun: checks.map((check) => check.command),
+    ...(passedExecutions.length > 0 ? { passedExecutions } : {}),
     monorepoDetected,
     ...(monorepoDetected ? { monorepoChecks } : {}),
     checkSet,
@@ -2659,10 +2677,13 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   incompleteReason?: string;
   /** Isolate raw diagnostics for failed-first attempts from the source full run. */
   rawReportLocation?: string;
+  /** Per-command lifecycle hooks, so a caller can announce each command as it starts. */
+  onCheckEvent?: CollectCompletionLintOptions["onCheckEvent"];
 }): Promise<CompletionLintResult> {
   const result = await collectCompletionLintPreview(folderUri, relevantFiles, {
     allowScopePrompt: true,
     token: options?.token,
+    onCheckEvent: options?.onCheckEvent,
     explicitCommands: options?.explicitCommands,
     explicitChecks: options?.explicitChecks,
     rawReportLocation: options?.rawReportLocation,

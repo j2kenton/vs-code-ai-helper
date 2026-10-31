@@ -221,22 +221,23 @@ void describe("collectCompletionLint — onCheckEvent observer", () => {
     await assert.doesNotReject(collectCompletionLint(dir, []));
   });
 
-  void it("runCompletionLint (the commit/push and Publish-Checks-command entry point) has no way to pass an observer", () => {
-    // `runCompletionLint` — used by runPublishChecks.ts (commit/push),
-    // publishPreflight.ts's persisted-preflight branch, and
-    // runLintingFixes.ts — accepts cancellation and failed-first options and forwards to
-    // `collectCompletionLintPreview` with no `onCheckEvent`.
-    // This is a structural (not just conventional) guarantee: there is no
-    // parameter through which one of those callers COULD publish activity,
-    // matching the plan's requirement that only the workflow completion-
-    // stage caller in reviewActions.ts wires the observer.
+  void it("runCompletionLint forwards an observer only when the caller supplies one; the preflight never does", () => {
+    // bugs3 Step 12: Publish Checks announces each command it runs, so `runCompletionLint`
+    // accepts an optional `onCheckEvent` and forwards exactly that option to
+    // `collectCompletionLintPreview` — it never creates an observer itself.
+    // `publishPreflight.ts`, which only decides whether to schedule a run, still has no way
+    // to publish activity.
     const source = nodeFs.readFileSync(
       nodePath.join(process.cwd(), "src", "utils", "completionLint.ts"),
       "utf8"
     );
     const entryPoint = source.match(/export async function runCompletionLint\([\s\S]*?const result = await collectCompletionLintPreview\([\s\S]*?\);/);
     assert.ok(entryPoint, "runCompletionLint must call collectCompletionLintPreview");
-    assert.doesNotMatch(entryPoint[0], /onCheckEvent/, "runCompletionLint must not accept or forward an observer");
+    assert.match(
+      entryPoint[0],
+      /onCheckEvent: options\?\.onCheckEvent/,
+      "runCompletionLint must forward only the caller's observer"
+    );
 
     const preflightSource = nodeFs.readFileSync(
       nodePath.join(process.cwd(), "src", "utils", "publishPreflight.ts"),

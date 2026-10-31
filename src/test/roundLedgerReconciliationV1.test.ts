@@ -28,6 +28,12 @@ import {
 } from "../services/workflowRuntimeServicesV1";
 import { appendChatMessageV1, readChatHistory } from "../utils/chatHistoryStore";
 import {
+  claimTerminalLineV1,
+  releaseLedgerTerminalLineV1,
+  resetTerminalLinesV1,
+  terminalLineKeyForRoundV1,
+} from "../utils/terminalLineEmitterV1";
+import {
   ChatInteractionTransactionStoreV1,
   ChatTransactionStoreResultV1,
 } from "../services/chatInteractionTransactionStoreV1";
@@ -885,6 +891,83 @@ void describe("repairMissingRoundOutcomeMessagesV1 (Part 4 step 14, pass (b))", 
         messages.filter((m) => m.kind === "outcome" && m.roundId === "attempt-has-outcome-1").length,
         1
       );
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+void describe("repairMissingRoundOutcomeMessagesV1 terminal-line coordination (bugs3 Step 3)", () => {
+  void it("adds no second line when the operation's persisted Ended line survived a reload (empty registry)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      resetTerminalLinesV1();
+      const { folderUri, folderPath } = makeTaskFolder("repair_observer_line_after_reload", [
+        {
+          roundId: "round-reload-1",
+          attemptIds: ["round-reload-1"],
+          operationId: "op-reload-1",
+          stage: "plan",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          endedAt: "2026-01-01T00:10:00.000Z",
+          state: "failed",
+        },
+      ]);
+      await appendChatMessageV1(
+        folderPath,
+        {
+          role: "assistant",
+          text: "Ended Plan — failed.",
+          stage: "plan",
+          at: "2026-01-01T00:10:00.000Z",
+          endedOperationId: "op-reload-1",
+        },
+        folderPath
+      );
+
+      const result = await repairMissingRoundOutcomeMessagesV1({ taskFolderUri: folderUri });
+      assert.deepEqual(result.repaired, []);
+      const messages = await readChatHistory(folderPath, folderPath);
+      assert.equal(messages.filter((m) => m.kind === "outcome").length, 0);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("refuses to repair a row whose line the ledger is already about to post, and posts it once otherwise", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      resetTerminalLinesV1();
+      const { folderUri, folderPath } = makeTaskFolder("repair_claims_emitter", [
+        {
+          roundId: "round-claim-1",
+          attemptIds: ["round-claim-1"],
+          stage: "plan",
+          mode: "implementation",
+          startedAt: "2026-01-01T00:05:00.000Z",
+          endedAt: "2026-01-01T00:10:00.000Z",
+          state: "failed",
+        },
+      ]);
+      // terminalizeRoundV1 persisted the row and claimed the line, but has not
+      // appended its message yet: a concurrent sweep must not add one.
+      assert.equal(claimTerminalLineV1(terminalLineKeyForRoundV1({ roundId: "round-claim-1" }, folderPath), "ledger"), true);
+      const racing = await repairMissingRoundOutcomeMessagesV1({ taskFolderUri: folderUri });
+      assert.deepEqual(racing.repaired, []);
+
+      // The ledger's append failed and it gave the claim back: repair posts once.
+      releaseLedgerTerminalLineV1(terminalLineKeyForRoundV1({ roundId: "round-claim-1" }, folderPath));
+      const first = await repairMissingRoundOutcomeMessagesV1({ taskFolderUri: folderUri });
+      assert.deepEqual(first.repaired, ["round-claim-1"]);
+      const second = await repairMissingRoundOutcomeMessagesV1({ taskFolderUri: folderUri });
+      assert.deepEqual(second.repaired, []);
+      const messages = await readChatHistory(folderPath, folderPath);
+      assert.equal(messages.filter((m) => m.kind === "outcome" && m.roundId === "round-claim-1").length, 1);
     } finally {
       wsStub.restore();
       fsBridge.restore();

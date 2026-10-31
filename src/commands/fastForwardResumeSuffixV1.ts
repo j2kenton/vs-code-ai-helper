@@ -4,6 +4,11 @@ import {
   stampFastForwardResumeProvenanceV1,
 } from "../utils/activeFastForwardRunsV1";
 import { WorkflowDecisionOptionV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import {
+  describeLiveTaskOperationV1,
+  getLiveTaskOperationV1,
+  LiveTaskOperationV1,
+} from "../utils/liveTaskOperationLookupV1";
 
 /**
  * RC3 item 4, Step 3: shared by the reconcile card (`reconcilePlanChecklist.ts`)
@@ -248,6 +253,92 @@ export function refreshFastForwardResumeOptionLabelsV1(record: WorkflowDecisionV
       changed = true;
     }
     return next;
+  });
+  return changed ? { ...record, options } : record;
+}
+
+/**
+ * bugs3 Step 2: the decision keys whose "…and try again" options dispatch the
+ * stage's next action. Both build their suffix with
+ * {@link fastForwardResumeSuffixV1}.
+ */
+/**
+ * "Mark reconciled" dispatches nothing, but its command refuses while an
+ * operation holds the task (it rewrites the progress record the operation is
+ * also writing), so the card holds it with the dispatching options rather than
+ * offering a choice the command would refuse.
+ */
+const RECONCILE_CONFIRMED_COMMAND_V1 = "vs-code-ai-helper.reconcilePlanChecklistConfirmed";
+
+const OPERATION_HELD_DECISION_KEYS_V1:ReadonlySet<string> = new Set([
+  "reconcilePlanChecklist",
+  "applyReviewerVerifiedTicks",
+]);
+
+function findTaskFolderPathInArgsV1(args: readonly unknown[] | undefined): string | undefined {
+  for (const arg of args ?? []) {
+    if (arg && typeof arg === "object") {
+      const candidate = (arg as Record<string, unknown>).taskFolderPath;
+      if (typeof candidate === "string") {
+        return candidate;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The operation running for the task right now that a dispatching option of
+ * `record` would collide with, read from the live operations state — never
+ * from how the card was raised. `undefined` when it would not collide.
+ */
+export function liveOperationBlockingOptionV1(
+  record: WorkflowDecisionV1,
+  option: WorkflowDecisionOptionV1
+): LiveTaskOperationV1 | undefined {
+  if (
+    record.state !== "pending" ||
+    !OPERATION_HELD_DECISION_KEYS_V1.has(record.decisionKey) ||
+    option.effect.kind !== "command" ||
+    !(option.resumeKind === "continue" || option.effect.command === RECONCILE_CONFIRMED_COMMAND_V1)
+  ) {
+    return undefined;
+  }
+  return getLiveTaskOperationV1(findTaskFolderPathInArgsV1(option.effect.args) ?? record.taskCanonicalId);
+}
+
+/**
+ * Render-time view of a pending reconcile / reviewer-verified-ticks card while
+ * an operation (a Fast Forward run, say) holds the task: each option that
+ * would dispatch the stage's next action into it is marked unavailable, naming
+ * what is running and that it is offered again when that ends, and the
+ * single-cycle consequence's "not raised by an active Fast Forward run" claim
+ * is replaced because it is untrue while one runs. This is a VIEW: the store
+ * applies it on reads only and never persists it, so the options come back by
+ * themselves once the operation ends. Answers are re-checked against the same
+ * live state in `WorkflowDecisionStoreV1.resolve`.
+ */
+export function holdDispatchingOptionsWhileOperationLiveV1(record: WorkflowDecisionV1): WorkflowDecisionV1 {
+  let changed = false;
+  const options = record.options.map((option) => {
+    const live = liveOperationBlockingOptionV1(record, option);
+    if (!live) {
+      return option;
+    }
+    changed = true;
+    const running = `${describeLiveTaskOperationV1(live)} is running for this task right now`;
+    return {
+      ...option,
+      disabled: true,
+      disabledReason:
+        option.resumeKind === "continue"
+          ? `${running}, and this would start another action beside it; it is offered again when it ends`
+          : `${running}, and changing the task's checklist record now would race it; it is offered again when it ends`,
+      consequence: option.consequence.endsWith(SINGLE_CYCLE_CONSEQUENCE_SUFFIX_V1)
+        ? option.consequence.slice(0, -SINGLE_CYCLE_CONSEQUENCE_SUFFIX_V1.length) +
+          ` ${running}, so this waits: it does not start or resume anything until that ends.`
+        : option.consequence,
+    };
   });
   return changed ? { ...record, options } : record;
 }

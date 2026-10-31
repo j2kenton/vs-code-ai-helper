@@ -27,10 +27,21 @@ import {
 import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptureV1";
 import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
+import { decideCliMajorV1, getCliMajorVersionV1 } from "../utils/cliMajorVersionV1";
 import { CheckExecutionFeedbackV1, ImplementationRunResult } from "./copilotImplementationRunner";
-import { cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
+import { CLINE_CLI_ARGV_PROMPT_PLACEHOLDER, cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
+import {
+  checkClinePromptReceiptOnDiskV1,
+  clineEditableLaunchGateV1,
+  createClineSessionIoV1,
+  promptNotDeliveredMessageV1,
+  resolveClineDataDirV1,
+  type ClineReceiptCheckV1,
+} from "../utils/clinePromptReceiptV1";
 import {
   classifyCliFailure,
+  describeExplicitUsageLimitV1,
+  explicitProviderUsageLimitLineV1,
   isAuthenticationFailure,
   isModelEntitlementFailure,
   isProviderCapacityError,
@@ -56,6 +67,8 @@ import {
 } from "../state/roundProcessRecordV1";
 import { currentRoundProcessRecordingTargetV1 } from "../state/roundProcessContextV1";
 import { readOtherProcessStartEpochMsV1 } from "../state/processStartTimeProbeV1";
+import { openStdinPromptSourceV1, type StdinPromptSourceV1 } from "../utils/stdinPromptTransportV1";
+import { fingerprintRevertTargetsV1, scopeUndeliveredPromptEditsV1 } from "../utils/undeliveredPromptEditsRevertV1";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -399,6 +412,12 @@ export interface CliExecResult {
    * wedged process apart from a genuinely long-running one.
    */
   timeoutReason?: "wall-clock" | "inactivity";
+  /**
+   * bugs3 Step 6: the provider's own session shows it never received the
+   * prompt Ensemble wrote. Such a run is reported as "prompt not delivered",
+   * is never continued or retried, and its edits are reported separately.
+   */
+  promptNotDeliveredV1?: boolean;
   /**
    * The provider's own session identifier for THIS run, when its event stream
    * reports one.
@@ -1419,14 +1438,24 @@ function extractKimiFinalOutput(
  * trailing non-JSON output that no message line accounted for, which for
  * Kimi is where a plain-text failure would land if it ever reached stdout.
  */
+const KIMI_OWN_ERROR_LINE_RE = /^error:\s/i;
+
 function extractKimiStructuredDiagnostics(
   stdout: string,
   parsed: ParsedCliEventLines = parseJsonLineEvents(stdout)
 ): StructuredCliDiagnostics {
-  const { events, unparsedText, unparsedScanSafeText } = parsed;
+  const { events, unparsedScanSafeText } = parsed;
+  // bugs3 Step 11: only Kimi's OWN `error: …` lines count. Other plain stdout
+  // lines are what a command the model ran printed (`git status`, a test
+  // summary), and scanning or quoting them let a round that merely edited auth
+  // tests read as an authentication failure.
+  const ownErrorLines = unparsedScanSafeText
+    .split("\n")
+    .filter((line) => KIMI_OWN_ERROR_LINE_RE.test(line))
+    .join("\n");
   return {
-    markerScanText: unparsedScanSafeText,
-    detail: unparsedText,
+    markerScanText: ownErrorLines,
+    detail: ownErrorLines,
     // Kimi's stream carries no structural retryable signal (same as cline);
     // transient-transport classification stays with applyTransportTransience
     // over the scoped diagnosticText.
@@ -2308,7 +2337,7 @@ export function createCliTextTransportV1(options: {
     options.maxEventStreamBytes ?? MAX_CLI_STRUCTURED_EVENT_STREAM_BYTES_V1;
   const diagnosisTailMaxBytes =
     options.diagnosisTailMaxBytes ?? MAX_CLI_FAILURE_DIAGNOSIS_TAIL_BYTES_V1;
-  return {
+  const transport = {
     runnerId: def.id,
     // Cancel and every watchdog settle only after the child is confirmed gone
     // (`terminateThenFinish`), so the broker must not settle ahead of it.
@@ -2316,6 +2345,25 @@ export function createCliTextTransportV1(options: {
     invoke(
       request: AgentExecutionRequestV1,
       output: BoundedResultWriterV1
+    ): Promise<AgentTransportExitV1> {
+      if (def.versionedContract === undefined) {
+        return transport.invokeResolved(request, output, undefined);
+      }
+      return resolveVersionedContractV1(def).then(
+        (contract): Promise<AgentTransportExitV1> =>
+          contract.refusal !== undefined
+            ? Promise.resolve({
+                kind: "transportFailure",
+                code: "cliVersionUnsupported",
+                detail: contract.refusal,
+              })
+            : transport.invokeResolved(request, output, contract.cliMajorVersion)
+      );
+    },
+    invokeResolved(
+      request: AgentExecutionRequestV1,
+      output: BoundedResultWriterV1,
+      cliMajorVersion: number | undefined
     ): Promise<AgentTransportExitV1> {
       if (request.mode !== "text") {
         // General-workspace CLI processes are unsupported for preflight and
@@ -2388,6 +2436,8 @@ export function createCliTextTransportV1(options: {
           cwd,
           promptFile,
           requiresFramedResult: true,
+          ...(promptFile !== undefined ? { promptChars: request.prompt.length } : {}),
+          ...(cliMajorVersion !== undefined ? { cliMajorVersion } : {}),
         });
       } catch (error) {
         cleanupPromptFile();
@@ -2507,7 +2557,15 @@ export function createCliTextTransportV1(options: {
             let lastActivityAt = Date.now();
 
             let child: cp.ChildProcess;
+            // bugs3 Step 6: a stdin provider's prompt rides in as a regular-file
+            // descriptor on POSIX (Node's default socket is ignored by Cline).
+            // A fresh source is opened for every attempt, so a retry or nudge
+            // starts at offset zero.
+            let stdinSource: StdinPromptSourceV1 | undefined;
             try {
+              if (promptTransport === "stdin") {
+                stdinSource = openStdinPromptSourceV1(stdinPromptText);
+              }
               child = cp.spawn(resolvedCommand, spawnArgs, {
                 cwd,
                 shell: useShell,
@@ -2518,8 +2576,12 @@ export function createCliTextTransportV1(options: {
                 // weaken the sanitized base.
                 env: { ...sanitizedCliEnv(), ...def.buildEnv?.(model) },
                 detached: process.platform !== "win32",
+                ...(stdinSource !== undefined ? { stdio: stdinSource.stdio } : {}),
               });
+              // The child holds its own copy of the descriptor now.
+              stdinSource?.dispose();
             } catch (error) {
+              stdinSource?.dispose();
               // cp.spawn threw: no OS process was ever created, so the
               // spawn-attempt increment taken before this call (below, at
               // the call site) must be proven abandoned — otherwise it would
@@ -2953,13 +3015,14 @@ export function createCliTextTransportV1(options: {
               });
             });
 
-            if (promptTransport === "stdin") {
+            if (promptTransport === "stdin" && stdinSource?.writeToChildStdin === true) {
               child.stdin?.on("error", () => {
                 // Ignore EPIPE when the process exits before consuming the
                 // prompt; the close handler reports the real failure.
               });
               child.stdin?.write(stdinPromptText);
             }
+            // With a file-descriptor stdin the child has no stdin pipe to end.
             child.stdin?.end();
           });
 
@@ -3063,6 +3126,28 @@ export function createCliTextTransportV1(options: {
       })();
     },
   };
+  return transport;
+}
+
+/**
+ * bugs3 Step 14: the major a version-sensitive provider's argv must be built
+ * for, or the reason the installed major is refused. A provider without a
+ * `versionedContract` resolves to nothing. An unreadable version falls back to
+ * the provider's `defaultMajor`; a readable major outside `supportedMajors` is
+ * refused before launch.
+ */
+export async function resolveVersionedContractV1(
+  def: CliProviderDefinition,
+  probe: (command: string) => Promise<number | undefined> = getCliMajorVersionV1
+): Promise<{ readonly cliMajorVersion?: number; readonly refusal?: string }> {
+  const contract = def.versionedContract;
+  if (contract === undefined) {
+    return {};
+  }
+  const decision = decideCliMajorV1(await probe(def.command), contract.supportedMajors, contract.defaultMajor);
+  return "unsupportedMajor" in decision
+    ? { refusal: contract.unsupportedMessage(decision.unsupportedMajor) }
+    : { cliMajorVersion: decision.major };
 }
 
 export const __testOnly = {
@@ -3323,8 +3408,14 @@ function toFriendlyError(
     !antigravityExplicitModelNotFound;
   const antigravityNotFound = antigravity404 && !antigravityUnrelatedResourceNotFound;
   const entitlementFailure = antigravityNotFound || isModelEntitlementFailure(structured ? scanSource : stderr);
+  // bugs3 Step 11: the provider's own usage-limit reply ("429 You've reached
+  // your 5-hour usage limit") is a quota failure even when other scanned text
+  // mentions login/401. Read from the CLI's own channels only (stderr and, for
+  // Kimi, its own `error:` lines), so a command the model ran cannot forge it.
+  const usageLimitLine = explicitProviderUsageLimitLineV1(scanSource);
   const authFailure =
     !entitlementFailure &&
+    usageLimitLine === undefined &&
     (def.authErrorMarkers.some((marker) => combined.includes(marker)) ||
       isAuthenticationFailure(structured ? scanSource : stderr));
 
@@ -3365,6 +3456,13 @@ function toFriendlyError(
     def.unsupportedVersionSignature !== undefined && rawStderr.includes(def.unsupportedVersionSignature.marker)
       ? def.unsupportedVersionSignature.message
       : undefined;
+  // A provider-declared failure with a known, actionable cause (devpass-code's
+  // managed-service port collision): its fix replaces the raw text and stack.
+  const knownFailure = def.knownFailureSignatures?.find(
+    (signature) =>
+      signature.pattern.test(rawStderr) ||
+      (realDiagnosticContent !== undefined && signature.pattern.test(realDiagnosticContent))
+  )?.message;
   const diagnosticText = antigravityNotFound
     ? antigravityExplicitModelNotFound
       ? `Antigravity CLI could not find configured model "${model ?? "unknown model"}" for this account or CLI version. ` +
@@ -3380,6 +3478,7 @@ function toFriendlyError(
     : diagnosticTextOverride ??
     `${cliDisplayLabel(def)} CLI failed: ${
       unsupportedVersion ||
+      knownFailure ||
       realDiagnosticContent ||
       (benignNoiseHint
         ? `exit code ${exitCode ?? "unknown"} / no diagnostic output (${benignNoiseHint})`
@@ -3391,7 +3490,9 @@ function toFriendlyError(
   // diagnosticText above and is kept, not replaced.
   const authSuffix = authFailure
     ? ` ${def.loginHintForModel?.(model) ?? def.loginHint}`
-    : entitlementFailure
+    : usageLimitLine !== undefined
+      ? ` ${describeExplicitUsageLimitV1(cliDisplayLabel(def), usageLimitLine)}`
+      : entitlementFailure
       ? antigravityNotFound
         ? " Try an enabled backup or change the model in AI Models for this stage."
         : " Switch this stage's model to one your account has access to, then try again."
@@ -3403,7 +3504,7 @@ function toFriendlyError(
       ? `The configured model may not be available for this account or CLI version. ${diagnosticText}`
       : diagnosticText,
     retryableHint: structured?.retryable === true,
-    quotaSignal: structured?.quotaSignal === true,
+    quotaSignal: structured?.quotaSignal === true || usageLimitLine !== undefined,
     hadNoDiagnosticContent,
   };
 }
@@ -3502,11 +3603,110 @@ async function waitForPidToExitV1(pid: number, timeoutMs = 5000, intervalMs = 10
 }
 
 
+type ExecCliAgentOptionsV1 = Parameters<typeof execCliAgentProcessV1>[0];
+
 /**
  * Run a provider CLI once: prompt in via stdin, answer out via stdout.
  * Cancellation kills the process tree.
+ *
+ * bugs3 Step 6: a Cline run is judged against its own session record after it
+ * ends. If the first user message there is not the prompt Ensemble wrote, the
+ * run is reported as "prompt not delivered" (never "cut short"), carries no
+ * continuation or retry signal, and the caller reports its edits separately.
  */
-export async function execCliAgent(options: {
+export async function execCliAgent(options: ExecCliAgentOptionsV1): Promise<CliExecResult> {
+  if (options.def.id !== "cline-cli") {
+    return execCliAgentProcessV1(options);
+  }
+  let spawned: { pid: number; spawnedAtMs: number } | undefined;
+  const result = await execCliAgentProcessV1({
+    ...options,
+    onSpawnedV1: (info) => {
+      spawned = info;
+      options.onSpawnedV1?.(info);
+    },
+  });
+  return applyClinePromptReceiptV1(options, result, spawned);
+}
+
+/**
+ * The receipt check's file access, replaceable in tests. The default reads
+ * Cline's own data folder.
+ */
+let clineReceiptCheckV1: (input: {
+  prompt: string;
+  binding: { pid: number; spawnedAtMs: number };
+}) => Promise<ClineReceiptCheckV1> = async ({ prompt, binding }) =>
+  checkClinePromptReceiptOnDiskV1({
+    dataDir: resolveClineDataDirV1(process.env, os.homedir()),
+    placeholder: CLINE_CLI_ARGV_PROMPT_PLACEHOLDER,
+    prompt,
+    binding,
+    io: createClineSessionIoV1(binding.spawnedAtMs - 30_000),
+  });
+
+let clineBarrierVerifiedOverrideForTestsV1: boolean | undefined;
+
+/**
+ * Test seam: pretend the pre-edit receipt barrier is verified, so tests that
+ * exercise the editing-failure and backup paths through Cline can run. Returns
+ * a function that restores the production gate.
+ */
+export function setClineEditableBarrierVerifiedForTestsV1(verified: boolean): () => void {
+  const previous = clineBarrierVerifiedOverrideForTestsV1;
+  clineBarrierVerifiedOverrideForTestsV1 = verified;
+  return () => {
+    clineBarrierVerifiedOverrideForTestsV1 = previous;
+  };
+}
+
+/** Test seam: swap the receipt check; returns a function that restores it. */
+export function setClineReceiptCheckForTestsV1(check: typeof clineReceiptCheckV1): () => void {
+  const previous = clineReceiptCheckV1;
+  clineReceiptCheckV1 = check;
+  return () => {
+    clineReceiptCheckV1 = previous;
+  };
+}
+
+async function applyClinePromptReceiptV1(
+  options: ExecCliAgentOptionsV1,
+  result: CliExecResult,
+  spawned: { pid: number; spawnedAtMs: number } | undefined
+): Promise<CliExecResult> {
+  // Nothing to judge when the process never started or the owner cancelled.
+  if (spawned === undefined || result.status === "cancelled") {
+    return result;
+  }
+  let check: ClineReceiptCheckV1;
+  try {
+    check = await clineReceiptCheckV1({ prompt: options.prompt, binding: spawned });
+  } catch {
+    check = { kind: "unverifiable", verdict: { ok: false, code: "noSessionRecord", detail: "The Cline session record could not be read." } };
+  }
+  if (check.kind === "delivered") {
+    return result;
+  }
+  // Without positive evidence of non-delivery, only a run that reports success
+  // is held to the check: a failed run already failed for its own reason. On
+  // Windows the session layout is unverified (owner evidence is Linux only), so
+  // an absent record there is not treated as proof the prompt was lost.
+  if (check.kind === "unverifiable" && (result.status !== "completed" || process.platform === "win32")) {
+    return result;
+  }
+  const verdict = check.verdict;
+  return {
+    status: "failed",
+    output: "",
+    errorMessage: promptNotDeliveredMessageV1(cliDisplayLabel(options.def), verdict),
+    failureKind: "generic",
+    promptNotDeliveredV1: true,
+  };
+}
+
+async function execCliAgentProcessV1(options: {
+  /** Reports the spawned process once the OS has started it. */
+  onSpawnedV1?: (info: { pid: number; spawnedAtMs: number }) => void;
   def: CliProviderDefinition;
   mode: CliRunMode;
   model: string | undefined;
@@ -3596,6 +3796,16 @@ export async function execCliAgent(options: {
   // 0600 temp prompt file and silently dropping the retry audit trail.
   // Report it the same way every other transport-precondition check in
   // this function does, via classifyCliFailure.
+  const versionedContract = await resolveVersionedContractV1(def);
+  if (versionedContract.refusal !== undefined) {
+    cleanupPromptFile();
+    return classifyCliFailure({
+      status: "failed",
+      output: "",
+      errorMessage: versionedContract.refusal,
+    });
+  }
+
   let args: string[];
   try {
     args = def.buildArgs(mode, model, {
@@ -3603,6 +3813,10 @@ export async function execCliAgent(options: {
       cwd,
       promptFile,
       resumePreviousConversation,
+      ...(promptFile !== undefined ? { promptChars: prompt.length } : {}),
+      ...(versionedContract.cliMajorVersion !== undefined
+        ? { cliMajorVersion: versionedContract.cliMajorVersion }
+        : {}),
     });
   } catch (error) {
     cleanupPromptFile();
@@ -3793,7 +4007,14 @@ export async function execCliAgent(options: {
         )
       : args;
     let child: cp.ChildProcess;
+    // bugs3 Step 6: on POSIX a stdin provider's prompt is the child's stdin
+    // file descriptor, not a write to Node's socket-backed pipe, which Cline
+    // 3.0.74 ignores (it then worked from the argv placeholder alone).
+    let stdinSource: StdinPromptSourceV1 | undefined;
     try {
+      if (promptTransport === "stdin") {
+        stdinSource = openStdinPromptSourceV1(prompt);
+      }
       child = cp.spawn(resolvedCommand, spawnArgs, {
         cwd,
         shell: useShell,
@@ -3809,8 +4030,15 @@ export async function execCliAgent(options: {
         // matters with shell:true. Windows has no process-group concept here
         // and uses taskkill /T on the PID tree instead.
         detached: process.platform !== "win32",
+        ...(stdinSource !== undefined ? { stdio: stdinSource.stdio } : {}),
       });
+      // The child holds its own copy of the descriptor now.
+      stdinSource?.dispose();
+      if (child.pid !== undefined) {
+        options.onSpawnedV1?.({ pid: child.pid, spawnedAtMs: Date.now() });
+      }
     } catch (error) {
+      stdinSource?.dispose();
       // cp.spawn threw: no OS process was ever created, so the spawn-attempt
       // increment taken before this call must be proven abandoned — see the
       // matching comment on the transport path's own catch block. Assigned
@@ -4287,13 +4515,14 @@ export async function execCliAgent(options: {
       finishAfterRecordingSettles({ status: "completed", output, rawOutput: stdout, sessionId: sessionIdOfRun() });
     });
 
-    if (promptTransport === "stdin") {
+    if (promptTransport === "stdin" && stdinSource?.writeToChildStdin === true) {
       child.stdin?.on("error", () => {
         // Ignore EPIPE when the process exits before consuming the prompt;
         // the close handler reports the real failure.
       });
       child.stdin?.write(prompt);
     }
+    // With a file-descriptor stdin the child has no stdin pipe to end.
     child.stdin?.end();
   });
 }
@@ -4640,6 +4869,7 @@ function toCliImplementationRunResult(
       timedOut: result.timeoutReason !== undefined,
       timeoutReason: result.timeoutReason,
       ...(result.providerCapacity === true ? { providerCapacity: true } : {}),
+      ...(result.promptNotDeliveredV1 === true ? { promptNotDeliveredV1: true } : {}),
     };
   }
   if (noChangeCompletionIsSuccess && !filesChangedUnknown && filesChanged.length === 0) {
@@ -4854,8 +5084,29 @@ export async function runImplementationWithCli(options: {
     };
   }
 
+  // bugs3 Step 6: a Cline run that never receives its prompt picks its own work
+  // from the repository. Receipt can only be confirmed after the fact unless the
+  // CLI holds its tools until the first message is validated, so an editable
+  // launch is refused while that barrier is unverified. Nothing ran.
+  if (def.id === "cline-cli") {
+    const gate = clineEditableLaunchGateV1(clineBarrierVerifiedOverrideForTestsV1);
+    if (!gate.allowed) {
+      return {
+        status: "failed",
+        filesChanged: [],
+        filesChangedUnknown: false,
+        errorMessage: gate.message,
+        failureKind: "generic",
+        promptNotDeliveredV1: true,
+      };
+    }
+  }
+
   onProgress(`Using ${def.label}...`);
   const before = await gitStatusSnapshot(cwd);
+  // The commit the round started from: an undelivered-prompt revert restores from
+  // this one, not from whatever HEAD is when the offer is later posted.
+  const roundStartHead = (await execGit(cwd, ["rev-parse", "--verify", "-q", "HEAD"]))?.trim() || undefined;
 
   let result = await execCliAgent({
     def,
@@ -5198,8 +5449,23 @@ export async function runImplementationWithCli(options: {
     }
   }
 
+  let undeliveredScope: ReturnType<typeof scopeUndeliveredPromptEditsV1> | undefined;
+  if (implResult.promptNotDeliveredV1 === true && !filesChangedUnknown && before !== undefined) {
+    const scope = scopeUndeliveredPromptEditsV1({ cwd, filesChanged, dirtyBefore: new Set(before.keys()) });
+    // Content and index state are read here, as the round ends, and the baseline
+    // is the commit it started from — not what the owner may have changed by the
+    // time a card is posted.
+    const targets = await fingerprintRevertTargetsV1(cwd, scope.revertable);
+    undeliveredScope = {
+      ...scope,
+      ...(roundStartHead !== undefined ? { baselineHead: roundStartHead } : {}),
+      ...(targets.length > 0 ? { targets } : {}),
+    };
+  }
+
   return {
     ...implResult,
+    ...(undeliveredScope !== undefined ? { undeliveredPromptEditScopeV1: undeliveredScope } : {}),
     ...(executedChecks.length > 0 ? { executedChecks } : {}),
   };
 }

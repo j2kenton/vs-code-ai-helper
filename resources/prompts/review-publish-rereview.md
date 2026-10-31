@@ -32,6 +32,8 @@ Then structure your review as:
 
 If a Sibling Review Disagreement section appears below, it is also a mechanical, deterministic check, not an AI claim: the high-level and low-level implementation reviews reported contradictory facts about the identical commit. Resolve it explicitly by deriving the current state from the workspace yourself — never by silently averaging the two scores or verdicts together.
 
+Carried gates: when the plan or task.md explicitly defers part of the work behind a later owner approval, or marks an owner gate OPEN that the current deliverable does not depend on (for example a proposal-only deliverable whose later Steps are gated), report that gate in the review text as informational — it is not a shipping blocker and not a failed check, and deferred Steps are not "unimplemented required Parts". A gate the current deliverable itself requires still blocks its dependent work.
+
 Record which commit you reviewed. End your response with these markers on their own lines, using the exact values shown below (copy them — do not compute or guess a SHA or a fingerprint yourself):
 
 ```

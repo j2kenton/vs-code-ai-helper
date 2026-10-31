@@ -37,12 +37,29 @@ export interface ChatActionOfferInputV1 {
   }[];
   /** The notification's own text; it becomes the decision's account of what happened and the recommendation's reason. */
   readonly noticeText: string;
+  /**
+   * Which option the card recommends. Defaults to the action itself. A caller
+   * whose action cannot change the outcome (a re-run of unchanged checks) names
+   * an alternative instead, or `none`, and gives the reason shown on the card.
+   */
+  readonly recommend?: {
+    readonly target: "none" | "action" | { readonly alternativeIndex: number };
+    readonly reasoning: string;
+  };
+  /** Consequence text for the action option, replacing the generic "Runs …" line. */
+  readonly actionConsequence?: string;
   /** True only for a "Resume" offer: the task stays paused until the action is chosen. */
   readonly holdsTaskPaused?: boolean;
   /** RC9 item 3: an optional offer holds nothing and blocks nothing; it is only a convenience. */
   readonly optional?: true;
   /** The task name the notice already uses, when the caller has it; defaults to the one read from progress. */
   readonly taskLabel?: string;
+  /** How choosing the action relates to the task's pause; defaults to `"continue"`. A cancel does not resume anything: `"unpause"`. */
+  readonly actionResumeKind?: "unpause" | "continue";
+  /** Wording for the closing do-nothing option, when "Not now" would misdescribe it (bugs3 Step 12: "Wait"). */
+  readonly doNothingOption?: { readonly label: string; readonly consequence: string };
+  /** Secondary information shown on the card, such as technical details kept out of the main text. */
+  readonly evidence?: readonly { readonly label: string; readonly detail: string }[];
 }
 
 export interface ChatPointerActionV1 {
@@ -89,8 +106,8 @@ export async function offerActionInChatV1(
         {
           optionId: "runAction",
           label: input.actionLabel,
-          resumeKind: "continue",
-          consequence: `Runs "${input.actionLabel}" for this task now.`,
+          resumeKind: input.actionResumeKind ?? "continue",
+          consequence: input.actionConsequence ?? `Runs "${input.actionLabel}" for this task now.`,
           effect: { kind: "command", command: input.command, args: input.args ?? [] },
         },
         ...(input.alternatives ?? []).map((alternative, index) => ({
@@ -106,17 +123,25 @@ export async function offerActionInChatV1(
         })),
         {
           optionId: "notNow",
-          label: "Not now",
+          label: input.doNothingOption?.label ?? "Not now",
           resumeKind: "unpause",
-          consequence: "Does nothing. The task stays as it is.",
+          consequence: input.doNothingOption?.consequence ?? "Does nothing. The task stays as it is.",
           effect: { kind: "doNothing" },
         },
       ],
-      recommendation: {
-        kind: "option",
-        optionId: "runAction",
-        reasoning: input.noticeText,
-      },
+      ...(input.evidence !== undefined && input.evidence.length > 0 ? { evidence: input.evidence } : {}),
+      recommendation:
+        input.recommend === undefined
+          ? { kind: "option", optionId: "runAction", reasoning: input.noticeText }
+          : input.recommend.target === "none"
+            ? { kind: "none", reasoning: input.recommend.reasoning }
+            : input.recommend.target === "action"
+              ? { kind: "option", optionId: "runAction", reasoning: input.recommend.reasoning }
+              : {
+                  kind: "option",
+                  optionId: `alternative${input.recommend.target.alternativeIndex + 1}`,
+                  reasoning: input.recommend.reasoning,
+                },
       gating: {
         holdsTaskPaused: input.holdsTaskPaused === true,
         unblocksProgress: input.optional !== true,

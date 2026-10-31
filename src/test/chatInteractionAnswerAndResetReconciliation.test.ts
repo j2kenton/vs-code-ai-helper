@@ -33,6 +33,7 @@ import {
   ChatDocumentInteractionV1,
   appendChatInteraction,
   readChatInteractions,
+  retireOperationInteractionsV1,
   resetChatHistoryV1,
   writeChatHistory,
 } from "../utils/chatHistoryStore";
@@ -157,6 +158,25 @@ function makeSettleFailingStore(
     sweepExpired: () => Promise.resolve({ expired: 0, removed: 0 }),
   };
 }
+
+void describe("stage departure of durable interactions", () => {
+  void it("settles the bound transaction before retiring its mirror and refuses later answers", async () => {
+    const folder = makeTaskFolder();
+    const operationId = allocateHex128IdV1();
+    const interactionId = allocateHex128IdV1();
+    await beginAndMirror(folder, folder, operationId, interactionId);
+    const reason = "retired by the task moving on, not answered";
+    assert.equal(await retireOperationInteractionsV1(folder, folder, { stage: "impl", reason }), 1);
+    const transaction = await sharedStore.load(operationId);
+    assert.equal(transaction.kind, "ok");
+    if (transaction.kind === "ok") assert.equal(transaction.transaction.settlement, "cancelled");
+    const mirror = (await readChatInteractions(folder, folder)).find((item) => item.interactionId === interactionId);
+    assert.equal(mirror?.state, "cancelled");
+    assert.equal(mirror?.retirementReason, reason);
+    const result = await sharedStore.submitAnswers(operationId, [{ questionId: "scope", selectedOptionIds: ["plan"] }], allocateHex128IdV1());
+    assert.equal(result.kind, "rejected");
+  });
+});
 
 void describe("chatHistoryStore — durable answer backfill (readChatInteractions)", () => {
   void it("backfills durably submitted answers into a still-unresolved mirror record", async () => {

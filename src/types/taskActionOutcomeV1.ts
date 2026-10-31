@@ -99,6 +99,14 @@ export interface ProviderChainCandidateStatusV1 {
   readonly deferredFailureKind?: "quota" | "model-entitlement";
   /** ISO reset time parsed from this candidate's failure detail, when `deferredFailureKind` is set and one was found. */
   readonly deferredResetAt?: string;
+  /**
+   * bugs3 Step 3: every attempt id the coordinator allocated and invoked for
+   * this candidate (the first attempt plus any same-candidate retry), so the
+   * round ledger can keep them even though no provider report was produced.
+   * Absent for a candidate that was skipped without being invoked, and for
+   * records persisted before this field existed.
+   */
+  readonly attemptIds?: readonly string[];
 }
 
 /**
@@ -117,6 +125,13 @@ export interface ProviderChainExhaustionV1 {
   readonly stage?: string;
   /** The resolved candidate chain, in ranked order, each with its skip/failure reason. */
   readonly candidates: readonly ProviderChainCandidateStatusV1[];
+  /**
+   * bugs3 Step 3: attempt ids the coordinator allocated that belong to no
+   * candidate entry above — the attempt allocated just before the registry
+   * reported nothing remaining, and attempts the registry skipped without
+   * invoking. Kept so the round ledger accounts for every allocation.
+   */
+  readonly unclaimedAttemptIds?: readonly string[];
 }
 
 export type TaskActionOutcomeV1 =
@@ -542,7 +557,7 @@ function decodeOptionalChainExhaustionV1(
   if (!isPlainRecordV1(raw)) {
     return "\"chainExhaustion\" is not an object";
   }
-  const unknown = unknownOutcomeField(raw, new Set(["stage", "candidates"]), "chainExhaustion");
+  const unknown = unknownOutcomeField(raw, new Set(["stage", "candidates", "unclaimedAttemptIds"]), "chainExhaustion");
   if (unknown) {
     return unknown;
   }
@@ -566,6 +581,7 @@ function decodeOptionalChainExhaustionV1(
         "reason",
         "deferredFailureKind",
         "deferredResetAt",
+        "attemptIds",
       ]),
       "chainExhaustion candidate"
     );
@@ -595,6 +611,14 @@ function decodeOptionalChainExhaustionV1(
     if (entry.deferredResetAt !== undefined && typeof entry.deferredResetAt !== "string") {
       return "\"chainExhaustion.candidates\" entry \"deferredResetAt\" must be a string when present";
     }
+    if (
+      entry.attemptIds !== undefined &&
+      (!Array.isArray(entry.attemptIds) ||
+        entry.attemptIds.length > MAX_CHAIN_CANDIDATES_V1 ||
+        entry.attemptIds.some((id: unknown) => typeof id !== "string" || id.length === 0))
+    ) {
+      return "\"chainExhaustion.candidates\" entry \"attemptIds\" must be a bounded array of non-empty strings when present";
+    }
     candidates.push({
       storedModelId: entry.storedModelId,
       providerLabel: entry.providerLabel,
@@ -604,11 +628,23 @@ function decodeOptionalChainExhaustionV1(
         ? { deferredFailureKind: entry.deferredFailureKind }
         : {}),
       ...(entry.deferredResetAt !== undefined ? { deferredResetAt: entry.deferredResetAt } : {}),
+      ...(entry.attemptIds !== undefined ? { attemptIds: entry.attemptIds as readonly string[] } : {}),
     });
+  }
+  if (
+    raw.unclaimedAttemptIds !== undefined &&
+    (!Array.isArray(raw.unclaimedAttemptIds) ||
+      raw.unclaimedAttemptIds.length > MAX_CHAIN_CANDIDATES_V1 * 4 ||
+      raw.unclaimedAttemptIds.some((id: unknown) => typeof id !== "string" || id.length === 0))
+  ) {
+    return "\"chainExhaustion.unclaimedAttemptIds\" must be a bounded array of non-empty strings when present";
   }
   return {
     ...(raw.stage !== undefined ? { stage: raw.stage } : {}),
     candidates,
+    ...(raw.unclaimedAttemptIds !== undefined
+      ? { unclaimedAttemptIds: raw.unclaimedAttemptIds as readonly string[] }
+      : {}),
   };
 }
 

@@ -1,18 +1,21 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
-import { clearEscalation, pauseTaskWithReason, setNextActorV1 } from "../utils/taskProgressTransforms";
+import { clearEscalationRecordingPlateauOverrideV1, pauseTaskWithReason, setNextActorV1 } from "../utils/taskProgressTransforms";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { IncompleteTask } from "../types/incompleteTask";
 import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { retirePendingQuestionsV1 } from "../utils/cardLifecycleV1";
+import { OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "../utils/ownerEvidenceV1";
 import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   createSafeAdmissionReleaseStateV1,
-  describeWorkAdmissionRefusalV1,
   recordAdmissionReleaseTriggerV1,
   requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
@@ -302,7 +305,8 @@ export async function resumePausedTask(
     commandId: "resumeTask",
   });
   if (admission.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(admission, taskLabel));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(admission, taskLabel));
+    offerBusyRefusalChoicesOnceV1(admission, taskLabel);
     return { outcome: "busy" };
   }
   // Item 2 / Step 57: same safe-release gate as reviewActions.ts's
@@ -457,7 +461,7 @@ export async function resumePausedTask(
           inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId,
           {
             mutateTarget: (current) => {
-              const cleared = { ...clearEscalation(current), updatedAt: new Date().toISOString() };
+              const cleared = { ...clearEscalationRecordingPlateauOverrideV1(current), updatedAt: new Date().toISOString() };
               // v1 fixes 2, Wave I chokepoint (arranges a stage dispatch):
               // when this resume is the one arming the durable
               // `scheduledRun`, automation acts next — the same fact
@@ -506,6 +510,20 @@ export async function resumePausedTask(
             decisionKey,
             "the task was resumed, ending the pause this escalation was holding"
           );
+        }
+        // bugs3 Step 8: an "Owner evidence needed" question was raised to
+        // un-pause this same hold. The resume re-runs the stage's review, which
+        // raises a fresh question if the evidence is still missing, so the old
+        // one is moot and must not stay answerable.
+        try {
+          await retirePendingQuestionsV1(
+            resolvedTask.taskFolderPath,
+            resolvedTask.canonicalId,
+            "retired because the task was resumed, so the stage's review runs again",
+            { matches: (question) => question.text.includes(OWNER_EVIDENCE_ANSWER_MARKER_V1) }
+          );
+        } catch (retireError) {
+          console.error("resume: could not retire the owner-evidence question", retireError);
         }
         // RC9 item 2: a "Resume" offer card asks for work that has now run.
         await withdrawWorkflowDecisionsByKeyV1(

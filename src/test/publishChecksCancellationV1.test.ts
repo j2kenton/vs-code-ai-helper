@@ -81,7 +81,13 @@ void describe("runPublishChecks wiring", () => {
 
   void it("registers the tracked operation as cancellable and forwards its token to the checks", () => {
     assert.match(source, /kind: "completion-checks",[\s\S]*?cancellable: true,/);
-    assert.match(source, /runCompletionLint\(\s*taskFolderUri,\s*resolvedTask\.progress\.implReviewFiles,\s*\{ token: cancelToken \}\s*\)/);
+    // The checks run through the shared failed-first helper (bugs3 Step 15), which
+    // is handed the cancel token and forwards it to every check it starts.
+    assert.match(source, /runChecksFailedFirstV1\(\{[\s\S]*?token: cancelToken,/);
+    const helper = nodePath.join(process.cwd(), "src", "utils", "failedFirstChecksV1.ts");
+    const helperSource = nodeFs.readFileSync(helper, "utf8");
+    assert.match(helperSource, /runCompletionLint\(taskFolderUri, relevantFiles, \{ token, onCheckEvent: input\.onCheckEvent \}\)/);
+    assert.match(helperSource, /\{\s*token,\s*onCheckEvent: input\.onCheckEvent,\s*explicitChecks: targetChecks,/);
   });
 
   void it("classifies the cancellation error before the generic failure notification", () => {

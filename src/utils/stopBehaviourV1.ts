@@ -243,27 +243,84 @@ function hitDescriptionV1(
     : `${providerLabel} hit ${outcome.failureKind ?? "a"} failure`;
 }
 
+function normalizedReasonV1(text: string): string {
+  return text.replace(/\s+/g, " ").replace(/[.\s]+$/, "").trim().toLowerCase();
+}
+
+/**
+ * bugs3 Step 11: the records worth listing after the headline error. The model
+ * that just ran is the one the headline describes, so exactly ONE "tried and
+ * failed" record for it (its label is the headline's provider label, or extends
+ * it with the model name, and it carries the same failure) is not a second
+ * attempt and is dropped. Every other attempted model keeps its own record and
+ * reason, even when it failed with the same wording, and the same label and
+ * outcome is never listed twice. Without this the one error was printed twice
+ * and the model that had just run was named as a backup.
+ */
+export function distinctBackupRecordsV1(
+  backups: readonly BackupAttemptRecordV1[] | undefined,
+  headlineError: string | undefined,
+  headlineLabel?: string,
+  headlineModelLabel?: string
+): readonly BackupAttemptRecordV1[] {
+  const headline = headlineError ? normalizedReasonV1(headlineError) : "";
+  const label = headlineLabel?.trim().toLowerCase() ?? "";
+  const modelLabel = headlineModelLabel?.trim().toLowerCase() ?? "";
+  const list = backups ?? [];
+  const labelOf = (backup: BackupAttemptRecordV1): string => backup.label.trim().toLowerCase();
+  const repeatsHeadline = (backup: BackupAttemptRecordV1): boolean => {
+    if (backup.outcome !== "tried-and-failed" || headline.length === 0) {
+      return false;
+    }
+    const reason = normalizedReasonV1(backup.reason);
+    if (reason.length === 0 || !(headline.includes(reason) || reason.includes(headline))) {
+      return false;
+    }
+    if (modelLabel.length > 0) {
+      // The caller knows which model produced the headline: only that model's
+      // record is the headline again. A different model of the same provider
+      // that failed with the same wording is a distinct attempt.
+      return labelOf(backup) === modelLabel;
+    }
+    return label.length === 0 || labelOf(backup) === label || labelOf(backup).startsWith(`${label} `);
+  };
+  const exact = label.length > 0 ? list.findIndex((b) => repeatsHeadline(b) && labelOf(b) === label) : -1;
+  const headlineIndex = exact >= 0 ? exact : list.findIndex(repeatsHeadline);
+  const seen = new Set<string>();
+  const kept: BackupAttemptRecordV1[] = [];
+  list.forEach((backup, index) => {
+    if (index === headlineIndex) {
+      return;
+    }
+    const key = `${backup.label}\u0000${backup.outcome}`;
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    kept.push(backup);
+  });
+  return kept;
+}
+
+function describeBackupRecordV1(backup: BackupAttemptRecordV1): string {
+  const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
+  return backup.outcome === "tried-and-failed"
+    ? `${subject} was tried and failed: ${backup.reason}.`
+    : backup.outcome === "disabled"
+      ? `${subject} is disabled in the stage's chain; enable it to use it here.`
+      : `${subject} was held back: ${backup.reason}.`;
+}
+
 export function describeMidRoundOutcomeV1(
   primaryProviderLabel: string,
   errorMessage: string | undefined,
-  outcome: MidRoundStopOutcomeV1
+  outcome: MidRoundStopOutcomeV1,
+  headlineModelLabel?: string
 ): string {
   switch (outcome.kind) {
     case "cascadeWithheldDirtyTree": {
-      const backupDetails =
-        outcome.backups && outcome.backups.length > 0
-          ? " " +
-            outcome.backups
-              .map((backup) => {
-                const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
-                return backup.outcome === "tried-and-failed"
-                  ? `${subject} was tried and failed: ${backup.reason}.`
-                  : backup.outcome === "disabled"
-                    ? `${subject} is disabled in the stage's chain; enable it to use it here.`
-                    : `${subject} was held back: ${backup.reason}.`;
-              })
-              .join(" ")
-          : "";
+      const listed = distinctBackupRecordsV1(outcome.backups, errorMessage, primaryProviderLabel, headlineModelLabel);
+      const backupDetails = listed.length > 0 ? " " + listed.map(describeBackupRecordV1).join(" ") : "";
       return (
         `Hit ${outcome.limitLabel} on ${primaryProviderLabel}` +
         (errorMessage ? ` (${errorMessage})` : "") +
@@ -286,16 +343,7 @@ export function describeMidRoundOutcomeV1(
           : `${primaryProviderLabel} hit a usage limit`) +
         (errorMessage ? `: ${errorMessage}` : "") +
         ". " +
-        outcome.backups
-          .map((backup) => {
-            const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
-            return backup.outcome === "tried-and-failed"
-              ? `${subject} was tried and failed: ${backup.reason}.`
-              : backup.outcome === "disabled"
-                ? `${subject} is disabled in the stage's chain; enable it to use it here.`
-                : `${subject} was held back: ${backup.reason}.`;
-          })
-          .join(" ") +
+        distinctBackupRecordsV1(outcome.backups, errorMessage, primaryProviderLabel, headlineModelLabel).map(describeBackupRecordV1).join(" ") +
         ` ${outcome.remedyText}`
       );
     case "handedToBackup":
@@ -343,20 +391,8 @@ export function describeMidRoundOutcomeV1(
         "not be confirmed."
       );
     case "authFailureBackupWithheld": {
-      const backupDetails =
-        outcome.backups && outcome.backups.length > 0
-          ? " " +
-            outcome.backups
-              .map((backup) => {
-                const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
-                return backup.outcome === "tried-and-failed"
-                  ? `${subject} was tried and failed: ${backup.reason}.`
-                  : backup.outcome === "disabled"
-                    ? `${subject} is disabled in the stage's chain; enable it to use it here.`
-                    : `${subject} was held back: ${backup.reason}.`;
-              })
-              .join(" ")
-          : "";
+      const listed = distinctBackupRecordsV1(outcome.backups, errorMessage, primaryProviderLabel, headlineModelLabel);
+      const backupDetails = listed.length > 0 ? " " + listed.map(describeBackupRecordV1).join(" ") : "";
       return (outcome.dirtyTree
         ? `Hit an authentication failure on ${primaryProviderLabel}` +
             (errorMessage ? ` (${errorMessage})` : "") +

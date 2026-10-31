@@ -608,13 +608,44 @@ void describe("runLintingFixes — RC6 item 5 execution paths", () => {
     assert.ok(result.surface.entries.some((e) => e.level === "error" && /scope check exploded/.test(e.message)));
   });
 
+  void it("AI edits were applied but their checks still fail: recommends another fix round, offers Run Publish Checks unrecommended (bugs3 Step 15)", async () => {
+    const result = await runFix("rc6-handback-checks-still-fail", 'node -e "process.exit(1)"', { ai: { fixes: true } });
+    assert.equal(
+      result.decisions.filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks").length,
+      0,
+      "Run Publish Checks is no longer the card's primary action"
+    );
+    const decisions = result.decisions.filter((decision) => decision.decisionKey === "chatActionOffer:runLintingFixes");
+    assert.equal(decisions.length, 1, "the terminal branch posts one actionable card");
+    const decision = decisions[0];
+    assert.ok(decision);
+    assert.match(decision.whatHappened, /AI final fixes were applied, but checks still fail/);
+    assert.deepEqual(decision.options.map((option) => option.label), [
+      "Fix Linting & Code Errors again", "Back to Implementation", "Choose a stronger Publish model", "Run Publish Checks", "Not now",
+    ]);
+    // No test list was extracted from the stub checks, so progress is unknown: the
+    // recommendation is the round that re-reads the failures, never the re-run.
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
+    assert.match(decision.recommendation.reasoning, /only repeat this result/);
+    assert.deepEqual(decision.options[0]?.effect, {
+      kind: "command",
+      command: "vs-code-ai-helper.runLintingFixes",
+      args: [{ taskFolderPath: result.taskFolderPath }],
+    });
+    assert.deepEqual(decision.options[2]?.effect, {
+      kind: "command",
+      command: "vs-code-ai-helper.openAiModels",
+      args: ["publish"],
+    });
+    assert.deepEqual(decision.options[3]?.effect, {
+      kind: "command",
+      command: "vs-code-ai-helper.runPublishChecks",
+      args: [{ taskFolderPath: result.taskFolderPath }],
+    });
+    assert.match(decision.options[3]?.consequence ?? "", /useful after you change something yourself/);
+  });
+
   for (const scenario of [
-    {
-      name: "AI edits were applied but their checks still fail",
-      options: { ai: { fixes: true } } as const,
-      testScript: 'node -e "process.exit(1)"',
-      expected: /AI final fixes were applied, but checks still fail/,
-    },
     {
       name: "final check outcome is unconfirmed",
       options: { scopeCheckThrows: true } as const,

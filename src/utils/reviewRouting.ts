@@ -7,6 +7,23 @@ import {
 } from "../types/taskProgress";
 import { BlockerResolver, meetsAutoAdvanceThreshold, ReviewBlocker } from "./reviewReadiness";
 import { resolveBlockerPlanReferencesV1 } from "./implementationChecklist";
+import {
+  describeKimiReadCapacityV1,
+  kimiPromptExceedsCapacityV1,
+  type KimiPromptSizeV1,
+  type KimiReadCapacityV1,
+} from "./kimiReadCapacityV1";
+
+/**
+ * bugs3 Step 5: the resolved Kimi read capacity and the prompt it is compared
+ * against. When supplied, `kimi-cli` is judged by this (version- and
+ * config-aware, character-based on 2.x) instead of the fixed legacy byte
+ * ceiling. Absent, the legacy ceiling applies unchanged.
+ */
+export interface KimiReadCheckV1 {
+  readonly capacity: KimiReadCapacityV1;
+  readonly prompt: KimiPromptSizeV1;
+}
 
 /**
  * RC7 item 3: wording that says plan work is not done yet. "Missing" is
@@ -19,6 +36,10 @@ export const UNBUILT_WORK_PHRASES_V1: readonly RegExp[] = [
   /\b(?:has|have)\s+not\s+(?:yet\s+)?been\s+(?:implemented|built|written|added|started)\b/i,
   /\bnot implemented\b/i,
   /\bunimplemented\b/i,
+  // "Unfinished Steps 1–3 and unbuilt Steps 4–10 remain: …" — the sentence
+  // must still resolve to open plan work, so the bare words are safe here.
+  /\bunfinished\b/i,
+  /\bunbuilt\b/i,
 ];
 
 /**
@@ -871,7 +892,8 @@ export const KNOWN_PROVIDER_READ_CEILING_BYTES_V1: Readonly<Record<string, numbe
 export function preferCandidateWithinReadCeilingV1(
   rankedStoredIds: readonly string[],
   promptByteLength: number | undefined,
-  providerIdOf: (storedModelId: string) => string | undefined
+  providerIdOf: (storedModelId: string) => string | undefined,
+  kimiCheck?: KimiReadCheckV1
 ): string | undefined {
   if (promptByteLength === undefined || rankedStoredIds.length === 0) {
     return undefined;
@@ -883,6 +905,9 @@ export function preferCandidateWithinReadCeilingV1(
       // fitting rather than as suspect — the same fail-open stance the
       // advisory takes for providers absent from the ceiling table.
       return false;
+    }
+    if (providerId === "kimi-cli" && kimiCheck !== undefined) {
+      return kimiPromptExceedsCapacityV1(kimiCheck.capacity, kimiCheck.prompt);
     }
     const ceiling = KNOWN_PROVIDER_READ_CEILING_BYTES_V1[providerId];
     return ceiling !== undefined && promptByteLength > ceiling;
@@ -907,10 +932,21 @@ export function preferCandidateWithinReadCeilingV1(
  */
 export function promptCeilingAdvisoryV1(
   promptLength: number | undefined,
-  providerId: string | undefined
+  providerId: string | undefined,
+  kimiCheck?: KimiReadCheckV1
 ): string | undefined {
   if (promptLength === undefined || providerId === undefined) {
     return undefined;
+  }
+  if (providerId === "kimi-cli" && kimiCheck !== undefined) {
+    if (!kimiPromptExceedsCapacityV1(kimiCheck.capacity, kimiCheck.prompt)) {
+      return undefined;
+    }
+    return (
+      `The assembled prompt (${promptLength} bytes) exceeds ${providerId}'s effective read limit of ` +
+      `${describeKimiReadCapacityV1(kimiCheck.capacity)} — it may be silently truncated. Shrink the prompt ` +
+      "(fewer/smaller context-pack files), raise Kimi's [read] default_max_chars, or route this stage to a different provider."
+    );
   }
   const ceiling = KNOWN_PROVIDER_READ_CEILING_BYTES_V1[providerId];
   if (ceiling === undefined || promptLength <= ceiling) {
@@ -1061,9 +1097,33 @@ export function decideReviewRoute(input: {
   blockers: readonly ReviewBlocker[];
   plateaued: boolean;
   secondOpinionTriedThisPlateau: boolean;
+  /**
+   * bugs3 Step 7: blockers (members of `blockers`) that ask only for owner
+   * evidence the plan defers to named later steps. They are carried gates the
+   * dependent steps must clear, so they never hold the stage or count toward
+   * a plateau; the route is decided on the remaining blockers.
+   */
+  carriedGateBlockers?: readonly ReviewBlocker[];
 }): RouteDecision {
-  const { score, threshold, blockers, plateaued, secondOpinionTriedThisPlateau } = input;
+  const { score, threshold, plateaued, secondOpinionTriedThisPlateau } = input;
+  const carriedSet = new Set<ReviewBlocker>(input.carriedGateBlockers ?? []);
+  const blockers = input.blockers.filter((b) => !carriedSet.has(b));
   const meetsThreshold = score !== null && score >= threshold;
+  if (blockers.length === 0 && carriedSet.size > 0) {
+    // Only carried gates remain. At threshold nothing holds the stage; below
+    // it the reviewer's own blocker cap is what keeps the score down, so ask
+    // the owner to advance with the gate carried instead of iterating on
+    // evidence no round can produce.
+    return meetsThreshold
+      ? {
+          route: "advance",
+          reason: `Score meets the configured threshold; ${carriedSet.size} owner gate(s) are carried to the plan's named later steps and do not hold this stage.`,
+        }
+      : {
+          route: "escalate",
+          reason: `Every remaining blocker is an owner gate the plan carries to named later steps (${carriedSet.size}); no review round can produce that evidence now, so the task can advance with the gate carried.`,
+        };
+  }
   const countByResolver = (resolver: BlockerResolver): number =>
     blockers.filter((b) => b.resolver === resolver).length;
   const taskFixable = countByResolver("task-fixable");

@@ -1146,10 +1146,12 @@ void describe("resumePausedTask integration (full command path)", () => {
         "the active-status write must never happen while another owner holds admission — proves " +
           "admission is acquired BEFORE the write, not merely alongside it"
       );
-      assert.ok(
-        msgs.captured.some((m) => m.method === "warning" && m.message.includes("runReviewWithAI")),
-        "must show the busy diagnostic naming the actual blocking owner"
-      );
+      // bugs3 Step 12: the refusal names the blocking action in plain words
+      // ("A review is running") and never shows the raw command id.
+      const busyWarning = msgs.captured.find((m) => m.method === "warning" && m.message.includes("already has a stage action in progress"));
+      assert.ok(busyWarning, "must show the busy diagnostic");
+      assert.match(busyWarning.message, /A review is running/, "must name the actual blocking owner in plain words");
+      assert.ok(!busyWarning.message.includes("runReviewWithAI"), "must not show the raw command id");
     } finally {
       msgs.restore();
       fs.restore();
@@ -1979,11 +1981,17 @@ void describe("resumeAndDispatchImplementationV1 (production code)", () => {
         uri: vscode.Uri
       ): Promise<Uint8Array> => {
         if (uri.fsPath === progressUri.fsPath) {
-          progressReads += 1;
+          // The busy-refusal chat offer (bugs3 Step 12) reads the task's progress
+          // to build its card, from inside the refused resume itself. That is
+          // part of the refusal, not the post-busy re-read guarded here.
+          const readByBusyRefusalOffer = new Error().stack?.includes("offerActionInChatV1") === true;
+          if (!readByBusyRefusalOffer) {
+            progressReads += 1;
+          }
           // Read 1 is the fixed-target preflight's authoritative read, which
           // legitimately precedes admission. Only a read AFTER that is the
           // forbidden post-busy re-read this test guards against.
-          if (progressReads >= 2 && !winnerSimulated) {
+          if (!readByBusyRefusalOffer && progressReads >= 2 && !winnerSimulated) {
             winnerSimulated = true;
             nodeFs.writeFileSync(
               progressUri.fsPath,

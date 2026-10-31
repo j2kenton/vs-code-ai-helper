@@ -1342,6 +1342,9 @@ function enrichChainExhaustionWithAttemptOutcomesV1(
     }
     cursor++;
     let lastMatch = first;
+    // bugs3 Step 3: every attempt id this candidate consumed, kept even when
+    // the attempt produced no outcome the reason text could be built from.
+    const attemptIds = [first.attemptId];
     // Fold in any immediately-following attempts this coordinator recorded
     // as a retry OF the one just consumed — never a heuristic model-id
     // match, so a later distinct candidate sharing the same model id is
@@ -1351,6 +1354,7 @@ function enrichChainExhaustionWithAttemptOutcomesV1(
       retryAttemptIds.has(reservedAttempts[cursor]!.attemptId)
     ) {
       lastMatch = reservedAttempts[cursor]!;
+      attemptIds.push(lastMatch.attemptId);
       cursor++;
     }
     if (lastMatch.outcome !== undefined) {
@@ -1374,11 +1378,24 @@ function enrichChainExhaustionWithAttemptOutcomesV1(
         reason: attemptOutcomeReasonTextV1(lastMatch.outcome, lastMatch.detail),
         ...(deferredFailureKind !== undefined ? { deferredFailureKind } : {}),
         ...(deferredResetAt !== undefined ? { deferredResetAt } : {}),
+        attemptIds,
       };
     }
-    return candidate;
+    return { ...candidate, attemptIds };
   });
-  return { ...exhaustion, candidates };
+  // bugs3 Step 3: every allocation no candidate claimed (the attempt allocated
+  // just before the registry reported nothing remaining, registry-skipped
+  // attempts, skip-on-retry reservations) still belongs to the round's ledger.
+  const claimed = new Set(candidates.flatMap((candidate) => candidate.attemptIds ?? []));
+  const unclaimedAttemptIds = session
+    .recordedAttemptOutcomes()
+    .map((attempt) => attempt.attemptId)
+    .filter((id) => !claimed.has(id));
+  return {
+    ...exhaustion,
+    candidates,
+    ...(unclaimedAttemptIds.length > 0 ? { unclaimedAttemptIds } : {}),
+  };
 }
 
 /**

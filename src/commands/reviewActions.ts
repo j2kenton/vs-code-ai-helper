@@ -29,7 +29,6 @@ import {
   acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   createSafeAdmissionReleaseStateV1,
-  describeWorkAdmissionRefusalV1,
   recordAdmissionReleaseTriggerV1,
   requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
@@ -37,6 +36,7 @@ import {
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import {
   clearStageActionRefusalReasonV1,
@@ -46,6 +46,7 @@ import {
   takeStageActionRefusalReasonV1,
   takeStageActionTerminalOutcomeV1,
 } from "../utils/stageActionRefusalV1";
+import { recordOperationTerminalOutcomeV1, terminalOutcomeFromTaskActionOutcomeV1 } from "../utils/operationEndedLineV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import {
   EffectivePauseSnapshotV1,
@@ -173,6 +174,9 @@ import {
   shouldLogNoOpContinuationRoundV1,
   stripImplementationContinuationNoticeV1,
 } from "./implementationRecoveryV1";
+import { describeUndeliveredPromptEditsV1 } from "../utils/clinePromptReceiptV1";
+import { offerUndeliveredPromptEditsRevertInChatV1 } from "./undeliveredPromptEditsOfferV1";
+import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import { syncOwedContinuationLedgerBestEffortV1 } from "../state/schedulingIntentV1";
 import { withRoundLeaseV1, markRoundLiveV1, clearRoundLiveV1 } from "../state/roundLeaseV1";
 import {
@@ -244,6 +248,7 @@ import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { candidateInvocationMessageV1, dispatchCorrelationFromOutcomeV1, persistCandidateDispatchModelChainV1 } from "../utils/dispatchModelChainV1";
 import {
+  collectAttemptIdsFromOutcomeV1,
   describeTaskActionFailureV1,
   describeTaskActionOutcomeForLogV1,
 } from "../utils/taskActionOutcomeTextV1";
@@ -302,6 +307,17 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
+import {
+  advanceAnywayLabelV1,
+  advanceBlockerGuidanceV1,
+  appendStageAdvanceOverrideV1,
+  buildStageAdvanceOverrideRecordV1,
+  runExclusiveStageAdvanceV1,
+  stageAdvanceConfirmationKeyV1,
+  STAGE_ADVANCE_OVERRIDE_FILE_V1,
+  stageAdvanceInFlightKeyV1,
+  voidStageAdvanceOverrideV1,
+} from "../utils/stageAdvanceOverrideV1";
 import { describeChainExhaustionTailV1 } from "../utils/chainExhaustionMessageV1";
 import {
   describeAutomationDefaultV1,
@@ -395,6 +411,7 @@ import {
   reconcileProgressWithChecklistV1,
   detectSiblingReviewDisagreement,
   isReviewDispatchAgainstUnchangedTreeV1,
+  isReviewedTreeProvablyChangedV1,
   REVIEWED_COMMIT_STAGES,
   REVIEW_TARGETS,
   IN_PROGRESS_REVIEW_PLACEHOLDER_PREFIX_V1,
@@ -424,6 +441,7 @@ import {
   CompletionCheckDescriptor,
   CompletionLintResult,
   parseRecordedCompletionChecksEvidenceV1,
+  resolveCurrentPublishCommandPlanV1,
   resolvePublishScopeFolder,
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
@@ -439,6 +457,7 @@ import {
 import {
   checkPublishChecksFreshnessV1,
   checkPublishChecksReuseEligibilityV1,
+  computeCommandIdentityV1,
   computeTreeFingerprintV1,
   describePublishChecksFreshnessFailureV1,
   ensurePublishReviewArtifactExistsV1,
@@ -477,6 +496,7 @@ import {
   latestQualifyingReviewMeetsThresholdV1,
   preferCandidateWithinReadCeilingV1,
   promptCeilingAdvisoryV1,
+  type KimiReadCheckV1,
   resolveBlockerLineageV1,
   REVIEW_RUBRIC_BLOCKER_SCORE_CAP,
   roundsWithoutTaskFixableDecrease,
@@ -486,6 +506,17 @@ import {
   runningImplementationRecommendedOptionV1,
   STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD,
 } from "../utils/reviewRouting";
+import {
+  fixRoundIdsSincePreviousReviewV1,
+  historyAfterFixCyclesV1,
+  resumeReReviewNoticeV1,
+  reviewPredatesRoundNeedsFreshReviewV1,
+} from "../utils/plateauFixCycleV1";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
+import { recordReviewInputsV1, reviewInputsChangedSinceV1, reviewWorkspaceChangedSinceV1 } from "../utils/reviewInputsChangedV1";
+import { measureKimiPromptV1 } from "../utils/kimiReadCapacityV1";
+import { getKimiReadCapacityV1 } from "../utils/kimiReadCapacityNodeV1";
+import { offerKimiReadConfigInChatV1 } from "./kimiReadConfigOfferV1";
 import { detectPlanArtifactDisagreementV1 } from "../utils/planArtifactMismatchV1";
 import { buildStandingBlockersNoticeV1 } from "../prompts/standingBlockersNoticeV1";
 import {
@@ -493,7 +524,15 @@ import {
   postEnvironmentalAdvanceNoticeV1,
   postLatchedOpenItemsDecisionV1,
   postUnbuiltStepsHoldDecisionV1,
+  readCarriedGateBlockersV1,
+  readDeferredPlanScopeV1,
 } from "../utils/reviewEscalation";
+import {
+  describeCarriedGateReportV1,
+  deferredOrGatedStepNumbersV1,
+  settleDeferredInProgressV1,
+  splitUnfinishedItemsByScopeV1,
+} from "../utils/deferredPlanScopeV1";
 import { findUnbuiltStepsWithoutCompletionBlockerV1 } from "../utils/reviewUnbuiltStepsV1";
 import {
   getAutoAdvanceMode,
@@ -2847,7 +2886,7 @@ export function createCompletionCheckActivityAccumulatorV1(
   onCheckEvent: {
     planned(total: number): void;
     started(descriptor: CompletionCheckDescriptor): void;
-    settled(descriptor: CompletionCheckDescriptor): void;
+    settled(descriptor: CompletionCheckDescriptor, result?: { readonly exitCode: number }): void;
     batchBoundary(): void;
   };
   close(): void;
@@ -3009,7 +3048,13 @@ export async function buildVerifiedChecksVariable(
       const progress = progressRead.ok ? progressRead.decoded.progress : undefined;
       const { folder: scopeFolder } = resolvePublishScopeFolder(folderUri, progress);
       const headCommitSha = await resolveHeadCommitSha(scopeFolder);
-      const reuseEligibility = await checkPublishChecksReuseEligibilityV1(
+      // bugs3 Step 17: a recorded pass stands in for the review's own run only if
+      // it ran the commands that would run now. When those cannot be determined the
+      // identity cannot be compared, so nothing is reused and the checks run.
+      const expectedCommandIdentity = computeCommandIdentityV1(resolveCurrentPublishCommandPlanV1(scopeFolder) ?? undefined);
+      const reuseEligibility = expectedCommandIdentity === undefined
+        ? { eligible: false as const }
+        : await checkPublishChecksReuseEligibilityV1(
         folderUri,
         scopeFolder,
         headCommitSha,
@@ -3023,7 +3068,8 @@ export async function buildVerifiedChecksVariable(
             recorded.commandsRun.length > 0 &&
             (!recorded.failedChecks || recorded.failedChecks.length === 0)
           );
-        }
+        },
+        expectedCommandIdentity
       );
       if (reuseEligibility.eligible && reuseEligibility.stamp) {
         const reportContent = await readPublishChecksFile(folderUri);
@@ -3990,7 +4036,18 @@ export async function handleReviewRoutingOutcome(options: {
       ? historyEntry.reviewerChallengedNonGoal.map((c) => c.nonGoalHeading)
       : undefined;
     const updated = await patchTaskProgressStrictV1(folderUri, (current) => {
-      let withHistory = appendReviewScoreHistory(current, historyEntry);
+      // bugs3 Step 9: record which fix rounds separate this review from the
+      // stage's previous one, so the plateau check reads ids, not timestamps.
+      const fixRoundIds = fixRoundIdsSincePreviousReviewV1(
+        current.reviewScoreHistory ?? [],
+        targetStage,
+        current.roundLedger,
+        historyEntry.at
+      );
+      let withHistory = appendReviewScoreHistory(
+        current,
+        fixRoundIds !== undefined ? { ...historyEntry, fixRoundIds } : historyEntry
+      );
       // wf10 continuation item 18: persist every newly-derived plan-non-goal
       // supersession alongside the history entry it was derived for, so a
       // later reconciliation/reconcile read sees the SAME decision this
@@ -4203,9 +4260,17 @@ export async function handleReviewRoutingOutcome(options: {
     // did; an unchanged (matched substantively, not byte-for-byte) or
     // growing set is the stall. The legacy score high-water-mark test
     // remains the default until the flag is enabled.
+    // bugs3 Step 9: only reviews separated by a real fix round (and after the
+    // latest overridden plateau) can show that fixing is not converging.
+    const plateauHistory = historyAfterFixCyclesV1(
+      updated.reviewScoreHistory ?? [],
+      targetStage,
+      updated.roundLedger,
+      updated.overriddenEscalations
+    );
     const plateaued = resilience.blockerSetPlateau
-      ? detectBlockerSetStall(updated.reviewScoreHistory ?? [], targetStage, plateauWindow)
-      : detectPlateau(updated.reviewScoreHistory ?? [], targetStage, plateauWindow);
+      ? detectBlockerSetStall(plateauHistory, targetStage, plateauWindow)
+      : detectPlateau(plateauHistory, targetStage, plateauWindow);
     // A second opinion has already been "tried this plateau" once any round
     // in the current unbroken run of plateaued rounds recorded one. Latches
     // on `secondOpinionAttempted`, not `kind`: every kind a second-opinion
@@ -4217,13 +4282,30 @@ export async function handleReviewRoutingOutcome(options: {
       progressBefore.escalation?.stage === targetStage &&
       progressBefore.escalation.secondOpinionAttempted === true;
 
+    const carriedGateBlockers = await readCarriedGateBlockersV1(folderUri, targetStage, blockers);
     const decision = decideReviewRoute({
       score,
       threshold,
       blockers,
       plateaued,
       secondOpinionTriedThisPlateau,
+      carriedGateBlockers,
     });
+
+    if (carriedGateBlockers.length > 0 && (decision.route === "advance" || decision.route === "advance-with-note")) {
+      // bugs3 Step 7: say what was set aside — a carried gate must be visible
+      // to the owner, never silently dropped (and at Publish, never a failed check).
+      try {
+        await appendChatMessageV1(folderUri.fsPath, {
+          role: "assistant",
+          text: describeCarriedGateReportV1(carriedGateBlockers, STAGE_DISPLAY_NAMES[targetStage], targetStage === "publish"),
+          stage: targetStage,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // Best-effort record only; the route decision stands.
+      }
+    }
 
     if (decision.route === "advance" || decision.route === "iterate") {
       return { escalated: false };
@@ -4629,6 +4711,12 @@ export async function terminalizeUnclosedReviewRoundV1(
         : {}),
       ...(terminalState === "failed" ? { rejectionReason: describeTaskActionFailureV1(outcome) } : {}),
     };
+    // bugs3 Step 3: the coordinator's own attempts first, then every attempt
+    // the outcome itself names (an exhausted chain's invoked candidates), so a
+    // review whose providers were all invoked is not left with none.
+    const unclosedAttemptIds = [
+      ...new Set([...(ctx.extraCoordinatorAttemptIds ?? []), ...collectAttemptIdsFromOutcomeV1(outcome)]),
+    ];
     await terminalizeRoundV1(
       ctx.reviewAttemptId,
       terminalState,
@@ -4636,9 +4724,7 @@ export async function terminalizeUnclosedReviewRoundV1(
       {
         taskFolderUri: ctx.folderUri,
         ...(correlation ? { operationId: correlation.operationId, attemptId: correlation.attemptId } : {}),
-        ...(ctx.extraCoordinatorAttemptIds?.length
-          ? { extraAttemptIds: ctx.extraCoordinatorAttemptIds }
-          : {}),
+        ...(unclosedAttemptIds.length > 0 ? { extraAttemptIds: unclosedAttemptIds } : {}),
         ...(ctx.taskMdSizeBand
           ? {
               postTerminalizePatch: (current) =>
@@ -5237,17 +5323,27 @@ async function routeReviewOutcomeV1(
         // exit is superseded: the open-items decision card below (an owner
         // decision, never an automatic advance) is where a latched clean
         // review hands the choice over.
-        const planIncomplete = isPlanIncomplete(progress);
+        // bugs3 Step 7: work the task description or the plan itself defers
+        // never holds the stage. One classifier (deferredPlanScopeV1) feeds
+        // this gate, the readiness-text check below and the checklist-behind
+        // card; review prose cannot add to it. Plan-review stages carry their
+        // own marker and have no implementation checklist to defer.
+        const deferredScope = isPlanReviewStage(targetStage) ? undefined : await readDeferredPlanScopeV1(folderUri);
+        const gateProgress = settleDeferredInProgressV1(progress, deferredScope?.counts.deferred ?? 0);
+        const planIncomplete = isPlanIncomplete(gateProgress);
         // Post-1.0 fixes, item 10: a review whose own verdict / next-work text
         // says plan steps are still to be built, with no `[completion]`
         // blocker, contradicts itself. It is not advanced on; the card below
         // says why. Implementation-side reviews with a real file scope only.
         const unbuiltStepsContradiction =
           !isPlanReviewStage(targetStage) && targetStage !== "publish" && !noTrackedFileSet
-            ? findUnbuiltStepsWithoutCompletionBlockerV1(content)
+            ? findUnbuiltStepsWithoutCompletionBlockerV1(
+                content,
+                deferredScope ? deferredOrGatedStepNumbersV1(deferredScope) : undefined
+              )
             : undefined;
         const meetsThreshold =
-          readyToAdvanceStage(score, autoAdvanceThreshold, progress) &&
+          readyToAdvanceStage(score, autoAdvanceThreshold, gateProgress) &&
           !noTrackedFileSet &&
           unbuiltStepsContradiction === undefined;
         if (noTrackedFileSet) {
@@ -5485,15 +5581,30 @@ async function routeReviewOutcomeV1(
               // The verified ticks were applied above, so what is still open
               // now is real. With nothing unchecked the notice below runs.
               const planAfterTicks = (await readPlanOfRecordV1(folderUri)).text;
-              const stillOpen = planAfterTicks
-                ? listUncheckedChecklistItemTextsV1(planAfterTicks, 10, { maxItemChars: 240 })
-                : { items: [] as string[], total: 0 };
+              // Re-read the scope against the plan after ticks (the one read
+              // above predates them) and split it: deferred work is listed on
+              // the card apart from the open items and never counted in them.
+              const scopeAfterTicks = isPlanReviewStage(targetStage) ? undefined : await readDeferredPlanScopeV1(folderUri);
+              const split = scopeAfterTicks
+                ? splitUnfinishedItemsByScopeV1(scopeAfterTicks, { maxItems: 10, maxItemChars: 240 })
+                : undefined;
+              const stillOpen = split
+                ? split.open
+                : planAfterTicks
+                  ? listUncheckedChecklistItemTextsV1(planAfterTicks, 10, { maxItemChars: 240 })
+                  : { items: [] as string[], total: 0 };
               if (stillOpen.total > 0) {
-                const cardPosted = await postLatchedOpenItemsDecisionV1(targetStage, next, stillOpen, {
-                  canonicalId: folderUri.fsPath,
-                  taskFolderPath: folderUri.fsPath,
-                  taskName: outcomeRoutingProgress?.displayName,
-                });
+                const cardPosted = await postLatchedOpenItemsDecisionV1(
+                  targetStage,
+                  next,
+                  stillOpen,
+                  {
+                    canonicalId: folderUri.fsPath,
+                    taskFolderPath: folderUri.fsPath,
+                    taskName: outcomeRoutingProgress?.displayName,
+                  },
+                  split ? { deferred: split.deferred, gated: split.gated } : undefined
+                );
                 if (!cardPosted) {
                   NotificationRouter.showWarning(
                     `${STAGE_DISPLAY_NAMES[targetStage]} is clean, but ${stillOpen.total} plan item(s) are still open and the ` +
@@ -5532,7 +5643,9 @@ async function routeReviewOutcomeV1(
           NotificationRouter.showInformation(
             buildStayingOnStageNoticeV1(
               score,
-              progress,
+              // The raw count (deferred work shown as unfinished); `gateProgress`
+              // is only non-null here, and equals it when nothing is deferred.
+              progress ?? gateProgress,
               excludedSuffix,
               checklistCountUnverified,
               hasOutstandingChecklistItems
@@ -6855,17 +6968,28 @@ export async function runReviewForFolder(
   // reviewer should derive current state from the workspace instead. Scoped
   // to implementation/publish review stages (REVIEWED_COMMIT_STAGES); plan
   // reviews don't use either variable so this is a harmless no-op for them.
+  //
+  // bugs3 Step 9: the task description and plan this review is dispatched against are recorded
+  // for EVERY review stage (plan reviews read both), so a later resume can tell an edit made
+  // while it ran from "nothing changed".
+  // The workspace identity is recorded too, for every stage: a plan review's artifact carries
+  // no reviewed-commit stamp, so this record is the only evidence a resume has that the
+  // repository it read is still the one in front of it.
+  const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
+  // RC1 item 3: stamped alongside reviewedCommitSha so a later dispatch of
+  // this same stage can tell "the working tree changed by hand" from
+  // "nothing changed" even though HEAD (which uncommitted edits never
+  // move) still reads the same — see isReviewDispatchAgainstUnchangedTreeV1.
+  const dispatchTreeFingerprint = await computeWorkingTreeFingerprintV1(workspaceRoot.uri.fsPath, {
+    excludeAbsolutePaths: [reviewUri.fsPath, previousVersionUri(reviewUri).fsPath],
+  });
+  await recordReviewInputsV1(folderUri.fsPath, reviewUri.fsPath, {
+    headSha: headSha ?? null,
+    treeFingerprint: dispatchTreeFingerprint ?? null,
+  });
   if (REVIEWED_COMMIT_STAGES.has(targetStage)) {
-    const headSha = await resolveHeadCommitSha(workspaceRoot.uri.fsPath);
     variables.reviewedCommitSha = headSha ?? "unknown";
-    // RC1 item 3: stamped alongside reviewedCommitSha so a later dispatch of
-    // this same stage can tell "the working tree changed by hand" from
-    // "nothing changed" even though HEAD (which uncommitted edits never
-    // move) still reads the same — see isReviewDispatchAgainstUnchangedTreeV1.
-    variables.reviewedTreeFingerprint =
-      (await computeWorkingTreeFingerprintV1(workspaceRoot.uri.fsPath, {
-        excludeAbsolutePaths: [reviewUri.fsPath, previousVersionUri(reviewUri).fsPath],
-      })) ?? "unknown";
+    variables.reviewedTreeFingerprint = dispatchTreeFingerprint ?? "unknown";
     if (previousReview !== undefined) {
       // The previous review is about to be reconciled against — or superseded.
       // If its recorded commit has fallen behind HEAD, its on-disk copy must
@@ -7791,7 +7915,14 @@ export async function runReviewForFolder(
         return undefined;
       }
     })();
-    const dispatchCeilingAdvisory = promptCeilingAdvisoryV1(promptByteLength, dispatchProviderId);
+    // bugs3 Step 5: kimi-code 2.x reads far more than the 66 KB measured on
+    // 0.x, so Kimi is judged by its installed version and effective config.
+    // Only probed for prompts big enough to matter (the probe runs a CLI).
+    const kimiReadCheck: KimiReadCheckV1 | undefined =
+      promptByteLength > 20_000
+        ? { capacity: await getKimiReadCapacityV1(), prompt: measureKimiPromptV1(prompt) }
+        : undefined;
+    const dispatchCeilingAdvisory = promptCeilingAdvisoryV1(promptByteLength, dispatchProviderId, kimiReadCheck);
     // The advisory alone was not enough (jester, 2026-08-28): it fired
     // correctly before dispatch, was shown as a warning, and the round ran on
     // the over-ceiling provider regardless — producing a 154-byte degenerate
@@ -7813,7 +7944,8 @@ export async function runReviewForFolder(
               } catch {
                 return undefined;
               }
-            }
+            },
+            kimiReadCheck
           );
     // What this round actually dispatches to. Only ever differs from the
     // stage's configured primary when that primary's known ceiling is
@@ -7830,6 +7962,21 @@ export async function runReviewForFolder(
             ? ` Using ${attributionModelLabel(ceilingPreferredModelId) ?? ceilingPreferredModelId} for this round instead.`
             : "")
       );
+      // bugs3 Step 5: the way to let Kimi read the whole prompt is a setting in
+      // the owner's own Kimi config, so it is offered in chat (once per task),
+      // never applied without their choice. Best-effort: a failure to post must
+      // not stop the round.
+      if (kimiReadCheck !== undefined && dispatchProviderId === "kimi-cli") {
+        try {
+          await offerKimiReadConfigInChatV1(
+            { canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage: targetStage },
+            kimiReadCheck.capacity,
+            kimiReadCheck.prompt
+          );
+        } catch (error) {
+          console.error("Kimi read-config offer failed:", error);
+        }
+      }
     }
 
     // Pre-flight the stage's resolved provider chain BEFORE burning a round
@@ -8928,8 +9075,9 @@ export async function runReviewWithAI(
     : undefined;
   if (early && early.outcome !== "acquired") {
     NotificationRouter.showWarning(
-      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+      describeWorkAdmissionRefusalForUserV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
     );
+    offerBusyRefusalChoicesOnceV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!));
     return;
   }
 
@@ -9016,11 +9164,12 @@ export async function runReviewWithAI(
       });
       if (late.outcome !== "acquired") {
         NotificationRouter.showWarning(
-          describeWorkAdmissionRefusalV1(
+          describeWorkAdmissionRefusalForUserV1(
             late,
             notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
           )
         );
+        offerBusyRefusalChoicesOnceV1(late, notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath));
         return;
       }
       handle = late.handle;
@@ -9190,8 +9339,9 @@ export async function applyReviewWithAI(
       : undefined;
   if (early && early.outcome !== "acquired") {
     NotificationRouter.showWarning(
-      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+      describeWorkAdmissionRefusalForUserV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
     );
+    offerBusyRefusalChoicesOnceV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!));
     return false;
   }
 
@@ -9274,11 +9424,12 @@ export async function applyReviewWithAI(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(
-        describeWorkAdmissionRefusalV1(
+        describeWorkAdmissionRefusalForUserV1(
           late,
           notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
         )
       );
+      offerBusyRefusalChoicesOnceV1(late, notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath));
       return false;
     }
     handle = late.handle;
@@ -9459,18 +9610,24 @@ export async function applyReviewWithAI(
     // Forward alike, mirroring the code loop's `stage: "impl"` child — the
     // tree follows the step that is actually running, and the row's activity
     // matches the "Applying review fixes…" notification.
+    // bugs3 Step 3: every attempt the coordinator allocates, kept even when the
+    // round is cancelled (a cancelled outcome names none of them itself).
+    const planFixAllocatedAttemptIds: string[] = [];
     const planFixOutcome = await runTrackedOperation(
       lockKey,
       { parent: op, label: stepNameV1("apply-review"), stage: "plan", kind: "apply-review", cancellable: true, refusedWhenFalse: true },
       async (fixOp) => {
         fixOp.reportActivity(stepProgressLabelV1("apply-review"));
-        return coordinator.executeAction({
+        const fixResult = await coordinator.executeAction({
           actionKey: APPLY_REVIEW_ACTION_KEY_V1,
           taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
           taskStatus: "active",
           taskStage: stage,
           rawInput: validatedInput,
           cancellationToken: fixOp.token ?? op.token!,
+          onAttemptAllocated: ({ attemptId }) => {
+            planFixAllocatedAttemptIds.push(attemptId);
+          },
           onCandidateInvokedV1: async (info) => {
             await observeCandidateModelInvocationV1(
               resolved.folderUri,
@@ -9481,6 +9638,11 @@ export async function applyReviewWithAI(
             );
           },
         });
+        // The child returns the coordinator's outcome object, which is never
+        // `false`, so without this it settled "succeeded" even when every
+        // candidate failed or was deferred (bugs3 item 3).
+        settleOperationFailedForRoundOutcomeV1(fixOp, fixResult);
+        return fixResult;
       }
     );
     if (planFixOutcome === undefined) {
@@ -9615,6 +9777,21 @@ export async function applyReviewWithAI(
       // distinct from "failed" for the exact same reason.
       const roundId = crypto.randomUUID();
       const terminalState: RoundLedgerTerminalStateV1 = outcome.kind === "cancelled" ? "cancelled" : "failed";
+      // The round ledger posts this round's "Ended: …" line below; the
+      // operation observer must not add a second one for the same operation.
+      // A Fast Forward parent keeps its own settlement: one inner round
+      // failing does not decide how the whole composite ends.
+      if (!options.parentOperation) {
+        const settled = terminalOutcomeFromTaskActionOutcomeV1(outcome);
+        recordOperationTerminalOutcomeV1(op.id, {
+          state: settled?.state ?? terminalState,
+          ...(settled?.reason !== undefined ? { reason: settled.reason } : {}),
+          ledgerSpeaks: true,
+        });
+        if (outcome.kind !== "cancelled") {
+          settleOperationFailedForRoundOutcomeV1(op, outcome);
+        }
+      }
       if (outcome.kind === "cancelled") {
         recordStageActionTerminalOutcomeV1(resolved.folderUri.fsPath, {
           kind: "cancelled",
@@ -9638,6 +9815,11 @@ export async function applyReviewWithAI(
           {
             taskFolderUri: resolved.folderUri,
             synthesizeIfMissing: () => ({ roundId, stage, mode: "apply-review" }),
+            // Every attempt the chain made, including those that produced no
+            // provider report, so the ledger row is not left with none.
+            extraAttemptIds: [
+              ...new Set([...planFixAllocatedAttemptIds, ...collectAttemptIdsFromOutcomeV1(outcome)]),
+            ],
           }
         );
       } catch {
@@ -9845,8 +10027,9 @@ export async function fastForwardReviewWithAI(
     : undefined;
   if (ffEarly && ffEarly.outcome !== "acquired") {
     NotificationRouter.showWarning(
-      describeWorkAdmissionRefusalV1(ffEarly, notificationTaskDisplayNameV1(undefined, ffEarlyFolderPath!))
+      describeWorkAdmissionRefusalForUserV1(ffEarly, notificationTaskDisplayNameV1(undefined, ffEarlyFolderPath!))
     );
+    offerBusyRefusalChoicesOnceV1(ffEarly, notificationTaskDisplayNameV1(undefined, ffEarlyFolderPath!));
     return;
   }
 
@@ -10039,11 +10222,12 @@ export async function fastForwardReviewWithAI(
     });
     if (ffLate.outcome !== "acquired") {
       NotificationRouter.showWarning(
-        describeWorkAdmissionRefusalV1(
+        describeWorkAdmissionRefusalForUserV1(
           ffLate,
           notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
         )
       );
+      offerBusyRefusalChoicesOnceV1(ffLate, notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath));
       return;
     }
     ffHandle = ffLate.handle;
@@ -10160,6 +10344,46 @@ export async function fastForwardReviewWithAI(
   // Disk, not the editor buffer: the coordinator writes the artifact to disk
   // only, and an open publish-review.md may still hold pre-promotion content.
   let initialContent = await readReviewArtifactFromDiskV1(reviewUri);
+  // bugs3 Step 9: a resumed run ("Keep iterating … from Apply Review") whose
+  // review is provably of the tree as it stands starts with Apply Review; the
+  // ledger heuristic below must not send it back through the same review.
+  let resumedTreeProvablyUnchanged = false;
+  let resumeReReviewNotice: string | undefined;
+  // The task description (owner scope and evidence) or the plan changed after the review was
+  // written: the code fingerprint cannot see the task folder, so this is checked on its own.
+  let resumedReviewInputsChanged = false;
+  // The review's own stamps prove the workspace moved (HEAD or working-tree fingerprint differs),
+  // e.g. an edit made by hand after the review with no implementation round in between.
+  let resumedTreeProvablyChanged = false;
+  if (initialContent !== undefined && resumeFromAttempt !== undefined) {
+    // Every review stage, plan reviews included: they read the same task description and plan.
+    resumedReviewInputsChanged = (await reviewInputsChangedSinceV1(resolved.folderUri.fsPath, reviewUri.fsPath)).changed;
+    const resumeWorkspaceRoot = REVIEWED_COMMIT_STAGES.has(targetStage) ? resolveOwnerWorkspace(resolved.progress) : undefined;
+    if (resumeWorkspaceRoot) {
+      const resumeHeadSha = await resolveHeadCommitSha(resumeWorkspaceRoot.uri.fsPath);
+      const resumeTreeFingerprint = await computeWorkingTreeFingerprintV1(resumeWorkspaceRoot.uri.fsPath, {
+        excludeAbsolutePaths: [reviewUri.fsPath, previousVersionUri(reviewUri).fsPath],
+      });
+      resumedTreeProvablyUnchanged =
+        !resumedReviewInputsChanged &&
+        isReviewDispatchAgainstUnchangedTreeV1(initialContent, resumeHeadSha, resumeTreeFingerprint);
+      resumedTreeProvablyChanged = isReviewedTreeProvablyChangedV1(initialContent, resumeHeadSha, resumeTreeFingerprint);
+    } else if (!REVIEWED_COMMIT_STAGES.has(targetStage)) {
+      // A plan review's artifact carries no reviewed-commit stamp; the identity recorded at its
+      // dispatch is compared instead. A review with no such record cannot be shown current.
+      const planStageWorkspace = resolveOwnerWorkspace(resolved.progress);
+      if (planStageWorkspace) {
+        const planStageHead = await resolveHeadCommitSha(planStageWorkspace.uri.fsPath);
+        const planStageFingerprint = await computeWorkingTreeFingerprintV1(planStageWorkspace.uri.fsPath, {
+          excludeAbsolutePaths: [reviewUri.fsPath, previousVersionUri(reviewUri).fsPath],
+        });
+        resumedTreeProvablyChanged = await reviewWorkspaceChangedSinceV1(resolved.folderUri.fsPath, reviewUri.fsPath, {
+          headSha: planStageHead ?? null,
+          treeFingerprint: planStageFingerprint ?? null,
+        });
+      }
+    }
+  }
   if (
     initialContent !== undefined &&
     (isUnusableAsExistingReview(initialContent) ||
@@ -10169,6 +10393,9 @@ export async function fastForwardReviewWithAI(
       // baseline. Refusing it here routes into the same fresh-review path a
       // stale placeholder takes.
       resolved.progress.reviewInvalidatedByRound?.stage === targetStage ||
+      // bugs3 Step 9: a resumed run does not fix against a review whose inputs (task description,
+      // plan) changed, at any review stage, or of a workspace its own stamps prove has moved.
+      (resumeFromAttempt !== undefined && (resumedReviewInputsChanged || resumedTreeProvablyChanged)) ||
       // v1 fixes 2, item 32/6 (Wave II): a leftover review from an EARLIER
       // visit to this stage — no `<!-- review-pass: N -->` marker at all, or
       // one behind the stage's current reservation — must never be trusted
@@ -10180,9 +10407,19 @@ export async function fastForwardReviewWithAI(
         (!isReviewPassCurrentV1(initialContent, resolved.progress.stageReviewPasses, targetStage) ||
           // ...or one written before the latest implementation round started:
           // it describes the tree from before that round.
-          reviewPredatesLatestImplementationRoundV1(resolved.progress, targetStage))))
+          reviewPredatesRoundNeedsFreshReviewV1({
+            predatesLatestRound: reviewPredatesLatestImplementationRoundV1(resolved.progress, targetStage),
+            resumedRun: resumeFromAttempt !== undefined,
+            treeProvablyUnchanged: resumedTreeProvablyUnchanged,
+          }))))
   ) {
     initialContent = undefined;
+    // A resumed "Keep iterating … from Apply Review" promises Apply Review
+    // first; when that cannot hold, the owner is told why a review comes first
+    // instead of finding a review where a fix was promised (bugs3 Step 9).
+    if (resumeFromAttempt !== undefined) {
+      resumeReReviewNotice = resumeReReviewNoticeV1(targetStage, resumedTreeProvablyUnchanged);
+    }
   }
   // RC3 item 6 (Step 8): a Publish review can never be dispatched while
   // Publish Checks are stale or missing — `requirePublishChecksFreshnessOrWarnV1`
@@ -10264,6 +10501,12 @@ export async function fastForwardReviewWithAI(
   }
 
   if (!initialContent) {
+    if (resumeReReviewNotice !== undefined) {
+      await appendChatMessageV1(
+        resolved.folderUri.fsPath,
+        { role: "assistant", text: resumeReReviewNotice, stage: targetStage, at: new Date().toISOString() }
+      ).catch(() => undefined);
+    }
     // No review has been run yet at this stage — run the initial review
     // first, then continue straight into the normal fast-forward loop
     // rather than telling the user to click Review separately first.
@@ -12166,7 +12409,104 @@ export async function nextStage(
   // Every notification below is about this one task (`resolved`) — wrapped
   // once here (rather than interpolating a task label at each call site) so
   // notification-task-naming attribution covers all of them.
-  return runWithNotificationTaskContextV1(resolved.progress.displayName, resolved.folderUri.fsPath, async () => {
+  return runWithNotificationTaskContextV1(resolved.progress.displayName, resolved.folderUri.fsPath, () =>
+    // One advance per task and source stage, held from the click until the
+    // transition has committed: a second click while the confirmation is open, or
+    // while the move is being written, is refused instead of raising another card.
+    runExclusiveStageAdvanceV1(
+      stageAdvanceInFlightKeyV1(resolved.folderUri.fsPath, resolved.progress.currentStage),
+      async (releaseAdvanceSlot) => {
+
+  // bugs3 Step 16: the owner's click is the decision to advance, so any
+  // acknowledgement of skipped blockers is ONE confirmation shown here, at the
+  // point of the click, before anything running is cancelled — answering "Not
+  // now" must leave the stage exactly as it was.
+  let skippedBlockersForOverride: ReviewBlocker[] = [];
+  let confirmedAdvanceKey: string | undefined;
+  let confirmedDestination: TaskStage | undefined;
+  const outstandingForAdvance = await getOutstandingPlanReviewBlockersForAdvanceV1(
+    resolved.folderUri,
+    resolved.progress.currentStage,
+    resolved.progress.blockerSupersessions
+  );
+  if (outstandingForAdvance.length > 0) {
+    const gateNext = computeNextStage(
+      resolved.progress.currentStage,
+      await resolveConfiguredReviewStages(resolved.folderUri)
+    );
+    if (gateNext) {
+      confirmedAdvanceKey = stageAdvanceConfirmationKeyV1(
+        resolved.folderUri.fsPath,
+        resolved.progress.currentStage,
+        gateNext,
+        outstandingForAdvance
+      );
+      confirmedDestination = gateNext;
+      if (!bypassBlockerGate) {
+        const confirmed =
+            (await askChatChoiceV1({
+              decisionKey: "confirmAdvanceOverBlockers",
+              target: {
+                canonicalId: normalizePath(resolved.folderUri.fsPath),
+                taskFolderPath: resolved.folderUri.fsPath,
+                stage: resolved.progress.currentStage,
+                taskName: resolved.progress.displayName ?? path.basename(resolved.folderUri.fsPath),
+              },
+              whatHappened:
+                `${STAGE_DISPLAY_NAMES[resolved.progress.currentStage]}'s review still lists ` +
+                `${outstandingForAdvance.length} blocker(s) not recorded as resolved:\n` +
+                outstandingForAdvance.map((b) => `- ${b.description}`).join("\n"),
+              whyUserNeeded: advanceBlockerGuidanceV1(outstandingForAdvance, STAGE_DISPLAY_NAMES[gateNext]),
+              options: [
+                {
+                  optionId: "advanceAnyway",
+                  label: advanceAnywayLabelV1(STAGE_DISPLAY_NAMES[gateNext]),
+                  consequence: `Moves the task to ${STAGE_DISPLAY_NAMES[gateNext]} and records that you advanced over these blockers.`,
+                },
+                {
+                  optionId: "notNow",
+                  label: "Not now",
+                  consequence: `Nothing changes: the task stays at ${STAGE_DISPLAY_NAMES[resolved.progress.currentStage]}.`,
+                },
+              ],
+              holdsProgress: true,
+              detail: "Answering continues the advance you started; Not now leaves the stage unchanged.",
+              restartGuidance: "Choose Complete Stage & Move On on this task again.",
+            })) === "advanceAnyway";
+        if (!confirmed) {
+          return;
+        }
+        // The confirmation can wait a long time: the answer applies only to the
+        // blocker set and destination the owner was shown. Re-read both and refuse
+        // (rather than advance over blockers nobody saw) when either changed.
+        const outstandingAfterAnswer = await getOutstandingPlanReviewBlockersForAdvanceV1(
+          resolved.folderUri,
+          resolved.progress.currentStage,
+          resolved.progress.blockerSupersessions
+        );
+        const destinationAfterAnswer = computeNextStage(
+          resolved.progress.currentStage,
+          await resolveConfiguredReviewStages(resolved.folderUri)
+        );
+        if (
+          destinationAfterAnswer !== gateNext ||
+          stageAdvanceConfirmationKeyV1(
+            resolved.folderUri.fsPath,
+            resolved.progress.currentStage,
+            gateNext,
+            outstandingAfterAnswer
+          ) !== confirmedAdvanceKey
+        ) {
+          NotificationRouter.showWarning(
+            `${resolved.progress.taskFolder} was not advanced: the review's blockers or the next stage changed while the confirmation was open. ` +
+              "Choose Complete Stage & Move On again to see the current blockers."
+          );
+          return;
+        }
+      }
+      skippedBlockersForOverride = outstandingForAdvance;
+    }
+  }
 
   // "Complete Stage & Move On" must abort whatever the current stage was
   // still running FIRST — before resolving configured review stages (which
@@ -12205,11 +12545,11 @@ export async function nextStage(
     const artifactName = missingCompletionArtifacts.join(", ");
     const noticeText =
       `${artifactName} hasn't been created yet. Write or generate it before advancing, ` +
-      "or explicitly complete this stage anyway.";
+      `or explicitly advance to ${STAGE_DISPLAY_NAMES[next]} anyway.`;
     const chatPointer = await offerActionInChatV1({
       taskFolderPath: resolved.folderUri.fsPath,
       progress: resolved.progress,
-      actionLabel: "Complete Anyway",
+      actionLabel: advanceAnywayLabelV1(STAGE_DISPLAY_NAMES[next]),
       command: "vs-code-ai-helper.completeStageAnywayV1",
       args: [{ taskFolderPath: resolved.folderUri.fsPath, artifactOverride: "user" }],
       noticeText,
@@ -12226,50 +12566,20 @@ export async function nextStage(
     return;
   }
 
-  // wf10 item 19 / Step 28: a plan-review stage whose latest review still
-  // lists a blocker no confirmed plan.md edit has superseded gets a warning
-  // rather than a silent advance — the whole point of a recorded
-  // supersession is that the artifacts agree before advice to advance is
-  // acted on (see readStageArtifactsForChat's and
-  // buildSoleBlockerReconcileGuidanceV1's doc comments, and this file's own
-  // `getOutstandingPlanReviewBlockersForAdvanceV1`). This is a warn-and-
-  // confirm, not a hard refusal: "Complete Anyway" is one click away, so a
-  // human who verified the blocker some other way (or disagrees with it) is
-  // never stranded — matching the "Publish Anyway" affordance already used
-  // for every sibling skip path in this same command.
-  if (!bypassBlockerGate) {
-    const outstandingBlockers = await getOutstandingPlanReviewBlockersForAdvanceV1(
-      resolved.folderUri,
-      resolved.progress.currentStage,
-      resolved.progress.blockerSupersessions
+  // The destination the owner confirmed must still be the destination: the
+  // configured review stages can change while the cancel above or the artifact
+  // check ran.
+  if (confirmedDestination !== undefined && skippedBlockersForOverride.length > 0 && next !== confirmedDestination) {
+    NotificationRouter.showWarning(
+      `${resolved.progress.taskFolder} was not advanced: the next stage changed from ${STAGE_DISPLAY_NAMES[confirmedDestination]} to ${STAGE_DISPLAY_NAMES[next]} after you confirmed. ` +
+        "Choose Complete Stage & Move On again."
     );
-    if (outstandingBlockers.length > 0) {
-      const blockerList = outstandingBlockers.map((b) => `- ${b.description}`).join("\n");
-      const noticeText =
-        `${resolved.progress.taskFolder}: ${STAGE_DISPLAY_NAMES[resolved.progress.currentStage]}'s review still ` +
-        `lists ${outstandingBlockers.length} blocker(s) not recorded as resolved:\n${blockerList}\n\n` +
-        "If you resolved this in stage chat, confirm the plan.md edit there so it's recorded. Otherwise, " +
-        "advance anyway if you've verified it some other way — a full re-review is a stronger option but not required.";
-      const chatPointer = await offerActionInChatV1({
-        taskFolderPath: resolved.folderUri.fsPath,
-        progress: resolved.progress,
-        actionLabel: "Complete Anyway",
-        command: "vs-code-ai-helper.completeStageAnywayV1",
-        args: [{ taskFolderPath: resolved.folderUri.fsPath }],
-        noticeText,
-        optional: true,
-        taskLabel: resolved.progress.displayName,
-      });
-      NotificationRouter.showWarning(
-        noticeText,
-        undefined,
-        undefined,
-        undefined,
-        chatPointer
-      );
-      return;
-    }
+    return;
   }
+
+  // wf10 item 19 / Step 28 (reworked by bugs3 Step 16): outstanding plan-review
+  // blockers are acknowledged by the single confirmation raised at the top of
+  // this command, not by a second "Complete Anyway" card after the click.
 
   // Special handling for advancing into "implementation" stage: copy the
   // current plan to plan-final.md if not already there. Review fix
@@ -12298,6 +12608,31 @@ export async function nextStage(
   // header. The legacy advanceStage helper remains in use for other
   // transition kinds (manual "Set Task Stage" jumps, resets, reopen,
   // recovery).
+  // The override is recorded BEFORE the move so an advance can never succeed
+  // without its audit line; a failed transition voids it below.
+  const advanceOverrideRecord =
+    skippedBlockersForOverride.length > 0
+      ? buildStageAdvanceOverrideRecordV1({
+          sourceStage: resolved.progress.currentStage,
+          destinationStage: next,
+          blockers: skippedBlockersForOverride.map((b) => ({
+            category: b.category,
+            resolver: b.resolver,
+            description: b.description,
+            ...(b.lineage && b.lineage.kind !== "new" ? { declaredLineage: `${b.lineage.kind}:${b.lineage.refId}` } : {}),
+          })),
+        })
+      : undefined;
+  if (
+    advanceOverrideRecord !== undefined &&
+    !(await appendStageAdvanceOverrideV1(resolved.folderUri.fsPath, advanceOverrideRecord))
+  ) {
+    NotificationRouter.showError(
+      `${resolved.progress.taskFolder} was not advanced: the override over ${skippedBlockersForOverride.length} blocker(s) could not be recorded in ` +
+        `${STAGE_ADVANCE_OVERRIDE_FILE_V1} in the task folder. Check that the folder is writable, then choose Complete Stage & Move On again.`
+    );
+    return;
+  }
   let transitionResult: StageTransitionResult | undefined;
   try {
     // v1 fixes item 1, Part 1b step 13 ("audit every pause-sensitive read ...
@@ -12322,6 +12657,13 @@ export async function nextStage(
       artifactOverride ? "user" : undefined
     );
   } catch (error) {
+    if (advanceOverrideRecord !== undefined) {
+      await voidStageAdvanceOverrideV1(
+        resolved.folderUri.fsPath,
+        advanceOverrideRecord,
+        error instanceof Error ? error.message : String(error)
+      );
+    }
     // Both paths throw (rather than resolving falsy) on a rejected
     // transition — e.g. an auto-advance already moved this task off the
     // expected source stage while this manual "Complete Stage & Move On"
@@ -12356,11 +12698,18 @@ export async function nextStage(
   }
 
   if (!transitionResult?.persisted) {
+    if (advanceOverrideRecord !== undefined) {
+      await voidStageAdvanceOverrideV1(resolved.folderUri.fsPath, advanceOverrideRecord, "the stage move was not persisted");
+    }
     NotificationRouter.showError(
       `Could not persist stage advance for ${resolved.progress.taskFolder}. Please try again.`
     );
     return;
   }
+
+  // The move is committed: a further click is a new advance from the new stage,
+  // and the follow-up dispatch below must not hold the slot while it runs.
+  releaseAdvanceSlot();
 
   // The deferred plan-revision adoption write (and card withdrawal) that used
   // to be applied here is now performed internally by
@@ -12607,7 +12956,16 @@ export async function nextStage(
       },
     });
   }
-  }, resolved.progress.currentStage);
+      },
+      () => {
+        NotificationRouter.showInformation(
+          `${resolved.progress.taskFolder}: an advance from ${STAGE_DISPLAY_NAMES[resolved.progress.currentStage]} is already in progress` +
+            " — answer its confirmation in the chat, or wait for it to finish."
+        );
+      }
+    ),
+    resolved.progress.currentStage
+  );
 }
 
 interface GenerateImplementationOutcomeContextV1 {
@@ -14061,7 +14419,43 @@ async function executeImplementationRun(
     options.parentOperation?.report?.(result.cascadeNoteV1.slice(0, 300));
   }
   let recovery: BegunImplementationRecoveryV1 | undefined;
-  if (incompleteRound || summaryIssue !== undefined || timedOutRound) {
+  // bugs3 Step 6: a provider that never received its prompt owes no continuation
+  // — a continuation would hand the same undelivered work to a model that picks
+  // its own. The failure is reported as "prompt not delivered", not "cut short".
+  const promptNotDelivered = result.promptNotDeliveredV1 === true;
+  if (promptNotDelivered) {
+    const undeliveredEdits = describeUndeliveredPromptEditsV1({
+      providerLabel: result.providerLabel ?? result.runnerId ?? "The provider",
+      filesChanged: sanitizeChangeSetV1(result.filesChanged),
+      filesChangedUnknown: result.filesChangedUnknown === true,
+      ...(result.undeliveredPromptEditScopeV1 ? { scope: result.undeliveredPromptEditScopeV1 } : {}),
+    });
+    if (undeliveredEdits !== undefined) {
+      try {
+        await appendChatMessageV1(folderUri.fsPath, {
+          role: "assistant",
+          text: `_${undeliveredEdits}_`,
+          stage: postRunReviewStage,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // The failure itself is reported below; this notice is best-effort.
+      }
+      // The revert is an offer, never an action: the owner chooses it in chat.
+      if (result.undeliveredPromptEditScopeV1 !== undefined) {
+        try {
+          await offerUndeliveredPromptEditsRevertInChatV1(
+            { canonicalId: folderUri.fsPath, taskFolderPath: folderUri.fsPath, stage: postRunReviewStage },
+            result.providerLabel ?? result.runnerId ?? "The provider",
+            result.undeliveredPromptEditScopeV1
+          );
+        } catch {
+          // The notice above already lists the files; the offer is best-effort.
+        }
+      }
+    }
+  }
+  if (!promptNotDelivered && (incompleteRound || summaryIssue !== undefined || timedOutRound)) {
     recovery = await beginImplementationRecoveryV1(folderUri, {
       trigger: incompleteRound
         ? incompleteRound.kind
@@ -16620,8 +17014,9 @@ export async function runImplementationWithAI(
     : undefined;
   if (early && early.outcome !== "acquired") {
     NotificationRouter.showWarning(
-      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+      describeWorkAdmissionRefusalForUserV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
     );
+    offerBusyRefusalChoicesOnceV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!));
     return false;
   }
 
@@ -16733,11 +17128,12 @@ export async function runImplementationWithAI(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(
-        describeWorkAdmissionRefusalV1(
+        describeWorkAdmissionRefusalForUserV1(
           late,
           notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
         )
       );
+      offerBusyRefusalChoicesOnceV1(late, notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath));
       return false;
     }
     handle = late.handle;
@@ -17274,6 +17670,8 @@ export async function runImplementationWithAI(
           decisionKey: "preImplementationRouting",
           taskCanonicalId: resolved.folderUri.fsPath,
           stage: resolved.progress.currentStage,
+          // bugs3 Step 19: "Keep running Implementation" refers to THIS round only.
+          liveReference: { kind: "implementation-operation", operationId: op.id },
           whatHappened: `${preRunDecision.reason}${whatHappenedSuffix}`,
           whyUserNeeded,
           options: [
@@ -17761,8 +18159,9 @@ export async function applyReviewEditWithAI(
       : undefined;
   if (early && early.outcome !== "acquired") {
     NotificationRouter.showWarning(
-      describeWorkAdmissionRefusalV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
+      describeWorkAdmissionRefusalForUserV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!))
     );
+    offerBusyRefusalChoicesOnceV1(early, notificationTaskDisplayNameV1(undefined, earlyFolderPath!));
     return false;
   }
 
@@ -17861,11 +18260,12 @@ export async function applyReviewEditWithAI(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(
-        describeWorkAdmissionRefusalV1(
+        describeWorkAdmissionRefusalForUserV1(
           late,
           notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath)
         )
       );
+      offerBusyRefusalChoicesOnceV1(late, notificationTaskDisplayNameV1(resolved.progress.displayName, resolved.folderUri.fsPath));
       return false;
     }
     handle = late.handle;

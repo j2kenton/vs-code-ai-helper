@@ -1238,6 +1238,10 @@ export async function runImplementationForModel(options: {
       return bare;
     }
   };
+  // The model whose result is the headline error (the primary, or the backup
+  // that ran last): its own "tried and failed" record is the headline again.
+  const headlineModelLabel = (): string | undefined =>
+    options.modelId !== undefined && options.modelId.length > 0 ? labelForBackup(options.modelId) : undefined;
   if (
     !authFailure &&
     primaryLeftTreeClean &&
@@ -1791,7 +1795,7 @@ export async function runImplementationForModel(options: {
             return firstBackup ? { heldBackBackupLabel: labelForBackup(firstBackup) } : {};
           })()
         : {}),
-    });
+    }, headlineModelLabel());
     options.onProgress(withheldMessage);
     // Part 5 step 1: surface a "Rerun after reset" action alongside the
     // withheld-cascade notice whenever a concrete, NEAR reset time is known
@@ -2059,7 +2063,7 @@ export async function runImplementationForModel(options: {
               }
               return records.length > 0 ? records : undefined;
             })(),
-          })
+          }, headlineModelLabel())
         : backupRecords.length > 0
           ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
               kind: "backupsExhausted",
@@ -2068,7 +2072,7 @@ export async function runImplementationForModel(options: {
                 record.label === stagePrimaryLabelV1 ? { ...record, isPrimary: true } : record
               ),
               remedyText: resolveFailureRemedyTextV1(),
-            })
+            }, headlineModelLabel())
         : !isCascadeEligibleFailureKind(result.failureKind)
           ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
               kind: "notCascadeEligible",

@@ -35,6 +35,14 @@ export interface ChatChoiceInputV1 {
   readonly evidence?: readonly { readonly label: string; readonly detail: string }[];
   /** Cancelling the owning operation dismisses this pending choice. */
   readonly token?: import("vscode").CancellationToken;
+  /** How to run the action again if a reload ends it while this card is open. */
+  readonly restartGuidance?: string;
+  /**
+   * Set when the asking command cannot continue until this is answered and the
+   * task's progress depends on it: the card is then shown as a decision the task
+   * is held on, never as "Optional".
+   */
+  readonly holdsProgress?: boolean;
 }
 
 /**
@@ -72,9 +80,10 @@ export async function askChatChoiceV1(input: ChatChoiceInputV1): Promise<string 
       })),
       recommendation,
       ...(input.evidence && input.evidence.length > 0 ? { evidence: input.evidence } : {}),
+      ...(input.restartGuidance !== undefined ? { restartGuidance: input.restartGuidance } : {}),
       gating: {
         holdsTaskPaused: false,
-        unblocksProgress: false,
+        unblocksProgress: input.holdsProgress === true,
         detail: input.detail ?? "Answering continues the command that asked.",
       },
     },

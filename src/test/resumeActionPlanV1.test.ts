@@ -274,14 +274,26 @@ void describe("describeResumeOptionV1", () => {
   // kind — not a bare pass-through of the planned action's label, which is
   // what let "Resume and re-run this stage" dispatch an implementation
   // round while reading as a review re-run.
-  void it("apply-review's label names the planned action and says it edits code", () => {
+  void it("apply-review's label names the planned action and says it edits code at an implementation-review stage", () => {
     const plan = planResumeActionV1(facts("impl-high-review", { reviewContent: review(HEAD, 3) }));
     assert.equal(plan.kind, "apply-review");
     assert.equal(
-      describeResumeOptionV1(plan).label,
-      "Resume and fix the review's 3 blockers (Claude Code) — runs an implementation round that edits code"
+      describeResumeOptionV1(plan, "impl-high-review").label,
+      "Resume and fix the review's 3 blockers (Claude Code) — edits code to address the review's findings"
     );
-    assert.match(describeResumeOptionV1(plan).consequence, /implementation round that edits the workspace/);
+    assert.match(describeResumeOptionV1(plan, "impl-high-review").consequence, /edits the workspace's code/);
+  });
+
+  // bugs3 Step 4: at a plan-review stage the same fix round revises plan.md.
+  void it("apply-review at a plan-review stage says it revises the plan and edits no code", () => {
+    const plan = planResumeActionV1(facts("plan-high-review", { reviewContent: review(HEAD, 2) }));
+    assert.equal(plan.kind, "apply-review");
+    for (const stage of ["plan-high-review", "plan-low-review", "plan"] as const) {
+      const option = describeResumeOptionV1(plan, stage);
+      assert.match(option.label, /— revises the plan \(plan\.md\); it does not edit code$/);
+      assert.match(option.consequence, /revises the plan \(plan\.md\)[^.]*; it does not edit code/);
+      assert.doesNotMatch(`${option.label} ${option.consequence}`, /implementation round|edits the workspace/i);
+    }
   });
 
   void it("run-review's label names the planned action and says it does not edit code", () => {

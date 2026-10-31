@@ -2,6 +2,15 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as path from "node:path";
 import * as fs from "node:fs/promises";
+import {
+  captureGitIndexLockSnapshotV1,
+  resolveGitIndexLockPathV1,
+  settleRoundGitIndexLockV1,
+  describeIndexLockSettlementV1,
+  type GitIndexLockHolderInspectorV1,
+  type GitIndexLockSettlementV1,
+  type GitIndexLockSnapshotV1,
+} from "./gitIndexLockV1";
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +35,7 @@ export interface RoundGitStateSnapshotV1 {
   readonly observedAt: string;
   readonly indexEntries: readonly RoundGitIndexEntryV1[];
   readonly stashEntries: readonly RoundGitStashEntryV1[];
+  readonly indexLock?: GitIndexLockSnapshotV1;
 }
 
 export interface RoundGitStateDeltaV1 {
@@ -45,8 +55,14 @@ export interface RoundGitObservationRecordV1 {
   readonly taskFolderPath: string;
   readonly repositoryRoot?: string;
   readonly before?: RoundGitStateSnapshotV1;
+  /**
+   * The lock observed before the round, captured on its own so a failure of
+   * the broader index/stash capture cannot hide a leftover lock from settlement.
+   */
+  readonly indexLockBefore?: GitIndexLockSnapshotV1;
   readonly after?: RoundGitStateSnapshotV1;
   readonly delta?: RoundGitStateDeltaV1;
+  readonly indexLockSettlement?: GitIndexLockSettlementV1;
   readonly unavailableReason?: string;
 }
 
@@ -54,6 +70,12 @@ export interface RoundGitInterferenceV1 {
   readonly unmergedPaths: readonly string[];
   readonly stashOperationIds: readonly string[];
   readonly stashObservations?: readonly RoundGitStashObservationV1[];
+  /**
+   * Index-lock outcomes found while recovering rounds the host never finished
+   * (killed before their `finally`): a removed or preserved lock, with age and
+   * what the owner can do. Informational; never holds a task.
+   */
+  readonly indexLockNotices?: readonly string[];
 }
 
 export interface RoundGitStashObservationV1 {
@@ -79,6 +101,24 @@ async function resolveRepositoryRoot(taskFolderPath: string): Promise<string> {
   return (await gitOutput(path.resolve(taskFolderPath), ["rev-parse", "--show-toplevel"])).trim();
 }
 
+/** Observe the repository's index lock; a failure to resolve or read it is recorded as an unknown state, never as absence. */
+async function observeGitIndexLockV1(repositoryRoot: string, now?: Date): Promise<GitIndexLockSnapshotV1> {
+  try {
+    return await captureGitIndexLockSnapshotV1(await resolveGitIndexLockPathV1(repositoryRoot), now);
+  } catch (error) {
+    return {
+      state: "unknown",
+      observedAt: (now ?? new Date()).toISOString(),
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/** A round that has started but has no after-round observation yet (running, or killed before its `finally`). */
+function isPendingRoundObservationV1(record: RoundGitObservationRecordV1): boolean {
+  return !record.after && Boolean(record.before || record.indexLockBefore);
+}
+
 /** Capture the index (including unmerged stages) and stash list without changing Git state. */
 export async function captureRoundGitStateV1(input: {
   readonly repositoryRoot: string;
@@ -86,6 +126,8 @@ export async function captureRoundGitStateV1(input: {
   readonly roundId: string;
   readonly operationId?: string;
   readonly now?: Date;
+  /** An index-lock observation already taken for this capture; it is used instead of observing again. */
+  readonly indexLock?: GitIndexLockSnapshotV1;
 }): Promise<RoundGitStateSnapshotV1> {
   const repositoryRoot = path.resolve(input.repositoryRoot);
   const taskFolderPath = path.resolve(input.taskFolderPath);
@@ -107,6 +149,7 @@ export async function captureRoundGitStateV1(input: {
     const [objectId, selector, subject] = stashParts.slice(i, i + 3);
     if (objectId && selector && subject !== undefined) stashEntries.push({ objectId, selector, subject });
   }
+  const indexLock = input.indexLock ?? await observeGitIndexLockV1(repositoryRoot, input.now);
   return {
     repositoryRoot,
     taskFolderPath,
@@ -115,6 +158,7 @@ export async function captureRoundGitStateV1(input: {
     observedAt: (input.now ?? new Date()).toISOString(),
     indexEntries,
     stashEntries,
+    ...(indexLock ? { indexLock } : {}),
   };
 }
 
@@ -156,7 +200,10 @@ function decodeObservationRecord(value: unknown): RoundGitObservationRecordV1 | 
 /** Find observed interference that still needs explicit owner handling. */
 export async function inspectRoundGitInterferenceV1(
   taskFolderPath: string,
-  options: { readonly liveOperationIds?: ReadonlySet<string> } = {}
+  options: {
+    readonly liveOperationIds?: ReadonlySet<string>;
+    readonly inspectLiveGitHolder?: GitIndexLockHolderInspectorV1;
+  } = {}
 ): Promise<RoundGitInterferenceV1> {
   const folder = path.resolve(taskFolderPath);
   const evidenceFolder = path.join(folder, "round-git-state-v1");
@@ -189,14 +236,53 @@ export async function inspectRoundGitInterferenceV1(
   const unmergedPaths = new Set<string>();
   const stashOperationIds = new Set<string>();
   const stashObservations: RoundGitStashObservationV1[] = [];
+  const indexLockNotices: string[] = [];
+  // Another unfinished round in this task that is still running can own a lock
+  // that appeared since its snapshot; an interrupted round's lock is then not
+  // attributable and must be preserved.
+  const anotherRoundStillRunning = (operationId: string): boolean =>
+    records.some((other) => other.operationId !== operationId && isPendingRoundObservationV1(other) && options.liveOperationIds?.has(other.operationId));
   for (const record of records) {
     let delta = record.delta;
-    if (!record.after && record.before && !options.liveOperationIds?.has(record.operationId)) {
+    if (isPendingRoundObservationV1(record) && !options.liveOperationIds?.has(record.operationId)) {
       // A process may have died before its finally path. Reconstruct an
       // observation now, clearly retaining the actual observation time and
       // unattributed status rather than losing the durable before snapshot.
-      delta = compareRoundGitStateV1(record.before, snapshot);
-      const recovered: RoundGitObservationRecordV1 = { ...record, after: snapshot, delta };
+      if (record.before) delta = compareRoundGitStateV1(record.before, snapshot);
+      // The killed round may also have left its index lock behind. Settle it
+      // with the same rules as a normal ending, against the persisted
+      // before-round lock observation. A round that already settled its lock
+      // before the after-round capture failed is not settled (or reported) twice.
+      let indexLockSettlement = record.indexLockSettlement;
+      if (!indexLockSettlement) {
+        try {
+          const lockRepositoryRoot = record.repositoryRoot ?? current;
+          const indexLockPath = await resolveGitIndexLockPathV1(lockRepositoryRoot);
+          indexLockSettlement = anotherRoundStillRunning(record.operationId)
+            ? {
+                outcome: "preserved",
+                reason: "uncertain",
+                detail: "another round in this task is still running and may own it",
+                ageMs: snapshot.indexLock?.ageMs,
+                lockPath: indexLockPath,
+              }
+            : await settleRoundGitIndexLockV1({
+                repositoryRoot: lockRepositoryRoot,
+                indexLockPath,
+                before: record.indexLockBefore ?? record.before?.indexLock,
+                after: snapshot.indexLock,
+                ...(options.inspectLiveGitHolder ? { inspectLiveGitHolder: options.inspectLiveGitHolder } : {}),
+              });
+        } catch (error) {
+          indexLockSettlement = {
+            outcome: "unobserved",
+            detail: `could not settle the index lock: ${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+        const lockNotice = describeIndexLockSettlementV1(indexLockSettlement);
+        if (lockNotice) indexLockNotices.push(`Round ${record.operationId} was interrupted: ${lockNotice}`);
+      }
+      const recovered: RoundGitObservationRecordV1 = { ...record, after: snapshot, ...(delta ? { delta } : {}), indexLockSettlement };
       const evidencePath = path.join(evidenceFolder, `${record.operationId}.json`);
       const temporaryPath = `${evidencePath}.recovered.tmp`;
       await fs.writeFile(temporaryPath, `${JSON.stringify(recovered, null, 2)}\n`);
@@ -206,7 +292,7 @@ export async function inspectRoundGitInterferenceV1(
     // pending until its owner disappears; otherwise a concurrent inspection
     // could persist a terminal snapshot and hide Git changes made later by
     // that live round.
-    if (!record.after && record.before && options.liveOperationIds?.has(record.operationId)) continue;
+    if (isPendingRoundObservationV1(record) && options.liveOperationIds?.has(record.operationId)) continue;
     for (const file of delta?.newUnmergedPaths ?? []) if (currentUnmerged.has(file)) unmergedPaths.add(file);
     const stashChanged = (delta?.addedStashes.length ?? 0) > 0 || (delta?.removedStashes.length ?? 0) > 0;
     if (stashChanged) {
@@ -229,6 +315,7 @@ export async function inspectRoundGitInterferenceV1(
     unmergedPaths: [...unmergedPaths].sort(),
     stashOperationIds: [...stashOperationIds].sort(),
     ...(stashObservations.length ? { stashObservations } : {}),
+    ...(indexLockNotices.length ? { indexLockNotices } : {}),
   };
 }
 
@@ -274,24 +361,38 @@ export async function withRoundGitStateObservationV1<T>(input: {
   readonly taskFolderPath: string;
   readonly roundId: string;
   readonly operationId: string;
+  /** Injectable live-writer inspection for the index-lock settlement (tests). */
+  readonly inspectLiveGitHolder?: GitIndexLockHolderInspectorV1;
+  /** Pause between re-inspections of a circumstantial live-process finding (tests pass 0). */
+  readonly lockRetryDelayMs?: number;
 }, run: () => Promise<T>, onObserved?: (record: RoundGitObservationRecordV1) => void): Promise<{ readonly result: T; readonly record: RoundGitObservationRecordV1 }> {
   const taskFolderPath = path.resolve(input.taskFolderPath);
   let before: RoundGitStateSnapshotV1 | undefined;
   let after: RoundGitStateSnapshotV1 | undefined;
   let repositoryRoot: string | undefined;
+  let indexLockBefore: GitIndexLockSnapshotV1 | undefined;
   let unavailableReason: string | undefined;
   let result!: T;
   let thrown: unknown;
   let didThrow = false;
   try {
     repositoryRoot = await resolveRepositoryRoot(taskFolderPath);
-    before = await captureRoundGitStateV1({ ...input, taskFolderPath, repositoryRoot });
   } catch (error) {
     unavailableReason = error instanceof Error ? error.message : String(error);
   }
+  if (repositoryRoot) {
+    // The lock is observed on its own, before the broader index/stash capture,
+    // so a failure of that capture cannot leave a leftover lock unreported.
+    indexLockBefore = await observeGitIndexLockV1(repositoryRoot);
+    try {
+      before = await captureRoundGitStateV1({ ...input, taskFolderPath, repositoryRoot, indexLock: indexLockBefore });
+    } catch (error) {
+      unavailableReason = error instanceof Error ? error.message : String(error);
+    }
+  }
   const evidenceFolder = path.join(taskFolderPath, "round-git-state-v1");
   const evidencePath = path.join(evidenceFolder, `${input.operationId}.json`);
-  if (before) {
+  if (repositoryRoot) {
     try {
       await fs.mkdir(evidenceFolder, { recursive: true });
       const initial: RoundGitObservationRecordV1 = {
@@ -299,8 +400,9 @@ export async function withRoundGitStateObservationV1<T>(input: {
         roundId: input.roundId,
         operationId: input.operationId,
         taskFolderPath,
-        ...(repositoryRoot ? { repositoryRoot } : {}),
-        before,
+        repositoryRoot,
+        ...(before ? { before } : {}),
+        ...(indexLockBefore ? { indexLockBefore } : {}),
       };
       await fs.writeFile(evidencePath, `${JSON.stringify(initial, null, 2)}\n`, { flag: "wx" });
     } catch (error) {
@@ -322,6 +424,33 @@ export async function withRoundGitStateObservationV1<T>(input: {
       unavailableReason = `could not capture the after-round Git state: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
+  // Settle a newly appearing index lock once the round has run, failed or been
+  // cancelled. The before snapshot's own lock observation decides ownership:
+  // only a lock that was absent before the round and is still present and
+  // unchanged afterward, with no live git writer, is removed.
+  let indexLockSettlement: GitIndexLockSettlementV1 | undefined;
+  if (repositoryRoot) {
+    try {
+      const indexLockPath = await resolveGitIndexLockPathV1(repositoryRoot);
+      // `after` can be missing when the whole after-round capture failed (or
+      // never ran); the lock is then observed directly so a leftover lock is
+      // still reported with its age and recovery guidance.
+      const afterLock = after?.indexLock ?? await captureGitIndexLockSnapshotV1(indexLockPath);
+      indexLockSettlement = await settleRoundGitIndexLockV1({
+        repositoryRoot,
+        indexLockPath,
+        before: indexLockBefore ?? before?.indexLock,
+        after: afterLock,
+        ...(input.inspectLiveGitHolder ? { inspectLiveGitHolder: input.inspectLiveGitHolder } : {}),
+        ...(input.lockRetryDelayMs !== undefined ? { retryDelayMs: input.lockRetryDelayMs } : {}),
+      });
+    } catch (error) {
+      indexLockSettlement = {
+        outcome: "unobserved",
+        detail: `could not settle the index lock: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
   const record: RoundGitObservationRecordV1 = {
     version: 1,
     roundId: input.roundId,
@@ -329,8 +458,10 @@ export async function withRoundGitStateObservationV1<T>(input: {
     taskFolderPath,
     ...(repositoryRoot ? { repositoryRoot } : {}),
     ...(before ? { before } : {}),
+    ...(indexLockBefore ? { indexLockBefore } : {}),
     ...(after ? { after } : {}),
     ...(delta ? { delta } : {}),
+    ...(indexLockSettlement ? { indexLockSettlement } : {}),
     ...(unavailableReason ? { unavailableReason } : {}),
   };
   try {

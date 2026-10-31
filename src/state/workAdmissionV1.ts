@@ -978,6 +978,22 @@ export function heldAdmissionClaimIdForTaskV1(taskFolderPath: string): string | 
 }
 
 /**
+ * The claim id of the `admission` marker currently on disk for `taskFolderPath`
+ * (held by any window or process), or `undefined` when none is. A card that
+ * must act on one specific claim compares this to the claim id it recorded, so
+ * a later claim on the same task is never mistaken for the original.
+ */
+export function currentAdmissionClaimIdForTaskV1(taskFolderPath: string): string | undefined {
+  for (const marker of listMarkersSyncV1(admissionDirV1(taskFolderPath))) {
+    const owner = readClaimInfoSyncV1(marker.filePath);
+    if (owner && owner.purpose === "admission") {
+      return owner.claimId;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Same-process PRE-genesis intent, keyed by task folder path to the set of
  * `ownerToken`s currently attempting `acquireWorkAdmissionV1` for it whose
  * genesis has not yet settled (durably acquired, busy, or writeFailed).

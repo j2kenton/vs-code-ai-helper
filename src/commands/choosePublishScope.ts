@@ -223,6 +223,7 @@ async function askPublishScopeInChatV1(
     stage,
     whatHappened: title ?? `${folderName}: choose the folder for Publish verification.`,
     whyUserNeeded: "The Publish checks must run against the project root or one of its package folders.",
+    restartGuidance: "Publish Checks were interrupted by a reload; run them again.",
     options: items.map((item, index) => ({
       optionId: `scope-${index}`,
       label: item.relPath || `${item.label} (project root)`,

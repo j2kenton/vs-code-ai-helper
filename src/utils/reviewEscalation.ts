@@ -29,11 +29,24 @@ import {
   findPlanStageNarrowingBlockerV1,
 } from "./planItemNarrowingV1";
 import { taskFixableAreAllUnbuiltWorkV1 } from "./reviewRouting";
+import { fixRoundSummaryV1 } from "./stageActionWordingV1";
+import {
+  classifyDeferredPlanScopeV1,
+  extractCarriedGatesV1,
+  gatesOutsideDeliverableV1,
+  summarizeCarriedEvidenceV1,
+  partitionCarriedEvidenceBlockersV1,
+  type CarriedEvidenceSummaryV1,
+  type CarriedGateV1,
+  type DeferredPlanScopeV1,
+  type ScopedItemListV1,
+} from "./deferredPlanScopeV1";
 import { resolveBlockerPlanReferencesV1, resolveExcludedOwnerHandoffV1 } from "./implementationChecklist";
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import * as path from "path";
 import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
+import { KEEP_ITERATING_SEQUENCE_NOTE_V1 } from "./plateauFixCycleV1";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
 import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "./effectiveReviewProgress";
 import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
@@ -292,6 +305,121 @@ export const ESCALATION_DECISION_KEYS_V1: readonly string[] = [
  * "Advance may stay on the card as an option") without reading as though the
  * plan were finished. Empty string when there is nothing open to name.
  */
+/**
+ * bugs3 Step 7: how many of the plan's open items the task description or the
+ * plan itself defers (they are shown as deferred and never hold a stage or
+ * recommend Back to Implementation). Best effort: an unreadable plan or task
+ * defers nothing.
+ */
+export async function readDeferredPlanScopeV1(folderUri: vscode.Uri): Promise<DeferredPlanScopeV1 | undefined> {
+  try {
+    const planText = await readTextIfExists(getCanonicalImplementationUri(folderUri));
+    if (planText === undefined) {
+      return undefined;
+    }
+    const taskMd = (await readTextIfExists(vscode.Uri.joinPath(folderUri, "task.md"))) ?? "";
+    return classifyDeferredPlanScopeV1({ planText, taskMd });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * bugs3 Step 7: the owner gates the plan carries at `stage`. At a plan-review
+ * stage every gate the plan marks open is carried; at any later stage only a
+ * gate the deliverable does not depend on is (a gate whose dependent steps
+ * were built or are authorized open work still holds them). The route
+ * decision and the escalation card both read this, so they cannot disagree.
+ */
+export async function carriedGatesForStageV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  planText: string
+): Promise<readonly CarriedGateV1[]> {
+  if (isPlanReviewStage(stage)) {
+    return extractCarriedGatesV1(planText);
+  }
+  return gatesOutsideDeliverableV1(
+    classifyDeferredPlanScopeV1({
+      planText,
+      taskMd: (await readTextIfExists(vscode.Uri.joinPath(folderUri, "task.md"))) ?? "",
+    })
+  );
+}
+
+/**
+ * bugs3 Step 7: the review's owner-evidence blockers that the plan carries to
+ * named later steps, for the route decision at a plan-review stage or Publish
+ * (where only a gate the deliverable does not depend on counts). Empty when
+ * the plan cannot be read, so an unreadable plan holds the stage as before.
+ */
+export async function readCarriedGateBlockersV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  blockers: readonly ReviewBlocker[]
+): Promise<readonly ReviewBlocker[]> {
+  const atPlanReview = isPlanReviewStage(stage);
+  if ((!atPlanReview && stage !== "publish") || blockers.length === 0) {
+    return [];
+  }
+  try {
+    const planText = await readTextIfExists(
+      atPlanReview
+        ? vscode.Uri.joinPath(folderUri, STAGE_ARTIFACT_FILENAMES.plan ?? "plan.md")
+        : getCanonicalImplementationUri(folderUri)
+    );
+    if (planText === undefined) {
+      return [];
+    }
+    const carriedGates = await carriedGatesForStageV1(folderUri, stage, planText);
+    return partitionCarriedEvidenceBlockersV1(
+      blockers,
+      { carriedGates, ...(atPlanReview ? { planText } : {}) },
+      (description) =>
+        OWNER_EVIDENCE_PREFIX_RE.test(description) || classifyEnvironmentalBlockerV1(description) === "owner-evidence"
+    ).carried;
+  } catch {
+    return [];
+  }
+}
+
+export async function readDeferredOpenPlanItemCountV1(folderUri: vscode.Uri): Promise<number> {
+  return (await readDeferredPlanScopeV1(folderUri))?.counts.deferred ?? 0;
+}
+
+/**
+ * "What clears this" for blockers that are all owner evidence the plan defers
+ * to later steps: the evidence is recorded when those steps run, so the stage
+ * advances with the gate carried and the dependent steps stay gated.
+ */
+function describeCarriedGateClearingV1(summary: CarriedEvidenceSummaryV1, stageName: string): string {
+  const steps = [...new Set(summary.gates.flatMap((gate) => gate.dependentSteps))].sort((a, b) => a - b);
+  const named = steps.length > 0 ? ` (Step${steps.length === 1 ? "" : "s"} ${steps.join(", ")})` : "";
+  const created = [...new Set(summary.gates.map((gate) => gate.createdResource).filter((r): r is string => !!r))];
+  if (created.length > 0) {
+    return (
+      `this evidence is about ${created.join("; ")}, which the plan itself creates${named}, so it cannot exist at ` +
+      `${stageName} and no one can gather it yet. Advance with the gate carried forward; the step that creates it ` +
+      "records the evidence when it runs"
+    );
+  }
+  return (
+    `the plan already marks this owner evidence as an open gate that waits on later steps${named}, so ${stageName} ` +
+    "is not held by it and it cannot be gathered yet. Advance with the gate carried forward; the steps that " +
+    "depend on it stay gated until you record the evidence in task.md"
+  );
+}
+
+/** A titled bullet list of carried (deferred or gated) items, or "" when there are none. */
+function describeCarriedItemsV1(title: string, list: ScopedItemListV1 | undefined): string {
+  if (!list || list.total === 0) {
+    return "";
+  }
+  const bullets = list.items.map((item) => `- ${item}`).join("\n");
+  const more = list.total > list.items.length ? `\n- …and ${list.total - list.items.length} more` : "";
+  return `\n\n${title} — ${list.total}:\n\n${bullets}${more}`;
+}
+
 function describeOpenPlanItemsNoteV1(planItemsOpen: number | undefined, nextStageName: string): string {
   if (!planItemsOpen || planItemsOpen <= 0) {
     return "";
@@ -446,8 +574,12 @@ function buildPlateauKeepIteratingOptionV1(
   taskFolderPath: string,
   stageName: string,
   taskFixableCount: number,
-  blockersCount: number
+  blockersCount: number,
+  stage?: TaskStage
 ): WorkflowDecisionOptionV1 {
+  // bugs3 Step 4: what the fix round does depends on the stage — at a plan
+  // stage it revises plan.md and edits no code.
+  const fixClause = fixRoundSummaryV1(stage).labelClause;
   const fastForwardState = getFastForwardRunStateV1(taskFolderPath);
   if (fastForwardState) {
     return {
@@ -457,9 +589,9 @@ function buildPlateauKeepIteratingOptionV1(
         `Keep iterating: resume Fast Forward (iteration ${fastForwardState.attemptNumber} of ` +
         `${fastForwardState.maxAttempts}) from Apply Review`,
       consequence:
-        `Resumes the task and continues Fast Forward from Apply Review, at iteration ` +
+        `Resumes the task and continues Fast Forward from Apply Review (a round that ${fixClause}), at iteration ` +
         `${fastForwardState.attemptNumber} of ${fastForwardState.maxAttempts} — it keeps iterating through the ` +
-        "remaining attempt budget this run already committed to, rather than running just one more round.",
+        `remaining attempt budget this run already committed to, rather than running just one more round. ${KEEP_ITERATING_SEQUENCE_NOTE_V1}`,
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
@@ -489,9 +621,9 @@ function buildPlateauKeepIteratingOptionV1(
     consequence:
       taskFixableCount > 0
         ? `Resumes the task and runs Apply Review against the ${taskFixableCount} task-fixable ` +
-          `${taskFixableCount === 1 ? "blocker" : "blockers"} — it edits the workspace to address ` +
+          `${taskFixableCount === 1 ? "blocker" : "blockers"} — a round that ${fixClause}, to address ` +
           `${taskFixableCount === 1 ? "it" : "them"}, then re-reviews ${stageName} for a fresh verdict. This runs ` +
-          "one Apply Review and one re-review; if the review is out of date it re-runs the review first instead."
+          `one Apply Review and one re-review. ${KEEP_ITERATING_SEQUENCE_NOTE_V1}`
         : `Resumes the task and runs Apply Review — nothing to act on: 0 of the ${blockersCount} ` +
           "remaining blocker(s) are task-fixable, so this will most likely reproduce the same verdict. This runs " +
           "one Apply Review and one re-review.",
@@ -576,6 +708,13 @@ export interface EscalationPlateauContextV1 {
    * then never recommends Advance.
    */
   readonly allBlockersNeedOwnerDecision?: boolean;
+  /**
+   * bugs3 Step 7: every remaining blocker is owner evidence the plan already
+   * defers to named later steps (a carried gate). The recommended option is
+   * then the one that lets the task move — advance, gate carried forward —
+   * not "Leave it paused".
+   */
+  readonly allBlockersCarriedGates?: boolean;
   /**
    * RC7 item 3: every reviewer-raised task-fixable blocker is a
    * `[completion]` blocker naming plan work that is still unbuilt
@@ -665,6 +804,7 @@ export function buildEscalationDecisionV1(
       planItemsOpen,
       narrowing,
       allBlockersNeedOwnerDecision = false,
+      allBlockersCarriedGates = false,
       taskFixableAllUnbuiltWork = false,
       unbuiltWorkReferences = [],
       ownerChecksOwed = [],
@@ -690,7 +830,7 @@ export function buildEscalationDecisionV1(
       // task-fixable — this is the "build the next items" alternative to
       // Advance the requirement calls for.
       ...(planItemsOpen > 0 ? [buildBuildRemainingOptionV1(target.taskFolderPath, planItemsOpen, stage)] : []),
-      buildPlateauKeepIteratingOptionV1(target.taskFolderPath, stageName, taskFixableCount, blockersCount),
+      buildPlateauKeepIteratingOptionV1(target.taskFolderPath, stageName, taskFixableCount, blockersCount, stage),
       {
         optionId: "handleMyself",
         label: "Leave it paused — I'll fix it",
@@ -805,6 +945,18 @@ export function buildEscalationDecisionV1(
               "The remaining blocker here matches a removal the last implementation round already declined, " +
               "citing rule 7 — no owner approval is recorded in the task's own Task Description. Another round " +
               "will decline it again; this needs a human decision, not more automated iteration.",
+          }
+        : // bugs3 Step 7: every remaining blocker is owner evidence the plan
+          // defers to named later steps. The evidence cannot exist yet, so
+          // "Leave it paused" can never clear it; advance with the gate carried.
+          allBlockersCarriedGates && nextStage && taskFixableCount === 0
+        ? {
+            kind: "option",
+            optionId: "advance",
+            reasoning:
+              "Every remaining blocker is owner evidence the plan already defers to later steps it names, and " +
+              "that evidence cannot exist at this stage — pausing to gather it cannot clear it. Advance with the " +
+              "gate carried forward; the steps that depend on it stay gated until the evidence is recorded.",
           }
         : // RC7 item 1: every remaining blocker clears only through an owner
           // decision, so Advance would skip the decision and the same blocker
@@ -1155,7 +1307,11 @@ export async function postEnvironmentalAdvanceNoticeV1(
   // count is therefore always read as 0, exactly like the plateau branch.
   const planItemsOpen = isPlanReviewStage(stage)
     ? 0
-    : ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0);
+    : Math.max(
+        0,
+        ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0) -
+          (await readDeferredOpenPlanItemCountV1(folderUri))
+      );
   // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: quote every
   // non-fixable blocker verbatim, not just the first with "(and N more of
   // the same kind)" — a summarized count is not the "command, file,
@@ -1342,7 +1498,13 @@ export async function postLatchedOpenItemsDecisionV1(
   stage: TaskStage,
   nextStage: TaskStage,
   open: { readonly items: readonly string[]; readonly total: number },
-  target: { canonicalId: string; taskFolderPath: string; taskName?: string }
+  target: { canonicalId: string; taskFolderPath: string; taskName?: string },
+  /**
+   * bugs3 Step 7: work the task description or the plan defers, or gates
+   * behind an open owner gate. Listed apart from the open items, never counted
+   * in them, and never a reason to recommend Back to Implementation.
+   */
+  carried?: { readonly deferred: ScopedItemListV1; readonly gated: ScopedItemListV1 }
 ): Promise<boolean> {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStageName = STAGE_DISPLAY_NAMES[nextStage];
@@ -1351,6 +1513,12 @@ export async function postLatchedOpenItemsDecisionV1(
   const noun = open.total === 1 ? "plan item is" : "plan items are";
   const listed = open.items.map((item) => `- ${item}`).join("\n");
   const more = open.total > open.items.length ? `\n- …and ${open.total - open.items.length} more` : "";
+  const carriedSections = [
+    describeCarriedItemsV1("Deferred by the task or plan (not counted as open)", carried?.deferred),
+    describeCarriedItemsV1("Waiting on an owner gate the plan carries (not counted as open)", carried?.gated),
+  ]
+    .filter((section) => section !== "")
+    .join("");
   const options: WorkflowDecisionOptionV1[] = [
     {
       optionId: "moveOn",
@@ -1384,7 +1552,7 @@ export async function postLatchedOpenItemsDecisionV1(
       stage,
       whatHappened:
         `${stageName} is clean, but this task's plan checklist is flagged as behind and ${open.total} ${noun} still open:\n\n` +
-        `${listed}${more}`,
+        `${listed}${more}${carriedSections}`,
       whyUserNeeded:
         "A clean review no longer holds the stage while the checklist is flagged as behind, but moving on with plan items " +
         "still open should be your decision, not the default.",
@@ -1825,7 +1993,10 @@ async function postReviewPlateauDecisionV1(
   // never be read as "N implementation items still open".
   const planItemsOpen =
     !isPlanReviewStage(stage) && effectiveProgress !== null
-      ? Math.max(0, effectiveProgress.total - effectiveProgress.complete)
+      ? Math.max(
+          0,
+          effectiveProgress.total - effectiveProgress.complete - (await readDeferredOpenPlanItemCountV1(folderUri))
+        )
       : 0;
 
   const nextStage = nextStageInOrderV1(stage);
@@ -1925,6 +2096,32 @@ async function postReviewPlateauDecisionV1(
         OWNER_EVIDENCE_PREFIX_RE.test(b.description) ||
         classifyEnvironmentalBlockerV1(b.description) === "owner-evidence"
     );
+  // bugs3 Step 7: owner evidence the plan itself defers to named later steps
+  // is a carried gate, not a hold on this stage — and when it depends on a
+  // resource the plan will create, pausing for the owner to gather it cannot
+  // help. Everything else (evidence the plan needs to be written, any other
+  // blocker) keeps the normal owner-decision recommendation.
+  let carriedEvidence: CarriedEvidenceSummaryV1 = { allCarried: false, gates: [] };
+  try {
+    const planTextForGates = await readTextIfExists(
+      isPlanReviewStage(stage)
+        ? vscode.Uri.joinPath(folderUri, STAGE_ARTIFACT_FILENAMES.plan ?? "plan.md")
+        : getCanonicalImplementationUri(folderUri)
+    );
+    if (planTextForGates !== undefined) {
+      carriedEvidence = summarizeCarriedEvidenceV1(
+        normalized.blockers,
+        {
+          carriedGates: await carriedGatesForStageV1(folderUri, stage, planTextForGates),
+          ...(isPlanReviewStage(stage) ? { planText: planTextForGates } : {}),
+        },
+        (description) =>
+          OWNER_EVIDENCE_PREFIX_RE.test(description) || classifyEnvironmentalBlockerV1(description) === "owner-evidence"
+      );
+    }
+  } catch {
+    carriedEvidence = { allCarried: false, gates: [] };
+  }
   // RC7 item 3: open plan items and only unbuilt-work completion blockers.
   const planOfRecordText = isPlanReviewStage(stage)
     ? undefined
@@ -1947,7 +2144,9 @@ async function postReviewPlateauDecisionV1(
           ),
         ]
       : [];
-  const ownerDecisionClearing = allBlockersNeedOwnerDecision
+  const ownerDecisionClearing = carriedEvidence.allCarried
+    ? describeCarriedGateClearingV1(carriedEvidence, stageName)
+    : allBlockersNeedOwnerDecision
     ? [
         ...new Set(
           normalized.blockers.map((b) =>
@@ -2024,6 +2223,7 @@ async function postReviewPlateauDecisionV1(
       dispatchModeEvidence,
       planItemsOpen,
       allBlockersNeedOwnerDecision,
+      allBlockersCarriedGates: carriedEvidence.allCarried,
       taskFixableAllUnbuiltWork,
       unbuiltWorkReferences,
       ownerChecksOwed,
@@ -2207,7 +2407,11 @@ export async function escalateReviewToHuman(
     // function is a best-effort notification path that must never fail the
     // review round that triggered it.
     const genericPlanItemsOpen = !isPlanReviewStage(stage)
-      ? ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0)
+      ? Math.max(
+          0,
+          ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0) -
+            (await readDeferredOpenPlanItemCountV1(folderUri))
+        )
       : 0;
     const genericDecisionInput = buildEscalationDecisionV1(
       kind,

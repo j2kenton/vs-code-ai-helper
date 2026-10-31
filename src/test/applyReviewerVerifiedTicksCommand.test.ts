@@ -421,7 +421,15 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
       const result = await run(
         "ff-active",
         { review: REVIEW_WITH_VERIFIED_ITEMS },
-        { confirm: true, useRealEffectArgs: true }
+        {
+          confirm: true,
+          useRealEffectArgs: true,
+          // The run that paused to raise this card has ended by the time the
+          // owner answers it. While it still runs, the store refuses the
+          // dispatching option (bugs3 Step 2: "is running for this task, so …
+          // would start another action beside it").
+          interference: (taskFolder) => clearFastForwardRunActiveV1(taskFolder),
+        }
       );
       const applyOption = result.decision?.options.find((o) => o.optionId === "apply");
       assert.ok(applyOption, "the apply option must be offered");

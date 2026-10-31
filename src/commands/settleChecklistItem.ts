@@ -164,6 +164,7 @@ export async function settleChecklistItem(
       target,
       title: mode === "tick" ? "Tick this item" : "Exclude this item",
       prompt: mode === "tick" ? "What did you see? Recorded beside the item." : "Why does it not apply? Recorded beside the item.",
+      restartGuidance: `choose ${mode === "tick" ? "Tick" : "Exclude"} on that plan item again.`,
     });
     if (note === undefined) {
       return false;

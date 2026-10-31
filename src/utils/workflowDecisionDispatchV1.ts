@@ -25,10 +25,20 @@ import {
   markWorkflowDecisionOrphanedV1,
 } from "../state/workflowDecisionStoreV1";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import {
+  ACTIVATION_ID_V1,
+  describeOrphanedAwaitedDecisionV1,
+  isOrphanedAwaitedDecisionV1,
+  registerAwaitedWaiterV1,
+  releaseAwaitedWaiterV1,
+} from "./awaitedDecisionWaitersV1";
 import { HandoffGatingV1 } from "../types/handoffGuidanceV1";
 import type { TaskStage } from "../types/taskProgress";
 import { ChatTarget, notifyPendingWorkflowDecision } from "../views/chatView";
-import { appendChatMessageV1 } from "./chatHistoryStore";
+import * as nodeFs from "node:fs";
+import * as nodePath from "node:path";
+import { appendChatMessageV1, CHAT_HISTORY_FILENAME } from "./chatHistoryStore";
+import { retirePendingQuestionsV1 } from "./cardLifecycleV1";
 import { recommendationPreconditionsV1 } from "./recommendationPreconditionsV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
@@ -204,7 +214,22 @@ export type PostWorkflowDecisionInputV1 = Omit<CreateWorkflowDecisionInputV1, "d
    * The first post still announces itself normally.
    */
   readonly quietRepost?: boolean;
+  /**
+   * For `awaitWorkflowDecisionAnswerV1` only: how to start the action again if
+   * a reload, crash or update ends the run the card is waiting on ("Publish
+   * Checks were interrupted by a reload; run them again."). Recorded on the
+   * decision and quoted when the card is dropped or answered too late.
+   */
+  readonly restartGuidance?: string;
 };
+
+/** How an awaited decision ended, kept distinct so a timeout is never reported as the owner cancelling. */
+export type AwaitedDecisionOutcomeV1 =
+  | { readonly kind: "answered"; readonly optionId: string }
+  | { readonly kind: "dismissed" | "timedOut" | "cancelled" | "interrupted" | "unavailable" };
+
+const DEFAULT_AWAITED_RESTART_GUIDANCE_V1 =
+  "Start the action again from the Tasks view or the stage's chat.";
 
 /**
  * Shared dispatch for every migrated decision point (task: "Replace hidden
@@ -344,35 +369,89 @@ export async function postWorkflowDecisionV1(
 /** Timeout for awaiting a workflow decision before auto-dismissing (10 minutes). */
 const WORKFLOW_DECISION_AWAIT_TIMEOUT_MS = 10 * 60 * 1000;
 
+export interface AwaitWorkflowDecisionOptionsV1 {
+  /**
+   * Keep the card open until it is answered, cancelled or interrupted, instead of
+   * dismissing it unanswered after {@link WORKFLOW_DECISION_AWAIT_TIMEOUT_MS}.
+   */
+  readonly noTimeout?: boolean;
+}
+
 export async function awaitWorkflowDecisionAnswerV1(
   input: PostWorkflowDecisionInputV1,
   target: ChatTarget,
-  token?: import("vscode").CancellationToken
+  token?: import("vscode").CancellationToken,
+  /**
+   * Told how the wait ended (answered, timed out, interrupted, dismissed, …) so
+   * a caller that only gets `undefined` back can still say which of those it was.
+   */
+  onOutcome?: (outcome: AwaitedDecisionOutcomeV1) => void,
+  options?: AwaitWorkflowDecisionOptionsV1
 ): Promise<string | undefined> {
+  const outcome = await awaitWorkflowDecisionOutcomeV1(input, target, token, options);
+  onOutcome?.(outcome);
+  return outcome.kind === "answered" ? outcome.optionId : undefined;
+}
+
+/**
+ * The awaiting helper's full result (bugs3 Step 13): which of answered,
+ * dismissed, timed out, cancelled or interrupted ended the wait, so a caller
+ * can say what stopped it instead of treating every non-answer as the owner
+ * cancelling. `awaitWorkflowDecisionAnswerV1` is this with the reason dropped.
+ *
+ * The waiter is registered BEFORE the card is posted, and the decision records
+ * its waiter, activation and restart guidance, so the activation sweep and the
+ * answer path can tell a live card from one a reload left behind without a
+ * hand-kept list of decision keys.
+ */
+export async function awaitWorkflowDecisionOutcomeV1(
+  input: PostWorkflowDecisionInputV1,
+  target: ChatTarget,
+  token?: import("vscode").CancellationToken,
+  options?: AwaitWorkflowDecisionOptionsV1
+): Promise<AwaitedDecisionOutcomeV1> {
   assertGatingRequirementV1(input.decisionKey, input.gating);
   const context = getExtensionContextV1();
   if (!context) {
-    return undefined;
+    return { kind: "unavailable" };
   }
   const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
-  const posted = await store.post({
-    ...input,
-    decisionId: input.decisionId ?? crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
-  });
+  const waiterId = registerAwaitedWaiterV1();
+  const { restartGuidance, ...decisionInput } = input;
+  let posted: Awaited<ReturnType<WorkflowDecisionStoreV1["post"]>>;
+  try {
+    posted = await store.post({
+      ...decisionInput,
+      awaited: {
+        waiterId,
+        activationId: ACTIVATION_ID_V1,
+        taskFolderPath: target.taskFolderPath,
+        restartGuidance: restartGuidance ?? DEFAULT_AWAITED_RESTART_GUIDANCE_V1,
+      },
+      decisionId: input.decisionId ?? crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    releaseAwaitedWaiterV1(waiterId);
+    throw err;
+  }
   if (!posted.ok) {
+    releaseAwaitedWaiterV1(waiterId);
     throw new Error(`workflow decision "${input.decisionKey}" failed validation: ${posted.reason}`);
   }
   notifyPendingWorkflowDecision(posted.decision, target);
   const decisionId = posted.decision.decisionId;
 
-  return new Promise<string | undefined>((resolve) => {
+  return new Promise<AwaitedDecisionOutcomeV1>((resolve) => {
     let settled = false;
     const changeSubscription = store.onDidChange(checkForResolution);
     const cancelSubscription = token?.onCancellationRequested(() => {
       void handleCancellation();
     });
-    const timeoutHandle = setTimeout(() => void handleTimeout(), WORKFLOW_DECISION_AWAIT_TIMEOUT_MS);
+    // A confirmation the owner asked for (Commit & Push) stays open while they are
+    // away; it ends by an answer, the operation's own Cancel, or a reload.
+    const timeoutHandle =
+      options?.noTimeout === true ? undefined : setTimeout(() => void handleTimeout(), WORKFLOW_DECISION_AWAIT_TIMEOUT_MS);
 
     async function handleCancellation(): Promise<void> {
       try {
@@ -380,7 +459,7 @@ export async function awaitWorkflowDecisionAnswerV1(
         // cancellation fires (a race with the user's own answer), `dismiss`
         // reports `alreadySettled` and is a no-op — `checkForResolution`
         // still wins the race for the returned value in that case.
-        await store.dismiss(decisionId);
+        await store.dismiss(decisionId, undefined, "cancelled");
       } catch (err) {
         // The write failed (e.g. a rejected `Memento.update`): the record
         // may still read `"pending"`. Cancellation must not hang on a
@@ -393,31 +472,31 @@ export async function awaitWorkflowDecisionAnswerV1(
         markWorkflowDecisionOrphanedV1(decisionId);
         void retryOrphanDismissV1(store, decisionId);
       } finally {
-        finish(undefined);
+        finish({ kind: "cancelled" });
       }
     }
 
     async function handleTimeout(): Promise<void> {
       console.warn(`Workflow decision "${decisionId}" (${input.decisionKey}) timed out after ${WORKFLOW_DECISION_AWAIT_TIMEOUT_MS}ms waiting for user answer`);
       try {
-        await store.dismiss(decisionId);
+        await store.dismiss(decisionId, undefined, "timedOut");
       } catch (err) {
         console.error(`Failed to dismiss timed-out workflow decision "${decisionId}"`, err);
         markWorkflowDecisionOrphanedV1(decisionId);
         void retryOrphanDismissV1(store, decisionId);
       } finally {
-        finish(undefined);
+        finish({ kind: "timedOut" });
       }
     }
 
     function checkForResolution(): void {
       const current = store.get(decisionId);
       if (current && current.state !== "pending") {
-        finish(current.resolvedOptionId);
+        finish(outcomeOfSettledDecisionV1(current));
       }
     }
 
-    function finish(value: string | undefined): void {
+    function finish(outcome: AwaitedDecisionOutcomeV1): void {
       if (settled) {
         return;
       }
@@ -425,7 +504,8 @@ export async function awaitWorkflowDecisionAnswerV1(
       clearTimeout(timeoutHandle);
       changeSubscription.dispose();
       cancelSubscription?.dispose();
-      resolve(value);
+      releaseAwaitedWaiterV1(waiterId);
+      resolve(outcome);
     }
 
     // Cover the (unlikely but possible) case where the decision was already
@@ -435,8 +515,23 @@ export async function awaitWorkflowDecisionAnswerV1(
   });
 }
 
+/** Map a settled record to how its wait ended: an answer, or the distinct reason it was not one. */
+function outcomeOfSettledDecisionV1(decision: WorkflowDecisionV1): AwaitedDecisionOutcomeV1 {
+  if (decision.resolvedOptionId !== undefined) {
+    return { kind: "answered", optionId: decision.resolvedOptionId };
+  }
+  if (decision.completionReason === "timedOut" || decision.completionReason === "cancelled") {
+    return { kind: decision.completionReason };
+  }
+  // A system retirement (withdrawn/superseded) or a reload sweep ended it, not the owner.
+  if (decision.state === "withdrawn" || decision.state === "superseded" || decision.completionReason === "interrupted") {
+    return { kind: "interrupted" };
+  }
+  return { kind: "dismissed" };
+}
+
 /**
- * `decisionKey`s created via `awaitWorkflowDecisionAnswerV1` — the ONLY
+ * Awaited decisions (bugs3 Step 13) — created via `awaitWorkflowDecisionAnswerV1` — the ONLY
  * continuation that can ever settle one of these is the in-process `Promise`
  * inside the call above. If the extension host restarts (window reload,
  * crash, update) while one is still `"pending"`, that promise — and the
@@ -455,10 +550,13 @@ export async function awaitWorkflowDecisionAnswerV1(
  * has no such flag and adding one would be new persisted schema for a
  * two-entry set that is already exhaustively known here.
  */
-const AWAIT_ANSWER_DECISION_KEYS: ReadonlySet<string> = new Set([
-  "implementationRoundLimitReached",
-  "quotaExhaustedDuringRun",
-]);
+/*
+ * The sweep no longer lists keys by hand: every decision the awaiting helper
+ * posts records its waiter (`WorkflowDecisionV1.awaited`), and
+ * `isOrphanedAwaitedDecisionV1` (awaitedDecisionWaitersV1.ts) asks whether
+ * that waiter is still alive in this activation. Only records written before
+ * the marker existed are matched by the legacy key list kept beside it.
+ */
 
 /**
  * Withdraw every still-pending decision matching `decisionKey` for one task
@@ -532,6 +630,19 @@ export async function retirePendingWorkflowDecisionsForTaskV1(
     readonly raisedAtOrBefore?: string;
   }
 ): Promise<void> {
+  // bugs3 Step 8: owner-evidence and every other question card is retired with
+  // the same reason, through the same filter, not only decisions.
+  // A task with no chat document has no question cards to retire.
+  if (nodeFs.existsSync(nodePath.join(target.taskFolderPath, CHAT_HISTORY_FILENAME))) {
+    try {
+      await retirePendingQuestionsV1(target.taskFolderPath, target.canonicalId, reason, {
+        ...(filter?.stage !== undefined ? { stage: filter.stage } : {}),
+        ...(filter?.raisedAtOrBefore !== undefined ? { raisedAtOrBefore: filter.raisedAtOrBefore } : {}),
+      });
+    } catch (err) {
+      console.error("Failed to retire pending question cards", err);
+    }
+  }
   const context = getExtensionContextV1();
   if (!context) {
     return;
@@ -560,12 +671,36 @@ export async function retirePendingWorkflowDecisionsForTaskV1(
   }
 }
 
+async function announceDroppedAwaitedDecisionV1(decision: WorkflowDecisionV1): Promise<void> {
+  const folder = decision.awaited?.taskFolderPath ?? decision.taskCanonicalId;
+  try {
+    if (!nodeFs.statSync(folder).isDirectory()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+  await appendChatMessageV1(folder, {
+    role: "assistant",
+    text: describeOrphanedAwaitedDecisionV1(decision),
+    stage: decision.stage,
+    at: new Date().toISOString(),
+  }, decision.taskCanonicalId).catch(() => undefined);
+}
+
+/**
+ * Dismiss every pending awaited decision nothing is waiting on any more, and
+ * say in the owning task's chat what was dropped and how to start it again
+ * (bugs3 Step 13). A decision with no usable task folder is still dismissed,
+ * just without a chat line.
+ */
 export async function dismissOrphanedAwaitedDecisionsV1(state: import("vscode").Memento): Promise<number> {
   const store = new WorkflowDecisionStoreV1(state);
-  const orphaned = store.listPending().filter((decision) => AWAIT_ANSWER_DECISION_KEYS.has(decision.decisionKey));
+  const orphaned = store.listPending().filter(isOrphanedAwaitedDecisionV1);
   for (const decision of orphaned) {
     try {
-      await store.dismiss(decision.decisionId);
+      await store.dismiss(decision.decisionId, undefined, "interrupted");
+      await announceDroppedAwaitedDecisionV1(decision);
     } catch (err) {
       // One decision's write failing must not abort the sweep for the rest
       // (the original shape's un-caught `await` inside this loop did

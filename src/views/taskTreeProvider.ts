@@ -15,6 +15,7 @@ import {
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
 import { taskOperations, taskKey, hasActiveOperationTargetingStage } from "../utils/taskOperations";
+import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
 import { hasPreviousVersion } from "../utils/artifactBackups";
 import { readRedoSidecar, isRedoAvailableFromRecord } from "../utils/redoSidecar";
@@ -38,6 +39,8 @@ import {
   REVIEW_TARGETS,
 } from "../utils/reviewReadiness";
 import { describeTaskFixableBlockersV1 } from "../utils/reviewRouting";
+import { describeDeferredChecklistCountsV1 } from "../utils/deferredPlanScopeV1";
+import { readDeferredPlanScopeV1 } from "../utils/reviewEscalation";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { isWaitingForHumanV1, withWaitingForHumanFallbackV1 } from "../utils/taskWatchdogV1";
 import { readPendingUserInputEvidenceV1 } from "../utils/pendingUserInputV1";
@@ -251,7 +254,9 @@ function buildTaskTooltip(
    * PART 6) — `undefined` only when no Memento was available to build the
    * ledger store from (e.g. a bare unit-test construction), in which case
    * the line is omitted rather than rendered as a false "unknown". */
-  schedulingPosture?: SchedulingPostureV1
+  schedulingPosture?: SchedulingPostureV1,
+  /** Set when the saved status says paused but an action holds the task: shown as running, not paused. */
+  runningWhilePausedAction?: string
 ): vscode.MarkdownString {
   // The tooltip is built with `supportHtml` (below) so its posture sentence
   // can carry a theme-aware colour span; every free-text value interpolated
@@ -263,7 +268,9 @@ function buildTaskTooltip(
   // must not display as "Paused" — the sync resolver treats it the same as
   // not-paused, matching every other migrated reader in this codebase.
   const isPaused = isEffectivelyPausedSyncV1(task.folderUri.fsPath, task.progress);
-  if (isPaused) {
+  if (isPaused && runningWhilePausedAction !== undefined) {
+    lines.push(`$(sync~spin) **Running** — ${escapeTooltipHtmlV1(runningWhilePausedAction)}`, "");
+  } else if (isPaused) {
     // A workflow-imposed pause carries its reason (e.g. an exhausted
     // provider chain, finding 4) — surfaced here so a paused-with-reason
     // task is distinguishable from one the user paused, and from a round
@@ -592,6 +599,19 @@ export class TaskNode extends vscode.TreeItem {
     const taskLevelOp = taskOperations
       .getTaskOperations(tKey)
       .find(op => op.exclusive && op.stage === undefined);
+    const heldOperationForPausedRow = isPaused
+      ? taskOperations.getTaskOperations(tKey).find(op => op.exclusive)
+      : undefined;
+    // bugs3 Step 12: a paused status beside a held operation (or an admission claim whose
+    // operation has not registered yet) is not paused: the live fact wins in the icon,
+    // the tooltip and the context value (which gates Resume / Pause), not only the icon.
+    const heldActionWhilePausedV1: { readonly description: string } | undefined = !isPaused
+      ? undefined
+      : heldOperationForPausedRow
+        ? { description: heldOperationForPausedRow.waitingForUser ? `${heldOperationForPausedRow.label} (waiting for you)` : heldOperationForPausedRow.label }
+        : hasLiveWorkAdmissionBestEffortV1(task.folderUri.fsPath) && pendingDecisions.length === 0
+          ? { description: "an action is starting" }
+          : undefined;
 
     if (isCreating) {
       // No taskLevelOp/paused/archived/completed branch below applies to an
@@ -618,6 +638,22 @@ export class TaskNode extends vscode.TreeItem {
         new vscode.ThemeColor("charts.blue")
       );
       this.description = `${taskLevelOp.label}…`;
+    } else if (isPaused && heldOperationForPausedRow) {
+      // bugs3 Step 12: a dispatched action (Move on → Publish Checks) can hold
+      // the task while its saved status still reads paused. The held operation
+      // is the live fact; a pause icon beside a running action contradicts it.
+      this.iconPath = heldOperationForPausedRow.waitingForUser
+        ? new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"))
+        : new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
+      this.description = heldOperationForPausedRow.waitingForUser
+        ? `${heldOperationForPausedRow.label} · waiting for you`
+        : `${heldOperationForPausedRow.label}…`;
+    } else if (isPaused && hasLiveWorkAdmissionBestEffortV1(task.folderUri.fsPath) && pendingDecisions.length === 0) {
+      // bugs3 Step 12: a dispatched action holds the task's admission claim before its operation
+      // has registered (Move on → Publish Checks preflight). Nothing is paused then; the
+      // action is starting, so the row says so instead of showing the pause icon.
+      this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
+      this.description = "starting an action…";
     } else if (isPaused) {
       // A paused task holding an unanswered decision is more usefully
       // described as waiting on the user than as paused: "paused" reads as
@@ -694,11 +730,11 @@ export class TaskNode extends vscode.TreeItem {
      * "Review Pending Decision" command to route to the right stage. */
     this.pendingDecision = sortedPendingDecisions[0];
 
-    this.tooltip = buildTaskTooltip(task, sortedPendingDecisions, schedulingPosture);
+    this.tooltip = buildTaskTooltip(task, sortedPendingDecisions, schedulingPosture, heldActionWhilePausedV1?.description);
 
     // Centralized context value construction via buildTaskContextValue
     this.contextValue = buildTaskContextValue({
-      status: isPaused ? "paused" : (task.progress.status || "active"),
+      status: isPaused && heldActionWhilePausedV1 === undefined ? "paused" : isPaused ? "active" : (task.progress.status || "active"),
       currentStage,
       hasLintPayload: task.progress.lintPayload !== undefined,
       lintPassed: task.progress.lintPayload?.passed,
@@ -768,6 +804,8 @@ export class StageNode extends vscode.TreeItem {
       /** Items closed without doing before Implementation first started,
        * already left out of `complete`/`total` (RC8 item 6) — named in the tooltip. */
       closedBeforeImplementation?: number;
+      /** Display line naming deferred / gated plan items (bugs3 Step 7), or "". */
+      deferredNote?: string;
     },
     /**
      * How many pending workflow decisions are scoped to THIS stage — the
@@ -1157,6 +1195,9 @@ export class StageNode extends vscode.TreeItem {
     if (stage === "impl" && (implementationProgress?.provisional ?? 0) > 0) {
       tooltipStr += `\n\n${implementationProgress!.verified ?? 0} reviewer-verified, ` +
         `${implementationProgress!.provisional} provisional checklist item${implementationProgress!.provisional === 1 ? "" : "s"}.`;
+    }
+    if (stage === "impl" && implementationProgress?.deferredNote) {
+      tooltipStr += `\n\n${implementationProgress.deferredNote}`;
     }
     if (missingPrerequisite) {
       tooltipStr +=
@@ -2131,7 +2172,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // task's count, flagged `unverified`, so the tree qualifies the number
       // instead of hiding it (merge of `ui 12` into `v1 f2`, 2026-09-21).
       let implementationProgress:
-        | { complete: number; total: number; verified?: number; provisional?: number; unverified?: boolean; closedBeforeImplementation?: number }
+        | { complete: number; total: number; verified?: number; provisional?: number; unverified?: boolean; closedBeforeImplementation?: number; deferredNote?: string }
         | undefined;
       if (stage === "impl") {
         const display = await readDisplayPlanChecklistProgressV1(task.folderUri);
@@ -2153,6 +2194,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
               ? { closedBeforeImplementation: shown.closedBeforeImplementation }
               : {})
           };
+          const deferredScope = await readDeferredPlanScopeV1(task.folderUri);
+          const deferredNote = deferredScope ? describeDeferredChecklistCountsV1(deferredScope.counts) : "";
+          if (deferredNote) {
+            implementationProgress.deferredNote = deferredNote;
+          }
         }
       }
 

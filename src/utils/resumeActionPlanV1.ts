@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { STAGE_ARTIFACT_FILENAMES, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
 import { resolveHeadCommitSha } from "./gitRepoInfo";
+import { fixRoundSummaryV1 } from "./stageActionWordingV1";
 import { previousVersionUri } from "./artifactBackups";
 import {
   describeUnusableSummaryRemedyV1,
@@ -477,7 +478,11 @@ export async function preflightFixedDispatchV1(
  * stage". `undefined` (the plan could not be loaded) still avoids the banned
  * wording rather than guessing an action.
  */
-export function describeResumeOptionV1(plan: ResumeActionPlanV1 | undefined): {
+export function describeResumeOptionV1(
+  plan: ResumeActionPlanV1 | undefined,
+  /** The task's current stage; decides what a fix round does (plan.md vs code). */
+  stage?: TaskStage
+): {
   readonly label: string;
   readonly consequence: string;
 } {
@@ -505,15 +510,18 @@ export function describeResumeOptionV1(plan: ResumeActionPlanV1 | undefined): {
           "path a scheduled resume uses — the task will not go active again without genuine work " +
           "arranged for it. A review reads the workspace and writes its own findings; it does not edit code.",
       };
-    case "apply-review":
+    case "apply-review": {
+      // bugs3 Step 4: what the fix round does depends on the stage — at a
+      // plan stage it revises plan.md and edits no code.
+      const fix = fixRoundSummaryV1(stage);
       return {
-        label: `${plan.label} — runs an implementation round that edits code`,
+        label: `${plan.label} — ${fix.labelClause}`,
         consequence:
           "Resumes the task and immediately starts applying the review through the same " +
           "admission-protected path a scheduled resume uses — the task will not go active again without " +
-          "genuine work arranged for it. This runs an implementation round that edits the workspace to " +
-          "address the review's findings.",
+          `genuine work arranged for it. ${fix.consequence}`,
       };
+    }
     case "stage-default":
       return {
         label: plan.label,

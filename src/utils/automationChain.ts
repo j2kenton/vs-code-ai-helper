@@ -14,6 +14,12 @@ import {
   terminalizeRoundV1,
 } from "./roundLedgerV1";
 import { writeRunLog } from "./runLog";
+import {
+  AutomationCommandOutcomeV1,
+  clearAutomationCommandOutcomeV1,
+  disarmAutomationCommandOutcomeV1,
+  takeAutomationCommandOutcomeV1,
+} from "./automationCommandOutcomeV1";
 
 /**
  * Lock-safe guarded dispatch for automation chains (auto-review,
@@ -333,8 +339,9 @@ function claimChainGuard(
 export function terminalizeGenericAutomationRoundBestEffortV1(
   taskKey: string | undefined,
   intentId: string | undefined,
-  state: "completed" | "failed" | "dropped",
-  errorOrReason?: unknown
+  state: "completed" | "failed" | "dropped" | "cancelled",
+  errorOrReason?: unknown,
+  extraAttemptIds: readonly string[] = []
 ): void {
   if (!taskKey || !intentId) {
     return;
@@ -342,11 +349,12 @@ export function terminalizeGenericAutomationRoundBestEffortV1(
   const outcome =
     state === "failed"
       ? { rejectionReason: errorOrReason instanceof Error ? errorOrReason.message : String(errorOrReason) }
-      : state === "dropped" && typeof errorOrReason === "string"
+      : (state === "dropped" || state === "cancelled") && typeof errorOrReason === "string"
         ? { rejectionReason: errorOrReason }
         : undefined;
   void terminalizeRoundV1(intentId, state, outcome, {
     taskFolderUri: vscode.Uri.file(taskKey),
+    ...(extraAttemptIds.length > 0 ? { extraAttemptIds } : {}),
   })
     .then((result) => {
       // pre-1.0.0 register item 16 / plan step 10: a dispatched round that
@@ -373,6 +381,26 @@ export function terminalizeGenericAutomationRoundBestEffortV1(
     .catch(() => {
       // Best-effort — never surfaces to the dispatch caller.
     });
+}
+
+/**
+ * A dispatched command that returned normally ends its round `completed` —
+ * unless it reported that the round failed or was cancelled
+ * (`reportAutomationCommandOutcomeV1`), in which case the row records that
+ * state with the reason and every attempt the round made. Without this, a Plan
+ * generation whose every candidate failed was recorded as a completed round
+ * with no attempts.
+ */
+function terminalizeAfterCommandReturnedBestEffortV1(
+  taskKey: string | undefined,
+  intentId: string | undefined,
+  reported: AutomationCommandOutcomeV1 | undefined
+): void {
+  if (reported === undefined) {
+    terminalizeGenericAutomationRoundBestEffortV1(taskKey, intentId, "completed");
+    return;
+  }
+  terminalizeGenericAutomationRoundBestEffortV1(taskKey, intentId, reported.state, reported.reason, reported.attemptIds);
 }
 
 /** A declined command's observer is part of settlement: it must not be able
@@ -531,7 +559,12 @@ export function scheduleAutomationChain(
           setPendingAutomationRoundIntentV1(dispatch.taskKey, id);
         }
       })
-      .then(() => runWithAutomaticOriginV1(() => deps.execute(dispatch.command, dispatch.arg)))
+      .then(() =>
+        runWithAutomaticOriginV1(() => {
+          clearAutomationCommandOutcomeV1(dispatch.taskKey);
+          return deps.execute(dispatch.command, dispatch.arg);
+        })
+      )
       .then(
         (executed) => {
           release();
@@ -541,18 +574,20 @@ export function scheduleAutomationChain(
           // ended the same way a chain drop does: nothing ran, so the
           // ledger records `"dropped"`, never a clean ending it never had.
           const declined = executed === false;
+          const reported = takeAutomationCommandOutcomeV1(dispatch.taskKey);
           if (declined) {
             void intentIdPromise.then((id) => terminalizeDeclinedAutomationBestEffortV1(dispatch, id));
           } else {
             void intentIdPromise.then((id) => {
-              void recordTerminalIntentBestEffortV1(id, "completed");
-              terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+              void recordTerminalIntentBestEffortV1(id, reported?.state ?? "completed");
+              terminalizeAfterCommandReturnedBestEffortV1(dispatch.taskKey, id, reported);
             });
           }
           return true;
         },
         (error) => {
           release();
+          disarmAutomationCommandOutcomeV1(dispatch.taskKey);
           // Review fix (wf "stage chat as a record of work" Part 4 step 13):
           // `deps.execute` rejecting means the dispatched command itself
           // threw — recording that as "completed" would durably misrepresent
@@ -619,23 +654,30 @@ export function scheduleAutomationChain(
             }
           })
           .then(() => {
-            Promise.resolve(runWithAutomaticOriginV1(() => deps.execute(dispatch.command, dispatch.arg))).then(
+            Promise.resolve(
+              runWithAutomaticOriginV1(() => {
+                clearAutomationCommandOutcomeV1(dispatch.taskKey);
+                return deps.execute(dispatch.command, dispatch.arg);
+              })
+            ).then(
               (executed) => {
                 release();
                 // Same fix as the immediate-dispatch branch above: a
                 // declined (`false`) resolve is not a clean ending.
                 const declined = executed === false;
+                const reported = takeAutomationCommandOutcomeV1(dispatch.taskKey);
                 if (declined) {
                   void intentIdPromise.then((id) => terminalizeDeclinedAutomationBestEffortV1(dispatch, id));
                 } else {
                   void intentIdPromise.then((id) => {
-                    void recordTerminalIntentBestEffortV1(id, "completed");
-                    terminalizeGenericAutomationRoundBestEffortV1(dispatch.taskKey, id, "completed");
+                    void recordTerminalIntentBestEffortV1(id, reported?.state ?? "completed");
+                    terminalizeAfterCommandReturnedBestEffortV1(dispatch.taskKey, id, reported);
                   });
                 }
               },
               (error) => {
                 release();
+                disarmAutomationCommandOutcomeV1(dispatch.taskKey);
                 // Same fix as the immediate-dispatch branch above: the
                 // deferred dispatch's command also rejected, so the real
                 // terminal state is "failed", never "completed".

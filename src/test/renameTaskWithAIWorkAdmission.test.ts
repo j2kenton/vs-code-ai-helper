@@ -105,11 +105,9 @@ void describe("renameTaskWithAI work admission (v1 fixes 2, Part 1a route audit)
 
       assert.equal(surface.entries.length, 1);
       assert.equal(surface.entries[0]?.level, "warning");
-      assert.match(
-        surface.entries[0]?.message ?? "",
-        /someOtherConcurrentCommand/,
-        "must name the actual blocking owner, not a generic 'task is busy' message"
-      );
+      // bugs3 Step 12: plain words; the command id and pid go to the log's details, not the message.
+      assert.match(surface.entries[0]?.message ?? "", /already has a stage action in progress/);
+      assert.doesNotMatch(surface.entries[0]?.message ?? "", /someOtherConcurrentCommand|pid \d+/);
     } finally {
       if (held.outcome === "acquired") {
         await held.handle.release();

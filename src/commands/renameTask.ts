@@ -47,6 +47,8 @@ import {
   requestSafeAdmissionReleaseV1,
   trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
@@ -498,7 +500,8 @@ export async function renameTaskWithAI(
   });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    offerBusyRefusalChoicesOnceV1(early);
     return;
   }
 
@@ -613,12 +616,18 @@ export async function renameTaskWithAI(
       const taskLabel = formatNotificationTaskLabelV1(task.progress.displayName, task.folderName);
       NotificationRouter.showWarning(
         lateAdmissionRefusalV1
-          ? describeWorkAdmissionRefusalV1(
+          ? describeWorkAdmissionRefusalForUserV1(
               lateAdmissionRefusalV1,
               notificationTaskDisplayNameV1(task.progress.displayName, task.folderName)
             )
           : `${taskLabel}: could not acquire work admission for this task.`
       );
+      if (lateAdmissionRefusalV1) {
+        offerBusyRefusalChoicesOnceV1(
+          lateAdmissionRefusalV1,
+          notificationTaskDisplayNameV1(task.progress.displayName, task.folderName)
+        );
+      }
       return;
     }
     if (refuseRenameWhileDescStageRuns(task.taskFolderPath)) return;

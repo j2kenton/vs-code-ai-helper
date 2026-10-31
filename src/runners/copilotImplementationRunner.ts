@@ -38,6 +38,7 @@ import { awaitWorkflowDecisionAnswerV1 } from "../utils/workflowDecisionDispatch
 import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1";
 import { ChatTarget } from "../views/chatView";
 import { TaskStage } from "../types/taskProgress";
+import type { UndeliveredEditScopeV1 } from "../utils/undeliveredPromptEditsRevertV1";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -636,6 +637,18 @@ export interface ImplementationRunResult {
   errorMessage?: string;
   /** Stable provider-neutral failure classification; set on failed results only. */
   failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
+  /**
+   * bugs3 Step 6: the provider did not receive the prompt Ensemble wrote (or
+   * its receipt cannot be confirmed before it may edit). The round failed as
+   * "prompt not delivered" and must never be continued as a "cut short" reply.
+   */
+  promptNotDeliveredV1?: boolean;
+  /**
+   * bugs3 Step 6: with `promptNotDeliveredV1`, which of the round's changed
+   * paths were clean before it began (safe to offer for revert) and which were
+   * already dirty (reported, never reverted by the offer).
+   */
+  undeliveredPromptEditScopeV1?: UndeliveredEditScopeV1;
   /**
    * True when the failure is a Codex "model is at capacity" reply (a
    * temporary overload at OpenAI) that outlived the same-model retries.

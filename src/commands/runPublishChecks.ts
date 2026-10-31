@@ -1,5 +1,13 @@
 import * as vscode from "vscode";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
+import { getPublishVerificationCommands } from "../config/settings";
+import {
+  buildFailingBaselineRecordV1,
+  clearFailingBaselineV1,
+  writeFailingBaselineV1,
+} from "../utils/failingBaselineV1";
 import * as crypto from "node:crypto";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { resolveTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
@@ -9,14 +17,18 @@ import { NotificationRouter } from "../utils/notificationRouter";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import {
   PublishChecksCancelledError,
-  describeCurrentPackageManagerV1,
-  resolveCurrentPublishCommandPlanV1,
   resolvePublishScopeFolder,
-  runCompletionLint,
-  persistCompletionLintResultV1,
   throwIfPublishChecksCancelledV1,
 } from "../utils/completionLint";
+import { runChecksFailedFirstV1 } from "../utils/failedFirstChecksV1";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
+import {
+  describePublishCancelSourceV1,
+  recordPublishChecksOutcomeV1,
+  recordPublishChecksRunningV1,
+  settleUnrecordedPublishChecksRunV1,
+} from "../utils/publishChecksOutcomeV1";
+import { createCompletionCheckActivityAccumulatorV1 } from "./reviewActions";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { handBackToHumanAfterPublishChecksV1 } from "../utils/taskProgressTransforms";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
@@ -42,6 +54,7 @@ import {
   computePublishScopeId,
   computeTreeFingerprintV1,
   invalidatePublishChecksFreshnessStampOnDiskV1,
+  withCommandIdentityV1,
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
 import {
@@ -50,7 +63,6 @@ import {
   beginTargetResolutionV1,
   describeTargetResolutionUnprotectedRootsV1,
   describeTargetResolutionWriteFailureV1,
-  describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
@@ -62,11 +74,8 @@ import { listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklis
 import { invalidatePlanItemEvidenceContradictedByFailuresV1 } from "../utils/taskProgressTransforms";
 import { associatePublishFailuresWithPlanItemsV1, formatPublishFailurePlanAssociationsV1, ownerHandOffCoverageFromTaskMdV1 } from "../utils/publishFailurePlanAssociationV1";
 import {
-  buildFailedPublishFirstTargetsV1,
   buildFailedPublishRunSnapshotV1,
   clearFailedPublishRunSnapshotV1,
-  isFailedPublishRunCompatibleV1,
-  readFailedPublishRunSnapshotV1,
   writeFailedPublishRunSnapshotV1,
 } from "../utils/failedPublishRunV1";
 
@@ -367,7 +376,8 @@ export async function runPublishChecks(
   });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    offerBusyRefusalChoicesOnceV1(early);
     return dispatched;
   }
 
@@ -472,10 +482,14 @@ export async function runPublishChecks(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(
-        describeWorkAdmissionRefusalV1(
+        describeWorkAdmissionRefusalForUserV1(
           late,
           notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
         )
+      );
+      offerBusyRefusalChoicesOnceV1(
+        late,
+        notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
       );
       return dispatched;
     }
@@ -483,52 +497,7 @@ export async function runPublishChecks(
     heartbeat = setInterval(() => void handle!.heartbeat(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
   }
 
-  // Admission is now guaranteed live for this exact target — reverse a
-  // watchdog-provenance pause (never a user pause) before any further setup,
-  // exactly like `runReviewWithAI`/`runLintingFixes`.
-  //
-  // 2026-09-10 review completion blocker (new): the reconciliation result was
-  // previously discarded — a genuine `userPaused` (a real user pause, not a
-  // watchdog one) or `unreadable` (progress could not be confirmed at all)
-  // outcome must stop this command from continuing into the checks below,
-  // exactly as `completeCommitAndPushTask`'s own first reconciliation already
-  // does. `resolvedTask.progress.status` is only the pre-reconciliation
-  // snapshot and cannot by itself distinguish "genuinely paused right now"
-  // from "was paused by the watchdog and this call just reversed it".
-  const publishReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(
-    vscode.Uri.file(resolvedTask.taskFolderPath)
-  );
-  if (
-    publishReconcileOutcome.outcome === "userPaused" ||
-    publishReconcileOutcome.outcome === "unreadable"
-  ) {
-    NotificationRouter.showWarning(
-      `${notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)}: Publish checks are only available for tasks that are not paused. Resume the task first.`
-    );
-    return dispatched;
-  }
-
-  // The inventory snapshot can still hold the previous stage for a moment
-  // after an auto-advance, so the stage check reads progress from disk.
-  const freshProgress = await readTaskProgressStrictV1(vscode.Uri.file(resolvedTask.taskFolderPath));
-  if (!freshProgress.ok || freshProgress.decoded.progress.currentStage !== "publish") {
-    NotificationRouter.showWarning(
-      `${notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)}: Publish checks are only available for tasks at the Publish stage.`
-    );
-    return dispatched;
-  }
-
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
-
-  // The inline tree button invokes this command directly (not through
-  // applyCurrentStageAction), so the run-time model guard must live here
-  // too: with no Publish model configured — or its provider disabled —
-  // warn and open AI Models instead of running checks whose plan
-  // verification would silently be recorded as unavailable.
-  if (!(await ensureStageModelConfigured(taskFolderUri, "publish", resolvedTask.progress.displayName))) {
-    return dispatched;
-  }
-
   const lockKey = taskFolderUri.fsPath;
 
   // Queue behind any other runPublishChecks call already in flight for this
@@ -564,11 +533,118 @@ export async function runPublishChecks(
         // (VS Code only honours `cancellable` for Notification progress).
         cancellable: true,
       },
-      async (operation): Promise<true> => {
+      async (operation): Promise<boolean> => {
         const cancelToken = operation.token;
         // A terminal outcome left by an earlier run must not be read as this run's.
         clearStageActionTerminalOutcomeV1(taskFolderUri.fsPath);
-        await vscode.window.withProgress(
+        // bugs3 Step 12: the run is visible and cancellable from its first moment. The
+        // admission preflight below (pause reconciliation, stage and model checks) and the
+        // scope/HEAD/tree-fingerprint work after it all run inside this tracked operation,
+        // so Cancel has a target and a refusal settles as an operation outcome rather than
+        // vanishing as a claim-only startup.
+        operation.reportActivity("preparing the checks", { resetElapsedOrigin: true });
+        const displayName = notificationTaskDisplayNameV1(
+          resolvedTask.progress.displayName,
+          resolvedTask.taskFolderPath
+        );
+        // Every preflight exit leaves a durable result, not only an in-memory terminal slot, so
+        // a refused or cancelled start is visible after a reload and in publish-review.md.
+        // `recordOutcome: false` is for refusals raised away from the Publish stage, where
+        // writing into the Publish report would create an artifact for a stage the task is not at.
+        const refusePreflight = async (reason: string, recordOutcome = true): Promise<false> => {
+          NotificationRouter.showWarning(`${displayName}: ${reason}`);
+          if (recordOutcome) {
+            await recordPublishChecksOutcomeV1(taskFolderUri, {
+              outcome: "failed",
+              at: new Date().toISOString(),
+              failedCommands: [],
+              reason: `not started — ${reason}`,
+              operationId: operation.id,
+            });
+          }
+          operation.settleAs("refused", reason);
+          return false;
+        };
+
+        const cancelPreflight = async (): Promise<false> => {
+          const cause = describePublishCancelSourceV1(operation.cancelSource?.());
+          await recordPublishChecksOutcomeV1(taskFolderUri, {
+            outcome: "cancelled",
+            at: new Date().toISOString(),
+            cause: `${cause}, before any command started`,
+            operationId: operation.id,
+          });
+          recordStageActionTerminalOutcomeV1(taskFolderUri.fsPath, {
+            kind: "cancelled",
+            actionLabel: "Publish Checks",
+            source: operation.cancelSource?.(),
+            operationId: operation.id,
+          });
+          operation.settleAs("cancelled", `Publish Checks were cancelled before any command started (${cause}).`);
+          return false;
+        };
+
+        // The inventory snapshot can still hold the previous stage for a moment after an
+        // auto-advance, so the stage check reads progress from disk. It comes first and is
+        // read-only, so a refusal for the wrong stage neither overwrites the previous result
+        // nor creates a Publish report for a stage the task is not at.
+        const freshProgress = await readTaskProgressStrictV1(taskFolderUri);
+        if (!freshProgress.ok || freshProgress.decoded.progress.currentStage !== "publish") {
+          return await refusePreflight("Publish checks are only available for tasks at the Publish stage.", false);
+        }
+
+        // From here on a host that disappears leaves a durable record: the "running" record is
+        // written before the slower preflight (pause reconciliation, model check), so activation
+        // recovery turns an abandoned preflight into an explicit "interrupted" result rather than
+        // leaving the previous run's result standing as this one's. Every exit below replaces it
+        // with a refused, cancelled or finished result.
+        const runningRecord = await recordPublishChecksRunningV1(taskFolderUri, operation.id);
+
+        // Admission is guaranteed live for this exact target — reverse a watchdog-provenance
+        // pause (never a user pause) before any further setup, exactly like
+        // `runReviewWithAI`/`runLintingFixes`. A genuine `userPaused` or `unreadable`
+        // outcome stops the command, as `completeCommitAndPushTask`'s first reconciliation
+        // does. `resolvedTask.progress.status` is only the pre-reconciliation snapshot.
+        // Any exception from here to the end of the run (pause reconciliation rejects when its
+        // progress write fails; the progress host can too) still ends the durable record with a
+        // failed result naming the error, instead of leaving "running" behind a failed operation
+        // until a later activation recovers it.
+        const settleOnUnexpectedError = async (error: unknown): Promise<never> => {
+          const message = error instanceof Error ? error.message : String(error);
+          await settleUnrecordedPublishChecksRunV1(taskFolderUri, operation.id, message).catch(() => undefined);
+          throw error;
+        };
+        const preflightRefusal = await (async (): Promise<false | undefined> => {
+          const publishReconcileOutcome = await reconcileWatchdogPauseAgainstAdmissionV1(taskFolderUri);
+          if (
+            publishReconcileOutcome.outcome === "userPaused" ||
+            publishReconcileOutcome.outcome === "unreadable"
+          ) {
+            return await refusePreflight(
+              "Publish checks are only available for tasks that are not paused. Resume the task first."
+            );
+          }
+          if (cancelToken?.isCancellationRequested) {
+            return await cancelPreflight();
+          }
+
+          // The inline tree button invokes this command directly (not through
+          // applyCurrentStageAction), so the run-time model guard lives here too: with no
+          // Publish model configured — or its provider disabled — warn and open AI Models
+          // instead of running checks whose plan verification would be recorded as unavailable.
+          if (!(await ensureStageModelConfigured(taskFolderUri, "publish", resolvedTask.progress.displayName))) {
+            return await refusePreflight("No Publish model is configured");
+          }
+          if (cancelToken?.isCancellationRequested) {
+            return await cancelPreflight();
+          }
+          return undefined;
+        })().catch(settleOnUnexpectedError);
+        if (preflightRefusal === false) {
+          return false;
+        }
+
+        await Promise.resolve(vscode.window.withProgress(
           {
             location: vscode.ProgressLocation.Window,
             title: "Running Publish checks (lint, tests, plan verification)...",
@@ -604,87 +680,39 @@ export async function runPublishChecks(
               // Cancellation kills the check process trees and rejects with
               // PublishChecksCancelledError BEFORE any result is persisted;
               // the invalidation above stands, so no stale stamp survives.
-              const priorFailure = await readFailedPublishRunSnapshotV1(taskFolderUri.fsPath);
-              let failedFirstResult: Awaited<ReturnType<typeof runCompletionLint>> | undefined;
-              let failedFirstPassNote: string | undefined;
-              if (priorFailure && priorFailure.failures.length > 0 && priorFailure.runner.packageManager) {
-                const currentCommands = resolveCurrentPublishCommandPlanV1(scopeGuess);
-                const priorCommands = priorFailure.commands.map(({ command }) => command);
-                const configuredPlanMatches = currentCommands !== null &&
-                  currentCommands.length === priorCommands.length &&
-                  currentCommands.every((command, index) => command.trim() === priorCommands[index]?.trim());
-                // Rebuild the compatibility evidence using today's bound task,
-                // scope, HEAD, environment and execution inputs. The old
-                // command plan is accepted only when the current explicit
-                // override still agrees; default plans are revalidated by
-                // current package scripts/configuration in the fingerprint.
-                const currentProbe = buildFailedPublishRunSnapshotV1({
-                  taskFolder: taskFolderUri.fsPath,
-                  repositoryRoot: scopeGuess,
-                  verificationScopeId: computePublishScopeId(scopeGuess),
-                  headCommit: beforeSha ?? undefined,
-                  result: {
-                    runAt: new Date().toISOString(),
-                    passed: false,
-                    summary: "compatibility probe",
-                    issueCount: 0,
-                    missingScripts: [],
-                    commandsRun: currentCommands ?? [],
-                    verifiedFolder: scopeGuess,
-                    verificationEnvironment: {
-                      cwd: scopeGuess,
-                      packageManager: describeCurrentPackageManagerV1(scopeGuess),
-                      envVarNames: Object.keys(process.env).sort(),
+              // bugs3 Step 15: the failed-first run is shared with Fix Linting &
+              // Code Errors' post-fix re-check (bugs2 Steps 29-30), so both consume
+              // exactly one result.
+              // bugs3 Step 12: each command is announced as it starts (chat "Progress"
+              // lines and the Tasks row read the operation's activity) and recorded in
+              // the durable running record as it starts and settles.
+              const checkActivity = createCompletionCheckActivityAccumulatorV1(operation, undefined, Date.now());
+              let checkOutcome: Awaited<ReturnType<typeof runChecksFailedFirstV1>>;
+              try {
+                checkOutcome = await runChecksFailedFirstV1({
+                  taskFolderUri,
+                  relevantFiles: resolvedTask.progress.implReviewFiles,
+                  token: cancelToken,
+                  scopeFolder: scopeGuess,
+                  headCommit: beforeSha,
+                  onCheckEvent: {
+                    planned: (total) => checkActivity.onCheckEvent.planned(total),
+                    started: (descriptor) => {
+                      runningRecord.commandStarted(descriptor.command);
+                      checkActivity.onCheckEvent.started(descriptor);
                     },
-                    failedChecks: [],
+                    settled: (descriptor, result) => {
+                      runningRecord.commandSettled(descriptor.command, result?.exitCode);
+                      checkActivity.onCheckEvent.settled(descriptor);
+                    },
+                    batchBoundary: () => checkActivity.onCheckEvent.batchBoundary(),
                   },
                 });
-                if (configuredPlanMatches && isFailedPublishRunCompatibleV1(priorFailure, currentProbe)) {
-                  const targets = buildFailedPublishFirstTargetsV1(priorFailure);
-                  const targetChecks = targets.map((target) => target.kind === "test-files"
-                    ? {
-                        command: `${target.prepareCommand} && ${target.command}`,
-                        executableCommand: `${target.prepareCommand} && ${target.command}`,
-                        cwd: target.cwd,
-                      }
-                    : {
-                        command: target.command,
-                        executableCommand: target.executableCommand,
-                        cwd: target.cwd,
-                      });
-                  if (targetChecks.length > 0) {
-                    const elapsedStart = Date.now();
-                    const failedFirst = await runCompletionLint(
-                      taskFolderUri,
-                      resolvedTask.progress.implReviewFiles,
-                      {
-                        token: cancelToken,
-                        explicitChecks: targetChecks,
-                        persist: false,
-                        rawReportLocation: `runs/failed-first-source-${priorFailure.failedAt.replace(/[^0-9TZ]/g, "-")}-attempt-${new Date().toISOString().replace(/[^0-9TZ]/g, "-")}.log`,
-                      }
-                    );
-                    if (!failedFirst.passed) {
-                      failedFirst.passed = false;
-                      failedFirst.passedModuloKnownFlakes = false;
-                      failedFirst.summary = `Rechecked ${targetChecks.length} previously failing check(s) from ${priorFailure.failedAt}; they still fail after ${Math.max(0, Date.now() - elapsedStart)} ms. Remaining Publish checks were not run. ${failedFirst.summary}`;
-                      await persistCompletionLintResultV1(taskFolderUri, failedFirst);
-                      failedFirstResult = failedFirst;
-                    } else {
-                      failedFirstPassNote = `Rechecked ${targetChecks.length} previously failing check(s) from ${priorFailure.failedAt}; they passed in ${Math.max(0, Date.now() - elapsedStart)} ms. Running the complete selected Publish check set now.`;
-                    }
-                  }
-                }
+              } finally {
+                checkActivity.close();
               }
-              const result = failedFirstResult ?? await runCompletionLint(
-                taskFolderUri,
-                resolvedTask.progress.implReviewFiles,
-                { token: cancelToken }
-              );
-              if (failedFirstPassNote && !failedFirstResult) {
-                result.summary = `${failedFirstPassNote} ${result.summary}`;
-                await persistCompletionLintResultV1(taskFolderUri, result);
-              }
+              const result = checkOutcome.result;
+              const failedFirstResult = checkOutcome.failedFirst ? result : undefined;
               throwIfPublishChecksCancelledV1(cancelToken);
               if (!failedFirstResult) await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
               throwIfPublishChecksCancelledV1(cancelToken);
@@ -708,7 +736,41 @@ export async function runPublishChecks(
               }
               const afterSha = await resolveHeadCommitSha(verifiedFolder);
               const afterFingerprint = await computeTreeFingerprintV1(verifiedFolder);
+              if (!failedFirstResult) {
+                // bugs3 Step 15: keep the complete failing result, bound to the commit,
+                // tree fingerprint, scope and commands it ran against, so a fix round
+                // on an unchanged tree starts from it instead of re-running everything.
+                const baseline = buildFailingBaselineRecordV1({
+                  result,
+                  headBefore: beforeSha,
+                  headAfter: afterSha,
+                  fingerprintBefore: beforeFingerprint,
+                  fingerprintAfter: afterFingerprint,
+                  scopeId: computePublishScopeId(verifiedFolder),
+                  configuredCommands: getPublishVerificationCommands(),
+                });
+                if (baseline) {
+                  await writeFailingBaselineV1(taskFolderUri.fsPath, baseline).catch((error) => {
+                    console.warn("[runPublishChecks] Could not record the failing result for reuse", error);
+                  });
+                } else {
+                  await clearFailingBaselineV1(taskFolderUri.fsPath).catch(() => undefined);
+                }
+              }
               const checksPassed = Boolean(result.passedModuloKnownFlakes ?? result.passed);
+              // bugs3 Step 12: the run's outcome is recorded beside the report on
+              // every exit, so a later pause, resume or reload cannot leave it unknown.
+              await recordPublishChecksOutcomeV1(
+                taskFolderUri,
+                checksPassed
+                  ? { outcome: "passed", at: new Date().toISOString(), operationId: operation.id }
+                  : {
+                      outcome: "failed",
+                      at: new Date().toISOString(),
+                      failedCommands: (result.failedChecks ?? []).map((check) => check.command),
+                      operationId: operation.id,
+                    }
+              );
               const freshStampWritten = Boolean(
                 checksPassed &&
                 beforeSha &&
@@ -727,6 +789,7 @@ export async function runPublishChecks(
                   completedAt: new Date().toISOString(),
                   scopeId: computePublishScopeId(verifiedFolder),
                   treeFingerprint: afterFingerprint,
+                  ...withCommandIdentityV1(result.commandsRun),
                 });
               }
               // A mismatch (working tree advanced mid-run, or HEAD could not be
@@ -990,9 +1053,18 @@ export async function runPublishChecks(
               if (error instanceof PublishChecksCancelledError) {
                 // Not a failure: the tracked operation settles as `cancelled`
                 // (its token is cancelled) and the user is told so. No stamp
-                // was written and nothing was persisted for this run.
+                // was written, and no check result was persisted for this run —
+                // but the cancellation itself is (bugs3 Step 12), with its cause,
+                // so the report's status line no longer reads "Not yet reviewed".
+                const cancelCause = describePublishCancelSourceV1(operation.cancelSource?.());
+                await recordPublishChecksOutcomeV1(taskFolderUri, {
+                  outcome: "cancelled",
+                  at: new Date().toISOString(),
+                  cause: cancelCause,
+                  operationId: operation.id,
+                });
                 const cancelledNotice =
-                  "Publish checks were cancelled. Nothing was recorded for this run — run the checks again when you're ready.";
+                  `Publish checks were cancelled. Cause: ${cancelCause}. No check result was recorded for this run — run the checks again when you're ready.`;
                 // The checks STARTED and were stopped: tell the caller that
                 // dispatched them (Fast Forward) so it reports "cancelled"
                 // (and by whom) instead of reading the missing result as a
@@ -1021,6 +1093,13 @@ export async function runPublishChecks(
                 return;
               }
               const errorMessage = error instanceof Error ? error.message : String(error);
+              await recordPublishChecksOutcomeV1(taskFolderUri, {
+                outcome: "failed",
+                at: new Date().toISOString(),
+                failedCommands: [],
+                reason: errorMessage.slice(0, 200),
+                operationId: operation.id,
+              });
               recordStageActionTerminalOutcomeV1(taskFolderUri.fsPath, {
                 kind: "failed",
                 actionLabel: "Publish Checks",
@@ -1035,7 +1114,9 @@ export async function runPublishChecks(
               );
             }
           }
-        );
+        )).catch(settleOnUnexpectedError);
+        // Whatever exit the body took, the durable record never stays "running".
+        await settleUnrecordedPublishChecksRunV1(taskFolderUri, operation.id);
         return true;
       }
     )

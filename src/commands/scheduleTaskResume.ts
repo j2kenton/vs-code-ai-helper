@@ -78,7 +78,6 @@ import {
   attemptAutomaticWorkAdmissionReclamationV1,
   authorizeWorkAdmissionHandoffV1,
   describeStaleWorkAdmissionTakeoverNoticeV1,
-  describeWorkAdmissionRefusalV1,
   garbageCollectStaleWorkAdmissionTombstonesV1,
   hasDurableResolutionInFlightV1,
   hasLiveWorkAdmissionExcludingOwnerV1,
@@ -91,6 +90,7 @@ import {
   WorkAdmissionAutomaticReclamationOutcomeV1,
   WorkAdmissionDeadOwnerGateV1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { describeSurvivingRecordedProcessV1, stopRecordedCliProcessesV1 } from "../state/recordedCliStopV1";
 
 /**
@@ -182,13 +182,13 @@ export function buildStalledTaskEscalationDecisionV1(
     : describeStalledActiveTaskEscalationV1(
         displayName,
         progress ? readStalledRoundReadingV1(progress) : undefined,
-        resumePlan && resumePlan.kind !== "blocked" ? describeResumeOptionV1(resumePlan).label : undefined
+        resumePlan && resumePlan.kind !== "blocked" ? describeResumeOptionV1(resumePlan, target.stage).label : undefined
       );
   if (resumePlan?.kind === "blocked") {
     return buildBlockedStalledTaskDecisionV1(target, whatHappened, resumePlan);
   }
   // v1 fixes 2, items 14 + 25: the button names the action it will run.
-  const resumeOption = describeResumeOptionV1(resumePlan);
+  const resumeOption = describeResumeOptionV1(resumePlan, target.stage);
   const options: WorkflowDecisionOptionV1[] = [
     {
       optionId: "resumeAndRerun",
@@ -1061,7 +1061,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         commandId: "vs-code-ai-helper.scheduleTaskResume.fire",
         onRefused: (outcome) =>
           recordRefusal(
-            describeWorkAdmissionRefusalV1(
+            describeWorkAdmissionRefusalForUserV1(
               outcome,
               notificationTaskDisplayNameV1(this.taskNames.get(taskFolderPath), taskFolderPath)
             )
@@ -2620,7 +2620,9 @@ export class TaskActionScheduler implements vscode.Disposable {
               : describeStalledActiveTaskEscalationV1(
                   notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath),
                   readStalledRoundReadingV1(task.progress),
-                  resumePlan && resumePlan.kind !== "blocked" ? describeResumeOptionV1(resumePlan).label : undefined
+                  resumePlan && resumePlan.kind !== "blocked"
+                    ? describeResumeOptionV1(resumePlan, task.progress.currentStage).label
+                    : undefined
                 )
           );
         }

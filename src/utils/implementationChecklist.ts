@@ -1085,6 +1085,99 @@ export function listOpenPlanItemRecordsV1(planOfRecord: string): readonly OpenPl
   return records;
 }
 
+/** A top-level checklist item together with the plan step it belongs to, when that is readable. */
+export interface PlanItemStepOwnerV1 extends OpenPlanItemRecordV1 {
+  /**
+   * The step number the item belongs to: its own `Step N` / `N.` prefix, else the
+   * numbered section heading (`### 4. …`, `### Step 4 — …`) it sits under.
+   * `undefined` when neither is present, or when the number is claimed by more
+   * than one distinct owner (a repeated numbering across Parts), which is
+   * never guessed at.
+   */
+  readonly stepNumber: number | undefined;
+  /** The section heading text the item sits under (empty when none). */
+  readonly section: string;
+}
+
+/**
+ * Every top-level checklist item in plan order with its step owner. Pure and
+ * conservative: an item whose step cannot be read exactly has no `stepNumber`.
+ */
+export function listPlanItemStepOwnersV1(planOfRecord: string): readonly PlanItemStepOwnerV1[] {
+  const seen = new Map<string, number>();
+  const raw: { record: OpenPlanItemRecordV1; step: number | undefined; ownerKey: string; section: string }[] = [];
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    if (item.nested) {
+      continue;
+    }
+    const settled = item.checked || item.excluded;
+    const key = occurrenceKeyV1(item.text, settled);
+    const occurrence = (seen.get(key) ?? 0) + 1;
+    seen.set(key, occurrence);
+    const itemText = unescapeChecklistItemTextV1(item.text);
+    const record: OpenPlanItemRecordV1 = {
+      itemId: computeOpenPlanItemIdV1(key, occurrence),
+      itemText,
+      occurrence,
+      settled,
+    };
+    const plainItem = itemText.replace(/^[\s*_`]+/, "");
+    const itemStep = /^step\s+(\d+)(?!\d)/i.exec(plainItem) ?? /^(\d+)[.)](?!\d)/.exec(plainItem);
+    if (itemStep) {
+      raw.push({ record, step: Number(itemStep[1]), ownerKey: `item:${itemText}`, section: item.section });
+      continue;
+    }
+    const plainSection = item.section.trim().replace(/^[\s*_`]+/, "");
+    const sectionStep = /^(?:step\s+)?(\d+)(?:\s*[:)—–-]|\.(?!\d)|\s*$)/i.exec(plainSection);
+    raw.push({
+      record,
+      step: sectionStep ? Number(sectionStep[1]) : undefined,
+      ownerKey: `section:${plainSection}`,
+      section: item.section,
+    });
+  }
+  const ownersByStep = new Map<number, Set<string>>();
+  for (const entry of raw) {
+    if (entry.step !== undefined) {
+      const owners = ownersByStep.get(entry.step) ?? new Set<string>();
+      owners.add(entry.ownerKey);
+      ownersByStep.set(entry.step, owners);
+    }
+  }
+  return raw.map((entry) => ({
+    ...entry.record,
+    section: entry.section,
+    stepNumber:
+      entry.step !== undefined && (ownersByStep.get(entry.step)?.size ?? 0) === 1 ? entry.step : undefined,
+  }));
+}
+
+/**
+ * The step numbers every `Step N` / `Steps N, M and K` / `Steps N–M` expression
+ * in `text` names, in order of appearance, plus the expressions that could not
+ * be read exactly (reversed or over-wide ranges). Never guesses at those.
+ */
+export function listStepNumbersNamedInTextV1(text: string): {
+  readonly steps: readonly number[];
+  readonly unreadable: readonly string[];
+} {
+  const steps: number[] = [];
+  const unreadable: string[] = [];
+  for (const match of text.matchAll(STEP_REFERENCE_RE)) {
+    const expanded = expandStepNumbersV1(match[2]!);
+    if (expanded === undefined) {
+      unreadable.push(match[0]);
+      continue;
+    }
+    for (const n of expanded) {
+      if (!steps.includes(n)) {
+        steps.push(n);
+      }
+    }
+  }
+  return { steps, unreadable };
+}
+
 /** One answer to one item on an open-items form (RC3 item 5, Step 10). */
 export interface OpenPlanItemsFormAnswerV1 {
   readonly itemId: string;
@@ -1368,8 +1461,16 @@ export interface BlockerPlanReferenceV1 {
 
 const PART_REFERENCE_RE =
   /\b[Pp]arts?\s+((?:[A-Z]|\d+)(?![A-Za-z0-9])(?:\s*(?:,\s*(?:and\s+)?|\s+and\s+|\s*&\s*)(?:[A-Z]|\d+)(?![A-Za-z0-9]))*)/g;
-const STEP_REFERENCE_RE = /\b(?:[Pp]art\s+([A-Z]|\d+)[,:\s]+)?[Ss]tep\s+(\d+)\b/g;
+/**
+ * `Step N`, plural `Steps N, M and K`, and ranges `Steps N–M` / `N-M` / `N to M`
+ * (ordinary hyphen or en dash). Group 1 is an optional Part prefix; group 2 is
+ * the whole numeric expression, tokenised by {@link expandStepNumbersV1}.
+ */
+const STEP_REFERENCE_RE =
+  /\b(?:[Pp]art\s+([A-Z]|\d+)[,:\s]+)?[Ss]teps?\s+(\d+(?:\s*(?:[-–]|\bto\b|\bthrough\b)\s*\d+|(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s*&\s*)(?:[Ss]teps?\s+)?\d+(?:\s*(?:[-–]|\bto\b|\bthrough\b)\s*\d+)?)*)(?!\d)/g;
 const QUOTED_SPAN_RE = /`([^`]+)`|"([^"]+)"|“([^”]+)”/g;
+/** A range wider than this is treated as malformed rather than expanded. */
+const MAX_STEP_RANGE_SPAN_V1 = 99;
 
 function stepRecordMatches(itemText: string, step: string): boolean {
   const plain = itemText.replace(/^[\s*_`]+/, "");
@@ -1377,11 +1478,104 @@ function stepRecordMatches(itemText: string, step: string): boolean {
 }
 
 /**
+ * Step numbers named by one {@link STEP_REFERENCE_RE} expression, or
+ * `undefined` when any range in it is reversed, wider than
+ * {@link MAX_STEP_RANGE_SPAN_V1} or otherwise malformed — a group that cannot
+ * be read exactly is not guessed at.
+ */
+function expandStepNumbersV1(expression: string): readonly number[] | undefined {
+  const numbers: number[] = [];
+  for (const token of expression.matchAll(/(\d+)(?:\s*(?:[-–]|\bto\b|\bthrough\b)\s*(\d+))?/g)) {
+    const from = Number(token[1]);
+    const to = token[2] === undefined ? from : Number(token[2]);
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || to < from || to - from > MAX_STEP_RANGE_SPAN_V1) {
+      return undefined;
+    }
+    for (let n = from; n <= to; n++) {
+      numbers.push(n);
+    }
+  }
+  return numbers.length > 0 ? numbers : undefined;
+}
+
+interface NumberedSectionV1 {
+  readonly number: number;
+  /** The Part heading key (`1`, `A`, …) the section sits under, when any. */
+  readonly part: string | undefined;
+  readonly open: number;
+  readonly settled: number;
+}
+
+/**
+ * Numbered section headings (`### 1. Title`, `### Step 2 — Title`) in the
+ * latest checklist rendering, each with the open/settled counts of its
+ * unindented checklist lines up to the next heading of the same or a higher
+ * level. A section with no checklist lines is not listed.
+ */
+function listNumberedSectionsV1(planOfRecord: string): readonly NumberedSectionV1[] {
+  const scoped = scopeToLatestChecklistV1(planOfRecord).region;
+  const all = headingsV1(scoped);
+  const lines = walkLinesV1(scoped);
+  const sections: NumberedSectionV1[] = [];
+  all.forEach((heading, at) => {
+    const title = heading.title.trim().replace(/^[\s*_`]+/, "");
+    const numbered = /^(?:step\s+)?(\d+)(?:\s*[:)—–-]|\.(?!\d)|\s*$)/i.exec(title);
+    if (!numbered) {
+      return;
+    }
+    let end = lines.length;
+    for (let h = at + 1; h < all.length; h++) {
+      const candidate = all[h];
+      if (candidate && candidate.level <= heading.level) {
+        end = candidate.line;
+        break;
+      }
+    }
+    let open = 0;
+    let settled = 0;
+    for (let i = heading.line + 1; i < end; i++) {
+      const line = lines[i];
+      if (!line || line.fenced) {
+        continue;
+      }
+      const item = ANY_ITEM_LINE.exec(line.text);
+      if (!item || (item[1] ?? "").length > 0) {
+        continue;
+      }
+      if (item[2]?.toLowerCase() === "x" || isExcludedChecklistItemText(item[3] ?? "")) {
+        settled++;
+      } else {
+        open++;
+      }
+    }
+    if (open + settled === 0) {
+      return;
+    }
+    let part: string | undefined;
+    for (let h = at - 1; h >= 0; h--) {
+      const candidate = all[h];
+      const partMatch = candidate && candidate.level < heading.level ? /^Part\s+([A-Za-z]|\d+)\b/i.exec(candidate.title.trim()) : null;
+      if (partMatch) {
+        part = (partMatch[1] ?? "").toUpperCase();
+        break;
+      }
+    }
+    sections.push({ number: Number(numbered[1]), part, open, settled });
+  });
+  return sections;
+}
+
+/**
  * RC7 item 3: the plan items a blocker's text points at, each with its
  * open/settled counts of top-level items. Item references are backticked or
- * quoted spans that name exactly one item; `Step N` names the one top-level
- * item starting with that step number (inside the named Part, when the text
- * gives one); `Part X` (also lists like "Parts A, B and D") covers the
+ * quoted spans that name exactly one item; `Step N` (also `Steps N, M and K`
+ * and `Steps N–M` ranges, with a hyphen or an en dash) names the one top-level
+ * item starting with that step number — or, when the plan groups its checklist
+ * under numbered section headings (`### 4. …`), that section's unindented
+ * items, counting only the ones still open (inside the named Part, when the
+ * text gives one). A list or range with any member that does not resolve to
+ * exactly one item or section, or a reversed or over-wide range, adds no
+ * reference. `Part X` (also lists like "Parts A, B and D") covers the
  * top-level checklist lines under the Part heading — an open nested child
  * never makes a Part count as open. A reference that matches nothing, or an
  * item span that matches several items, is dropped.
@@ -1421,24 +1615,55 @@ export function resolveBlockerPlanReferencesV1(
   }
 
   const consumedParts = new Set<string>();
+  let numberedSections: readonly NumberedSectionV1[] | undefined;
   for (const match of text.matchAll(STEP_REFERENCE_RE)) {
     const part = match[1];
-    const step = match[2]!;
     if (part !== undefined) {
       consumedParts.add(part.toUpperCase());
+    }
+    const steps = expandStepNumbersV1(match[2]!);
+    if (steps === undefined) {
+      continue;
     }
     const candidates =
       part !== undefined
         ? partTopLevel(part.toUpperCase())
         : records.map((record) => ({ text: record.itemText, settled: record.settled }));
-    const hits = candidates.filter((candidate) => stepRecordMatches(candidate.text, step));
-    if (hits.length === 1) {
-      references.push({
+    // Every step in a list or range must resolve to exactly one item or one
+    // numbered section; a group with an unresolvable or ambiguous member adds
+    // no reference at all.
+    const group: BlockerPlanReferenceV1[] = [];
+    for (const step of steps) {
+      const hits = candidates.filter((candidate) => stepRecordMatches(candidate.text, String(step)));
+      if (hits.length === 1) {
+        group.push({
+          kind: "step",
+          reference: `Step ${step}`,
+          open: hits[0]!.settled ? 0 : 1,
+          settled: hits[0]!.settled ? 1 : 0,
+        });
+        continue;
+      }
+      if (hits.length > 1) {
+        break;
+      }
+      numberedSections ??= listNumberedSectionsV1(planOfRecord);
+      const sections = numberedSections.filter(
+        (section) =>
+          section.number === step && (part === undefined || section.part === part.toUpperCase())
+      );
+      if (sections.length !== 1) {
+        break;
+      }
+      group.push({
         kind: "step",
         reference: `Step ${step}`,
-        open: hits[0]!.settled ? 0 : 1,
-        settled: hits[0]!.settled ? 1 : 0,
+        open: sections[0]!.open,
+        settled: sections[0]!.settled,
       });
+    }
+    if (group.length === steps.length) {
+      references.push(...group);
     }
   }
 

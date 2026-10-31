@@ -2618,3 +2618,32 @@ void describe("StageNode — waiting for you on the current stage row (v1 fixes 
   });
 });
 
+// bugs3 Step 12: a task whose saved status reads paused while a dispatched action holds it
+// (Move on → Publish Checks) is shown as running everywhere the row speaks: the icon, the
+// tooltip and the context value that gates Resume and Pause.
+void describe("TaskNode — held action while the saved status reads paused (bugs3 Step 12)", () => {
+  void it("a paused task with no held action keeps the pause presentation", () => {
+    const node = new TaskNode(makePausedTask("publish"), false);
+    assert.strictEqual((node.iconPath as import("vscode").ThemeIcon).id, "debug-pause");
+    assert.match((node.tooltip as import("vscode").MarkdownString).value, /Paused/);
+    assert.match(String(node.contextValue), /paused/);
+  });
+
+  void it("a held operation makes the icon, tooltip and context value say running, not paused", () => {
+    const task = makePausedTask("publish");
+    const handle = taskOperations.begin(task.folderUri.fsPath, { label: "Publish Checks", stage: "publish", exclusive: true });
+    assert.ok(handle);
+    try {
+      const node = new TaskNode(task, false);
+      assert.strictEqual((node.iconPath as import("vscode").ThemeIcon).id, "loading~spin");
+      const tooltip = (node.tooltip as import("vscode").MarkdownString).value;
+      assert.match(tooltip, /Running/);
+      assert.match(tooltip, /Publish Checks/);
+      assert.doesNotMatch(tooltip, /Paused/);
+      assert.doesNotMatch(String(node.contextValue), /paused/, "Resume must not be offered beside a running action");
+    } finally {
+      taskOperations.end(handle);
+    }
+  });
+});
+

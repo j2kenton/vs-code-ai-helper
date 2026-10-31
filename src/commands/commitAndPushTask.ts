@@ -17,11 +17,14 @@ import { selectNextTask } from "./markTaskDone";
 import { NotificationRouter } from "../utils/notificationRouter";
 import {
   CompletionLintResult,
+  resolveCurrentPublishCommandPlanV1,
+  resolvePublishScopeFolder,
   upsertCompletionChecksReportV1,
 } from "../utils/completionLint";
+import { decideCommitPushChecksReuseV1 } from "../utils/commitPushChecksReuseV1";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { checkPublishPreflight } from "../utils/publishPreflight";
-import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishReadiness } from "../utils/gitRepoInfo";
+import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishReadiness, resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { refreshStaleReviewBannersForTaskV1 } from "../utils/reviewFreshness";
 import { runLintingFixes } from "./runLintingFixes";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
@@ -34,7 +37,17 @@ import { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME } from "../utils/c
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { isLegacyAiRouteDisabledV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
-import { awaitWorkflowDecisionAnswerV1 } from "../utils/workflowDecisionDispatchV1";
+import { awaitWorkflowDecisionAnswerV1, type AwaitedDecisionOutcomeV1 } from "../utils/workflowDecisionDispatchV1";
+import {
+  clearCommitPushStopStateV1,
+  commitPushChecksWereReusedV1,
+  commitPushCheckedTreeV1,
+  noteCommitPushCheckedTreeV1,
+  noteCommitPushChecksReusedV1,
+  recordCommitPushStopV1,
+  type CommitPushCheckedTreeV1,
+} from "../utils/commitPushStopCauseV1";
+import { computeCommandIdentityV1, computeTreeFingerprintV1 } from "../utils/publishChecksFreshness";
 import {
   ensureTaskRunsDirectoryV1,
   ensureWorkflowTaskFolderRootV1,
@@ -63,7 +76,6 @@ import {
   beginTargetResolutionV1,
   describeTargetResolutionUnprotectedRootsV1,
   describeTargetResolutionWriteFailureV1,
-  describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
@@ -73,6 +85,8 @@ import {
   requestSafeAdmissionReleaseV1,
   trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeResumeNotSettledV1 } from "../utils/storedAnswerResumeV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
@@ -255,13 +269,16 @@ async function askCommitPushInChatV1(args: {
   token?: vscode.CancellationToken;
 }): Promise<string | undefined> {
   const stage: TaskStage = "publish";
-  return awaitWorkflowDecisionAnswerV1(
+  let ended: AwaitedDecisionOutcomeV1 | undefined;
+  const answer = await awaitWorkflowDecisionAnswerV1(
     {
       decisionKey: args.decisionKey,
       taskCanonicalId: args.taskFolderUri.fsPath,
       stage,
       whatHappened: args.whatHappened,
       whyUserNeeded: args.whyUserNeeded,
+      restartGuidance:
+        "Commit & Push was interrupted by a reload, so nothing was committed or pushed; choose Commit & Push again.",
       options: args.options.map((option) => ({
         optionId: option.optionId,
         label: option.label,
@@ -279,8 +296,21 @@ async function askCommitPushInChatV1(args: {
       },
     },
     { canonicalId: args.taskFolderUri.fsPath, taskFolderPath: args.taskFolderUri.fsPath, stage },
-    args.token
+    args.token,
+    (outcome) => {
+      ended = outcome;
+    },
+    // The owner started Commit & Push and may look away while the checks run: the
+    // confirmation waits for them instead of being withdrawn unanswered.
+    { noTimeout: true }
   );
+  // bugs3 Step 17: say what stopped the run. An explicit Cancel is an answer and
+  // never reaches here; a timeout, a reload or a dismissal is not the owner
+  // cancelling, and the final notice must not claim it was.
+  if (answer === undefined && ended !== undefined && (ended.kind === "timedOut" || ended.kind === "interrupted" || ended.kind === "dismissed")) {
+    recordCommitPushStopV1(args.taskFolderUri.fsPath, ended.kind, args.decisionKey);
+  }
+  return answer;
 }
 
 /**
@@ -1648,6 +1678,7 @@ export type CommitAndPushNotCompletedReasonV1 =
   | "privateContentStaged"
   | "gitNotReady"
   | "checksDeclined"
+  | "checksNoLongerCurrent"
   | "fixWithAiUnavailable"
   | "taskFolderChangesDeclined"
   | "runArtifactsDeclined"
@@ -1841,6 +1872,167 @@ export type CommitPushCompletionChecksResultV1 =
       readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "checksDeclined" | "fixWithAiUnavailable">;
     };
 
+/** The recorded-pass decision for the tree as it is right now. */
+async function decideCurrentCommitPushChecksReuseV1(
+  resolvedTask: ResolvedTaskContext,
+  decide: typeof decideCommitPushChecksReuseV1 = decideCommitPushChecksReuseV1
+): Promise<Awaited<ReturnType<typeof decideCommitPushChecksReuseV1>>> {
+  const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+  const scopeFolder = resolvePublishScopeFolder(taskFolderUri, resolvedTask.progress).folder;
+  return decide({
+    taskFolderUri,
+    scopeFolder,
+    headCommitSha: await resolveHeadCommitSha(scopeFolder),
+    currentCommands: resolveCurrentPublishCommandPlanV1(scopeFolder),
+  });
+}
+
+/**
+ * Whether the recorded pass this attempt relied on still matches the tree. True
+ * when the attempt ran the checks itself (nothing was relied on).
+ *
+ * @internal exported for testing
+ */
+export async function isReusedCommitPushChecksStillCurrentV1(
+  resolvedTask: ResolvedTaskContext,
+  decide?: typeof decideCommitPushChecksReuseV1
+): Promise<boolean> {
+  if (!commitPushChecksWereReusedV1(resolvedTask.taskFolderPath)) {
+    return true;
+  }
+  return (await decideCurrentCommitPushChecksReuseV1(resolvedTask, decide)).reuse;
+}
+
+/**
+ * Re-check, after the owner confirmed, that a recorded pass used in place of a
+ * fresh run still matches the commit, files, scope and commands. The
+ * confirmation no longer expires, so it can be answered long after the checks
+ * were skipped.
+ *
+ * @internal exported for testing
+ */
+export async function revalidateReusedCommitPushChecksV1(
+  resolvedTask: ResolvedTaskContext,
+  decide?: typeof decideCommitPushChecksReuseV1
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly detail: string }> {
+  if (!commitPushChecksWereReusedV1(resolvedTask.taskFolderPath)) {
+    return { ok: true };
+  }
+  const again = await decideCurrentCommitPushChecksReuseV1(resolvedTask, decide);
+  if (again.reuse) {
+    return { ok: true };
+  }
+  noteCommitPushChecksReusedV1(resolvedTask.taskFolderPath, false);
+  return {
+    ok: false,
+    detail:
+      `Commit and push stopped before staging anything: ${again.reason} since the checks were skipped, ` +
+      "so the recorded Publish Checks result no longer covers what would be committed. Nothing was committed or pushed; " +
+      "choose Commit & Push again — the checks will run again.",
+  };
+}
+
+export interface CommitPushTreeReaderV1 {
+  head(scopeFolder: string): Promise<string | undefined>;
+  fingerprint(scopeFolder: string): Promise<string | undefined>;
+  /** Identity of the verification command set as configured right now. */
+  commandIdentity(scopeFolder: string): Promise<string | undefined>;
+}
+
+const REAL_COMMIT_PUSH_TREE_READER_V1: CommitPushTreeReaderV1 = {
+  head: resolveHeadCommitSha,
+  fingerprint: computeTreeFingerprintV1,
+  commandIdentity: (scopeFolder) =>
+    Promise.resolve(computeCommandIdentityV1(resolveCurrentPublishCommandPlanV1(scopeFolder) ?? undefined)),
+};
+
+/**
+ * The commit, working-tree fingerprint and command set a set of checks covers.
+ * Taken BEFORE the checks start and kept as their identity: a snapshot taken
+ * after them would adopt whatever the tree became while they ran (or while the
+ * scope check ran) as the "checked" baseline.
+ */
+export async function captureCommitPushCheckedTreeV1(
+  resolvedTask: ResolvedTaskContext,
+  reader: CommitPushTreeReaderV1 = REAL_COMMIT_PUSH_TREE_READER_V1
+): Promise<CommitPushCheckedTreeV1> {
+  const scopeFolder = resolvePublishScopeFolder(vscode.Uri.file(resolvedTask.taskFolderPath), resolvedTask.progress).folder;
+  return {
+    scopeFolder,
+    headCommitSha: await reader.head(scopeFolder),
+    treeFingerprint: await reader.fingerprint(scopeFolder),
+    commandIdentity: await reader.commandIdentity(scopeFolder),
+  };
+}
+
+/**
+ * The last gate before `git add`: the checks this attempt relied on (it ran
+ * them, or reused a recorded pass) must still describe the commit and files
+ * about to be staged. Document saves and the commit-message review run between
+ * the confirmation and staging and can take as long as the owner likes, so
+ * neither the confirmation-time check nor the check itself is enough. Nothing is
+ * gated when the owner published over failing checks (no pass was relied on).
+ *
+ * @internal exported for testing
+ */
+export async function verifyCommitPushCheckedTreeBeforeStagingV1(
+  resolvedTask: ResolvedTaskContext,
+  reader: CommitPushTreeReaderV1 = REAL_COMMIT_PUSH_TREE_READER_V1,
+  decide?: typeof decideCommitPushChecksReuseV1
+): Promise<{ readonly ok: true } | { readonly ok: false; readonly detail: string }> {
+  const checked = commitPushCheckedTreeV1(resolvedTask.taskFolderPath);
+  if (checked === undefined) {
+    return { ok: true };
+  }
+  const stopped = (why: string): { readonly ok: false; readonly detail: string } => {
+    noteCommitPushChecksReusedV1(resolvedTask.taskFolderPath, false);
+    return {
+      ok: false,
+      detail:
+        `Commit and push stopped before staging anything: ${why} since the checks passed, so their result no longer ` +
+        "covers what would be committed. Nothing was committed or pushed; choose Commit & Push again — the checks will run again.",
+    };
+  };
+  // An identity that was never captured cannot be compared, and a comparison
+  // that cannot be made is not waived: the pass is not tied to any tree.
+  if (checked.headCommitSha === undefined) {
+    return stopped("the commit the checks covered was not identified, so the pass cannot be tied to what would be committed,");
+  }
+  if (checked.treeFingerprint === undefined) {
+    return stopped("the files the checks covered were not identified, so the pass cannot be tied to what would be committed,");
+  }
+  const head = await reader.head(checked.scopeFolder);
+  if (head === undefined) {
+    return stopped("the current commit could not be read, so it cannot be matched to the checked one,");
+  }
+  if (head !== checked.headCommitSha) {
+    return stopped("the commit changed");
+  }
+  const fingerprint = await reader.fingerprint(checked.scopeFolder);
+  if (fingerprint === undefined) {
+    return stopped("the files could not be re-read, so they cannot be matched to the checked ones,");
+  }
+  if (fingerprint !== checked.treeFingerprint) {
+    return stopped("files changed");
+  }
+  // The command set that authorised the pass, fresh run or reused: a changed
+  // verification setting or script during the wait invalidates it either way.
+  // Unknown on either side is not "unchanged": two unreadable identities would
+  // otherwise compare equal and authorise a pass tied to no command set.
+  if (checked.commandIdentity === undefined) {
+    return stopped("the verification commands the checks ran were not identified, so the pass cannot be tied to them,");
+  }
+  const commandIdentity = await reader.commandIdentity(checked.scopeFolder);
+  if (commandIdentity === undefined) {
+    return stopped("the current verification commands could not be read, so they cannot be matched to the checked ones,");
+  }
+  if (commandIdentity !== checked.commandIdentity) {
+    return stopped("the verification commands changed");
+  }
+  const recorded = await revalidateReusedCommitPushChecksV1(resolvedTask, decide);
+  return recorded.ok ? { ok: true } : recorded;
+}
+
 /**
  * §10.2's failing-checks decision (Publish Anyway / Fix with AI / Cancel,
  * plan C3) as its own coordinator-native step: `commitPushRowV1.ts`'s
@@ -1888,7 +2080,30 @@ export async function runCommitPushCompletionChecksV1(
   // push), so it's surfaced directly by executeCommitPushV1's own pre-check
   // instead of going through the failing-checks modal below, which is
   // reserved for lint/test failures.
+  let freshChecksRequired = false;
+  // The commit, files and command set each check run starts from. The last run's
+  // identity is the one the pass is tied to, so files the checks themselves
+  // changed (or anything edited while they ran) cannot become the "checked" tree.
+  let checkedIdentity: CommitPushCheckedTreeV1 | undefined;
+  // A stop cause or reuse note left by an earlier attempt must not colour this one.
+  clearCommitPushStopStateV1(resolvedTask.taskFolderPath);
   const runChecks = async (): Promise<CompletionLintResult> => {
+    checkedIdentity = await captureCommitPushCheckedTreeV1(resolvedTask);
+    // bugs3 Step 17: a passing Publish Checks result recorded for exactly this
+    // commit, working tree, scope and command set stands in for a fresh run (the
+    // reported case re-ran a 12-minute `verify` a minute after it passed). A
+    // result that is missing, failing, stale or different runs fresh, and says why.
+    // Only the first pass can reuse: after Fix with AI the tree has changed.
+    if (!freshChecksRequired) {
+      const reuse = await decideCurrentCommitPushChecksReuseV1(resolvedTask);
+      if (reuse.reuse) {
+        noteCommitPushChecksReusedV1(resolvedTask.taskFolderPath, true);
+        op.report(reuse.message);
+        return reuse.result;
+      }
+      op.report(`Running the checks fresh: ${reuse.reason}.`);
+    }
+    freshChecksRequired = true;
     const preflight = (await runTrackedOperation(
       lockKey,
       { parent: op, label: "Completion checks", stage: "publish", kind: "completion-checks" },
@@ -1980,7 +2195,8 @@ export async function runCommitPushCompletionChecksV1(
         lintPayload,
         { reason: "user chose Publish Anyway despite failing checks" }
       );
-      break;
+      noteCommitPushCheckedTreeV1(resolvedTask.taskFolderPath, undefined);
+      return { ok: true };
     }
     if (choice !== "fixWithAi") {
       return { ok: false, reason: "checksDeclined" };
@@ -2002,6 +2218,10 @@ export async function runCommitPushCompletionChecksV1(
     );
     lintPayload = await runChecks();
   }
+  // The checks passed: remember the commit, files and commands they started from
+  // (not a fresh snapshot of whatever the tree is now), so staging can confirm
+  // nothing moved while they ran or while the owner reviewed and confirmed.
+  noteCommitPushCheckedTreeV1(resolvedTask.taskFolderPath, checkedIdentity);
   return { ok: true };
 }
 
@@ -2086,7 +2306,8 @@ export type CommitPushConfirmResultV1 =
  * @internal exported for the commitPush.v1 row and for testing
  */
 export async function resolveCommitPushStagingScopeV1(
-  resolvedTask: ResolvedTaskContext
+  resolvedTask: ResolvedTaskContext,
+  token?: vscode.CancellationToken
 ): Promise<CommitPushScopeResultV1> {
   const indexCheck = await checkCommitPushIndexPrivacyV1(resolvedTask);
   if (!indexCheck.ok) {
@@ -2144,6 +2365,7 @@ export async function resolveCommitPushStagingScopeV1(
             const choice = await askCommitPushInChatV1({
               taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
               decisionKey: "commitPushExistingStagedChanges",
+              token,
               whatHappened:
                 `${commitPushTaskLabel(resolvedTask)} — this repository already has ${preStagedFiles.length} staged change(s) alongside unstaged changes.\n\n` +
                 "Commit everything together (staged and unstaged changes in one commit), " +
@@ -2198,6 +2420,7 @@ export async function resolveCommitPushStagingScopeV1(
           const choice = await askCommitPushInChatV1({
             taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
             decisionKey: "commitPushIncludeTaskFolder",
+            token,
             whatHappened:
               `${commitPushTaskLabel(resolvedTask)} — no source code changes found outside the task folder.\n\n` +
               "Only the task's planning files (in the task folder) have changed. " +
@@ -2234,6 +2457,7 @@ export async function resolveCommitPushStagingScopeV1(
             const artifactChoice = await askCommitPushInChatV1({
               taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
               decisionKey: "commitPushIncludeRunArtifacts",
+              token,
               whatHappened:
                 `${commitPushTaskLabel(resolvedTask)} — the only changes in the task folder are run artifacts ` +
                 "(runs/, context-pack.md). " +
@@ -2321,7 +2545,8 @@ export async function resolveCommitPushStagingScopeV1(
 export async function confirmCommitPushScopeV1(
   resolvedTask: ResolvedTaskContext,
   repoRoot: string,
-  scope: CommitPushResolvedScopeV1
+  scope: CommitPushResolvedScopeV1,
+  token?: vscode.CancellationToken
 ): Promise<CommitPushConfirmResultV1> {
   return vscode.window.withProgress(
     {
@@ -2420,6 +2645,7 @@ export async function confirmCommitPushScopeV1(
         const confirmed = await askCommitPushInChatV1({
           taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
           decisionKey: "commitPushFinalScopeConfirmation",
+          token,
           whatHappened: confirmMessage,
           whyUserNeeded:
             "Pushing is outward-facing and largely irreversible; nothing is staged or pushed until you confirm.",
@@ -2501,6 +2727,14 @@ export async function confirmCommitPushScopeV1(
 
         if (confirmed !== "commitAndPush") {
           return { kind: "notCompleted", reason: "userCancelled" };
+        }
+
+        // The confirmation may have waited as long as the owner was away. A
+        // recorded passing result used to skip the checks only stands if it still
+        // matches the tree now; otherwise nothing is staged and the owner is told.
+        const stillCurrent = await revalidateReusedCommitPushChecksV1(resolvedTask);
+        if (!stillCurrent.ok) {
+          return { kind: "notCompleted", reason: "checksNoLongerCurrent", detail: stillCurrent.detail };
         }
 
         return { kind: "confirmed", gitReadiness, scope: nextScope };
@@ -2783,7 +3017,7 @@ export type CommitPushStageAndCommitResultV1 =
   | { readonly kind: "committed" }
   | {
       readonly kind: "notCompleted";
-      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "gitCommitFailed">;
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "gitCommitFailed" | "checksNoLongerCurrent">;
       // See `checkCommitPushIndexPrivacyV1`'s `detail` field — same contract.
       readonly detail: string;
     };
@@ -2801,6 +3035,12 @@ export async function stageAndCommitCommitPushV1(
       cancellable: false,
     },
     async (progress): Promise<CommitPushStageAndCommitResultV1> => {
+      // Final freshness gate: before anything is staged, and outside the try below so
+      // a refusal never runs its `git reset` over changes the owner had staged already.
+      const stillChecked = await verifyCommitPushCheckedTreeBeforeStagingV1(resolvedTask);
+      if (!stillChecked.ok) {
+        return { kind: "notCompleted", reason: "checksNoLongerCurrent", detail: stillChecked.detail };
+      }
       progress.report({ message: "Staging changes..." });
       try {
         if (scopedFiles.length > 0) {
@@ -3126,7 +3366,8 @@ export async function commitAndPushTask(
   });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    offerBusyRefusalChoicesOnceV1(early);
     releaseCommitPushToken();
     return;
   }
@@ -3242,10 +3483,14 @@ export async function commitAndPushTask(
       });
       if (late.outcome !== "acquired") {
         NotificationRouter.showWarning(
-          describeWorkAdmissionRefusalV1(
+          describeWorkAdmissionRefusalForUserV1(
             late,
             notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
           )
+        );
+        offerBusyRefusalChoicesOnceV1(
+          late,
+          notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
         );
         return;
       }
@@ -3378,7 +3623,8 @@ export async function completeCommitAndPushTask(
   });
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    offerBusyRefusalChoicesOnceV1(early);
     releaseCommitPushToken();
     return;
   }
@@ -3549,10 +3795,14 @@ export async function completeCommitAndPushTask(
       });
       if (late.outcome !== "acquired") {
         NotificationRouter.showWarning(
-          describeWorkAdmissionRefusalV1(
+          describeWorkAdmissionRefusalForUserV1(
             late,
             notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
           )
+        );
+        offerBusyRefusalChoicesOnceV1(
+          late,
+          notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
         );
         return;
       }

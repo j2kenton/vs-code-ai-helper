@@ -26,6 +26,7 @@ import { describe, it } from "node:test";
 import * as vscode from "vscode";
 
 import { runPublishChecks } from "../commands/runPublishChecks";
+import { resumeAndSetTaskStageV1 } from "../commands/resumeTask";
 import { completeCommitAndPushTask } from "../commands/commitAndPushTask";
 import { peekTaskFolderPathSynchronouslyV1, resolveTaskContext } from "../utils/resolveTaskContext";
 import { TaskInventory } from "../state/taskInventory";
@@ -46,6 +47,8 @@ import { safeRemoveDir } from "./testFsUtils";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { runFastForwardPublishChecksV1 } from "../utils/fastForwardPublishChecksV1";
+import { PublishChecksCancelledError } from "../utils/completionLint";
+import { readPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
 import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
@@ -337,8 +340,8 @@ void describe("runPublishChecks work admission against applyCurrentStageAction's
       assert.equal(surface.entries[0]?.level, "warning");
       assert.match(
         surface.entries[0]?.message ?? "",
-        /someOtherConcurrentCommand/,
-        "must name the actual blocking owner — proves the folder path was extracted correctly, not just that nothing threw"
+        /"acas-shape-busy" already has a stage action in progress/,
+        "must name the busy task (the owner is described in plain words; ids stay in the details) — proves the folder path was extracted correctly, not just that nothing threw"
       );
     } finally {
       if (held.outcome === "acquired") {
@@ -450,7 +453,7 @@ void describe("runPublishChecks work admission against applyCurrentStageAction's
       });
       assert.equal(ok, false);
       assert.equal(settled.length, 1);
-      assert.match(settled[0] ?? "", /^Publish Checks declined to start: .*no AI model is configured/);
+      assert.match(settled[0] ?? "", /^Publish Checks declined to start: .*No Publish model is configured/);
       assert.doesNotMatch(settled[0] ?? "", /only available for tasks at the Publish stage/);
       const row = terminalEntryFor({
         id: "op-ff",
@@ -461,7 +464,7 @@ void describe("runPublishChecks work admission against applyCurrentStageAction's
         detail: settled[0],
         stage: "publish",
       } as unknown as TaskOperationSnapshot);
-      assert.match(row?.message ?? "", /refused — nothing was started \(Publish Checks declined to start: .*no AI model is configured/);
+      assert.match(row?.message ?? "", /refused — nothing was started \(Publish Checks declined to start: .*No Publish model is configured/);
     } finally {
       modelsStub.restore();
       rf.restore();
@@ -1015,7 +1018,7 @@ void describe(
           assert.equal(surface.entries[0]?.level, "warning");
           assert.match(
             surface.entries[0]?.message ?? "",
-            /someOtherConcurrentCommand/,
+            /"rpc-hook-active-discovered-by-refresh-busy" already has a stage action in progress/,
             "must have attempted admission against the refresh-discovered ACTIVE task, not the stale-cache paused guess"
           );
         } finally {
@@ -1371,5 +1374,310 @@ void describe("runPublishChecks failed-first execution sequences", () => {
     const { calls } = await runSequence("failed-first-incompatible", "pass", false);
     assert.equal(calls.length, 1);
     assert.equal(calls[0]?.explicitChecks, undefined);
+  });
+});
+
+/**
+ * bugs3 Step 12/14: the composed lifecycle through the real `runPublishChecks` handler — the durable
+ * record is "running" while a command runs, ends with the run's own result on every exit, and a
+ * preflight that throws still settles it (it used to stay "running" behind a failed operation).
+ */
+void describe("runPublishChecks durable result across the composed lifecycle (bugs3 Steps 12 and 14)", () => {
+  function publishTask(name: string): { taskFolderPath: string; progress: TaskProgress } {
+    const taskFolderPath = makeTaskFolder(name);
+    const progress = fixtureProgress(taskFolderPath, { currentStage: "publish" });
+    writeProgress(taskFolderPath, progress);
+    return { taskFolderPath, progress };
+  }
+
+  void it("a preflight that throws settles the running record as failed, naming the error, never as passed", async () => {
+    const { taskFolderPath, progress } = publishTask("composed-preflight-throws");
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const originalEnsure = modelSelectionModule.ensureStageModelConfigured;
+    modelSelectionModule.ensureStageModelConfigured = (): Promise<boolean> =>
+      Promise.reject(new Error("model settings could not be read"));
+    try {
+      await assert.rejects(
+        runPublishChecks(makeInventory(taskFolderPath, progress), applyCurrentStageActionDispatchArg(taskFolderPath, progress)),
+        /model settings could not be read/
+      );
+      const outcome = readPublishChecksOutcomeV1(taskFolderPath);
+      assert.equal(outcome?.outcome, "failed", "the durable result is a failure, not a stale running record");
+      assert.match(outcome?.outcome === "failed" ? (outcome.reason ?? "") : "", /model settings could not be read/);
+      assert.equal(hasLiveWorkAdmissionBestEffortV1(taskFolderPath), false, "admission is released after the throw");
+    } finally {
+      modelSelectionModule.ensureStageModelConfigured = originalEnsure;
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("shows the running command in the durable record while it runs, then ends with the passed result", async () => {
+    const { taskFolderPath, progress } = publishTask("composed-progress-then-pass");
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const run = stubPublishChecksRun();
+    const originalLint = completionLintModule.runCompletionLint;
+    const midRun: unknown[] = [];
+    type CheckEvents = {
+      started(d: { command: string }): void;
+      settled(d: { command: string }, r?: { exitCode: number }): void;
+    };
+    completionLintModule.runCompletionLint = (
+      _uri: unknown,
+      _files: unknown,
+      options?: { onCheckEvent?: CheckEvents }
+    ): Promise<unknown> => {
+      options?.onCheckEvent?.started({ command: "npm run test" });
+      return new Promise((resolve) => {
+        // Let the record's queued write land, then observe it mid-command.
+        setTimeout(() => {
+          midRun.push(readPublishChecksOutcomeV1(taskFolderPath));
+          options?.onCheckEvent?.settled({ command: "npm run test" }, { exitCode: 0 });
+          resolve({ passed: true, summary: "all passed", commandsRun: ["npm run test"] });
+        }, 50);
+      });
+    };
+    try {
+      const dispatched = await runPublishChecks(
+        makeInventory(taskFolderPath, progress),
+        applyCurrentStageActionDispatchArg(taskFolderPath, progress)
+      );
+      assert.equal(dispatched, true, JSON.stringify(surface.entries));
+      const during = midRun[0] as { outcome?: string; runningCommands?: string[] } | undefined;
+      assert.equal(during?.outcome, "running");
+      assert.deepEqual(during?.runningCommands, ["npm run test"]);
+      assert.equal(readPublishChecksOutcomeV1(taskFolderPath)?.outcome, "passed");
+    } finally {
+      completionLintModule.runCompletionLint = originalLint;
+      run.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+
+  void it("a cancelled command ends with a cancelled result and never a pass", async () => {
+    const { taskFolderPath, progress } = publishTask("composed-cancelled-mid-command");
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const run = stubPublishChecksRun();
+    const originalLint = completionLintModule.runCompletionLint;
+    completionLintModule.runCompletionLint = (
+      _uri: unknown,
+      _files: unknown,
+      options?: { onCheckEvent?: { started(d: { command: string }): void } }
+    ): Promise<unknown> => {
+      options?.onCheckEvent?.started({ command: "npm run test" });
+      return Promise.reject(new PublishChecksCancelledError());
+    };
+    try {
+      await runPublishChecks(
+        makeInventory(taskFolderPath, progress),
+        applyCurrentStageActionDispatchArg(taskFolderPath, progress)
+      );
+      const outcome = readPublishChecksOutcomeV1(taskFolderPath);
+      assert.equal(outcome?.outcome, "cancelled");
+      assert.doesNotMatch(surface.entries.map((entry) => entry.message).join("\n"), /Publish checks passed/);
+    } finally {
+      completionLintModule.runCompletionLint = originalLint;
+      run.restore();
+      rf.restore();
+      ws.restore();
+      deactivateNotificationRouter();
+    }
+  });
+});
+
+/**
+ * bugs3 Step 12/14 (review: composed decision-to-Publish coverage): Move on is
+ * `resumeAndSetTaskStageV1` — the real resume, admission hold, stage move and
+ * dispatch — whose dispatched stage action is the REAL `runPublishChecks` handler.
+ * Only the stage-move command (`setTaskStage`, covered by its own suite) and the
+ * check processes are stubbed, so the delayed preflight, command progress,
+ * cancellation and durable settlement are observed through the actual hand-off
+ * (admission token, `nextActor`, task status) rather than a hand-made claim.
+ */
+void describe("Move on dispatches Publish Checks through the real resume path (bugs3 Steps 12 and 14)", () => {
+  const SET_STAGE = "vs-code-ai-helper.setTaskStage";
+  const APPLY_STAGE_ACTION = "vs-code-ai-helper.applyCurrentStageAction";
+
+  type CommandsHost = { _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown> };
+  type CheckEvents = { started(d: { command: string }): void; settled(d: { command: string }, r?: { exitCode: number }): void };
+  type RunningRecord = { outcome?: string; runningCommands?: string[] };
+
+  function readProgressFile(taskFolderPath: string): TaskProgress {
+    return JSON.parse(fs.readFileSync(path.join(taskFolderPath, "task-progress.json"), "utf8")) as TaskProgress;
+  }
+
+  async function waitFor(condition: () => boolean, label: string): Promise<void> {
+    for (let attempt = 0; attempt < 150 && !condition(); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(condition(), "timed out waiting for " + label);
+  }
+
+  /** Starts Move on to Publish for a task paused at Low-Level Code Review. */
+  function moveOnToPublish(
+    name: string,
+    hooks: {
+      preflight?: (taskFolderPath: string) => Promise<void>;
+      lint: (taskFolderPath: string, options?: { onCheckEvent?: CheckEvents }) => Promise<unknown>;
+    }
+  ): { taskFolderPath: string; outcome: Promise<void>; surface: RecordingSurface; restore: () => void } {
+    const taskFolderPath = makeTaskFolder(name);
+    const paused = fixtureProgress(taskFolderPath, { currentStage: "impl-low-review", status: "paused" });
+    writeProgress(taskFolderPath, paused);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const ws = installWorkspaceFoldersStub();
+    const rf = installReadFileBridge();
+    const run = stubPublishChecksRun();
+    const originalEnsure = modelSelectionModule.ensureStageModelConfigured;
+    modelSelectionModule.ensureStageModelConfigured = async (): Promise<boolean> => {
+      await hooks.preflight?.(taskFolderPath);
+      return true;
+    };
+    const originalLint = completionLintModule.runCompletionLint;
+    completionLintModule.runCompletionLint = (_uri: unknown, _files: unknown, options?: { onCheckEvent?: CheckEvents }): Promise<unknown> =>
+      hooks.lint(taskFolderPath, options);
+    const values = new Map<string, unknown>();
+    const memento = {
+      get: (key: string): unknown => values.get(key),
+      update: (key: string, value: unknown): Promise<void> => {
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      keys: (): readonly string[] => [...values.keys()],
+    } as unknown as vscode.Memento;
+    const inventory = makeInventory(taskFolderPath, paused);
+    const commandsObj = vscode.commands as unknown as CommandsHost;
+    const originalCommand = commandsObj._executeCommandOverride;
+    commandsObj._executeCommandOverride = async (id: string, ...args: unknown[]): Promise<unknown> => {
+      const arg = args[0] as { cancelResultOutV1?: { current?: unknown }; admissionHandoffTokenV1?: string } | undefined;
+      if (id === SET_STAGE) {
+        writeProgress(taskFolderPath, { ...readProgressFile(taskFolderPath), currentStage: "publish" });
+        if (arg?.cancelResultOutV1) {
+          arg.cancelResultOutV1.current = { ok: true };
+        }
+        return true;
+      }
+      if (id === APPLY_STAGE_ACTION) {
+        return runPublishChecks(
+          inventory,
+          applyCurrentStageActionDispatchArg(taskFolderPath, readProgressFile(taskFolderPath), arg?.admissionHandoffTokenV1)
+        );
+      }
+      return undefined;
+    };
+    const outcome = resumeAndSetTaskStageV1(
+      inventory,
+      new CurrentTaskStore(memento),
+      { taskFolderPath, stage: "publish", expectedSourceStage: "impl-low-review" }
+    );
+    return {
+      taskFolderPath,
+      outcome,
+      surface,
+      restore: (): void => {
+        commandsObj._executeCommandOverride = originalCommand;
+        completionLintModule.runCompletionLint = originalLint;
+        modelSelectionModule.ensureStageModelConfigured = originalEnsure;
+        run.restore();
+        rf.restore();
+        ws.restore();
+        deactivateNotificationRouter();
+      },
+    };
+  }
+
+  void it("holds the task as running through the delayed preflight and the command, then records the passed result", async () => {
+    const seen: {
+      preflight?: { outcome?: string; status?: string; held: boolean };
+      command?: { outcome?: string; running?: string[]; status?: string };
+    } = {};
+    let releasePreflight: () => void = () => undefined;
+    const preflightGate = new Promise<void>((resolve) => {
+      releasePreflight = resolve;
+    });
+    const move = moveOnToPublish("move-on-pass", {
+      preflight: async (folder) => {
+        await waitFor(() => readPublishChecksOutcomeV1(folder)?.outcome === "running", "the durable running record");
+        seen.preflight = {
+          outcome: readPublishChecksOutcomeV1(folder)?.outcome,
+          status: readProgressFile(folder).status,
+          held: hasLiveWorkAdmissionBestEffortV1(folder),
+        };
+        await preflightGate;
+      },
+      lint: async (folder, options) => {
+        options?.onCheckEvent?.started({ command: "npm run test" });
+        await waitFor(
+          () => (readPublishChecksOutcomeV1(folder) as RunningRecord | undefined)?.runningCommands?.[0] === "npm run test",
+          "the running command in the durable record"
+        );
+        const record = readPublishChecksOutcomeV1(folder) as RunningRecord | undefined;
+        seen.command = { outcome: record?.outcome, running: record?.runningCommands, status: readProgressFile(folder).status };
+        options?.onCheckEvent?.settled({ command: "npm run test" }, { exitCode: 0 });
+        return { passed: true, summary: "all passed", commandsRun: ["npm run test"] };
+      },
+    });
+    try {
+      await waitFor(() => seen.preflight !== undefined, "the preflight observation");
+      releasePreflight();
+      await move.outcome;
+      assert.equal(seen.preflight?.outcome, "running", "the durable record exists before the preflight finishes");
+      assert.equal(seen.preflight?.status, "active", "the task is not shown as paused while the dispatched action holds it");
+      assert.equal(seen.preflight?.held, true, "the dispatched action's admission is held through the preflight");
+      assert.equal(seen.command?.outcome, "running");
+      assert.deepEqual(seen.command?.running, ["npm run test"]);
+      assert.equal(seen.command?.status, "active");
+      assert.equal(readPublishChecksOutcomeV1(move.taskFolderPath)?.outcome, "passed");
+      assert.equal(hasLiveWorkAdmissionBestEffortV1(move.taskFolderPath), false, "the hold is released once the result is recorded");
+    } finally {
+      releasePreflight();
+      move.restore();
+    }
+  });
+
+  void it("records a mid-command cancellation as cancelled, never passed", async () => {
+    const move = moveOnToPublish("move-on-cancelled", {
+      lint: (_folder, options) => {
+        options?.onCheckEvent?.started({ command: "npm run test" });
+        return Promise.reject(new PublishChecksCancelledError());
+      },
+    });
+    try {
+      await move.outcome;
+      assert.equal(readPublishChecksOutcomeV1(move.taskFolderPath)?.outcome, "cancelled");
+      assert.doesNotMatch(move.surface.entries.map((entry) => entry.message).join("\n"), /Publish checks passed/);
+      assert.equal(hasLiveWorkAdmissionBestEffortV1(move.taskFolderPath), false);
+    } finally {
+      move.restore();
+    }
+  });
+
+  void it("a preflight that throws settles the record as failed and releases the hold, instead of leaving it running", async () => {
+    const move = moveOnToPublish("move-on-preflight-throws", {
+      preflight: () => Promise.reject(new Error("model settings could not be read")),
+      lint: () => Promise.resolve({ passed: true, summary: "unreachable", commandsRun: [] }),
+    });
+    try {
+      await assert.rejects(move.outcome, /model settings could not be read/);
+      const outcome = readPublishChecksOutcomeV1(move.taskFolderPath);
+      assert.equal(outcome?.outcome, "failed");
+      assert.match(outcome?.outcome === "failed" ? (outcome.reason ?? "") : "", /model settings could not be read/);
+      assert.equal(hasLiveWorkAdmissionBestEffortV1(move.taskFolderPath), false);
+    } finally {
+      move.restore();
+    }
   });
 });

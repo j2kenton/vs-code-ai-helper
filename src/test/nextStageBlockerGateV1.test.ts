@@ -30,6 +30,9 @@ import { safeRemoveDir } from "./testFsUtils";
 /* eslint-disable @typescript-eslint/no-var-requires */
 const taskOperationsModule = require("../utils/taskOperations") as Record<string, unknown>;
 const settingsModule = require("../config/settings") as Record<string, unknown>;
+const chatChoiceModule = require("../utils/chatChoiceV1") as {
+  askChatChoiceV1: (req: AskedChoice) => Promise<string | undefined>;
+};
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 interface RecordedEntry {
@@ -141,6 +144,13 @@ function makeNode(folder: string): { task: IncompleteTask } {
   };
 }
 
+interface AskedChoice {
+  decisionKey: string;
+  whatHappened: string;
+  holdsProgress?: boolean;
+  options: ReadonlyArray<{ optionId: string; label: string }>;
+}
+
 const REVIEW_WITH_BLOCKER =
   "Readiness: 6/10\n\n" +
   "<!-- blockers:start -->\n" +
@@ -167,49 +177,152 @@ void describe("nextStage — blocker-gate warning on manual advance (wf10 item 1
 
     const context = makeContext();
     __extensionContextV1TestOnly.set(context);
+    const chatChoiceMod = chatChoiceModule;
+    const origAsk = chatChoiceMod.askChatChoiceV1;
+    const asked: AskedChoice[] = [];
+    chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+      asked.push(req);
+      return Promise.resolve("notNow");
+    };
 
     try {
       await nextStage(vscode.Uri.file(container), context, makeNode(taskFolder));
 
-      assert.ok(cancelCalled, "the gate check runs after the existing cancel-running-operations step");
-      const gateWarning = surface.entries.find((entry) =>
-        entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision"
-      );
-      assert.ok(gateWarning, "a warning opening the Complete Anyway chat decision must be posted");
-      assert.match(gateWarning.message, /the owner must approve the tie policy/);
-      assert.equal(gateWarning.level, "warning");
-      assert.equal(gateWarning.actionCommand?.title, "Open in Chat");
-
-      const store = new WorkflowDecisionStoreV1(context.workspaceState);
-      const decision = store.listPending().find((d) => d.decisionKey === "chatActionOffer:completeStageAnywayV1");
-      assert.ok(decision, "a workflow decision for Complete Anyway must be posted in chat");
-      const action = decision.options.find((o) => o.optionId === "runAction");
-      assert.equal(action?.label, "Complete Anyway");
-      assert.deepEqual(action?.effect, {
-        kind: "command",
-        command: "vs-code-ai-helper.completeStageAnywayV1",
-        args: [{ taskFolderPath: taskFolder }],
-      });
+      // bugs3 Step 16: ONE confirmation at the click, labelled with what happens, not a second chat card.
+      assert.equal(asked.length, 1);
+      const [question] = asked;
+      assert.equal(question!.decisionKey, "confirmAdvanceOverBlockers");
+      assert.equal(question!.holdsProgress, true, "a card the advance waits on is never labelled Optional");
+      assert.match(question!.options.find((o) => o.optionId === "advanceAnyway")!.label, /^Advance to .+ anyway$/);
+      assert.ok(!question!.options.some((o) => /Complete/.test(o.label)), "no option reads as finishing the task");
+      assert.match(question!.whatHappened, /the owner must approve the tie policy/);
       assert.ok(
-        !surface.entries.some((entry) => /advanced to:/.test(entry.message)),
-        "the stage must NOT have actually advanced — the gate returns before the transition runs"
+        !new WorkflowDecisionStoreV1(context.workspaceState).listPending().some((d) => d.decisionKey === "chatActionOffer:completeStageAnywayV1"),
+        "no second chat card is raised"
       );
-
-      // Verify unavailable-chat behavior: no direct action fallback attached to the toast
+      assert.equal(cancelCalled, false, "Not now leaves the running stage alone");
+      assert.ok(!surface.entries.some((entry) => /advanced to:/.test(entry.message)), "Not now does not advance");
+      assert.ok(!fs.existsSync(path.join(taskFolder, "advance-overrides-v1.jsonl")), "Not now records no override");
+    } finally {
+      chatChoiceMod.askChatChoiceV1 = origAsk;
       __extensionContextV1TestOnly.reset();
-      surface.entries.length = 0;
-      await nextStage(vscode.Uri.file(container), makeContext(), makeNode(taskFolder));
-      const unavailWarning = surface.entries.find((entry) =>
-        entry.level === "warning" && entry.message.includes("the owner must approve the tie policy")
+      taskOperationsModule.cancelRunningOperationsForTask = origCancel;
+      fsBridge.restore();
+      deactivateNotificationRouter();
+      safeRemoveDir(container);
+    }
+  });
+
+  void it("confirming advances once and records the override with the skipped blocker; a repeated click joins the open confirmation", async () => {
+    const container = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-next-stage-advance-anyway-"));
+    const taskFolder = path.join(container, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    writeTaskProgress(taskFolder);
+    fs.writeFileSync(path.join(taskFolder, "plan.md"), "# Plan\n\n- [ ] Do the work\n");
+    fs.writeFileSync(path.join(taskFolder, "plan-high-review.md"), REVIEW_WITH_BLOCKER);
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const fsBridge = installFsBridge();
+    const origCancel = taskOperationsModule.cancelRunningOperationsForTask;
+    taskOperationsModule.cancelRunningOperationsForTask = (): Promise<{ ok: boolean; reason?: string }> =>
+      Promise.resolve({ ok: true });
+    const origTriggers = settingsModule.completeAndMoveOnTriggersAI;
+    settingsModule.completeAndMoveOnTriggersAI = (): boolean => false;
+    const chatChoiceMod = chatChoiceModule;
+    const origAsk = chatChoiceMod.askChatChoiceV1;
+    const asked: AskedChoice[] = [];
+    let answer: (value: string) => void = () => undefined;
+    chatChoiceMod.askChatChoiceV1 = (req): Promise<string | undefined> => {
+      asked.push(req);
+      return new Promise((resolve) => {
+        answer = resolve;
+      });
+    };
+
+    try {
+      const context = makeContext();
+      const first = nextStage(vscode.Uri.file(container), context, makeNode(taskFolder));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const second = nextStage(vscode.Uri.file(container), context, makeNode(taskFolder));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(asked.length, 1, "repeating the click never raises a second card");
+      answer("advanceAnyway");
+      await Promise.all([first, second]);
+
+      const persisted = JSON.parse(fs.readFileSync(path.join(taskFolder, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.notEqual(persisted.currentStage, "plan-high-review", `advanced; notifications: ${JSON.stringify(surface.entries)}`);
+      assert.equal(surface.entries.filter((entry) => /advanced to:/.test(entry.message)).length, 1, "the transition ran exactly once");
+      const lines = fs
+        .readFileSync(path.join(taskFolder, "advance-overrides-v1.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { sourceStage: string; destinationStage: string; actor: string; skippedBlockers: { description: string }[] });
+      assert.equal(lines.length, 1, "one override record");
+      assert.equal(lines[0]!.sourceStage, "plan-high-review");
+      assert.equal(lines[0]!.destinationStage, persisted.currentStage);
+      assert.equal(lines[0]!.actor, "owner");
+      assert.deepEqual(lines[0]!.skippedBlockers.map((b) => b.description), ["the owner must approve the tie policy"]);
+      assert.match(
+        (lines[0]!.skippedBlockers[0] as unknown as { id: string }).id,
+        /^[0-9a-f]{12}$/,
+        "the skipped blocker carries a stable id"
       );
-      assert.ok(unavailWarning, "warning still posted when chat is unavailable");
-      assert.equal(
-        unavailWarning.actionCommand,
-        undefined,
-        "when chat is unavailable, notification carries no direct work-starting button"
+      assert.ok(
+        surface.entries.some((entry) => /already in progress/.test(entry.message)),
+        "the repeated click is told an advance is already under way"
       );
     } finally {
-      __extensionContextV1TestOnly.reset();
+      chatChoiceMod.askChatChoiceV1 = origAsk;
+      settingsModule.completeAndMoveOnTriggersAI = origTriggers;
+      taskOperationsModule.cancelRunningOperationsForTask = origCancel;
+      fsBridge.restore();
+      deactivateNotificationRouter();
+      safeRemoveDir(container);
+    }
+  });
+
+  void it("refuses a confirmation whose blocker set changed while it was open, and records no override", async () => {
+    const container = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-next-stage-advance-changed-"));
+    const taskFolder = path.join(container, "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    writeTaskProgress(taskFolder);
+    fs.writeFileSync(path.join(taskFolder, "plan.md"), "# Plan\n\n- [ ] Do the work\n");
+    fs.writeFileSync(path.join(taskFolder, "plan-high-review.md"), REVIEW_WITH_BLOCKER);
+
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const fsBridge = installFsBridge();
+    const origCancel = taskOperationsModule.cancelRunningOperationsForTask;
+    taskOperationsModule.cancelRunningOperationsForTask = (): Promise<{ ok: boolean; reason?: string }> =>
+      Promise.resolve({ ok: true });
+    const origTriggers = settingsModule.completeAndMoveOnTriggersAI;
+    settingsModule.completeAndMoveOnTriggersAI = (): boolean => false;
+    const origAsk = chatChoiceModule.askChatChoiceV1;
+    let answer: (value: string) => void = () => undefined;
+    chatChoiceModule.askChatChoiceV1 = (): Promise<string | undefined> =>
+      new Promise((resolve) => {
+        answer = resolve;
+      });
+
+    try {
+      const run = nextStage(vscode.Uri.file(container), makeContext(), makeNode(taskFolder));
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // A new review lands while the card is open: different blocker, different set.
+      fs.writeFileSync(
+        path.join(taskFolder, "plan-high-review.md"),
+        REVIEW_WITH_BLOCKER.replace("the owner must approve the tie policy", "a different blocker the owner never saw")
+      );
+      answer("advanceAnyway");
+      await run;
+
+      const persisted = JSON.parse(fs.readFileSync(path.join(taskFolder, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(persisted.currentStage, "plan-high-review", "the stage did not move");
+      assert.ok(!fs.existsSync(path.join(taskFolder, "advance-overrides-v1.jsonl")), "no override was recorded");
+      assert.ok(surface.entries.some((entry) => /changed while the confirmation was open/.test(entry.message)));
+    } finally {
+      chatChoiceModule.askChatChoiceV1 = origAsk;
+      settingsModule.completeAndMoveOnTriggersAI = origTriggers;
       taskOperationsModule.cancelRunningOperationsForTask = origCancel;
       fsBridge.restore();
       deactivateNotificationRouter();

@@ -597,7 +597,7 @@ void describe("parseOpencodeModelsOutput", () => {
     }) as typeof childProcess.spawn;
 
     try {
-      const parsed = await discoverDevpassModelsWithTimeout("devpass", 500);
+      const parsed = await discoverDevpassModelsWithTimeout("devpass", 500, () => Promise.resolve(1));
       assert.deepStrictEqual(observedArgs, ["models", "--verbose"]);
       assert.deepStrictEqual(parsed, [
         { model: "devpass/m1", name: "M1" },

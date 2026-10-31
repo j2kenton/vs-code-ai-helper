@@ -985,11 +985,10 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       const entries = (lastState?.entries as ReadonlyArray<{ role: string; text: string }> | undefined) ?? [];
       const decline = entries.find((e) => e.role === "assistant" && /Could not resume/.test(e.text));
       assert.ok(decline, "expected a declined-in-chat message naming the other owner");
-      assert.match(
-        decline.text,
-        /someOtherConcurrentCommand/,
-        "must name the actual blocking owner, not a generic refusal"
-      );
+      // bugs3 Step 12: plain words (a stage action is in progress, Cancel / Wait); the command id
+      // and pid are logged as details, not shown in the chat.
+      assert.match(decline.text, /already has a stage action in progress/);
+      assert.doesNotMatch(decline.text, /someOtherConcurrentCommand|pid \d+/);
     } finally {
       if (held.outcome === "acquired") {
         await held.handle.release();

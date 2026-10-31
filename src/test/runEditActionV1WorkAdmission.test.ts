@@ -96,10 +96,14 @@ void describe("resumeEditPreflightInteractionV1 work admission (v1 fixes item 1,
 
       assert.equal(result.ok, false);
       if (!result.ok) {
-        assert.match(
+        // bugs3 Step 12: the refusal is in plain words (the action, how long, Cancel / Wait); the
+        // command id and pid are kept out of the message and go to the log's details instead.
+        assert.match(result.reason, /already has a stage action in progress/);
+        assert.match(result.reason, /Cancel:.*Wait:/);
+        assert.doesNotMatch(
           result.reason,
-          /someOtherConcurrentCommand/,
-          "must name the actual blocking owner, not a generic 'task is busy' message"
+          /someOtherConcurrentCommand|pid \d+/,
+          "technical identifiers stay out of the owner-facing message"
         );
       }
       assert.equal(callCount, 1, "must refuse after exactly the one early admission-peek lookup");

@@ -48,6 +48,13 @@ export type WorkflowDecisionOptionEffectV1 =
 export interface WorkflowDecisionCommandResultV1 {
   readonly outcome: "done" | "refused" | "alreadyDone";
   readonly message?: string;
+  /**
+   * bugs3 Step 2: set with `refused` when the command declined because an
+   * operation holds the task. The answer was recorded before the command ran,
+   * so the card is put back to pending and offers the choice again once that
+   * operation ends.
+   */
+  readonly reopenCard?: boolean;
 }
 
 export function isWorkflowDecisionCommandResultV1(value: unknown): value is WorkflowDecisionCommandResultV1 {
@@ -113,6 +120,40 @@ export interface WorkflowDecisionEvidenceItemV1 {
 
 export type WorkflowDecisionStateV1 = "pending" | "resolved" | "dismissed" | "superseded" | "withdrawn";
 
+/**
+ * bugs3 Steps 8 and 13: a decision answered by an in-process continuation
+ * (`awaitWorkflowDecisionAnswerV1`) records which waiter owns it. Absent on
+ * durable command-backed decisions and on records written before this field.
+ */
+export interface WorkflowDecisionAwaitedOriginV1 {
+  /** Unique per in-process await; only a live waiter can act on an answer. */
+  readonly waiterId: string;
+  /** The extension-host activation that owns the waiter. */
+  readonly activationId: string;
+  /** Task folder, so a sweep can say in that task's chat what was dropped. */
+  readonly taskFolderPath: string;
+  /** How to start the interrupted action again ("Publish Checks were interrupted by a reload; run them again."). */
+  readonly restartGuidance: string;
+}
+
+/**
+ * bugs3 Steps 8 and 19: the live operation a running-only card refers to, so
+ * the card can be withdrawn or refused when that exact operation has ended.
+ */
+export interface WorkflowDecisionLiveReferenceV1 {
+  readonly kind: "implementation-operation";
+  readonly operationId?: string;
+  readonly roundId?: string;
+}
+
+/** Why an awaited decision ended, kept distinct so none is reported as the owner cancelling. */
+export type WorkflowDecisionCompletionReasonV1 =
+  | "answered"
+  | "dismissed"
+  | "timedOut"
+  | "cancelled"
+  | "interrupted";
+
 export interface WorkflowDecisionV1 {
   readonly decisionId: string;
   /**
@@ -168,6 +209,19 @@ export interface WorkflowDecisionV1 {
    * from the panel is legible as "no longer applicable", not silence.
    */
   readonly withdrawnReason?: string;
+  /**
+   * Set only when `state === "dismissed"` (bugs3 Step 8): who dismissed the
+   * card and when. Dismissal dispatches nothing and writes nothing to
+   * `task.md`; a later answer is refused with this on record.
+   */
+  readonly dismissedBy?: string;
+  readonly dismissedAt?: string;
+  /** Present only when an in-process waiter owns the answer (see {@link WorkflowDecisionAwaitedOriginV1}). */
+  readonly awaited?: WorkflowDecisionAwaitedOriginV1;
+  /** Present only on a card whose options refer to one live operation. */
+  readonly liveReference?: WorkflowDecisionLiveReferenceV1;
+  /** How an awaited decision ended, when it did not end by being answered in the chat. */
+  readonly completionReason?: WorkflowDecisionCompletionReasonV1;
 }
 
 export type CreateWorkflowDecisionResultV1 =
@@ -216,6 +270,10 @@ export interface CreateWorkflowDecisionInputV1 {
     readonly conditionFingerprint: string;
     readonly answeredOptionIds: readonly string[];
   };
+  /** In-process waiter ownership (bugs3 Step 13); set by `awaitWorkflowDecisionAnswerV1` only. */
+  readonly awaited?: WorkflowDecisionAwaitedOriginV1;
+  /** The live operation a running-only card refers to (bugs3 Step 19). */
+  readonly liveReference?: WorkflowDecisionLiveReferenceV1;
   readonly createdAt: string;
 }
 
@@ -397,6 +455,27 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
     }
   }
 
+  if (input.awaited !== undefined) {
+    const { waiterId, activationId, taskFolderPath, restartGuidance } = input.awaited;
+    if (
+      !isNonEmptyString(waiterId) ||
+      !isNonEmptyString(activationId) ||
+      !isNonEmptyString(taskFolderPath) ||
+      !isNonEmptyString(restartGuidance)
+    ) {
+      return {
+        ok: false,
+        reason: 'a supplied "awaited" origin requires a waiter id, activation id, task folder and restart guidance',
+      };
+    }
+  }
+  if (input.liveReference !== undefined) {
+    const { operationId, roundId } = input.liveReference;
+    if (!isNonEmptyString(operationId) && !isNonEmptyString(roundId)) {
+      return { ok: false, reason: 'a supplied "liveReference" requires an operation id or a round id' };
+    }
+  }
+
   return {
     ok: true,
     decision: {
@@ -410,6 +489,8 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
       recommendation,
       ...(input.evidence !== undefined ? { evidence: input.evidence } : {}),
       ...(input.gating !== undefined ? { gating: input.gating } : {}),
+      ...(input.awaited !== undefined ? { awaited: input.awaited } : {}),
+      ...(input.liveReference !== undefined ? { liveReference: input.liveReference } : {}),
       ...(input.suppressWhileAnswered !== undefined
         ? {
             identity: workflowDecisionIdentityV1(

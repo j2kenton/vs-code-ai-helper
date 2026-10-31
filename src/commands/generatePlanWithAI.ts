@@ -15,9 +15,12 @@ import { renderPromptTemplate } from "../utils/promptTemplates";
 import { isExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import { writeRunLog } from "../utils/runLog";
 import {
+  collectAttemptIdsFromOutcomeV1,
   describeTaskActionFailureV1,
   describeTaskActionOutcomeForLogV1,
 } from "../utils/taskActionOutcomeTextV1";
+import { reportAutomationCommandOutcomeV1 } from "../utils/automationCommandOutcomeV1";
+import { recordOperationTerminalOutcomeV1 } from "../utils/operationEndedLineV1";
 import { pickTaskFolder } from "../utils/pickTaskFolder";
 import { checkRunnerAvailabilityForModel } from "../runners/runnerRegistry";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
@@ -26,6 +29,7 @@ import { ensureAiConsent } from "../utils/aiConsent";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { TaskInventory } from "../state/taskInventory";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { attributionHeader, safeOpenTextDocument } from "../utils/fileUtils";
@@ -34,7 +38,6 @@ import {
   acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   createSafeAdmissionReleaseStateV1,
-  describeWorkAdmissionRefusalV1,
   recordAdmissionReleaseTriggerV1,
   requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
@@ -42,6 +45,7 @@ import {
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import {
   recordStageActionRefusalReasonV1,
@@ -296,7 +300,8 @@ export async function generatePlanWithAI(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    offerBusyRefusalChoicesOnceV1(early);
     return;
   }
 
@@ -397,8 +402,9 @@ export async function generatePlanWithAI(
       });
       if (late.outcome !== "acquired") {
         NotificationRouter.showWarning(
-          describeWorkAdmissionRefusalV1(late, notificationTaskDisplayNameV1(undefined, taskFolderUri.fsPath))
+          describeWorkAdmissionRefusalForUserV1(late, notificationTaskDisplayNameV1(undefined, taskFolderUri.fsPath))
         );
+        offerBusyRefusalChoicesOnceV1(late, notificationTaskDisplayNameV1(undefined, taskFolderUri.fsPath));
         return;
       }
       handle = late.handle;
@@ -633,6 +639,12 @@ export interface GeneratePlanOutcomeContextV1 {
   readonly modelLabel: string | undefined;
   readonly effectiveReviewMode: AutoTriggerMode;
   readonly operation?: TaskOperationHandle;
+  /**
+   * bugs3 Step 3: every attempt id the coordinator allocated for this run,
+   * captured as each was allocated, so a cancelled run or an unreserved
+   * allocation still reaches the round ledger.
+   */
+  readonly allocatedAttemptIds?: readonly string[];
 }
 
 export interface GeneratePlanOutcomeResultV1 {
@@ -651,6 +663,10 @@ export interface GeneratePlanOutcomeResultV1 {
  * command invocation and by an explicit Chat Resume, so both paths behave
  * identically once the coordinator has produced an outcome.
  */
+function mergeAttemptIdsV1(first: readonly string[] | undefined, second: readonly string[]): string[] {
+  return [...new Set([...(first ?? []), ...second])];
+}
+
 export async function handleGeneratePlanOutcomeV1(
   outcome: TaskActionOutcomeV1,
   ctx: GeneratePlanOutcomeContextV1
@@ -790,6 +806,18 @@ export async function handleGeneratePlanOutcomeV1(
       source: ctx.operation?.cancelSource?.(),
       operationId: ("correlation" in outcome ? outcome.correlation?.operationId : undefined) ?? ctx.operation?.id,
     });
+    const ledgerSpeaksForCancelled = reportAutomationCommandOutcomeV1(ctx.taskRef.taskFolderPath, {
+      state: "cancelled",
+      reason: "Plan generation cancelled.",
+      attemptIds: mergeAttemptIdsV1(ctx.allocatedAttemptIds, collectAttemptIdsFromOutcomeV1(outcome)),
+    });
+    if (ctx.operation) {
+      recordOperationTerminalOutcomeV1(ctx.operation.id, {
+        state: "cancelled",
+        reason: "Plan generation cancelled.",
+        ledgerSpeaks: ledgerSpeaksForCancelled,
+      });
+    }
     ctx.operation?.settleAs("cancelled", "Plan generation cancelled.");
     NotificationRouter.showInformation("Plan generation cancelled.");
   } else if (
@@ -808,6 +836,22 @@ export async function handleGeneratePlanOutcomeV1(
       reason: failureReason,
       operationId: ("correlation" in outcome ? outcome.correlation?.operationId : undefined) ?? ctx.operation?.id,
     });
+    // The round ledger row an automation dispatch opened for this command must
+    // end `failed` with every attempt made, not `completed` with none. That
+    // row posts the round's one "Ended" line, so the operation observer stays
+    // silent for this operation when a dispatch is waiting on the report.
+    const ledgerSpeaksForFailed = reportAutomationCommandOutcomeV1(ctx.taskRef.taskFolderPath, {
+      state: "failed",
+      reason: failureReason,
+      attemptIds: mergeAttemptIdsV1(ctx.allocatedAttemptIds, collectAttemptIdsFromOutcomeV1(outcome)),
+    });
+    if (ctx.operation) {
+      recordOperationTerminalOutcomeV1(ctx.operation.id, {
+        state: "failed",
+        reason: failureReason,
+        ledgerSpeaks: ledgerSpeaksForFailed,
+      });
+    }
     ctx.operation?.settleAs("failed", failureReason);
     NotificationRouter.showError(
       `Plan generation failed: ${failureReason}. ` +
@@ -1070,6 +1114,7 @@ async function generatePlanWithAIForResolvedTask(
         // Notifications-row cancel button both abort the same provider run.
         const linked = linkCancellationTokens(token, op.token);
         let outcome: TaskActionOutcomeV1;
+        const allocatedAttemptIds: string[] = [];
         try {
           const dispatchStage = await readCurrentStageForDispatchV1(taskFolderUri, ownedTask.progress.currentStage);
           outcome = await coordinator.executeAction({
@@ -1079,6 +1124,9 @@ async function generatePlanWithAIForResolvedTask(
             taskStage: dispatchStage,
             rawInput: validatedInput,
             cancellationToken: linked.token,
+            onAttemptAllocated: ({ attemptId }) => {
+              allocatedAttemptIds.push(attemptId);
+            },
           });
         } finally {
           linked.dispose();
@@ -1098,6 +1146,7 @@ async function generatePlanWithAIForResolvedTask(
           modelLabel,
           effectiveReviewMode,
           operation: op,
+          allocatedAttemptIds,
         });
         succeeded = handled.succeeded;
         triggerAutoReview = handled.triggerAutoReview;
@@ -1176,6 +1225,7 @@ export async function resumeGeneratePlanInteractionV1(
 
   // RC10 item 1: the provider round is a tracked operation (same label, stage
   // and kind as the fresh path); the outcome handling below runs outside it.
+  const resumedAllocatedAttemptIds: string[] = [];
   const outcome = await runResumedRoundOperationV1(
     ownedTask.taskFolderPath,
     { label: "Generate Plan", stage: "plan", kind: "generate-plan", displayName: ownedTask.progress.displayName },
@@ -1191,6 +1241,9 @@ export async function resumeGeneratePlanInteractionV1(
           resumeIdempotencyId,
           cancellationToken: linked.token,
           onCandidateInvokedV1: (info) => op.setModel?.(info.storedModelId),
+          onAttemptAllocated: ({ attemptId }) => {
+            resumedAllocatedAttemptIds.push(attemptId);
+          },
         });
       } finally {
         linked.dispose();
@@ -1204,6 +1257,7 @@ export async function resumeGeneratePlanInteractionV1(
       canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
       taskName: ownedTask.progress.displayName,
     },
+    allocatedAttemptIds: resumedAllocatedAttemptIds,
     chatViewProvider,
     orchestrator,
     prompt,

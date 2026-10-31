@@ -51,6 +51,11 @@ import {
   KIMI_REASONING_EFFORTS_V1,
   type DiscoveredCliModel,
 } from "../utils/cliModelDiscovery";
+import {
+  DEVPASS_DEFAULT_MAJOR_V1,
+  DEVPASS_SUPPORTED_MAJORS_V1,
+  devpassUnsupportedMajorMessageV1,
+} from "../utils/cliMajorVersionV1";
 import { FRAME_END_V1, FRAME_START_V1 } from "../types/aiResultEnvelope";
 import { AI_RESULT_CONTRACT_END_MARKER_V1 } from "../prompts/aiResultContractV1";
 
@@ -129,6 +134,17 @@ export interface CliBuildArgsContext {
    * reading a file — keeps it adjacent to the instruction it must obey last.
    */
   requiresFramedResult?: boolean;
+  /**
+   * The prompt's size in characters, set for `promptTransport: "file"` runs so
+   * a provider can ask its file-reading tool for the whole file in one read
+   * (Kimi's Read `max_chars`). Absent when the size is unknown.
+   */
+  promptChars?: number;
+  /**
+   * The installed CLI's major version, set by the runner only for providers
+   * that declare `versionedContract`.
+   */
+  cliMajorVersion?: number;
 }
 
 export interface CliConversationResumeDefinition {
@@ -304,6 +320,24 @@ export interface CliProviderDefinition {
    * `marker`, `message` replaces the raw output as the reason shown.
    */
   unsupportedVersionSignature?: { readonly marker: string; readonly message: string };
+  /**
+   * bugs3 Step 14: a provider whose argument and discovery contract differs
+   * between CLI majors. The runner probes `<command> --version` before
+   * building argv and passes the major as `context.cliMajorVersion`; a major
+   * outside `supportedMajors` fails the round before launch with
+   * `unsupportedMessage`. An unreadable version falls back to `defaultMajor`.
+   */
+  versionedContract?: {
+    readonly supportedMajors: readonly number[];
+    readonly defaultMajor: number;
+    readonly unsupportedMessage: (detectedMajor: number) => string;
+  };
+  /**
+   * Provider failure texts that have a known, actionable cause. When a failed
+   * run's stderr or error text matches `pattern`, `message` replaces the raw
+   * output (and any stack) as the reason shown.
+   */
+  knownFailureSignatures?: ReadonlyArray<{ readonly pattern: RegExp; readonly message: string }>;
   /**
    * Optional same-conversation recovery for a provider whose headless CLI
    * persists a failed turn and exposes a continuation flag. Unlike replaying
@@ -999,11 +1033,25 @@ export const CLINE_CLI_ARGV_PROMPT_PLACEHOLDER =
  */
 export function buildKimiCliPromptFileInstruction(
   promptFile: string,
-  requiresFramedResult = false
+  requiresFramedResult = false,
+  promptChars?: number
 ): string {
+  // bugs3 Step 5: kimi-code 2.x's Read tool takes a per-call `max_chars`
+  // (default 100,000, up to 500,000). Asking for the prompt's own size in one
+  // read helps when the user's config leaves the default; it is a harmless
+  // extra when the config already allows more, and Kimi may ignore it.
+  const singleRead =
+    promptChars !== undefined && Number.isFinite(promptChars) && promptChars > 0
+      ? `Make that read once, with the Read tool's max_chars argument set to ${Math.min(
+          Math.ceil(promptChars),
+          KIMI_READ_MAX_CHARS_CAP_V1
+        )}, so the whole file comes back in a single read. `
+      : "";
   return (
     `Your complete instructions and context for this run are in the file at ${promptFile}. ` +
-    "Read that entire file before doing anything else. One read usually returns all of it — do not " +
+    "Read that entire file before doing anything else. " +
+    singleRead +
+    "One read usually returns all of it — do not " +
     "assume it was cut short. Only if a read stops before the end of the file was it truncated; in that " +
     "case continue with further reads using an explicit line range, each starting where the previous one " +
     "stopped, since repeating an identical read returns the same bytes and can never advance you. Once " +
@@ -1015,6 +1063,9 @@ export function buildKimiCliPromptFileInstruction(
       : "")
   );
 }
+
+/** The largest `max_chars` kimi-code 2.x's Read tool accepts (its configurable `maxChars`). */
+export const KIMI_READ_MAX_CHARS_CAP_V1 = 500_000;
 
 /**
  * Restates the V1 output-format contract in argv for `promptTransport:
@@ -1847,9 +1898,11 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // failure would disrupt the user's real credentials (same caution as
     // cline-cli above). Matches the union of markers used by the other
     // multi-model CLI providers here rather than a narrower guess.
+    // bugs3 Step 11: the bare word "login" is gone — it matched the CLI's own
+    // hints and any scanned text that merely mentioned signing in. "not logged
+    // in" and the credential words still catch a genuine sign-in failure.
     authErrorMarkers: [
       "not logged in",
-      "login",
       "authenticate",
       "api key",
       "unauthorized",
@@ -2059,7 +2112,11 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // size. It must directly follow "-p" to be read as that flag's value.
       args.push(
         "-p",
-        buildKimiCliPromptFileInstruction(context.promptFile, context.requiresFramedResult === true)
+        buildKimiCliPromptFileInstruction(
+          context.promptFile,
+          context.requiresFramedResult === true,
+          context.promptChars
+        )
       );
       return args;
     },
@@ -2178,8 +2235,34 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         "finish the remaining requested work without restarting or reverting completed work. " +
         "Emit the required final result frame exactly as originally instructed.",
     },
+    // devpass-code 1.x and 2.x speak different CLIs (npm now installs 2.x, a
+    // fork of OpenCode 2). Both are supported; any other major is refused
+    // before launch rather than failing on its usage text.
+    versionedContract: {
+      supportedMajors: DEVPASS_SUPPORTED_MAJORS_V1,
+      defaultMajor: DEVPASS_DEFAULT_MAJOR_V1,
+      unsupportedMessage: devpassUnsupportedMajorMessageV1,
+    },
+    // devpass-code 2.x runs on a managed background service that defaults to
+    // 127.0.0.1:49374 — the same port as OpenCode 2's. Observed text: "Managed
+    // service port 49374 … is already in use".
+    knownFailureSignatures: [
+      {
+        pattern: /managed service port\s+\d+[^\n]*already in use/i,
+        message:
+          "devpass-code's background service could not start because its port is already in use " +
+          "(OpenCode 2's service uses the same default port). Move devpass-code's service to a free port with " +
+          "`devpass-code service set port <n>` (for example 49375), then try again.",
+      },
+    ],
     buildArgs(mode, model, context): string[] {
-      const args = ["run", "--format", "json"];
+      // The runner always supplies the probed major (falling back to
+      // `versionedContract.defaultMajor`); a caller that gives none gets the
+      // original 1.x argument shape.
+      const isV2 = context?.cliMajorVersion !== undefined && context.cliMajorVersion >= 2;
+      // 2.x sends `run` to a shared background service unless told otherwise;
+      // `--standalone` gives each run a private server (as for OpenCode 2).
+      const args = isV2 ? ["run", "--standalone", "--format", "json"] : ["run", "--format", "json"];
       if (context?.resumePreviousConversation) {
         // Prefer the EXACT session over "the last one in this directory".
         // `--continue` is cwd-scoped (verified live 2026-08-18), and every
@@ -2215,9 +2298,14 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       args.push("--agent", mode === "edit" ? "build" : "plan");
       const parsedModel = parseOpencodeModelSelection(model);
       if (parsedModel.model) {
-        args.push("--model", parsedModel.model);
+        // 2.x dropped `--variant`: the level rides on the model as
+        // `provider/model#variant` (verified against 2.0.29's `run --help`).
+        args.push(
+          "--model",
+          isV2 && parsedModel.variant ? `${parsedModel.model}#${parsedModel.variant}` : parsedModel.model
+        );
       }
-      if (parsedModel.variant) {
+      if (parsedModel.variant && !isV2) {
         args.push("--variant", parsedModel.variant);
       }
       return args;

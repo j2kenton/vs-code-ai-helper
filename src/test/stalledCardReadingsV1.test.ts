@@ -65,7 +65,7 @@ void describe("stalled card readings (RC1 item 9)", () => {
       blockers: 3,
     });
     const text = describeStalledActiveTaskEscalationV1("Task A", reading);
-    assert.match(text, /last round \(review at impl-high-review\) finished \(score 8\/10, 3 blockers\)/);
+    assert.match(text, /last round \(a round that reads the work and records findings; it does not edit anything at High-Level Code Review\) finished \(score 8\/10, 3 blockers\)/);
     assert.match(text, /Nothing broke/);
     assert.doesNotMatch(text, /consecutive rounds/);
   });

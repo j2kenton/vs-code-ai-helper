@@ -1250,6 +1250,34 @@ export function isReviewDispatchAgainstUnchangedTreeV1(
 }
 
 /**
+ * The converse of {@link isReviewDispatchAgainstUnchangedTreeV1}: true only when
+ * the review's own stamps PROVE the workspace moved since it was dispatched, i.e.
+ * a recorded commit that is no longer HEAD, or a recorded working-tree
+ * fingerprint that differs from the live one. Unknown signals (no stamp, git
+ * unavailable) are "cannot tell" and read false here, so this only ever adds
+ * certainty to a stale verdict and never invents one. A resumed run uses it to
+ * discard a review of a tree an external edit has changed, even when no
+ * implementation round ran after that review.
+ */
+export function isReviewedTreeProvablyChangedV1(
+  existingReviewContent: string | undefined,
+  headSha: string | undefined,
+  currentTreeFingerprint: string | undefined
+): boolean {
+  if (!existingReviewContent) {
+    return false;
+  }
+  if (headSha !== undefined) {
+    const freshness = computeReviewFreshness(existingReviewContent, headSha);
+    if (freshness.reviewedSha !== undefined && freshness.behindHead) {
+      return true;
+    }
+  }
+  const recordedFingerprint = parseReviewedTreeFingerprintV1(existingReviewContent);
+  return recordedFingerprint !== undefined && currentTreeFingerprint !== undefined && recordedFingerprint !== currentTreeFingerprint;
+}
+
+/**
  * Insert, refresh, or remove the single stale banner line that marks a review
  * whose recorded commit is no longer HEAD:
  *

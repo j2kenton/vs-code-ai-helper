@@ -77,6 +77,12 @@ import { recordStageActionTerminalOutcomeV1 } from "./stageActionRefusalV1";
 import { RoundLedgerEntryV1, RoundLedgerModeV1, STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { formatTimeHHmm } from "./timeFormat";
 import { STALE_DISPATCH_GRACE_MS } from "./taskWatchdogV1";
+import {
+  claimTerminalLineV1,
+  operationSpokeTerminalLineV1,
+  releaseLedgerTerminalLineV1,
+  terminalLineKeyForRoundV1,
+} from "./terminalLineEmitterV1";
 import { getChatInteractionTransactionStoreV1 } from "../services/workflowRuntimeServicesV1";
 import { ChatTransactionStoreResultV1 } from "../services/chatInteractionTransactionStoreV1";
 
@@ -413,9 +419,30 @@ export async function repairMissingRoundOutcomeMessagesV1(
       .filter((m) => m.kind === "outcome" && m.roundId !== undefined)
       .map((m) => m.roundId as string)
   );
+  // Operations whose terminal line is already persisted — by the observer or
+  // the ledger — recognised from the transcript itself, so this holds after a
+  // window reload when the in-process registry is empty.
+  const hasEndedOperationLine = new Set(
+    messages.filter((m) => m.endedOperationId !== undefined).map((m) => m.endedOperationId as string)
+  );
   const repaired: string[] = [];
   for (const row of terminalRows) {
     if (hasOutcomeMessage.has(row.roundId)) {
+      continue;
+    }
+    if (row.operationId !== undefined && hasEndedOperationLine.has(row.operationId)) {
+      continue;
+    }
+    // The operation observer already posted this round's "Ended" line in this
+    // session; the shared registry says a second line would be a duplicate.
+    if (row.operationId !== undefined && operationSpokeTerminalLineV1(row.operationId)) {
+      continue;
+    }
+    // Claim the row's terminal line like any other ledger writer, so a
+    // terminalization that persisted the row but has not appended its message
+    // yet (or a concurrent sweep) cannot add a second one.
+    const terminalLineKey = terminalLineKeyForRoundV1(row, taskFolderPath);
+    if (!claimTerminalLineV1(terminalLineKey, "ledger")) {
       continue;
     }
     try {
@@ -429,13 +456,15 @@ export async function repairMissingRoundOutcomeMessagesV1(
           kind: "outcome",
           roundId: row.roundId,
           ...(row.intentId !== undefined ? { intentId: row.intentId } : {}),
+          ...(row.operationId !== undefined ? { endedOperationId: row.operationId } : {}),
         },
         canonicalId
       );
       repaired.push(row.roundId);
     } catch {
       // Best-effort — a later sweep retries; never blocks reconciliation of
-      // other rows for this task.
+      // other rows for this task. Give the claim back so that retry can post.
+      releaseLedgerTerminalLineV1(terminalLineKey);
     }
   }
   return { repaired };

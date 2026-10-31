@@ -18,6 +18,7 @@ import {
   computePublishScopeId,
   readPublishChecksFile,
   PublishChecksFreshnessStampV1,
+  withCommandIdentityV1,
 } from "../utils/publishChecksFreshness";
 import { checkAndReviewPublishV1 } from "../commands/checkAndReviewPublish";
 import { createPublishFixReleaseCoordinatorV1 } from "../commands/runLintingFixes";
@@ -333,7 +334,11 @@ void describe("Publish Check Fingerprinting & Reuse (Steps 29-31 / Part 5)", () 
       childProcess.execSync("git config user.name 'Test User'", { cwd: tmpDir, stdio: "ignore" });
       childProcess.execSync("git config user.email 'test@example.com'", { cwd: tmpDir, stdio: "ignore" });
       fs.writeFileSync(path.join(tmpDir, "file.ts"), "export const a = 1;\n", "utf8");
-      childProcess.execSync("git add file.ts && git commit -m 'init'", { cwd: tmpDir, stdio: "ignore" });
+      // The review reuses a recorded pass only for the commands that would run now
+      // (bugs3 Step 17): a pnpm project whose `verify` script is the Publish command.
+      fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify({ scripts: { verify: "echo ok" } }), "utf8");
+      fs.writeFileSync(path.join(tmpDir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+      childProcess.execSync("git add file.ts package.json pnpm-lock.yaml && git commit -m 'init'", { cwd: tmpDir, stdio: "ignore" });
       const headSha = childProcess.execSync("git rev-parse HEAD", { cwd: tmpDir, encoding: "utf8" }).trim();
 
       const taskFolder = path.join(tmpDir, ".ensemble", "2026-10-24_task_1");
@@ -388,6 +393,7 @@ void describe("Publish Check Fingerprinting & Reuse (Steps 29-31 / Part 5)", () 
         completedAt: new Date().toISOString(),
         scopeId: computePublishScopeId(tmpDir),
         treeFingerprint: fp,
+        ...withCommandIdentityV1(["pnpm run verify"]),
       });
 
       // 1. Entry gate checkPublishChecksFreshnessV1 is valid
@@ -568,7 +574,9 @@ void describe("Publish Check Fingerprinting & Reuse (Steps 29-31 / Part 5)", () 
       childProcess.execSync("git config user.name 'Test User'", { cwd: tmpDir, stdio: "ignore" });
       childProcess.execSync("git config user.email 'test@example.com'", { cwd: tmpDir, stdio: "ignore" });
       fs.writeFileSync(path.join(tmpDir, "file.ts"), "export const a = 1;\n", "utf8");
-      childProcess.execSync("git add file.ts && git commit -m 'init'", { cwd: tmpDir, stdio: "ignore" });
+      fs.writeFileSync(path.join(tmpDir, "package.json"), JSON.stringify({ scripts: { verify: "echo ok" } }), "utf8");
+      fs.writeFileSync(path.join(tmpDir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+      childProcess.execSync("git add file.ts package.json pnpm-lock.yaml && git commit -m 'init'", { cwd: tmpDir, stdio: "ignore" });
       const headSha = childProcess.execSync("git rev-parse HEAD", { cwd: tmpDir, encoding: "utf8" }).trim();
 
       const taskFolder = path.join(tmpDir, ".ensemble", "2026-10-24_task_1");
@@ -646,6 +654,7 @@ void describe("Publish Check Fingerprinting & Reuse (Steps 29-31 / Part 5)", () 
         completedAt: new Date().toISOString(),
         scopeId: computePublishScopeId(tmpDir),
         treeFingerprint: fp,
+        ...withCommandIdentityV1(["pnpm run verify"]),
       });
 
       // 2. checkAndReviewPublish skips Publish Checks when fresh and goes straight to review

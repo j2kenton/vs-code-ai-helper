@@ -50,13 +50,14 @@ import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
   createSafeAdmissionReleaseStateV1,
-  describeWorkAdmissionRefusalV1,
   requestSafeAdmissionReleaseV1,
   revokeWorkAdmissionHandoffV1,
   trySafeAdmissionReleaseV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
   recordAdmissionReleaseTriggerV1,
+  currentAdmissionClaimIdForTaskV1,
 } from "./state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "./utils/busyAdmissionTextV1";
 import { CHAT_HISTORY_FILENAME } from "./utils/chatHistoryConstants";
 import {
   notificationTaskDisplayNameV1,
@@ -120,6 +121,8 @@ import { registerPauseTaskCommand } from "./commands/pauseTask";
 import { registerArchiveTaskCommands } from "./commands/archiveTask";
 import { registerPinTaskCommands } from "./commands/pinTask";
 import { registerReconcilePlanChecklistCommands } from "./commands/reconcilePlanChecklist";
+import { registerKimiReadConfigCommands } from "./commands/kimiReadConfigOfferV1";
+import { registerUndeliveredPromptEditsCommands } from "./commands/undeliveredPromptEditsOfferV1";
 import { registerHandoffChecksCommandsV1 } from "./commands/handoffChecksV1";
 import { registerSettleChecklistItemCommandV1 } from "./commands/settleChecklistItem";
 import { registerApplyReviewerVerifiedTicksCommands } from "./commands/applyReviewerVerifiedTicks";
@@ -180,13 +183,19 @@ import { CurrentTaskStore } from "./utils/currentTaskStore";
 import { IMPLEMENTATION_FILENAME, TASK_PROGRESS_FILENAME, TaskStatus } from "./types/taskProgress";
 import { handleImplementationChecklistChangeV1 } from "./views/implementationChecklistRefreshV1";
 import { warmCliModelCache } from "./utils/modelSelection";
+import { setCliMajorPersistenceV1 } from "./utils/cliMajorVersionV1";
+import { formatCliDiscoveryFailureV1, setCliDiscoveryFailureSinkV1 } from "./utils/cliModelDiscovery";
 import { StatusTreeProvider, STATUS_VIEW_ID } from "./views/statusView";
 import { initNotificationRouter, deactivateNotificationRouter, NotificationRouter } from "./utils/notificationRouter";
+import { getLiveTaskOperationV1 } from "./utils/liveTaskOperationLookupV1";
+import { resolveClaimCancelTargetV1 } from "./utils/busyRefusalChoicesV1";
 import { initReviewEscalationChat } from "./utils/reviewEscalation";
 import { installOperationNotificationBridge } from "./utils/operationNotificationBridge";
 import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
+import { recoverAbandonedPublishChecksRunV1 } from "./utils/publishChecksOutcomeV1";
+import { retireFreeTextQuestionsFromEarlierActivationV1 } from "./utils/cardLifecycleV1";
 import { runWithRoundProcessTaskFolderV1 } from "./state/roundProcessContextV1";
 import type { OperationKind } from "./utils/operationTaxonomy";
 import { STAGE_DISPLAY_NAMES, type TaskStage } from "./types/taskProgress";
@@ -267,6 +276,14 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log("Ensemble is now active!");
   setExtensionContextV1(context);
+  // The last readable major of each CLI (devpass-code 1.x vs 2.x) survives a
+  // window reload, so a failed `--version` probe keeps the contract in use.
+  setCliMajorPersistenceV1({
+    load: (command) => context.globalState.get<number>(`ensemble.cliMajor.${command}`),
+    save: (command, major) => {
+      void context.globalState.update(`ensemble.cliMajor.${command}`, major);
+    },
+  });
   // Cloud runner/viewer split (hostRoleV1.ts): resolved once, here, and
   // fixed for this host's lifetime. A VIEWER activates every view and
   // command but runs no AI and no automation: the sections below that
@@ -311,6 +328,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // record of what it read survived the session.
   const toolSessionLog = vscode.window.createOutputChannel("Ensemble: Tool Sessions", { log: true });
   context.subscriptions.push(toolSessionLog);
+  // bugs3 Step 10: a model-discovery failure used to fall back to the built-in
+  // list silently. Every failure is now logged (provider, command, exit code or
+  // timeout, first stderr lines) so the fallback can be diagnosed.
+  setCliDiscoveryFailureSinkV1((failure) => toolSessionLog.warn(formatCliDiscoveryFailureV1(failure)));
+  context.subscriptions.push({ dispose: () => setCliDiscoveryFailureSinkV1(undefined) });
 
   // A Copilot tool session can run up to MAX_TOOL_ROUNDS_V1 rounds emitting
   // nothing observable, which on 2026-08-17 made a working run
@@ -812,7 +834,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (admission.outcome !== "acquired") {
         return {
           ok: false,
-          reason: describeWorkAdmissionRefusalV1(
+          reason: describeWorkAdmissionRefusalForUserV1(
             admission,
             notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath)
           ),
@@ -1235,9 +1257,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // returns has settled, which only happens once every statement below,
   // including this one, has completed. This mirrors the cancellation-time
   // dismiss the helper itself does for the in-session case.
-  await dismissOrphanedAwaitedDecisionsV1(context.workspaceState).catch((err) =>
-    console.error("Orphaned workflow-decision sweep failed", err)
-  );
+  // A viewer owns no waiters: sweeping there would dismiss the runner's live
+  // cards, so only the runner's activation drops what a reload orphaned.
+  if (!viewerHost) {
+    await dismissOrphanedAwaitedDecisionsV1(context.workspaceState).catch((err) =>
+      console.error("Orphaned workflow-decision sweep failed", err)
+    );
+  }
 
   // Read-only classification of legacy `creating` folders, published as a
   // barrier that both the first task-inventory publication (below) and every
@@ -1396,6 +1422,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerArchiveTaskCommands(context, inventory, currentTaskStore);
   registerPinTaskCommands(context, inventory);
   registerReconcilePlanChecklistCommands(context, inventory, currentTaskStore);
+  registerKimiReadConfigCommands(context);
+  registerUndeliveredPromptEditsCommands(context);
   registerHandoffChecksCommandsV1(context, inventory);
   registerSettleChecklistItemCommandV1(context, inventory, currentTaskStore);
   registerApplyReviewerVerifiedTicksCommands(context, inventory, currentTaskStore);
@@ -1540,8 +1568,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // until the run observes the token and ends.
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.cancelOperation",
-    (node?: { id?: string; sourceOperationId?: string }) => {
-      const operationId = typeof node?.id === "string" ? node.id : node?.sourceOperationId;
+    (node?: { id?: string; sourceOperationId?: string; taskFolderPath?: string; claimId?: string }) => {
+      let operationId = typeof node?.id === "string" ? node.id : node?.sourceOperationId;
+      // A busy-refusal Cancel raised while only an admission claim existed names the task and
+      // that claim. The operation holding the task is looked up now, but only while the same
+      // claim still holds it: an ended or replaced action is never cancelled by this card.
+      if (typeof operationId !== "string" && typeof node?.taskFolderPath === "string") {
+        const target = resolveClaimCancelTargetV1(node.taskFolderPath, node.claimId, {
+          currentClaimId: currentAdmissionClaimIdForTaskV1,
+          liveOperationId: (folder) => getLiveTaskOperationV1(folder)?.operationId,
+        });
+        if (target.kind !== "operation") {
+          NotificationRouter.showInformation(target.message);
+          return;
+        }
+        operationId = target.operationId;
+      }
       if (typeof operationId !== "string") return;
       const opTaskName = taskOperations.getAll().find((op) => op.id === operationId)?.taskName;
       if (!taskOperations.cancelOperation(operationId, "notifications")) {
@@ -2240,6 +2282,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     taskTreeProvider.refresh();
     if (viewerHost) {
       return;
+    }
+    // bugs3 Step 12: a Publish Checks run that was still "running" when its window stopped
+    // is settled as interrupted (its outcome unknown), never left reading "Not yet reviewed".
+    for (const task of inventory.getTasks()) {
+      await recoverAbandonedPublishChecksRunV1(vscode.Uri.file(task.taskFolderPath), {
+        ownRunIsLive: () => taskOperations.getTaskOperations(task.taskFolderPath).length > 0,
+      }).catch((err) => console.error("Publish Checks run recovery failed", err));
+      // bugs3 Step 8: a free-text question asked by an earlier activation has no command
+      // waiting on it any more; withdraw it and say how to run its action again.
+      await retireFreeTextQuestionsFromEarlierActivationV1(task.taskFolderPath, task.canonicalId ?? task.taskFolderPath).catch(
+        (err) => console.error("Orphaned free-text question sweep failed", err)
+      );
     }
     // Git-ignore handling for Ensemble resources is automatic (no settings
     // UI); a legacy/custom resource folder additionally gets a one-time

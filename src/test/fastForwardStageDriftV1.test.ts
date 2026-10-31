@@ -67,7 +67,7 @@ void describe("RC5 source wiring", () => {
   void it("runs the Publish Checks gate before the existing-review check, and requires the checks to have passed", () => {
     const fn = reviewActions.slice(reviewActions.indexOf("export async function fastForwardReviewWithAI"));
     const gate = fn.indexOf('if (targetStage === "publish") {\n    const publishScopeFolder');
-    const noReview = fn.indexOf("  if (!initialContent) {\n    // No review has been run yet at this stage");
+    const noReview = fn.indexOf("\n  if (!initialContent) {\n");
     assert.ok(gate > 0 && noReview > gate, "the Publish gate must not sit inside the no-existing-review branch");
     assert.match(fn.slice(gate, noReview), /savedChecksPassed/);
     assert.match(fn.slice(gate, noReview), /if \(!savedChecksPassed\) \{/);
@@ -76,7 +76,7 @@ void describe("RC5 source wiring", () => {
   void it("checks the saved result on the valid-freshness path too, not only after running the checks", () => {
     const fn = reviewActions.slice(reviewActions.indexOf("export async function fastForwardReviewWithAI"));
     const gate = fn.indexOf('if (targetStage === "publish") {\n    const publishScopeFolder');
-    const noReview = fn.indexOf("  if (!initialContent) {\n    // No review has been run yet at this stage");
+    const noReview = fn.indexOf("\n  if (!initialContent) {\n");
     const slice = fn.slice(gate, noReview);
     const ranBranchStart = slice.indexOf('if (freshnessBeforeChecks.status !== "valid") {');
     const savedRead = slice.indexOf("const savedChecksPayload");

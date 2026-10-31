@@ -12,10 +12,14 @@ import * as nodePath from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
+import { execFileSync } from "node:child_process";
 import {
   checkPublishChecksFreshnessV1,
+  checkPublishChecksReuseEligibilityV1,
   classifyPublishChecksFreshnessV1,
+  computeCommandIdentityV1,
   computePublishScopeId,
+  computeTreeFingerprintV1,
   describePublishChecksFreshnessFailureV1,
   invalidatePublishChecksFreshnessStamp,
   invalidatePublishChecksFreshnessStampOnDiskV1,
@@ -25,6 +29,7 @@ import {
   PublishChecksFreshnessStampV1,
   readPublishChecksFreshnessStampV1,
   renderPublishChecksFreshnessStamp,
+  withCommandIdentityV1,
   withPublishChecksReportLockV1,
   writeFileAtomicV1,
   writePublishChecksFreshnessStampV1,
@@ -355,5 +360,111 @@ void describe("publishChecksFreshness — entry-point freshness gate (plan PART 
     await writePublishChecksFreshnessStampV1(taskFolder, stampFor(SCOPE_A, COMMIT_1));
     const check = await checkPublishChecksFreshnessV1(taskFolder, SCOPE_A, COMMIT_2);
     assert.equal(check.status, "staleCommit");
+  });
+});
+
+void describe("publishChecksFreshness — command identity (bugs3 Step 15)", () => {
+  void it("is order-sensitive, ignores padding, and is undefined for an unknown set", () => {
+    const a = computeCommandIdentityV1(["pnpm run lint", "pnpm run test"]);
+    assert.ok(a);
+    assert.equal(computeCommandIdentityV1(["  pnpm run lint ", "pnpm run test"]), a);
+    assert.notEqual(computeCommandIdentityV1(["pnpm run test", "pnpm run lint"]), a);
+    assert.notEqual(computeCommandIdentityV1(["pnpm run lint"]), a);
+    assert.equal(computeCommandIdentityV1([]), undefined);
+    assert.equal(computeCommandIdentityV1(undefined), undefined);
+    assert.deepEqual(withCommandIdentityV1(undefined), {});
+    assert.deepEqual(withCommandIdentityV1(["pnpm run lint", "pnpm run test"]), { commandIdentity: a });
+  });
+
+  void it("round-trips through the stamp, and a legacy stamp without it still parses", () => {
+    const identity = computeCommandIdentityV1(["pnpm run verify"]);
+    const parsed = parsePublishChecksFreshnessStamp(
+      renderPublishChecksFreshnessStamp({ ...SAMPLE_STAMP, treeFingerprint: "ffffffff", commandIdentity: identity })
+    );
+    assert.equal(parsed?.commandIdentity, identity);
+    assert.equal(parsed?.treeFingerprint, "ffffffff");
+
+    const legacy = parsePublishChecksFreshnessStamp(renderPublishChecksFreshnessStamp(SAMPLE_STAMP));
+    assert.ok(legacy, "an old record must still be readable");
+    assert.equal(legacy.commandIdentity, undefined);
+  });
+
+  void describe("reuse eligibility", () => {
+    const repo = nodeFs.mkdtempSync(nodePath.join(TEST_ROOT, "repo-"));
+    const git = (...args: string[]): string => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+    git("init", "-q");
+    git("config", "user.email", "t@example.com");
+    git("config", "user.name", "t");
+    nodeFs.writeFileSync(nodePath.join(repo, "a.txt"), "a\n");
+    git("add", "a.txt");
+    git("commit", "-q", "-m", "init");
+    const head = git("rev-parse", "HEAD");
+    const commands = ["pnpm run lint", "pnpm run test"];
+
+    async function stampWith(name: string, commandIdentity: string | undefined): Promise<vscode.Uri> {
+      const taskFolder = makeTaskFolder(name);
+      const fingerprint = await computeTreeFingerprintV1(repo);
+      assert.ok(fingerprint);
+      await writePublishChecksFreshnessStampV1(taskFolder, {
+        formatVersion: 1,
+        runId: "22222222-2222-4222-8222-222222222222",
+        verifiedCommitSha: head,
+        completedAt: "2026-10-30T00:00:00.000Z",
+        scopeId: computePublishScopeId(repo),
+        treeFingerprint: fingerprint,
+        ...(commandIdentity ? { commandIdentity } : {}),
+      });
+      return taskFolder;
+    }
+
+    void it("accepts a matching identity, and does not compare identity when none is required", async () => {
+      const identity = computeCommandIdentityV1(commands)!;
+      const taskFolder = await stampWith("reuse-match", identity);
+      assert.equal(
+        (await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head, undefined, identity)).eligible,
+        true
+      );
+      assert.equal((await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head)).eligible, true);
+    });
+
+    void it("refuses a different command set, with a reason", async () => {
+      const taskFolder = await stampWith("reuse-mismatch", computeCommandIdentityV1(commands));
+      const result = await checkPublishChecksReuseEligibilityV1(
+        taskFolder,
+        repo,
+        head,
+        undefined,
+        computeCommandIdentityV1(["pnpm run verify"])
+      );
+      assert.equal(result.eligible, false);
+      assert.match(result.reason ?? "", /different command set/);
+    });
+
+    void it("refuses a legacy stamp when a command identity is required, but not otherwise", async () => {
+      const taskFolder = await stampWith("reuse-legacy", undefined);
+      const required = await checkPublishChecksReuseEligibilityV1(
+        taskFolder,
+        repo,
+        head,
+        undefined,
+        computeCommandIdentityV1(commands)
+      );
+      assert.equal(required.eligible, false);
+      assert.match(required.reason ?? "", /legacy record/);
+      assert.equal((await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head)).eligible, true);
+    });
+
+    void it("still refuses a changed tree even when the identity matches", async () => {
+      const identity = computeCommandIdentityV1(commands)!;
+      const taskFolder = await stampWith("reuse-changed-tree", identity);
+      nodeFs.writeFileSync(nodePath.join(repo, "a.txt"), "changed\n");
+      try {
+        const result = await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head, undefined, identity);
+        assert.equal(result.eligible, false);
+        assert.match(result.reason ?? "", /fingerprint has changed/);
+      } finally {
+        nodeFs.writeFileSync(nodePath.join(repo, "a.txt"), "a\n");
+      }
+    });
   });
 });

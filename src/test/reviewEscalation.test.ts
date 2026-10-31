@@ -1219,9 +1219,111 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
         assert.equal(buildRemaining.effect.command, "vs-code-ai-helper.resumeAndSetTaskStage");
         assert.notEqual(buildRemaining.effect.command, "vs-code-ai-helper.fastForwardReviewWithAI");
         assert.equal((buildRemaining.effect.args?.[0] as { stage?: string }).stage, "impl");
+        // bugs3 item 18: the live Fast Forward run is captured on the option, so the
+        // Implementation dispatch continues that run (and its budget) instead of
+        // starting a separate one.
+        assert.equal((buildRemaining.effect.args?.[0] as { resumeFastForward?: boolean }).resumeFastForward, true);
       }
     } finally {
       clearFastForwardRunActiveV1(folderUri.fsPath);
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // bugs3 item 18: the verbatim "Unfinished Steps 1–3 and unbuilt Steps 4–10
+  // remain" blocker beside an owner-evidence blocker, against a plan of numbered
+  // section headings holding unnumbered items (114 items, 15 settled), must
+  // recommend building the 99 open items, with "What clears this" and the
+  // option's own dispatch agreeing — never Apply Review.
+  void it("the verbatim grouped unbuilt-work blocker recommends Build the 99 open plan items and dispatches Implementation (bugs3 item 18)", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("plateau-grouped-unbuilt-steps");
+    seedProgress(store, folderUri, baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-13" }));
+
+    const sections: [number, number, number][] = [
+      [1, 6, 2], [2, 5, 1], [3, 4, 1], [4, 0, 14], [5, 0, 14], [6, 0, 14], [7, 0, 14], [8, 0, 14], [9, 0, 14], [10, 0, 11],
+    ];
+    const lines = ["<!-- ensemble:implementation-checklist -->", "", "# Plan", ""];
+    for (const [n, settled, open] of sections) {
+      lines.push(`### ${n}. Section ${n}`, "");
+      for (let i = 1; i <= settled; i++) lines.push(`- [x] S${n} settled item ${i}`);
+      for (let i = 1; i <= open; i++) lines.push(`- [ ] S${n} open item ${i}`);
+      lines.push("");
+    }
+    store.set(vscode.Uri.joinPath(folderUri, "plan-final.md").toString(), lines.join("\n"));
+    verifyTickedPlanItems(store, folderUri);
+
+    const blockers: ReviewBlocker[] = [
+      {
+        category: "completion",
+        resolver: "task-fixable",
+        description:
+          "Unfinished Steps 1–3 and unbuilt Steps 4–10 remain: complete schema reconciliation/inventory, catalog drift " +
+          "integration, dependency/bundling and multipart support, offline recovery and fixtures, portable " +
+          "entrypoint/runbook, exporter/provenance, validator/combined alarm, digest, and owner-gated retention.",
+        origin: "reviewer",
+      },
+      {
+        category: "completion",
+        resolver: "environmental",
+        description:
+          "Owner evidence needed: selected historical export source key/version ID, preserved compatibility destination " +
+          "key/version ID, and source/destination HEAD byte lengths recorded in task.md before Step 10.",
+        origin: "reviewer",
+      },
+    ];
+
+    try {
+      const escalated = await escalateReviewToHuman(
+        folderUri,
+        "impl-high-review",
+        "plateau",
+        "stuck",
+        "attempt-13",
+        undefined,
+        false,
+        undefined,
+        { content: "Readiness: 7/10\n", blockers, taskFixableCount: 1 }
+      );
+      assert.strictEqual(escalated, true);
+
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "buildRemaining");
+      const buildRemaining = decision.options.find((o) => o.optionId === "buildRemaining");
+      assert.ok(buildRemaining);
+      assert.match(buildRemaining.label, /Build the 99 open plan items/);
+      const clears = decision.evidence?.find((item) => item.label === "What clears this")?.detail ?? "";
+      assert.match(clears, /choose "Build the 99 open plan items"/, "What clears this names the same dispatch");
+      assert.doesNotMatch(clears, /Keep iterating|Apply Review/);
+      // Taking it dispatches Implementation: no Apply Review, no move to another review stage.
+      assert.deepEqual(buildRemaining.effect, {
+        kind: "command",
+        command: "vs-code-ai-helper.resumeAndSetTaskStage",
+        args: [
+          {
+            taskFolderPath: folderUri.fsPath,
+            stage: "impl",
+            resumeFastForward: false,
+            expectedSourceStage: "impl-high-review",
+          },
+        ],
+      });
+      const keepIterating = decision.options.find((o) => o.optionId === "keepIterating");
+      assert.notEqual(
+        decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined,
+        keepIterating?.optionId,
+        "Apply Review is not the recommendation for unbuilt work"
+      );
+    } finally {
       deactivateNotificationRouter();
       __extensionContextV1TestOnly.reset();
     }

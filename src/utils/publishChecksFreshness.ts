@@ -29,9 +29,28 @@ export interface PublishChecksFreshnessStampV1 {
   completedAt: string;
   scopeId: string;
   treeFingerprint?: string;
+  /**
+   * bugs3 Step 15: digest of the ordered commands the run actually executed.
+   * Absent on stamps written before it existed (a legacy record), which are
+   * read as valid for freshness but never as proof of a particular command set.
+   */
+  commandIdentity?: string;
 }
 
 export const PUBLISH_CHECKS_STAMP_FORMAT_VERSION = 1 as const;
+
+/**
+ * bugs3 Step 15: the effective command identity of a Publish Checks run — a
+ * digest of the ordered, trimmed commands it executed. Undefined when no
+ * command is known, so an unknown set never fabricates an identity.
+ */
+export function computeCommandIdentityV1(commands: readonly string[] | undefined): string | undefined {
+  const normalized = (commands ?? []).map((command) => command.trim()).filter((command) => command.length > 0);
+  if (normalized.length === 0) {
+    return undefined;
+  }
+  return crypto.createHash("sha256").update(JSON.stringify(normalized)).digest("hex").slice(0, 32);
+}
 
 export const PUBLISH_CHECKS_STAMP_START = "<!-- publish-checks-freshness:start -->";
 export const PUBLISH_CHECKS_STAMP_END = "<!-- publish-checks-freshness:end -->";
@@ -181,6 +200,12 @@ export function computePublishScopeId(scopeFolderAbsolutePath: string): string {
   return crypto.createHash("sha256").update(scopeFolderAbsolutePath).digest("hex").slice(0, 16);
 }
 
+/** Spread into a stamp: `{ commandIdentity }` when the commands are known, else nothing. */
+export function withCommandIdentityV1(commands: readonly string[] | undefined): { commandIdentity?: string } {
+  const commandIdentity = computeCommandIdentityV1(commands);
+  return commandIdentity ? { commandIdentity } : {};
+}
+
 /**
  * Render the managed freshness block. Deliberately HTML-comment-only (like
  * the section markers elsewhere in this file) so it reads as metadata, not
@@ -198,6 +223,7 @@ export function renderPublishChecksFreshnessStamp(stamp: PublishChecksFreshnessS
     `<!-- completed-at: ${stamp.completedAt} -->`,
     `<!-- scope-id: ${stamp.scopeId} -->`,
     ...(stamp.treeFingerprint ? [`<!-- tree-fingerprint: ${stamp.treeFingerprint} -->`] : []),
+    ...(stamp.commandIdentity ? [`<!-- command-identity: ${stamp.commandIdentity} -->`] : []),
     PUBLISH_CHECKS_STAMP_END,
   ].join("\n");
 }
@@ -411,6 +437,7 @@ export function parsePublishChecksFreshnessStamp(
   const completedAt = readStampField(block, "completed-at");
   const scopeId = readStampField(block, "scope-id");
   const treeFingerprint = readStampField(block, "tree-fingerprint");
+  const commandIdentity = readStampField(block, "command-identity");
   if (
     formatVersionRaw !== String(PUBLISH_CHECKS_STAMP_FORMAT_VERSION) ||
     !runId ||
@@ -427,6 +454,7 @@ export function parsePublishChecksFreshnessStamp(
     completedAt,
     scopeId,
     ...(treeFingerprint ? { treeFingerprint } : {}),
+    ...(commandIdentity ? { commandIdentity } : {}),
   };
 }
 
@@ -1025,7 +1053,14 @@ export async function checkPublishChecksReuseEligibilityV1(
   taskFolderUri: vscode.Uri,
   scopeFolder: string,
   headCommitSha: string | undefined,
-  evidenceValidator?: (content: string) => boolean
+  evidenceValidator?: (content: string) => boolean,
+  /**
+   * bugs3 Step 15: the identity of the commands the caller needs the recorded
+   * pass to have run. When given, a stamp without an identity (a legacy
+   * record) or with a different one is ineligible; when omitted, command
+   * identity is not compared.
+   */
+  expectedCommandIdentity?: string
 ): Promise<PublishChecksReuseEligibilityResultV1> {
   const stamp = await readPublishChecksFreshnessStampV1(taskFolderUri);
   const currentFingerprint = await computeTreeFingerprintV1(scopeFolder);
@@ -1038,6 +1073,17 @@ export async function checkPublishChecksReuseEligibilityV1(
   }
   if (!currentFingerprint || currentFingerprint !== stamp.treeFingerprint) {
     return { eligible: false, reason: "Working tree fingerprint has changed since checks ran" };
+  }
+  if (expectedCommandIdentity !== undefined) {
+    if (!stamp.commandIdentity) {
+      return {
+        eligible: false,
+        reason: "Recorded checks predate command identity, so they cannot show which commands ran (legacy record)",
+      };
+    }
+    if (stamp.commandIdentity !== expectedCommandIdentity) {
+      return { eligible: false, reason: "The recorded checks ran a different command set than the one now required" };
+    }
   }
   if (evidenceValidator) {
     const reportContent = await readPublishChecksFile(taskFolderUri);

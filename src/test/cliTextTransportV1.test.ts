@@ -843,6 +843,9 @@ void describe("createCliTextTransportV1 per shipped CLI definition", () => {
       ...def,
       command: "node",
       commandAliases: undefined,
+      // The scripted command is `node`: probing its `--version` would read
+      // Node's own major and refuse it as an unsupported devpass-code.
+      versionedContract: undefined,
       buildArgs(
         mode: CliRunMode,
         model: string | undefined,

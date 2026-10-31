@@ -82,7 +82,6 @@ import {
   beginTargetResolutionV1,
   describeTargetResolutionUnprotectedRootsV1,
   describeTargetResolutionWriteFailureV1,
-  describeWorkAdmissionRefusalV1,
   endTargetResolutionV1,
   revokeWorkAdmissionHandoffV1,
   WorkAdmissionHandleV1,
@@ -92,6 +91,8 @@ import {
   requestSafeAdmissionReleaseV1,
   trySafeAdmissionReleaseV1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeResumeNotSettledV1 } from "../utils/storedAnswerResumeV1";
@@ -556,7 +557,7 @@ export async function chatWithStage(
     if (targetResolutionHandle) {
       await endTargetResolutionV1(targetResolutionHandle);
     }
-    const refusalNotice = describeWorkAdmissionRefusalV1(early);
+    const refusalNotice = describeWorkAdmissionRefusalForUserV1(early);
     const candidateTask = wantsSend && !hasAutomaticOriginV1() && earlyFolderPath
       ? inventory.getTaskByPath(earlyFolderPath) ??
         inventory.getTasks().find((t) => t.taskFolderPath === earlyFolderPath || t.canonicalId === resolverArg?.canonicalId)
@@ -579,7 +580,8 @@ export async function chatWithStage(
         refusalNotice
       );
     }
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    offerBusyRefusalChoicesOnceV1(early);
     return;
   }
 
@@ -697,10 +699,14 @@ export async function chatWithStage(
       if (late.outcome !== "acquired") {
         await endTargetResolutionOnceV1();
         NotificationRouter.showWarning(
-          describeWorkAdmissionRefusalV1(
+          describeWorkAdmissionRefusalForUserV1(
             late,
             notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath)
           )
+        );
+        offerBusyRefusalChoicesOnceV1(
+          late,
+          notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath)
         );
         return;
       }

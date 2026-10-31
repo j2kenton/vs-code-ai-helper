@@ -84,13 +84,13 @@ import { formatNotificationTaskLabelV1, runWithNotificationTaskContextV1 } from 
 import {
   acquireOrAdoptWorkAdmissionV1,
   createSafeAdmissionReleaseStateV1,
-  describeWorkAdmissionRefusalV1,
   recordAdmissionReleaseTriggerV1,
   requestSafeAdmissionReleaseV1,
   trySafeAdmissionReleaseV1,
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
@@ -1871,7 +1871,7 @@ export async function resumeEditPreflightInteractionV1(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
-    return { ok: false, reason: describeWorkAdmissionRefusalV1(early) };
+    return { ok: false, reason: describeWorkAdmissionRefusalForUserV1(early) };
   }
 
   let handle: WorkAdmissionHandleV1 | undefined = early?.outcome === "acquired" ? early.handle : undefined;
@@ -1952,7 +1952,7 @@ export async function resumeEditPreflightInteractionV1(
       handoffToken: admissionHandoffTokenV1,
     });
     if (late.outcome !== "acquired") {
-      return { ok: false, reason: describeWorkAdmissionRefusalV1(late) };
+      return { ok: false, reason: describeWorkAdmissionRefusalForUserV1(late) };
     }
     handle = late.handle;
     heartbeat = setInterval(() => void heartbeatTickV1(), WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);

@@ -746,6 +746,53 @@ void describe("taskProgressDecoderV1", () => {
     }
   });
 
+  void it("decodes a reviewScoreHistory entry's recorded fixRoundIds, including an empty list", () => {
+    for (const ids of [["round-1", "round-2"], []]) {
+      const result = decodeTaskProgressTextV1(
+        doc({
+          ensembleProgressVersion: 1,
+          reviewScoreHistory: [
+            {
+              stage: "impl-high-review",
+              score: 8,
+              attemptId: "attempt-1",
+              at: "2026-07-01T10:00:00.000Z",
+              blockerCount: 0,
+              taskFixableCount: 0,
+              fixRoundIds: ids,
+            },
+          ],
+        })
+      );
+      assert.equal(result.ok, true);
+      if (result.ok) {
+        assert.deepEqual(result.decoded.progress.reviewScoreHistory?.[0]?.fixRoundIds, ids);
+      }
+    }
+  });
+
+  void it("rejects fixRoundIds that are not a bounded list of non-empty ids", () => {
+    for (const bad of ["round-1", [1], [""], Array.from({ length: 201 }, (_, index) => `r${index}`)]) {
+      expectRecovery(
+        doc({
+          ensembleProgressVersion: 1,
+          reviewScoreHistory: [
+            {
+              stage: "impl-high-review",
+              score: 8,
+              attemptId: "attempt-1",
+              at: "2026-07-01T10:00:00.000Z",
+              blockerCount: 0,
+              taskFixableCount: 0,
+              fixRoundIds: bad,
+            },
+          ],
+        }),
+        "invalidFieldValue"
+      );
+    }
+  });
+
   void it("rejects a reviewScoreHistory entry whose reviewPass is not a non-negative integer", () => {
     expectRecovery(
       doc({

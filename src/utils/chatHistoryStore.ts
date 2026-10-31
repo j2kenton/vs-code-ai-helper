@@ -340,6 +340,13 @@ export interface ChatMessage {
    * when known — lets an activity/outcome pair be correlated back to the
    * announcement that started it even before a ledger row existed. */
   intentId?: string;
+  /**
+   * The tracked operation whose terminal "Ended …" line this message is (bugs3
+   * Step 3). Persisted so the line is recognisable after a window reload, when
+   * the in-process terminal-line registry is empty: reconciliation uses it to
+   * avoid adding a second terminal line for an operation that already has one.
+   */
+  endedOperationId?: string;
   /** The `WorkflowDecisionV1` id this message anchors, set together with
    * `kind: "decision"`. */
   decisionId?: string;
@@ -366,6 +373,25 @@ export interface ChatMessage {
    * since that was already the only mechanism available to them).
    */
   id?: string;
+  /**
+   * Set when a pending `role: "question"` card was closed without an answer
+   * (bugs3 Step 8): `retired` by the system (the task left its stage, or a
+   * resume or later answer made it moot) or `dismissed` by the owner. Written
+   * in place together with `pending: false`, so every reader (the awaiting
+   * check, compaction) treats the question as settled, and so the answer path
+   * can refuse a late reply with the recorded reason.
+   */
+  settlement?: ChatQuestionSettlementV1;
+}
+
+/** How a question card was closed without an answer (bugs3 Step 8). */
+export interface ChatQuestionSettlementV1 {
+  readonly kind: "retired" | "dismissed";
+  /** Plain-language reason, shown verbatim in the transcript. */
+  readonly reason: string;
+  /** Who dismissed it (`dismissed` only). */
+  readonly by?: string;
+  readonly at: string;
 }
 
 /** The display-mirror states a structured-question interaction can be in (plan §5.1/§5.5). */
@@ -430,6 +456,11 @@ export interface ChatDocumentInteractionV1 {
   readonly state: ChatDocumentInteractionStateV1;
   readonly answers?: readonly StructuredAnswerV1[];
   readonly postedAt: string;
+  /** Why an unanswered interaction was retired, when known. */
+  readonly retirementReason?: string;
+  /** Owner dismissal provenance; absent on legacy cancellations. */
+  readonly dismissedBy?: string;
+  readonly dismissedAt?: string;
   /**
    * App-only, `actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1` map of a
    * `singleChoice`/`multipleChoice` question's `optionId` to the effect
@@ -498,7 +529,7 @@ export interface OpenPlanItemsFormItemV1 {
   readonly reason: string;
 }
 
-export type OpenPlanItemsFormStateV1 = "open" | "applied" | "stale";
+export type OpenPlanItemsFormStateV1 = "open" | "applied" | "stale" | "dismissed";
 
 /**
  * RC3 item 5, Step 10: the chat-document entry behind the in-chat "Decide item
@@ -515,6 +546,9 @@ export interface OpenPlanItemsFormV1 {
   readonly resumeFastForwardV1?: { readonly attemptNumber: number; readonly maxAttempts: number };
   readonly state: OpenPlanItemsFormStateV1;
   readonly postedAt: string;
+  readonly closedReason?: string;
+  readonly closedAt?: string;
+  readonly closedBy?: string;
 }
 
 interface ChatDocumentV1 {
@@ -865,6 +899,9 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
     if (e.decisionId !== undefined && (typeof e.decisionId !== "string" || e.decisionId.length === 0)) {
       return undefined;
     }
+    if (e.endedOperationId !== undefined && (typeof e.endedOperationId !== "string" || e.endedOperationId.length === 0)) {
+      return undefined;
+    }
     if (
       e.answersQuestionAt !== undefined &&
       (typeof e.answersQuestionAt !== "string" || e.answersQuestionAt.length === 0)
@@ -878,6 +915,26 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
     }
     if (e.id !== undefined && (typeof e.id !== "string" || e.id.length === 0)) {
       return undefined;
+    }
+    let settlement: ChatQuestionSettlementV1 | undefined;
+    if (e.settlement !== undefined) {
+      const s = e.settlement as Record<string, unknown>;
+      if (
+        typeof s !== "object" ||
+        s === null ||
+        (s.kind !== "retired" && s.kind !== "dismissed") ||
+        typeof s.reason !== "string" ||
+        typeof s.at !== "string" ||
+        (s.by !== undefined && typeof s.by !== "string")
+      ) {
+        return undefined;
+      }
+      settlement = {
+        kind: s.kind,
+        reason: s.reason,
+        at: s.at,
+        ...(typeof s.by === "string" ? { by: s.by } : {}),
+      };
     }
     messages.push({
       role: e.role,
@@ -904,9 +961,11 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
       ...(e.kind !== undefined ? { kind: e.kind as "activity" | "outcome" | "decision" } : {}),
       ...(typeof e.roundId === "string" ? { roundId: e.roundId } : {}),
       ...(typeof e.intentId === "string" ? { intentId: e.intentId } : {}),
+      ...(typeof e.endedOperationId === "string" ? { endedOperationId: e.endedOperationId } : {}),
       ...(typeof e.decisionId === "string" ? { decisionId: e.decisionId } : {}),
       ...(typeof e.answersQuestionAt === "string" ? { answersQuestionAt: e.answersQuestionAt } : {}),
       ...(typeof e.id === "string" ? { id: e.id } : {}),
+      ...(settlement !== undefined ? { settlement } : {}),
     });
   }
   return messages;
@@ -924,7 +983,7 @@ export function decodeOpenPlanItemsFormsV1(raw: unknown): OpenPlanItemsFormV1[] 
     if (typeof e.taskBindingId !== "string" || e.taskBindingId.length === 0) return undefined;
     if (typeof e.stage !== "string" || !VALID_STAGES.has(e.stage)) return undefined;
     if (typeof e.planFingerprint !== "string" || typeof e.postedAt !== "string") return undefined;
-    if (e.state !== "open" && e.state !== "applied" && e.state !== "stale") return undefined;
+    if (e.state !== "open" && e.state !== "applied" && e.state !== "stale" && e.state !== "dismissed") return undefined;
     if (!Array.isArray(e.items)) return undefined;
     const items: OpenPlanItemsFormItemV1[] = [];
     for (const rawItem of e.items) {
@@ -965,6 +1024,9 @@ export function decodeOpenPlanItemsFormsV1(raw: unknown): OpenPlanItemsFormV1[] 
       ...(resume ? { resumeFastForwardV1: resume } : {}),
       state: e.state,
       postedAt: e.postedAt,
+      ...(typeof e.closedReason === "string" ? { closedReason: e.closedReason } : {}),
+      ...(typeof e.closedAt === "string" ? { closedAt: e.closedAt } : {}),
+      ...(typeof e.closedBy === "string" ? { closedBy: e.closedBy } : {}),
     });
   }
   return forms;
@@ -986,6 +1048,9 @@ function validateInteractions(raw: unknown): ChatDocumentInteractionV1[] | undef
     const decodedQuestions = decodeStructuredQuestionsV1(e.questions);
     if (!decodedQuestions.ok || !decodedQuestions.questions) return undefined;
     if (typeof e.postedAt !== "string") return undefined;
+    if (e.retirementReason !== undefined && typeof e.retirementReason !== "string") return undefined;
+    if (e.dismissedBy !== undefined && typeof e.dismissedBy !== "string") return undefined;
+    if (e.dismissedAt !== undefined && typeof e.dismissedAt !== "string") return undefined;
     if (typeof e.state !== "string" || !INTERACTION_STATES.has(e.state)) return undefined;
     let answers: readonly StructuredAnswerV1[] | undefined;
     if (e.answers !== undefined) {
@@ -1021,6 +1086,9 @@ function validateInteractions(raw: unknown): ChatDocumentInteractionV1[] | undef
       state: e.state as ChatDocumentInteractionStateV1,
       ...(answers !== undefined ? { answers } : {}),
       postedAt: e.postedAt,
+      ...(typeof e.retirementReason === "string" ? { retirementReason: e.retirementReason } : {}),
+      ...(typeof e.dismissedBy === "string" ? { dismissedBy: e.dismissedBy } : {}),
+      ...(typeof e.dismissedAt === "string" ? { dismissedAt: e.dismissedAt } : {}),
       ...(optionEffects !== undefined ? { optionEffects } : {}),
     });
   }
@@ -2130,7 +2198,8 @@ export async function recordChatInteractionAnswers(
   taskFolderPath: string,
   canonicalId: string,
   interactionId: string,
-  answers: readonly StructuredAnswerV1[]
+  answers: readonly StructuredAnswerV1[],
+  settleLocal = false
 ): Promise<void> {
   await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
     const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
@@ -2141,8 +2210,15 @@ export async function recordChatInteractionAnswers(
     if (index === -1) {
       throw new Error(`no interaction with id ${interactionId} exists`);
     }
+    const current = document.interactions[index]!;
+    if (current.state !== "unresolved") {
+      throw new Error(current.retirementReason ?? (current.dismissedBy ? `dismissed by ${current.dismissedBy} at ${current.dismissedAt}` : `question is ${current.state}`));
+    }
+    if (settleLocal && current.actionKey !== LOCAL_ONLY_INTERACTION_ACTION_KEY_V1) {
+      throw new Error("only local questions can be settled with their answers");
+    }
     const interactions = document.interactions.slice();
-    interactions[index] = { ...interactions[index]!, answers };
+    interactions[index] = { ...current, answers, ...(settleLocal ? { state: "resumed" as const } : {}) };
     await persistDocument(taskFolderPath, { ...document, interactions }, revision, canonicalId);
   });
 }
@@ -2152,7 +2228,8 @@ export async function settleChatInteraction(
   taskFolderPath: string,
   canonicalId: string,
   interactionId: string,
-  settlement: ChatInteractionMirrorSettlementV1
+  settlement: ChatInteractionMirrorSettlementV1,
+  dismissal?: { readonly by: string; readonly at: string }
 ): Promise<void> {
   await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
     const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
@@ -2164,7 +2241,12 @@ export async function settleChatInteraction(
       throw new Error(`no interaction with id ${interactionId} exists`);
     }
     const interactions = document.interactions.slice();
-    interactions[index] = { ...interactions[index]!, state: settlement };
+    const current = interactions[index]!;
+    if (!dismissal && current.state === settlement) return;
+    if (current.state !== "unresolved" && !(dismissal && current.state === "cancelled" && !current.retirementReason && !current.dismissedBy)) {
+      throw new Error(current.retirementReason ?? (current.dismissedBy ? `dismissed by ${current.dismissedBy} at ${current.dismissedAt}` : `question is ${current.state}`));
+    }
+    interactions[index] = { ...current, state: settlement, ...(dismissal ? { dismissedBy: dismissal.by, dismissedAt: dismissal.at } : {}) };
     await persistDocument(taskFolderPath, { ...document, interactions }, revision, canonicalId);
   });
 }
@@ -2245,7 +2327,8 @@ export async function readOpenPlanItemsFormsV1(
   });
 }
 
-/** Move a form to `state`. Returns false when no such form exists. */
+/** Move a form to `state`. Returns false when no such form exists.
+ * (bugs3 Step 8: question settlement lives in `settleChatQuestionsV1` below.) */
 export async function setOpenPlanItemsFormStateV1(
   taskFolderPath: string,
   canonicalId: string,
@@ -2269,6 +2352,266 @@ export async function setOpenPlanItemsFormStateV1(
     chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
   });
   return found;
+}
+
+/** Close only still-open forms; serialized with other chat-document updates. */
+export async function closeOpenPlanItemsFormsV1(
+  taskFolderPath: string, canonicalId: string,
+  filter: { readonly stage?: TaskStage; readonly formId?: string; readonly raisedAtOrBefore?: string },
+  closure: { readonly state: "stale" | "dismissed"; readonly reason: string; readonly by?: string }
+): Promise<OpenPlanItemsFormV1[]> {
+  return withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    if (!document?.openPlanItemsForms) return [];
+    const closed: OpenPlanItemsFormV1[] = [];
+    const forms = document.openPlanItemsForms.map((form) => {
+      if (form.state !== "open" || (filter.stage !== undefined && form.stage !== filter.stage) ||
+          (filter.formId !== undefined && form.formId !== filter.formId) ||
+          (filter.raisedAtOrBefore !== undefined && form.postedAt > filter.raisedAtOrBefore)) return form;
+      const next: OpenPlanItemsFormV1 = { ...form, state: closure.state, closedReason: closure.reason,
+        closedAt: new Date().toISOString(), ...(closure.by ? { closedBy: closure.by } : {}) };
+      closed.push(next);
+      return next;
+    });
+    if (closed.length) {
+      await persistDocument(taskFolderPath, { ...document, openPlanItemsForms: forms }, revision, canonicalId);
+      chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
+    }
+    return closed;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Question retirement, dismissal and guarded answers (bugs3 Step 8)
+// ---------------------------------------------------------------------------
+
+/** The key a reply binds to: the question's stable `id`, else its `at`. */
+export function chatQuestionKeyV1(message: Pick<ChatMessage, "id" | "at">): string {
+  return message.id ?? message.at;
+}
+
+/** Which pending questions {@link settleChatQuestionsV1} closes. */
+export interface SettleChatQuestionsFilterV1 {
+  /** Only the question with this key. */
+  readonly questionKey?: string;
+  /** Only questions raised on this stage. */
+  readonly stage?: TaskStage;
+  /** Only questions raised at or before this ISO instant (a later one is never closed). */
+  readonly raisedAtOrBefore?: string;
+  /** Only questions this predicate accepts (e.g. owner-evidence cards). */
+  readonly matches?: (question: ChatMessage) => boolean;
+}
+
+/**
+ * Close pending `role: "question"` cards without an answer, in place and
+ * atomically with respect to {@link appendChatAnswerToPendingQuestionV1}: a
+ * question already answered, already settled, or a read-only legacy recovery
+ * record is left alone. Returns the questions it closed (as they were before).
+ */
+export async function settleChatQuestionsV1(
+  taskFolderPath: string,
+  canonicalId: string,
+  filter: SettleChatQuestionsFilterV1,
+  settlement: { readonly kind: "retired" | "dismissed"; readonly reason: string; readonly by?: string; readonly at?: string }
+): Promise<ChatMessage[]> {
+  const closed: ChatMessage[] = [];
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    if (!document) {
+      return;
+    }
+    const answered = new Set<string>();
+    for (const m of document.messages) {
+      if (m.role === "user" && m.answersQuestionAt !== undefined) {
+        answered.add(m.answersQuestionAt);
+      }
+    }
+    const at = settlement.at ?? new Date().toISOString();
+    const raisedCutoff = filter.raisedAtOrBefore === undefined ? undefined : Date.parse(filter.raisedAtOrBefore);
+    const next = document.messages.map((m) => {
+      if (
+        m.role !== "question" ||
+        (m.pending !== true && !(m.pending === undefined && m.text.includes("<!-- ensemble:chat-answer:"))) ||
+        m.settlement !== undefined ||
+        m.legacyRecovery !== undefined ||
+        answered.has(chatQuestionKeyV1(m))
+      ) {
+        return m;
+      }
+      if (filter.questionKey !== undefined && chatQuestionKeyV1(m) !== filter.questionKey) {
+        return m;
+      }
+      if (filter.stage !== undefined && m.stage !== filter.stage) {
+        return m;
+      }
+      if (raisedCutoff !== undefined && !Number.isNaN(raisedCutoff) && Date.parse(m.at) > raisedCutoff) {
+        return m;
+      }
+      if (filter.matches !== undefined && !filter.matches(m)) {
+        return m;
+      }
+      closed.push(m);
+      return {
+        ...m,
+        pending: false,
+        settlement: {
+          kind: settlement.kind,
+          reason: settlement.reason,
+          at,
+          ...(settlement.by !== undefined ? { by: settlement.by } : {}),
+        },
+      };
+    });
+    if (closed.length === 0) {
+      return;
+    }
+    await persistDocument(taskFolderPath, { ...document, messages: next }, revision, canonicalId);
+  });
+  return closed;
+}
+
+/**
+ * Close the unresolved LOCAL-ONLY interaction cards (the choice cards no
+ * operation backs — `LOCAL_ONLY_INTERACTION_ACTION_KEY_V1`) raised on a
+ * departed stage. Operation-backed interactions are deliberately left to their
+ * own transaction settlement: closing only their display mirror would disagree
+ * with the durable transaction. Returns how many were closed.
+ */
+export async function expireLocalOnlyInteractionsV1(
+  taskFolderPath: string,
+  canonicalId: string,
+  filter: { readonly stage: TaskStage; readonly raisedAtOrBefore?: string; readonly reason?: string }
+): Promise<number> {
+  let count = 0;
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    if (!document) {
+      return;
+    }
+    const cutoff = filter.raisedAtOrBefore === undefined ? undefined : Date.parse(filter.raisedAtOrBefore);
+    const interactions = document.interactions.map((i) => {
+      if (
+        i.actionKey !== LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 ||
+        i.state !== "unresolved" ||
+        i.stage !== filter.stage ||
+        (cutoff !== undefined && !Number.isNaN(cutoff) && Date.parse(i.postedAt) > cutoff)
+      ) {
+        return i;
+      }
+      count += 1;
+      return { ...i, state: "expired" as const, ...(filter.reason ? { retirementReason: filter.reason } : {}) };
+    });
+    if (count > 0) {
+      const messages = filter.reason
+        ? [...document.messages, { role: "assistant" as const, text: `Withdrawn: ${filter.reason}`, stage: filter.stage, at: new Date().toISOString() }]
+        : document.messages;
+      await persistDocument(taskFolderPath, { ...document, interactions, messages }, revision, canonicalId);
+      chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
+    }
+  });
+  return count;
+}
+
+/** Settle operation-backed cards in their authoritative store before updating their mirrors. */
+export async function retireOperationInteractionsV1(
+  taskFolderPath: string,
+  canonicalId: string,
+  filter: { readonly stage: TaskStage; readonly raisedAtOrBefore?: string; readonly reason: string }
+): Promise<number> {
+  return withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    const store = getChatInteractionTransactionStoreV1();
+    if (!document || !store || isViewerHostV1()) return 0;
+    const cutoff = filter.raisedAtOrBefore === undefined ? undefined : Date.parse(filter.raisedAtOrBefore);
+    const interactions = [...document.interactions];
+    let count = 0;
+    for (let index = 0; index < interactions.length; index++) {
+      const interaction = interactions[index]!;
+      if (interaction.state !== "unresolved" || interaction.actionKey === LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 ||
+          interaction.stage !== filter.stage ||
+          (cutoff !== undefined && !Number.isNaN(cutoff) && Date.parse(interaction.postedAt) > cutoff)) continue;
+      const loaded = await store.load(interaction.operationId);
+      if (loaded.kind !== "ok") continue;
+      const transaction = loaded.transaction;
+      if (transaction.interactionId !== interaction.interactionId || transaction.chatDocumentId !== document.documentId ||
+          transaction.taskBindingId !== document.taskBindingId || transaction.stage !== interaction.stage ||
+          transaction.actionKey !== interaction.actionKey || transaction.state === "settled") continue;
+      const result = await store.cancel(interaction.operationId);
+      if (result.kind !== "ok") continue;
+      interactions[index] = { ...interaction, state: "cancelled", retirementReason: filter.reason };
+      count++;
+    }
+    if (count > 0) {
+      await persistDocument(taskFolderPath, {
+        ...document,
+        interactions,
+        messages: [...document.messages, { role: "assistant", text: `Withdrawn: ${filter.reason}`, stage: filter.stage, at: new Date().toISOString() }],
+      }, revision, canonicalId);
+      chatHistoryChangeEmitterV1.fire({ taskFolderPath, canonicalId });
+    }
+    return count;
+  });
+}
+
+export type AppendChatAnswerResultV1 =
+  | { readonly kind: "answered"; readonly question: ChatMessage }
+  | { readonly kind: "alreadyAnswered" }
+  /** The card was retired or dismissed first; the answer was NOT saved. */
+  | { readonly kind: "settled"; readonly settlement: ChatQuestionSettlementV1; readonly question: ChatMessage }
+  | { readonly kind: "missing" };
+
+/**
+ * Save `answer` (a `role: "user"` message carrying `answersQuestionAt`) only
+ * if the question it addresses is still pending, in the same serialized
+ * document update that {@link settleChatQuestionsV1} uses — so a retirement or
+ * dismissal that lands first always wins and a late answer is never saved.
+ */
+export async function appendChatAnswerToPendingQuestionV1(
+  taskFolderPath: string,
+  canonicalId: string,
+  questionKey: string,
+  answer: ChatMessage
+): Promise<AppendChatAnswerResultV1> {
+  let result: AppendChatAnswerResultV1 = { kind: "missing" };
+  await withChatDocumentQueueV1(taskFolderPath, canonicalId, async () => {
+    const { document, revision } = await readChatDocument(taskFolderPath, canonicalId);
+    const question = document?.messages.find((m) => m.role === "question" && chatQuestionKeyV1(m) === questionKey);
+    if (!document || !question) {
+      return;
+    }
+    if (question.settlement !== undefined) {
+      result = { kind: "settled", settlement: question.settlement, question };
+      return;
+    }
+    if (document.messages.some((m) => m.role === "user" && m.answersQuestionAt === questionKey)) {
+      result = { kind: "alreadyAnswered" };
+      return;
+    }
+    if (question.pending !== true) {
+      result = {
+        kind: "settled",
+        question,
+        settlement: { kind: "retired", reason: "this question is no longer pending", at: question.at },
+      };
+      return;
+    }
+    const compacted = compactMessages([...document.messages, answer], document.compaction.compactedMessageCount);
+    await persistDocument(
+      taskFolderPath,
+      {
+        ...document,
+        messages: compacted.messages,
+        compaction: {
+          compactedMessageCount: compacted.compactedCount,
+          ...(compacted.digest !== undefined ? { lastCompactionDigest: compacted.digest } : {}),
+        },
+      },
+      revision,
+      canonicalId
+    );
+    result = { kind: "answered", question };
+  });
+  return result;
 }
 
 // ---------------------------------------------------------------------------

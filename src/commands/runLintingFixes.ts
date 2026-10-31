@@ -1,5 +1,13 @@
 import * as vscode from "vscode";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { FAILURE_CLUSTER_PROMPT_MAX_CHARS_V1, selectFailureClustersForPromptV1, type FailingTestSummaryV1 } from "../utils/failingTestsV1";
+import {
+  afterRoundChecksV1,
+  decideFixHandbackV1,
+  describeFixProgressV1,
+  measureFixProgressV1,
+  type FixProgressV1,
+} from "../utils/lintFixHandbackPolicyV1";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import * as path from "path";
@@ -29,7 +37,54 @@ import {
   runImplementationOrSealedV1,
 } from "./runEditActionV1";
 import { getUnrelatedWorkspaceChanges, isGitWorkspace } from "./reviewActions";
-import { allowsDirtyWorktreeChanges } from "../config/settings";
+import { allowsDirtyWorktreeChanges, getPublishVerificationCommands } from "../config/settings";
+import {
+  completionLintResultFromBaselineV1,
+  decideFailingBaselineReuseV1,
+  readFailingBaselineV1,
+} from "../utils/failingBaselineV1";
+import { runChecksFailedFirstV1, type FailedFirstChecksOutcomeV1 } from "../utils/failedFirstChecksV1";
+import {
+  buildFailedPublishRunSnapshotV1,
+  clearFailedPublishRunSnapshotV1,
+  writeFailedPublishRunSnapshotV1,
+} from "../utils/failedPublishRunV1";
+
+/**
+ * Keeps the failed-first reference current after a post-fix re-check, the way
+ * Publish Checks does: a complete failing run becomes the next reference, a
+ * complete pass clears it, and a failed-first partial result changes nothing
+ * (it is not a complete run).
+ */
+async function recordPostFixCheckRunV1(
+  taskFolderUri: vscode.Uri,
+  outcome: FailedFirstChecksOutcomeV1,
+  scopeFolder: string,
+  headCommit: string | null | undefined
+): Promise<void> {
+  if (outcome.failedFirst) {
+    return;
+  }
+  const result = outcome.result;
+  const failing = !result.passed || (result.failedChecks?.length ?? 0) > 0;
+  if (failing) {
+    const verifiedFolder = result.verifiedFolder ?? scopeFolder;
+    await writeFailedPublishRunSnapshotV1(
+      taskFolderUri.fsPath,
+      buildFailedPublishRunSnapshotV1({
+        taskFolder: taskFolderUri.fsPath,
+        repositoryRoot: verifiedFolder,
+        verificationScopeId: computePublishScopeId(verifiedFolder),
+        headCommit: headCommit ?? undefined,
+        result,
+      })
+    ).catch((error) => {
+      console.warn("[runLintingFixes] Could not persist failed-check identities", error);
+    });
+  } else {
+    await clearFailedPublishRunSnapshotV1(taskFolderUri.fsPath).catch(() => undefined);
+  }
+}
 import { getProductionActionConversationOrchestratorV1 } from "../actions/productionTaskActionRuntimeV1";
 import type { ChatViewProvider } from "../views/chatView";
 import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
@@ -47,7 +102,6 @@ import {
 import {
   acquireWorkAdmissionV1,
   createSafeAdmissionReleaseStateV1,
-  describeWorkAdmissionRefusalV1,
   heldAdmissionClaimIdForTaskV1,
   recordAdmissionReleaseTriggerV1,
   requestSafeAdmissionReleaseV1,
@@ -56,6 +110,8 @@ import {
   WorkAdmissionHandleV1,
   WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1,
 } from "../state/workAdmissionV1";
+import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import { scheduleAutomationChain } from "../utils/automationChain";
@@ -67,6 +123,7 @@ import {
   computePublishScopeId,
   computeTreeFingerprintV1,
   markPublishReviewStaleV1,
+  withCommandIdentityV1,
   writePublishChecksFreshnessStampV1,
   writePublishFixNoteV1,
 } from "../utils/publishChecksFreshness";
@@ -157,13 +214,86 @@ function isFileInFolder(fileUri: vscode.Uri, folderPath: string): boolean {
          compareFilePath === compareFolderPath;
 }
 
+/**
+ * The failing tests grouped by test file, largest group first, each with one
+ * complete assertion message — so a cause shared by most of the failures (38 of
+ * 68 sharing one missing section) is visible instead of a name list cut off
+ * before any cause. Empty when no check listed its failing tests.
+ */
+export function buildFailureClustersForPromptV1(
+  failedChecks: readonly { readonly command: string; readonly failingTests?: FailingTestSummaryV1 }[]
+): readonly { command: string; file: string; failingTests: number; examples: readonly string[]; assertion?: string }[] {
+  const all = failedChecks.flatMap((check) =>
+    (check.failingTests?.clusters ?? []).map((cluster) => ({ command: check.command, cluster }))
+  );
+  all.sort((a, b) => b.cluster.count - a.cluster.count);
+  const { clusters } = selectFailureClustersForPromptV1(
+    all.map((entry) => entry.cluster),
+    FAILURE_CLUSTER_PROMPT_MAX_CHARS_V1
+  );
+  return clusters.map((cluster) => ({
+    command: all.find((entry) => entry.cluster === cluster)?.command ?? "",
+    file: cluster.file,
+    failingTests: cluster.count,
+    examples: cluster.titles,
+    ...(cluster.assertion !== undefined ? { assertion: cluster.assertion } : {}),
+  }));
+}
+
 /** Build the user-visible recovery choice shared by every lint-fix hand-back. */
 export function offerLintFixRecoveryInChatV1(
   taskFolderPath: string,
   taskLabel: string,
   noticeText: string,
-  optional = false
+  optional = false,
+  /**
+   * Set when a fix round just left checks failing. The card then recommends a
+   * step that can change the outcome (another fix round, or Back to
+   * Implementation after a low-yield round) and offers Run Publish Checks
+   * without a recommendation, since nothing has changed since the last run.
+   */
+  leftFailing?: { readonly progress?: FixProgressV1 }
 ): Promise<Awaited<ReturnType<typeof offerActionInChatV1>>> {
+  if (leftFailing !== undefined) {
+    const decision = decideFixHandbackV1(leftFailing.progress);
+    return offerActionInChatV1({
+      taskFolderPath,
+      taskLabel,
+      actionLabel: "Fix Linting & Code Errors again",
+      command: "vs-code-ai-helper.runLintingFixes",
+      args: [{ taskFolderPath }],
+      actionConsequence:
+        "Runs another fix round against the failures that remain. Pick a different Publish model in AI Models first if you want a stronger one.",
+      alternatives: [
+        {
+          label: "Back to Implementation",
+          command: "vs-code-ai-helper.setTaskStage",
+          args: [{ taskFolderPath, stage: "implementation" }],
+          consequence: "Returns the task to Implementation, for failures that need real plan work rather than a lint-style fix.",
+        },
+        {
+          label: "Choose a stronger Publish model",
+          command: "vs-code-ai-helper.openAiModels",
+          args: ["publish"],
+          consequence:
+            "Opens AI Models on the Publish stage. Nothing runs; once you have picked a model, choose Fix Linting & Code Errors again.",
+        },
+        {
+          label: "Run Publish Checks",
+          command: "vs-code-ai-helper.runPublishChecks",
+          args: [{ taskFolderPath }],
+          consequence:
+            "Re-runs the full checks. Nothing has changed since they last ran, so on its own this repeats the same result; it is useful after you change something yourself.",
+        },
+      ],
+      noticeText,
+      recommend: {
+        target: decision.recommended === "fixAgain" ? "action" : { alternativeIndex: 0 },
+        reasoning: decision.reason,
+      },
+      ...(optional ? { optional: true as const } : {}),
+    });
+  }
   return offerActionInChatV1({
     taskFolderPath,
     taskLabel,
@@ -530,7 +660,8 @@ export async function runLintingFixes(
       })
     : undefined;
   if (early && early.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalV1(early));
+    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    offerBusyRefusalChoicesOnceV1(early);
     return;
   }
 
@@ -611,10 +742,14 @@ export async function runLintingFixes(
     });
     if (late.outcome !== "acquired") {
       NotificationRouter.showWarning(
-        describeWorkAdmissionRefusalV1(
+        describeWorkAdmissionRefusalForUserV1(
           late,
           notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
         )
+      );
+      offerBusyRefusalChoicesOnceV1(
+        late,
+        notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
       );
       return;
     }
@@ -707,13 +842,15 @@ export async function runLintingFixes(
   const taskFolderUri = vscode.Uri.file(resolvedTask.taskFolderPath);
   const showFixHandbackV1 = async (
     noticeText: string,
-    level: "warning" | "error" = "warning"
+    level: "warning" | "error" = "warning",
+    leftFailing?: { readonly progress?: FixProgressV1 }
   ): Promise<void> => {
     const chatPointer = await offerLintFixRecoveryInChatV1(
       resolvedTask.taskFolderPath,
       taskLabel,
       noticeText,
-      true
+      true,
+      leftFailing
     );
     const message = `${noticeText}${chatPointer ? " Open the decision in Chat to continue." : ""}`;
     if (level === "error") {
@@ -951,11 +1088,52 @@ export async function runLintingFixes(
             const deterministicBeforeSha = await resolveHeadCommitSha(deterministicScopeFolder);
             const deterministicBeforeFingerprint = await computeTreeFingerprintV1(deterministicScopeFolder);
 
-            const postFixLint = await runCompletionLint(taskFolderUri, relevantFiles, { token: cancelToken });
+            // bugs3 Step 15: when the automatic fixes saved nothing and the commit,
+            // tree fingerprint, scope and configured commands all match the last
+            // failing Publish Checks run, that run IS the baseline: re-running the
+            // full checks (about 35 minutes in the reported case) could only print
+            // it again. Anything missing or different runs fresh, with the reason.
+            const baselineDecision = decideFailingBaselineReuseV1({
+              record: await readFailingBaselineV1(taskFolderUri.fsPath),
+              current: {
+                headCommit: deterministicBeforeSha,
+                treeFingerprint: deterministicBeforeFingerprint,
+                scopeId: computePublishScopeId(deterministicScopeFolder),
+                configuredCommands: getPublishVerificationCommands(),
+              },
+              deterministicEdits: autofixedRelativePaths.size,
+            });
+            if (baselineDecision.reuse) {
+              progress.report({ message: "Using the last failing check result (nothing changed since)..." });
+            } else {
+              progress.report({ message: `Running the checks fresh: ${baselineDecision.reason}.` });
+            }
+            const postFixLint = baselineDecision.reuse
+              ? completionLintResultFromBaselineV1(baselineDecision.record)
+              : await runCompletionLint(taskFolderUri, relevantFiles, { token: cancelToken });
             throwIfPublishChecksCancelledV1(cancelToken);
             await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
             throwIfPublishChecksCancelledV1(cancelToken);
             finalChecksV1 = { passed: postFixLint.passed, failedChecks: postFixLint.failedChecks };
+
+            if (!baselineDecision.reuse && !postFixLint.passed) {
+              // A fresh full failing run is the reference the post-fix re-check starts
+              // from (failed checks first, bugs2 Steps 29-30), exactly as a failing
+              // Publish Checks run records it.
+              const baselineScope = postFixLint.verifiedFolder ?? deterministicScopeFolder;
+              await writeFailedPublishRunSnapshotV1(
+                taskFolderUri.fsPath,
+                buildFailedPublishRunSnapshotV1({
+                  taskFolder: taskFolderUri.fsPath,
+                  repositoryRoot: baselineScope,
+                  verificationScopeId: computePublishScopeId(baselineScope),
+                  headCommit: deterministicBeforeSha,
+                  result: postFixLint,
+                })
+              ).catch((error) => {
+                console.warn("[runLintingFixes] Could not persist failed-check identities", error);
+              });
+            }
 
             if (!postFixLint.passed) {
 
@@ -1005,7 +1183,12 @@ export async function runLintingFixes(
                 const lint = JSON.stringify({
                   summary: postFixLint.summary,
                   issueCount: postFixLint.issueCount,
-                  failedChecks: postFixLint.failedChecks,
+                  failedChecks: postFixLint.failedChecks.map((check) =>
+                    check.failingTests?.clusters === undefined
+                      ? check
+                      : { ...check, failingTests: { ...check.failingTests, clusters: undefined } }
+                  ),
+                  failureClusters: buildFailureClustersForPromptV1(postFixLint.failedChecks),
                   remainingFiles: remainingLintIssues,
                   diagnostics: postFixDiagnostics.map(([uri, ds]) => ({ file: uri.fsPath, messages: ds.map((d) => d.message) })),
                   rawReportLocation: postFixLint.rawReportLocation ?? "runs/raw-check-output.log",
@@ -1234,9 +1417,21 @@ export async function runLintingFixes(
                     const beforeSha = await resolveHeadCommitSha(scopeFolder);
                     const beforeFingerprint = await computeTreeFingerprintV1(scopeFolder);
 
-                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles, { token: cancelToken });
+                    // The re-check goes through the failed-first run Publish Checks uses
+                    // (bugs2 Steps 29-30): the checks that failed run first and, only if
+                    // they now pass, the complete set runs once. That one result is the
+                    // outcome; no second full run follows it.
+                    const rerunOutcome = await runChecksFailedFirstV1({
+                      taskFolderUri,
+                      relevantFiles,
+                      token: cancelToken,
+                      scopeFolder,
+                      headCommit: beforeSha,
+                    });
+                    const rerunLint = rerunOutcome.result;
                     throwIfPublishChecksCancelledV1(cancelToken);
-                    await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    if (!rerunOutcome.failedFirst) await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    await recordPostFixCheckRunV1(taskFolderUri, rerunOutcome, scopeFolder, beforeSha);
                     throwIfPublishChecksCancelledV1(cancelToken);
                     finalChecksV1 = { passed: rerunLint.passed, failedChecks: rerunLint.failedChecks };
                     await inventory.refresh();
@@ -1268,8 +1463,16 @@ export async function runLintingFixes(
                       fixSucceededV1 = false;
                       if (!rerunLint.passed) {
                         settleFixOperation("failed", "checks still fail after the AI fixes were applied");
+                        const fixProgress = measureFixProgressV1(
+                          postFixLint.failedChecks,
+                          afterRoundChecksV1(rerunLint.failedChecks, rerunLint.passedExecutions),
+                          rerunLint.commandsRun
+                        );
                         await showFixHandbackV1(
-                          `AI final fixes were applied, but checks still fail (${classification.summary}). Fix the remaining issues, then run Publish Checks.`
+                          `AI final fixes were applied, but checks still fail (${classification.summary}).` +
+                            `${fixProgress !== undefined ? ` ${describeFixProgressV1(fixProgress)}` : ""}`,
+                          "warning",
+                          { progress: fixProgress }
                         );
                       } else if (classification.hasUnrun) {
                         settleFixOperation("failed", "prior failing checks were omitted or unrun after the AI fixes were applied");
@@ -1311,6 +1514,7 @@ export async function runLintingFixes(
                           completedAt: new Date().toISOString(),
                           scopeId: computePublishScopeId(verifiedFolder),
                           treeFingerprint: afterFingerprint,
+                          ...withCommandIdentityV1(rerunLint.commandsRun),
                         });
                       }
                       throwIfPublishChecksCancelledV1(cancelToken);
@@ -1328,9 +1532,17 @@ export async function runLintingFixes(
                     // the last word for this run, not silently overridden by
                     // the unrelated deterministic-autofix-count message
                     // below (see the `return` after this block).
-                    const rerunLint = await runCompletionLint(taskFolderUri, relevantFiles, { token: cancelToken });
+                    const rerunOutcome = await runChecksFailedFirstV1({
+                      taskFolderUri,
+                      relevantFiles,
+                      token: cancelToken,
+                      scopeFolder: deterministicScopeFolder,
+                      headCommit: deterministicBeforeSha,
+                    });
+                    const rerunLint = rerunOutcome.result;
                     throwIfPublishChecksCancelledV1(cancelToken);
-                    await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    if (!rerunOutcome.failedFirst) await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
+                    await recordPostFixCheckRunV1(taskFolderUri, rerunOutcome, deterministicScopeFolder, deterministicBeforeSha);
                     throwIfPublishChecksCancelledV1(cancelToken);
                     finalChecksV1 = { passed: rerunLint.passed, failedChecks: rerunLint.failedChecks };
                     await inventory.refresh();
@@ -1403,6 +1615,7 @@ export async function runLintingFixes(
                   completedAt: new Date().toISOString(),
                   scopeId: computePublishScopeId(verifiedFolder),
                   treeFingerprint: afterFingerprint,
+                  ...withCommandIdentityV1(postFixLint.commandsRun),
                 });
               }
             }

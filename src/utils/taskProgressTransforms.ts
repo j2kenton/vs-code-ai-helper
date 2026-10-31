@@ -1292,6 +1292,31 @@ export function clearEscalation(
 }
 
 /**
+ * bugs3 Step 9: clear the escalation as `clearEscalation` does, but when it is
+ * a plateau also record it in `overriddenEscalations`. A human resume over a
+ * plateau pause (the card's "Keep iterating" included) is an override, and the
+ * plateau check starts a fresh baseline after the latest overridden plateau —
+ * without the record, the very next review of the same blockers re-raised the
+ * plateau it had just been told to ride through. Idempotent per escalation
+ * (identified by stage, kind and `at`).
+ */
+export function clearEscalationRecordingPlateauOverrideV1(
+  progress: TaskProgress,
+  options?: { preserveFreshness?: boolean }
+): TaskProgress {
+  const escalation = progress.escalation;
+  if (!escalation) {
+    return progress;
+  }
+  const alreadyRecorded = (progress.overriddenEscalations ?? []).some(
+    (entry) => entry.stage === escalation.stage && entry.kind === escalation.kind && entry.at === escalation.at
+  );
+  const recorded =
+    escalation.kind === "plateau" && !alreadyRecorded ? appendOverriddenEscalation(progress, escalation) : progress;
+  return clearEscalation(recorded, options);
+}
+
+/**
  * Record that a post-implementation type-check (2g) failed on a round that
  * DID change files, so the caller can surface it immediately instead of
  * handing a non-compiling tree to a reviewer as if it were reviewable.

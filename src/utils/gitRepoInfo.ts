@@ -3,6 +3,7 @@ import { createHash } from "crypto";
 import { promises as fsPromises } from "fs";
 import * as path from "path";
 import { classifyWorkflowPathV1 } from "../services/workflowPrivacyClassifierV1";
+import { buildIndexLockFailureDiagnosisV1, isStaleIndexLockFailureV1 } from "./gitIndexLockV1";
 
 /**
  * Run a git command with safe argument passing (no shell interpolation).
@@ -40,6 +41,13 @@ export async function runGitCommand(
     gitProcess.on("close", (code) => {
       if (code === 0) {
         resolve({ stdout, stderr });
+      } else if (isStaleIndexLockFailureV1(stderr)) {
+        // A stale index lock is an Ensemble-owned Git failure: name the lock's
+        // age and what to do, instead of passing through git's own "another git
+        // process seems to be running".
+        void buildIndexLockFailureDiagnosisV1({ repositoryRoot: cwd, stderr })
+          .then((diagnosis) => reject(new Error(diagnosis)))
+          .catch(() => reject(new Error(`git ${command} failed with code ${code}\n${stderr}`)));
       } else {
         reject(new Error(`git ${command} failed with code ${code}\n${stderr}`));
       }

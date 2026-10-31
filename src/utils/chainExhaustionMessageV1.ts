@@ -1,5 +1,7 @@
 import { describeModelWithProviderV1 } from "../runners/providers";
 import type { ProviderChainCandidateStatusV1 } from "../types/taskActionOutcomeV1";
+import { STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
+import { isAuthenticationFailure } from "./quota";
 
 /**
  * One line naming every model a stage's chain tried and why each could not run
@@ -30,4 +32,48 @@ export function describeChainExhaustionTailV1(
   return (
     `${tried}To change the list, choose "Change the model in AI Models"; it opens AI Models focused on ${stageName}.`
   );
+}
+
+/**
+ * bugs3 Step 3: the cheapest next step for each kind of reason in an exhausted
+ * chain, instead of one fixed pointer. A quota or usage-limit candidate points
+ * at waiting for the reset (with its time when the provider gave one), a
+ * credential failure points at signing in to that provider again, and
+ * switching the stage's model is always offered because it works for every
+ * reason. Never suggests signing in for a quota candidate.
+ */
+export function describeChainRecoveryV1(
+  candidates: readonly ProviderChainCandidateStatusV1[],
+  stageKey?: string
+): string {
+  if (candidates.length === 0) {
+    return "";
+  }
+  const stageName = stageKey !== undefined ? (STAGE_DISPLAY_NAMES[stageKey as TaskStage] ?? stageKey) : undefined;
+  const steps: string[] = [];
+  const quota = candidates.filter((candidate) => candidate.deferredFailureKind === "quota");
+  if (quota.length > 0) {
+    const resets = quota
+      .map((candidate) => (candidate.deferredResetAt !== undefined ? Date.parse(candidate.deferredResetAt) : Number.NaN))
+      .filter((time) => !Number.isNaN(time))
+      .sort((a, b) => a - b);
+    steps.push(
+      resets.length > 0
+        ? `wait for the usage limit to reset (earliest ${new Date(resets[0]!).toLocaleString()})`
+        : "wait for the usage limit to reset"
+    );
+  }
+  const signIn = candidates.filter(
+    (candidate) => candidate.deferredFailureKind === undefined && isAuthenticationFailure(candidate.reason)
+  );
+  if (signIn.length > 0) {
+    const providers = [...new Set(signIn.map((candidate) => candidate.providerLabel))];
+    steps.push(`sign in again to ${providers.join(" and ")}`);
+  }
+  steps.push(
+    stageName !== undefined
+      ? `switch ${stageName}'s model (open AI Models on that stage)`
+      : "switch the stage's model in AI Models"
+  );
+  return `Next: ${steps.join(", or ")}.`;
 }

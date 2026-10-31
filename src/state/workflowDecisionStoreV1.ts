@@ -4,10 +4,22 @@ import {
   CreateWorkflowDecisionInputV1,
   createWorkflowDecisionV1,
   normalizeWorkflowDecisionV1,
+  WorkflowDecisionCompletionReasonV1,
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
 } from "../types/workflowDecisionV1";
-import { refreshFastForwardResumeOptionLabelsV1 } from "../commands/fastForwardResumeSuffixV1";
+import { awaitedRestartGuidanceV1, isAwaitedWaiterLiveV1 } from "../utils/awaitedDecisionWaitersV1";
+import {
+  holdDispatchingOptionsWhileOperationLiveV1,
+  liveOperationBlockingOptionV1,
+  refreshFastForwardResumeOptionLabelsV1,
+} from "../commands/fastForwardResumeSuffixV1";
+import { describeLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
+import {
+  endedLiveReferenceRefusalV1,
+  RUN_IMPLEMENTATION_OPTION_ID_V1,
+  viewEndedLiveReferenceV1,
+} from "../utils/liveReferenceCardV1";
 
 const STORAGE_KEY = "workflowDecisions";
 /** The Memento key holding every decision (hostDecisionMirrorV1.ts mirrors it into viewers). */
@@ -41,6 +53,21 @@ function changeEmitterFor(state: vscode.Memento): vscode.EventEmitter<void> {
  */
 export function notifyWorkflowDecisionsChangedV1(state: vscode.Memento): void {
   changeEmitterFor(state).fire();
+}
+
+/** Serialize whole-array Memento updates across store instances in this host. */
+const decisionWritesV1 = new WeakMap<vscode.Memento, Promise<void>>();
+
+async function serializeDecisionWriteV1<T>(state: vscode.Memento, work: () => Promise<T>): Promise<T> {
+  const previous = decisionWritesV1.get(state) ?? Promise.resolve();
+  const result = previous.catch(() => undefined).then(work);
+  const tail = result.then(() => undefined, () => undefined);
+  decisionWritesV1.set(state, tail);
+  try {
+    return await result;
+  } finally {
+    if (decisionWritesV1.get(state) === tail) decisionWritesV1.delete(state);
+  }
 }
 
 /**
@@ -161,9 +188,10 @@ export type ResolveWorkflowDecisionResultV1 =
    * `alreadySettled`: the store record itself may not be settled yet — this
    * fires from the in-process tombstone, ahead of and independent of the
    * persisted state, so the caller never dispatches an option's effect into
-   * a continuation that no longer exists.
+   * a continuation that no longer exists. `restartGuidance` is present when
+   * the decision records how to start the interrupted action again.
    */
-  | { readonly kind: "orphaned" };
+  | { readonly kind: "orphaned"; readonly restartGuidance?: string };
 
 export type DismissWorkflowDecisionResultV1 =
   | { readonly kind: "dismissed"; readonly decision: WorkflowDecisionV1 }
@@ -233,6 +261,16 @@ export class WorkflowDecisionStoreV1 {
       .map(refreshFastForwardResumeOptionLabelsV1);
   }
 
+  /**
+   * `all()` as the owner sees it: options that would collide with an
+   * operation running right now are marked unavailable (bugs3 Step 2). Reads
+   * only — the write paths use `all()`, so the hold is never persisted and
+   * lifts by itself when the operation ends.
+   */
+  private view(): WorkflowDecisionV1[] {
+    return this.all().map(holdDispatchingOptionsWhileOperationLiveV1).map(viewEndedLiveReferenceV1);
+  }
+
   private async saveAll(decisions: readonly WorkflowDecisionV1[]): Promise<void> {
     await this.state.update(STORAGE_KEY, enforceWorkflowDecisionCapV1(decisions));
     changeEmitterFor(this.state).fire();
@@ -262,6 +300,10 @@ export class WorkflowDecisionStoreV1 {
    * than leaving 244 stale duplicates permanently unresolved beside it.
    */
   async post(input: CreateWorkflowDecisionInputV1): Promise<PostWorkflowDecisionResultV1> {
+    return serializeDecisionWriteV1(this.state, () => this.postLockedV1(input));
+  }
+
+  private async postLockedV1(input: CreateWorkflowDecisionInputV1): Promise<PostWorkflowDecisionResultV1> {
     const created = createWorkflowDecisionV1(input);
     if (!created.ok) {
       return created;
@@ -329,7 +371,7 @@ export class WorkflowDecisionStoreV1 {
    */
   listPending(taskCanonicalId?: string): readonly WorkflowDecisionV1[] {
     const needle = taskCanonicalId !== undefined ? normalizePath(taskCanonicalId) : undefined;
-    return this.all().filter(
+    return this.view().filter(
       (decision) =>
         decision.state === "pending" &&
         !isWorkflowDecisionOrphanedV1(decision.decisionId) &&
@@ -338,7 +380,7 @@ export class WorkflowDecisionStoreV1 {
   }
 
   get(decisionId: string): WorkflowDecisionV1 | undefined {
-    return this.all().find((decision) => decision.decisionId === decisionId);
+    return this.view().find((decision) => decision.decisionId === decisionId);
   }
 
   /**
@@ -359,6 +401,10 @@ export class WorkflowDecisionStoreV1 {
    * task is that command's own concern, not this store's.
    */
   async resolve(decisionId: string, optionId: string): Promise<ResolveWorkflowDecisionResultV1> {
+    return serializeDecisionWriteV1(this.state, () => this.resolveLockedV1(decisionId, optionId));
+  }
+
+  private async resolveLockedV1(decisionId: string, optionId: string): Promise<ResolveWorkflowDecisionResultV1> {
     if (isWorkflowDecisionOrphanedV1(decisionId)) {
       // The waiter that could act on this answer is already gone (its
       // dismissal write failed but the continuation still ended). Refuse
@@ -376,15 +422,43 @@ export class WorkflowDecisionStoreV1 {
     if (decision.state !== "pending") {
       return { kind: "alreadySettled", decision };
     }
-    const option = decision.options.find((candidate) => candidate.optionId === optionId);
+    if (decision.awaited !== undefined && !isAwaitedWaiterLiveV1(decision.awaited)) {
+      // Only the in-process waiter that posted this card could act on an answer
+      // (bugs3 Step 13). A reload, or a waiter that already ended, left a card
+      // nothing is waiting on: refuse it rather than save an answer that
+      // resumes nothing, and say how to start the action again.
+      return { kind: "orphaned", restartGuidance: awaitedRestartGuidanceV1(decision) };
+    }
+    // The explicit Run Implementation option exists only in the ended-run view
+    // (bugs3 Step 19), so look the option up there.
+    const answerable = optionId === RUN_IMPLEMENTATION_OPTION_ID_V1 ? viewEndedLiveReferenceV1(decision) : decision;
+    const option = answerable.options.find((candidate) => candidate.optionId === optionId);
     if (!option) {
       return { kind: "rejected", reason: `decision "${decisionId}" has no option "${optionId}"` };
     }
+    // A keep-running answer for an Implementation round that has since ended
+    // must not be recorded as running anything (bugs3 Step 19).
+    const endedRefusal = endedLiveReferenceRefusalV1(decision, option);
+    if (endedRefusal) {
+      return { kind: "rejected", reason: endedRefusal };
+    }
+    // Re-checked against the live operations state at answer time, not from
+    // how the card looked when it was rendered (bugs3 Step 2).
+    const collidingOperation = liveOperationBlockingOptionV1(decision, option);
+    if (collidingOperation) {
+      return {
+        kind: "rejected",
+        reason:
+          `${describeLiveTaskOperationV1(collidingOperation)} is running for this task, so "${option.label}" ` +
+          "would start another action beside it. Choose it again when that ends.",
+      };
+    }
     const resolved: WorkflowDecisionV1 = {
-      ...decision,
+      ...answerable,
       state: "resolved",
       resolvedOptionId: optionId,
       resolvedAt: new Date().toISOString(),
+      ...(decision.awaited !== undefined ? { completionReason: "answered" as const } : {}),
     };
     const next = [...existing];
     next[index] = resolved;
@@ -392,8 +466,44 @@ export class WorkflowDecisionStoreV1 {
     return { kind: "resolved", decision: resolved, option };
   }
 
+  /**
+   * Put a decision this very answer just resolved back to pending, because the
+   * effect it promised was refused before it ran (an operation started between
+   * the click and the dispatch — bugs3 Step 2). Only the matching resolution
+   * is undone; a decision already settled any other way is left alone.
+   */
+  async reopenResolved(decisionId: string, optionId: string): Promise<boolean> {
+    return serializeDecisionWriteV1(this.state, () => this.reopenResolvedLockedV1(decisionId, optionId));
+  }
+
+  private async reopenResolvedLockedV1(decisionId: string, optionId: string): Promise<boolean> {
+    const existing = this.all();
+    const index = existing.findIndex((decision) => decision.decisionId === decisionId);
+    const decision = index === -1 ? undefined : existing[index]!;
+    if (!decision || decision.state !== "resolved" || decision.resolvedOptionId !== optionId) {
+      return false;
+    }
+    const { resolvedOptionId: _optionId, resolvedAt: _resolvedAt, ...rest } = decision;
+    const next = [...existing];
+    next[index] = { ...rest, state: "pending" };
+    await this.saveAll(next);
+    return true;
+  }
+
   /** Dismiss a pending decision without selecting an option. */
-  async dismiss(decisionId: string): Promise<DismissWorkflowDecisionResultV1> {
+  async dismiss(
+    decisionId: string,
+    by?: string,
+    completionReason?: WorkflowDecisionCompletionReasonV1
+  ): Promise<DismissWorkflowDecisionResultV1> {
+    return serializeDecisionWriteV1(this.state, () => this.dismissLockedV1(decisionId, by, completionReason));
+  }
+
+  private async dismissLockedV1(
+    decisionId: string,
+    by?: string,
+    completionReason?: WorkflowDecisionCompletionReasonV1
+  ): Promise<DismissWorkflowDecisionResultV1> {
     const existing = this.all();
     const index = existing.findIndex((decision) => decision.decisionId === decisionId);
     if (index === -1) {
@@ -403,7 +513,12 @@ export class WorkflowDecisionStoreV1 {
     if (decision.state !== "pending") {
       return { kind: "alreadySettled", decision };
     }
-    const dismissed: WorkflowDecisionV1 = { ...decision, state: "dismissed" };
+    const dismissed: WorkflowDecisionV1 = {
+      ...decision,
+      state: "dismissed",
+      ...(by !== undefined ? { dismissedBy: by, dismissedAt: new Date().toISOString() } : {}),
+      ...(completionReason !== undefined ? { completionReason } : {}),
+    };
     const next = [...existing];
     next[index] = dismissed;
     await this.saveAll(next);
@@ -424,6 +539,10 @@ export class WorkflowDecisionStoreV1 {
    * second withdrawal), exactly like `dismiss`.
    */
   async withdraw(decisionId: string, reason: string): Promise<WithdrawWorkflowDecisionResultV1> {
+    return serializeDecisionWriteV1(this.state, () => this.withdrawLockedV1(decisionId, reason));
+  }
+
+  private async withdrawLockedV1(decisionId: string, reason: string): Promise<WithdrawWorkflowDecisionResultV1> {
     const existing = this.all();
     const index = existing.findIndex((decision) => decision.decisionId === decisionId);
     if (index === -1) {
@@ -446,6 +565,10 @@ export class WorkflowDecisionStoreV1 {
    * Returns how many records were removed.
    */
   async removeForTask(taskCanonicalId: string): Promise<number> {
+    return serializeDecisionWriteV1(this.state, () => this.removeForTaskLockedV1(taskCanonicalId));
+  }
+
+  private async removeForTaskLockedV1(taskCanonicalId: string): Promise<number> {
     const needle = normalizePath(taskCanonicalId);
     const existing = this.all();
     const kept = existing.filter((decision) => normalizePath(decision.taskCanonicalId) !== needle);

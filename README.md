@@ -68,7 +68,7 @@ Ensemble supports GitHub Copilot and nine CLI integrations. A provider is suppor
 | **OpenCode Zen / Go** | OpenCode 2: installer (below) or `npm install -g @opencode/cli` (replaces the OpenCode 1 package `opencode-ai`; uninstall that first) | Run `opencode`, type `/connect`, choose **OpenCode Console** (for Zen) or **OpenCode Go**, and paste the API key from the OpenCode Console | Zen: pay-as-you-go credits ([Zen](https://opencode.ai/docs/zen/)). Go: monthly subscription ([Go](https://opencode.ai/docs/go/)) | [OpenCode docs](https://opencode.ai/docs/) |
 | **Cline CLI** | `npm install -g cline` (Node 20+) | `cline auth`, then choose ClinePass | ClinePass subscription only (Ensemble always passes `-P cline-pass`). See [ClinePass](https://cline.bot/cline-pass) | [Installation](https://docs.cline.bot/cline-cli/installation), [authorizing](https://docs.cline.bot/getting-started/authorizing-with-cline) |
 | **Kimi Code CLI** | Official installer only (below) | `kimi login` | Kimi membership, or a Kimi Platform pay-as-you-go API key. See [membership](https://www.kimi.com/en/help/membership/membership-overview) | [Getting started](https://www.kimi.com/code/docs/en/kimi-code-cli/guides/getting-started) |
-| **devpass-code** | `npm i -g devpass-code` | `devpass-code auth login`, then choose "LLM Gateway DevPass" | DevPass monthly subscription. See [DevPass](https://devpass.llmgateway.io/) | [GitHub](https://github.com/theopenco/devpass-code), [guide](https://docs.llmgateway.io/guides/devpass-code) |
+| **devpass-code** | `npm i -g devpass-code@2.0.29` (1.x, verified with 1.18.11, also works) | `devpass-code auth login`, then choose "LLM Gateway DevPass" | DevPass monthly subscription. See [DevPass](https://devpass.llmgateway.io/) | [GitHub](https://github.com/theopenco/devpass-code), [guide](https://docs.llmgateway.io/guides/devpass-code) |
 
 Installer commands (macOS/Linux unless noted):
 
@@ -93,6 +93,11 @@ curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
 ```
 
 OpenCode appears as two separate provider rows in Ensemble: **OpenCode Zen** for `opencode/...` models and **OpenCode Go** for `opencode-go/...` models. They use the same `opencode` CLI and can use the same OpenCode key, but enabling or connecting one does not grant access to the other. A Zen/Go backup is only used when you explicitly select it as a backup model. Ensemble needs OpenCode 2; with OpenCode 1 still installed, an OpenCode round stops and tells you how to switch. devpass-code is a fork of OpenCode with its own single "LLM Gateway DevPass" account, so it appears as one provider row.
+
+Ensemble supports devpass-code **1.x** (verified with 1.18.11) and **2.x** (verified with 2.0.29), detecting which is installed before each run; any other major is refused with a message naming the supported versions. On 2.x, Ensemble runs `devpass-code run --standalone` and passes a reasoning level as `provider/model#variant`; it lists models with `devpass-code api --standalone model.list`. Notes for 2.x:
+
+- devpass-code 2.x's background service defaults to port 49374, the same as OpenCode 2's. If both are installed and a run reports the port is in use, move devpass-code's service with `devpass-code service set port <n>`.
+- 1.x cannot open a data folder that 2.x has written ("Database is not empty and has no session table"). Before moving from 2.x back to 1.x, deliberately set that data folder aside (rename or back it up) — it holds your devpass-code sessions, so don't delete it unless you mean to lose them.
 
 Enable the CLI providers you want under **Ensemble: Configure AI Models**. AI actions consume real quota or money, and implementation runs modify workspace files.
 

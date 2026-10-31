@@ -1,4 +1,14 @@
 import * as cp from "child_process";
+import * as nodeFs from "node:fs";
+import * as nodeOs from "node:os";
+import * as nodePath from "node:path";
+import {
+  DEVPASS_DEFAULT_MAJOR_V1,
+  DEVPASS_SUPPORTED_MAJORS_V1,
+  decideCliMajorV1,
+  devpassUnsupportedMajorMessageV1,
+  getCliMajorVersionV1,
+} from "./cliMajorVersionV1";
 import { killProcessTree, sanitizedCliEnv } from "./cliProcessUtils";
 
 export interface DiscoveredCliModel {
@@ -133,6 +143,158 @@ export function parseKiroModelsOutput(output: string): DiscoveredCliModel[] {
 }
 
 const DISCOVERY_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+const DISCOVERY_STDERR_HEAD_CHARS = 2000;
+const DISCOVERY_STDERR_LOG_LINES = 5;
+
+/** Why a model-discovery call left the picker without a live list. */
+export type CliDiscoveryFailureReasonV1 =
+  | "spawn"
+  | "timeout"
+  | "exit"
+  | "overflow"
+  | "outputFile"
+  /** The installed CLI's major is one Ensemble does not support; `stderrHead` carries the remedy. */
+  | "unsupportedVersion"
+  /** Exit 0, but nothing parseable — a truncated response or a changed format. */
+  | "noModels"
+  /**
+   * Exit 0 and a well-formed listing that holds no models (blank output, or an
+   * empty JSON list): the CLI answered, there is just nothing in the catalog — a
+   * signed-out or empty account — which is not a malformed or failed response.
+   */
+  | "emptyCatalog";
+
+/**
+ * Whether an exit-0 listing that yielded no models was an empty answer rather
+ * than output Ensemble could not read: blank output, or JSON that is an empty
+ * list (or an object whose `data`, `models` or `items` list is empty).
+ */
+export function isEmptyCliCatalogOutputV1(stdout: string): boolean {
+  const text = stdout.trim();
+  if (text.length === 0) {
+    return true;
+  }
+  try {
+    const value: unknown = JSON.parse(text);
+    if (Array.isArray(value)) {
+      return value.length === 0;
+    }
+    if (typeof value === "object" && value !== null) {
+      for (const key of ["data", "models", "items"]) {
+        const list = (value as Record<string, unknown>)[key];
+        if (Array.isArray(list)) {
+          return list.length === 0;
+        }
+      }
+    }
+  } catch {
+    // Not JSON: a text listing that parsed to nothing is unreadable, not empty.
+  }
+  return false;
+}
+
+/** One failed discovery, shaped for the diagnostic log (no stdout, redacted stderr). */
+export interface CliDiscoveryFailureV1 {
+  readonly provider: string;
+  readonly command: string;
+  readonly reason: CliDiscoveryFailureReasonV1;
+  readonly exitCode?: number;
+  readonly stderrHead: string;
+}
+
+let discoveryFailureSink: ((failure: CliDiscoveryFailureV1) => void) | undefined;
+
+/** Installs the diagnostic sink (the extension's output channel); pass undefined to remove it. */
+export function setCliDiscoveryFailureSinkV1(sink: ((failure: CliDiscoveryFailureV1) => void) | undefined): void {
+  discoveryFailureSink = sink;
+}
+
+/** The newest failure per provider name, so the picker can say why it shows the built-in list. */
+const latestDiscoveryFailureByProvider = new Map<string, { readonly at: number; readonly failure: CliDiscoveryFailureV1 }>();
+
+/**
+ * The failure a provider's discovery reported at or after `sinceMs`, if any.
+ * `command` is the CLI executable (a path or a bare name); failures are keyed
+ * by its file name without extension, as `runCliModelDiscovery` reports them.
+ */
+export function latestCliDiscoveryFailureV1(command: string, sinceMs: number): CliDiscoveryFailureV1 | undefined {
+  const entry = latestDiscoveryFailureByProvider.get(nodePath.basename(command).replace(/\.(cmd|exe|bat)$/i, ""));
+  return entry !== undefined && entry.at >= sinceMs ? entry.failure : undefined;
+}
+
+/** Forget remembered failures; for tests. */
+export function clearCliDiscoveryFailuresV1(): void {
+  latestDiscoveryFailureByProvider.clear();
+}
+
+/** The reason a discovery left the built-in list in place, in a few plain words. */
+export function describeCliDiscoveryFailureReasonV1(failure: CliDiscoveryFailureV1): string {
+  switch (failure.reason) {
+    case "timeout":
+      return "the model listing timed out";
+    case "exit":
+      return `the model listing exited with code ${failure.exitCode ?? "unknown"}`;
+    case "spawn":
+      return "the CLI could not be started";
+    case "overflow":
+      return "the model listing produced more output than the discovery limit";
+    case "outputFile":
+      return "the model listing could not use its temporary output file";
+    case "unsupportedVersion":
+      return failure.stderrHead.length > 0 ? failure.stderrHead : "this CLI version is not supported";
+    case "emptyCatalog":
+      return "the CLI answered with an empty model list (is it signed in?)";
+    default:
+      return "the model listing returned nothing Ensemble could read";
+  }
+}
+
+function reportCliDiscoveryFailureV1(failure: CliDiscoveryFailureV1): void {
+  latestDiscoveryFailureByProvider.set(failure.provider, { at: Date.now(), failure });
+  try {
+    discoveryFailureSink?.(failure);
+  } catch {
+    // A logging fault must never turn into a discovery fault.
+  }
+}
+
+/** The first few stderr lines, with secret-looking values masked. */
+export function boundDiscoveryStderrV1(stderr: string): string {
+  return stderr
+    .split(/\r?\n/)
+    .filter((line) => line.trim().length > 0)
+    .slice(0, DISCOVERY_STDERR_LOG_LINES)
+    .map((line) =>
+      line
+        .replace(/\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}/gi, "$1 ***")
+        .replace(/((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)\S+/gi, "$1***")
+        .replace(/\b(?:sk|llmg|ghp|gho)[-_][A-Za-z0-9_-]{10,}/g, "***")
+        .slice(0, 300)
+    )
+    .join("\n");
+}
+
+/** One line for the log: provider, command, exit code or timeout, and the stderr head. */
+export function formatCliDiscoveryFailureV1(failure: CliDiscoveryFailureV1): string {
+  const how =
+    failure.reason === "timeout"
+      ? "timed out"
+      : failure.reason === "exit"
+        ? `exited with code ${failure.exitCode ?? "unknown"}`
+        : failure.reason === "spawn"
+          ? "could not be started"
+          : failure.reason === "overflow"
+            ? "produced more output than the discovery limit"
+            : failure.reason === "outputFile"
+              ? "could not use its temporary output file"
+              : failure.reason === "unsupportedVersion"
+                ? "was not run because this CLI version is not supported"
+                : failure.reason === "emptyCatalog"
+                  ? "answered successfully with an empty model list"
+                  : "exited 0 but returned no models Ensemble could read";
+  const stderr = failure.stderrHead.length > 0 ? `\n  stderr: ${failure.stderrHead.replace(/\n/g, "\n          ")}` : "";
+  return `Model discovery for ${failure.provider} failed — \`${failure.command}\` ${how}; showing the built-in list.${stderr}`;
+}
 
 /**
  * Runs a model-discovery CLI call and resolves with whatever the parser can
@@ -155,13 +317,54 @@ function runCliModelDiscovery(
   command: string,
   args: readonly string[],
   timeoutMs: number,
-  parse: (output: string) => DiscoveredCliModel[]
+  parse: (output: string) => DiscoveredCliModel[],
+  options: { readonly stdoutToFile?: boolean } = {}
 ): Promise<DiscoveredCliModel[]> {
   return new Promise((resolve) => {
     let settled = false;
     let stdout = "";
     let stdoutBytes = 0;
     let overflowed = false;
+    let stderrHead = "";
+
+    const reportFailure = (reason: CliDiscoveryFailureReasonV1, exitCode?: number | null): void => {
+      reportCliDiscoveryFailureV1({
+        provider: nodePath.basename(command).replace(/\.(cmd|exe|bat)$/i, ""),
+        command: [command, ...args].join(" "),
+        reason,
+        ...(typeof exitCode === "number" ? { exitCode } : {}),
+        stderrHead: boundDiscoveryStderrV1(stderrHead),
+      });
+    };
+
+    // bugs3 Step 14: devpass-code 2.x's `api model.list` loses output past
+    // 262,144 bytes when stdout is a pipe (exit 0, truncated JSON; observed
+    // 2026-10-28 — the complete response is ~359 KB). Giving the child a
+    // regular file as stdout delivers all of it, so the answer is read back
+    // from that file once the process has exited.
+    let outputFile: string | undefined;
+    let outputFd: number | undefined;
+    const closeOutputFile = (): void => {
+      if (outputFd !== undefined) {
+        try {
+          nodeFs.closeSync(outputFd);
+        } catch {
+          // Already closed.
+        }
+        outputFd = undefined;
+      }
+    };
+    const removeOutputFile = (): void => {
+      closeOutputFile();
+      if (outputFile !== undefined) {
+        try {
+          nodeFs.unlinkSync(outputFile);
+        } catch {
+          // Best-effort cleanup.
+        }
+        outputFile = undefined;
+      }
+    };
 
     const finish = (result: readonly DiscoveredCliModel[]): void => {
       if (settled) {
@@ -169,12 +372,29 @@ function runCliModelDiscovery(
       }
       settled = true;
       clearTimeout(timer);
+      removeOutputFile();
       resolve([...result]);
     };
+
+    if (options.stdoutToFile === true) {
+      try {
+        outputFile = nodePath.join(
+          nodeOs.tmpdir(),
+          `ensemble-discovery-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.out`
+        );
+        outputFd = nodeFs.openSync(outputFile, "w+", 0o600);
+      } catch {
+        removeOutputFile();
+        reportFailure("outputFile");
+        resolve([]);
+        return;
+      }
+    }
 
     let child: cp.ChildProcess;
     try {
       child = cp.spawn(command, args as string[], {
+        ...(outputFd !== undefined ? { stdio: ["ignore", outputFd, "pipe"] as cp.StdioOptions } : {}),
         windowsHide: true,
         env: sanitizedCliEnv(),
         // Windows-only: without a shell, spawn calls CreateProcess directly,
@@ -194,16 +414,27 @@ function runCliModelDiscovery(
         detached: process.platform !== "win32",
       });
     } catch {
+      removeOutputFile();
+      reportFailure("spawn");
       resolve([]);
       return;
     }
 
+    // The child holds its own copy of the descriptor now.
+    closeOutputFile();
+
     const timer = setTimeout(() => {
+      if (!settled) {
+        reportFailure("timeout");
+      }
       killProcessTree(child);
       finish([]);
     }, timeoutMs);
 
     child.on("error", () => {
+      if (!settled) {
+        reportFailure("spawn");
+      }
       finish([]);
     });
 
@@ -217,6 +448,7 @@ function runCliModelDiscovery(
         // as a failure (empty result) rather than parsing a truncated
         // mid-object buffer, which could silently return a partial catalog.
         overflowed = true;
+        reportFailure("overflow");
         killProcessTree(child);
         finish([]);
         return;
@@ -233,12 +465,37 @@ function runCliModelDiscovery(
     // discovery timeout instead of returning quickly. No overflow guard is
     // needed on this side since bytes are discarded immediately rather than
     // accumulated.
-    child.stderr?.on("data", () => {
-      // Draining only; content is not used by any discovery caller today.
+    child.stderr?.on("data", (chunk: Buffer) => {
+      // Drained; only the first bytes are kept, for the failure diagnostic.
+      if (stderrHead.length < DISCOVERY_STDERR_HEAD_CHARS) {
+        stderrHead += chunk.toString("utf8").slice(0, DISCOVERY_STDERR_HEAD_CHARS - stderrHead.length);
+      }
     });
 
     child.on("close", (code) => {
-      if (overflowed) {
+      if (overflowed || settled) {
+        return;
+      }
+      if (outputFile !== undefined) {
+        try {
+          if (nodeFs.statSync(outputFile).size > DISCOVERY_MAX_BUFFER_BYTES) {
+            reportFailure("overflow", code);
+            finish([]);
+            return;
+          }
+          stdout = nodeFs.readFileSync(outputFile, "utf8");
+        } catch {
+          reportFailure("outputFile", code);
+          finish([]);
+          return;
+        }
+      }
+      // A CLI that exited non-zero may have printed only part of its catalog before
+      // failing, so its output is not accepted as a live list even when it parses:
+      // the failure is logged and the picker keeps the earlier or built-in list.
+      if (code !== null && code !== 0) {
+        reportFailure("exit", code);
+        finish([]);
         return;
       }
       const parsed = parse(stdout);
@@ -246,10 +503,10 @@ function runCliModelDiscovery(
         finish(parsed);
         return;
       }
-      if (code !== 0) {
-        finish([]);
-        return;
-      }
+      // Exit 0 with nothing parseable is the truncated/changed-format case; a
+      // non-zero exit is the CLI refusing the command. Both leave the picker on
+      // its built-in list, so both are logged.
+      reportFailure(code !== 0 ? "exit" : isEmptyCliCatalogOutputV1(stdout) ? "emptyCatalog" : "noModels", code);
       finish(parsed);
     });
   });
@@ -455,7 +712,10 @@ export function parseOpencodeModelsOutput(output: string): DiscoveredCliModel[] 
  * parseOpencodeModelSelection are unchanged. Anything that is not that shape
  * yields no models.
  */
-export function parseOpencodeApiModelListOutput(output: string): DiscoveredCliModel[] {
+export function parseOpencodeApiModelListOutput(
+  output: string,
+  options: { readonly providerID?: string; readonly priceTier?: boolean } = {}
+): DiscoveredCliModel[] {
   let parsed: unknown;
   try {
     parsed = JSON.parse(output.trim());
@@ -475,9 +735,12 @@ export function parseOpencodeApiModelListOutput(output: string): DiscoveredCliMo
     if (typeof model.id !== "string" || !model.id || typeof model.providerID !== "string" || !model.providerID) {
       continue;
     }
+    if (options.providerID !== undefined && model.providerID !== options.providerID) {
+      continue;
+    }
     const fullId = `${model.providerID}/${model.id}`;
     const displayName = (typeof model.name === "string" && model.name.trim()) || fullId;
-    const priceTierV1 = parseOpenCodePriceTierV1(model.cost);
+    const priceTierV1 = options.priceTier === false ? undefined : parseOpenCodePriceTierV1(model.cost);
     result.push({ model: fullId, name: displayName, ...(priceTierV1 ? { priceTierV1 } : {}) });
     if (!Array.isArray(model.variants)) {
       continue;
@@ -630,10 +893,46 @@ export async function discoverDevpassModels(command: string): Promise<
   return discoverDevpassModelsWithTimeout(command, 30_000);
 }
 
+/** The provider alias devpass-code's own catalog and account key use. */
+export const DEVPASS_PROVIDER_ID_V1 = "llmgateway-devpass";
+
 export async function discoverDevpassModelsWithTimeout(
   command: string,
-  timeoutMs: number
+  timeoutMs: number,
+  probeMajor: (command: string) => Promise<number | undefined> = getCliMajorVersionV1
 ): Promise<DiscoveredCliModel[]> {
+  // The same decision the run path makes (resolveVersionedContractV1): an
+  // unreadable version assumes the default major, an unsupported one is
+  // refused with the supported-version remedy instead of guessing a contract.
+  const decision = decideCliMajorV1(
+    await probeMajor(command),
+    DEVPASS_SUPPORTED_MAJORS_V1,
+    DEVPASS_DEFAULT_MAJOR_V1
+  );
+  if ("unsupportedMajor" in decision) {
+    reportCliDiscoveryFailureV1({
+      provider: "devpass-code",
+      command: `${command} --version`,
+      reason: "unsupportedVersion",
+      stderrHead: devpassUnsupportedMajorMessageV1(decision.unsupportedMajor),
+    });
+    return [];
+  }
+  if (decision.major >= 2) {
+    // 2.x dropped `models --verbose`; its catalog is `api --standalone
+    // model.list` (verified against 2.0.29, 2026-10-28), a `{ location, data }`
+    // envelope whose models carry array-valued `variants`. It lists the same
+    // models under two provider aliases, so only `llmgateway-devpass` — the
+    // one the 1.x catalog and the account key use — is offered. stdout goes to
+    // a file because a pipe capture truncates the ~359 KB response.
+    return runCliModelDiscovery(
+      command,
+      ["api", "--standalone", "model.list"],
+      timeoutMs,
+      (output) => parseOpencodeApiModelListOutput(output, { providerID: DEVPASS_PROVIDER_ID_V1, priceTier: false }),
+      { stdoutToFile: true }
+    );
+  }
   return runCliModelDiscovery(
     command,
     ["models", "--verbose"],

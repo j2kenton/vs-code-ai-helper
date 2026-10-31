@@ -2,9 +2,13 @@ import * as vscode from "vscode";
 import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import {
   clearTaskStageModels,
+  describeCliDiscoveryFallbackV1,
   findTaskModelConflicts,
   getAvailableModels,
+  hasUndiscoveredCliProvidersV1,
+  refreshCliModelsV1,
 } from "../utils/modelSelection";
+import { resolveEnsembleHostRoleV1, type EnsembleHostRoleV1 } from "../state/hostRoleV1";
 import {
   getModelSettings,
   getEnabledProviders,
@@ -31,10 +35,29 @@ type IncomingMessage =
   | { type: "rendered" }
   | { type: "saveSettings"; settings: ModelSettings }
   | { type: "saveProviders"; enabledProviders: Record<string, boolean> }
+  | { type: "refreshModels" }
   | { type: "validationError"; message: string }
   | { type: "providerSignIn"; providerId: string }
   | { type: "providerUsage"; providerId: string }
   | { type: "suppressUnsavedWarning" };
+
+/**
+ * Whether opening AI Models must run the read-only model listing itself: only a
+ * viewer window (which has no startup warm-up), and only while some provider has
+ * not been asked yet. A runner window already warmed its cache at activation.
+ */
+export function shouldDiscoverModelsOnDemandV1(hostRole: EnsembleHostRoleV1, anyUndiscovered: boolean): boolean {
+  return hostRole === "viewer" && anyUndiscovered;
+}
+
+/**
+ * The line shown under a provider whose live model list could not be obtained
+ * ("Showing the built-in list; live list unavailable: …"), or "" when its list
+ * is live, has not been tried yet, or the provider has no CLI to discover from.
+ */
+export function describeProviderDiscoveryNoteV1(cliProviderId: string | undefined): string {
+  return cliProviderId === undefined ? "" : (describeCliDiscoveryFallbackV1(cliProviderId) ?? "");
+}
 
 /** Provider label for terminal titles/messages, without a doubled "CLI". */
 function accountEntryDisplayLabel(entry: ProviderAccountEntry): string {
@@ -255,6 +278,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // the panel permanently blank. Waiting for the webview to announce
           // it's ready avoids that race regardless of timing.
           await this._postInit(webviewView.webview);
+          if (shouldDiscoverModelsOnDemandV1(resolveEnsembleHostRoleV1(), hasUndiscoveredCliProvidersV1())) {
+            void this._discoverModelsOnDemand(webviewView.webview);
+          }
           break;
         }
         case "rendered": {
@@ -296,6 +322,19 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           setTimeout(() => { this._selfOriginatedProviderWrite = false; }, 3000);
           await setEnabledProviders(data.enabledProviders);
           NotificationRouter.showInformation("Provider selection saved.");
+          await this._postProvidersRefresh(webviewView.webview);
+          break;
+        }
+        case "refreshModels": {
+          // Re-run every provider's discovery and re-post the picker's models and
+          // per-provider notes; the model form's unsaved edits are untouched
+          // (the same targeted refresh a provider-selection save uses).
+          void webviewView.webview.postMessage({ type: "modelsRefreshing" });
+          try {
+            await refreshCliModelsV1();
+          } catch (error) {
+            console.warn("[settingsView] Model refresh failed", error);
+          }
           await this._postProvidersRefresh(webviewView.webview);
           break;
         }
@@ -497,6 +536,22 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
     });
   }
 
+  /**
+   * A viewer window runs no startup warm-up (it probes no CLI while it only
+   * watches), so its picker would otherwise show the built-in lists however old
+   * they are. Opening AI Models asks each installed CLI for its read-only model
+   * listing once, then re-posts the lists; the picker is already on screen with
+   * the built-ins in the meantime.
+   */
+  private async _discoverModelsOnDemand(webview: vscode.Webview): Promise<void> {
+    try {
+      await refreshCliModelsV1();
+    } catch (error) {
+      console.warn("[settingsView] On-demand model discovery failed", error);
+    }
+    await this._postProvidersRefresh(webview);
+  }
+
   /** Shared provider-row view-model builder — see _postInit and _postProvidersRefresh. */
   private _buildProviderViewModels() {
     return PROVIDER_ACCOUNT_ENTRIES.map((provider) => ({
@@ -511,6 +566,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       // models were discovered at all — before a run has failed, instead of
       // only inside post-failure error strings.
       installHint: cliDefinitionForProviderAccountId(provider.id)?.installHint ?? "",
+      // Why this provider's picker is showing the built-in list, when its live
+      // discovery failed or timed out; empty when the list is live or untried.
+      discoveryNote: describeProviderDiscoveryNoteV1(cliDefinitionForProviderAccountId(provider.id)?.id),
       // UI button state comes from the same capability descriptor the
       // handler dispatches on: enabled for terminal/interactive/
       // vscode-command/manual, and also for unsupported when it carries a
@@ -839,6 +897,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             margin: var(--ensemble-space-2) 0 0;
             font-size: var(--ensemble-small-font-size);
             color: var(--ensemble-info-foreground);
+          }
+          /* Why a provider's picker shows the built-in list instead of the
+             CLI's live one; muted status text, indented under its row. */
+          .provider-discovery-note {
+            margin: 0 0 var(--ensemble-space-2) var(--ensemble-space-3);
+            font-size: var(--ensemble-small-font-size);
+            color: var(--ensemble-disabled-foreground);
           }
           /* Sits directly under its provider row, indented to read as
              belonging to that provider rather than to the whole list. A
@@ -1724,11 +1789,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                       : '<button type="button" class="secondary provider-usage" disabled title="' + escapeHtml(provider.usageTooltip) + '">Check usage</button>')
                   : '') +
                 '</div>' +
+                (provider.discoveryNote
+                  ? '<div class="provider-discovery-note" role="status">' + escapeHtml(provider.discoveryNote) + '</div>'
+                  : '') +
                 (provider.permissionWarning
                   ? '<details class="provider-warning"><summary>Warning</summary><p>' + escapeHtml(provider.permissionWarning) + '</p></details>'
                   : '')
               ).join('') +
-              '<div class="btn-container"><button id="discard-providers-btn" class="secondary" disabled title="Revert unsaved provider selection changes back to the last saved settings">' + DISCARD_ICON_SVG + 'Discard Unsaved Changes</button>' +
+              '<div class="btn-container"><button id="refresh-models-btn" class="secondary" title="Ask every installed CLI for its current model list and update the pickers below, without reloading the window">Refresh models</button>' +
+              '<button id="discard-providers-btn" class="secondary" disabled title="Revert unsaved provider selection changes back to the last saved settings">' + DISCARD_ICON_SVG + 'Discard Unsaved Changes</button>' +
               '<button id="save-providers-btn" disabled title="Save the enabled provider selection">' + SAVE_ICON_SVG + 'Save Provider Selection</button></div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
@@ -1740,6 +1809,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               button.addEventListener('click', () => {
                 vscode.postMessage({ type: 'providerUsage', providerId: button.dataset.usageProvider });
               });
+            });
+            container.querySelector('#refresh-models-btn').addEventListener('click', event => {
+              // The host answers with providersRefreshed, which re-renders this
+              // panel (and so re-enables the button) with the new lists and notes.
+              const button = event.currentTarget;
+              button.disabled = true;
+              button.textContent = 'Refreshing models…';
+              vscode.postMessage({ type: 'refreshModels' });
             });
             container.querySelector('#save-providers-btn').addEventListener('click', () => {
               const next = {};
