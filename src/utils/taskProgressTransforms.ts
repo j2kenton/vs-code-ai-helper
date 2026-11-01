@@ -22,6 +22,9 @@ import {
   MAX_ROUND_LEDGER_ENTRIES,
   MAX_ROUND_OUTCOMES,
   MAX_PLAN_ITEM_EVIDENCE_ENTRIES,
+  MAX_PLAN_ITEM_OWNER_DECISIONS,
+  MAX_PLAN_ITEM_OWNER_TEST_RUNS,
+  PlanItemOwnerDecisionV1,
   PlanItemReviewerVerificationV1,
   PlanItemTestReportV1,
   QuotaParkRecordV1,
@@ -102,6 +105,62 @@ export function recordPlanItemReviewerVerificationV1<T extends TaskProgress>(
     records[index] = { ...current, verifications: [...(current.verifications ?? []), verification].slice(-100) };
   }
   return { ...progress, planItemEvidence: records.slice(-MAX_PLAN_ITEM_EVIDENCE_ENTRIES) } as T;
+}
+
+/**
+ * bugs4 item 7: records an explicit owner decision (a form tick or exclusion)
+ * in the top-level `planItemOwnerDecisions` list (not inside an evidence entry,
+ * which shipped builds would reject). Owner provenance only: it adds no claim
+ * and no reviewer verification, so the gate can tell the two apart.
+ */
+export function recordPlanItemOwnerDecisionV1<T extends TaskProgress>(
+  progress: T,
+  input: { readonly planRevision: string; readonly itemText: string; readonly at: string; readonly formId: string; readonly decision: "tick" | "exclude" }
+): T {
+  const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const records = [...(progress.planItemOwnerDecisions ?? [])];
+  if (records.some((row) => row.planRevision === input.planRevision && row.itemKey === itemKey &&
+      row.formId === input.formId && row.decision === input.decision)) return progress;
+  const decision: PlanItemOwnerDecisionV1 = {
+    planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000),
+    source: "owner", at: input.at, formId: input.formId, decision: input.decision,
+  };
+  records.push(decision);
+  return { ...progress, planItemOwnerDecisions: records.slice(-MAX_PLAN_ITEM_OWNER_DECISIONS) } as T;
+}
+
+/**
+ * bugs4 item 21 / Step 19: records a test run the owner ran by hand, as test evidence for the named
+ * items with owner provenance (top-level list, not inside an evidence entry). The same form
+ * submission is never recorded twice.
+ */
+export function recordPlanItemOwnerTestRunV1<T extends TaskProgress>(
+  progress: T,
+  input: {
+    readonly planRevision: string;
+    readonly itemTexts: readonly string[];
+    readonly at: string;
+    readonly formId: string;
+    readonly command: string;
+    readonly exitCode: number;
+    readonly summary: string;
+  }
+): T {
+  const records = [...(progress.planItemOwnerTestRuns ?? [])];
+  if (records.some((row) => row.formId === input.formId && row.planRevision === input.planRevision)) return progress;
+  const itemKeys = [...new Set(input.itemTexts.map(normalizeChecklistItemTextV1))].slice(0, 200);
+  if (itemKeys.length === 0) return progress;
+  records.push({
+    planRevision: input.planRevision,
+    source: "owner",
+    at: input.at,
+    formId: input.formId,
+    command: input.command.slice(0, 4000),
+    exitCode: input.exitCode,
+    summary: input.summary.slice(0, 8000),
+    itemKeys,
+  });
+  return { ...progress, planItemOwnerTestRuns: records.slice(-MAX_PLAN_ITEM_OWNER_TEST_RUNS) } as T;
 }
 
 export function recordPlanItemTestReportV1<T extends TaskProgress>(

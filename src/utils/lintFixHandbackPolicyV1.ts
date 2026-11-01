@@ -14,6 +14,7 @@
  * count that exceeds its list is reported as a count, never as named passes.
  */
 import type { FailingTestSummaryV1 } from "./failingTestsV1";
+import type { FixChainBlockKindV1 } from "./lintFixChainBlockV1";
 
 interface FailedCheckLikeV1 {
   readonly command: string;
@@ -313,7 +314,19 @@ export function describeFixProgressV1(progress: FixProgressV1): string {
   return text;
 }
 
-export type FixHandbackRecommendationV1 = "fixAgain" | "backToImplementation";
+/** One plain sentence naming a chain-level block, for the card's recommendation reason. */
+export function describeFixChainBlockV1(kind: FixChainBlockKindV1): string {
+  switch (kind) {
+    case "quota":
+      return "every enabled Publish model is out of quota";
+    case "payment-required":
+      return "the Publish model's account needs credits";
+    case "auth":
+      return "the Publish model needs a new sign-in";
+  }
+}
+
+export type FixHandbackRecommendationV1 = "fixAgain" | "backToImplementation" | "chooseModel";
 
 export interface FixHandbackDecisionV1 {
   readonly recommended: FixHandbackRecommendationV1;
@@ -336,7 +349,22 @@ export interface FixHandbackDecisionV1 {
  *   (or a stronger Publish model chosen in AI Models) is recommended instead of
  *   the same round again.
  */
-export function decideFixHandbackV1(progress: FixProgressV1 | undefined): FixHandbackDecisionV1 {
+export function decideFixHandbackV1(
+  progress: FixProgressV1 | undefined,
+  chainBlock?: FixChainBlockKindV1
+): FixHandbackDecisionV1 {
+  if (chainBlock !== undefined) {
+    // The round could not run at all, so its yield says nothing about the failures. Another fix
+    // round, or a re-run of the checks, would meet the same unavailable chain.
+    return {
+      recommended: "chooseModel",
+      lowYield: false,
+      reason:
+        `The fix round could not finish because ${describeFixChainBlockV1(chainBlock)}, so another round on the same models ` +
+        "would fail the same way, and re-running Publish Checks would repeat the failing result. Choose a different Publish model, " +
+        "then run Fix Linting & Code Errors again.",
+    };
+  }
   if (progress === undefined || !progress.exact) {
     return {
       recommended: "fixAgain",
@@ -361,5 +389,27 @@ export function decideFixHandbackV1(progress: FixProgressV1 | undefined): FixHan
     recommended: "fixAgain",
     lowYield: false,
     reason: `This round made real progress (${progress.fixed} of ${progress.before} failing tests now pass); another fix round targets the remaining ${progress.after}.`,
+  };
+}
+
+/**
+ * bugs4 item 31: the hand-back for a Fix Linting & Code Errors run that was cancelled. When a check
+ * run in this fix had already shown failing checks, the cancel leaves them failing and unverified,
+ * so the card is the left-failing card (another fix round, or a model change), not "Run Publish
+ * Checks" on a tree nobody re-checked. `leftFailing` is passed through to the card as-is.
+ */
+export function cancelledFixHandbackV1(
+  detail: string,
+  checksKnownFailing: boolean
+): { readonly noticeText: string; readonly leftFailing: { readonly progress?: FixProgressV1 } | undefined } {
+  if (checksKnownFailing) {
+    return {
+      noticeText: `Fix Linting & Code Errors was cancelled.${detail} The checks that failed before this run have not been re-verified.`,
+      leftFailing: {},
+    };
+  }
+  return {
+    noticeText: `Fix Linting & Code Errors was cancelled.${detail} Review any retained edits, then run Publish Checks to verify the current workspace.`,
+    leftFailing: undefined,
   };
 }

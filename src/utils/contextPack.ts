@@ -21,6 +21,7 @@ import {
 } from "./contextEligibility";
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { resolveGitRepo, runGitCommand } from "./gitRepoInfo";
+import { USER_REQUEST_SOURCE_LABEL_V1 } from "./userRequestLabelV1";
 
 /**
  * Resolve the real, symlink-free path of the nearest existing ancestor of
@@ -323,6 +324,8 @@ export async function generateContextPack(
   lines.push(vscode.workspace.asRelativePath(workspaceUri, false) || ".");
   lines.push("");
   lines.push("## User Request");
+  lines.push("");
+  lines.push(USER_REQUEST_SOURCE_LABEL_V1);
   lines.push("");
   lines.push(taskContent ?? "_No task.md content found._");
   lines.push("");
@@ -695,6 +698,8 @@ export async function generateImplReviewContextPack(
   lines.push(vscode.workspace.asRelativePath(workspaceUri, false) || ".");
   lines.push("");
   lines.push("## User Request");
+  lines.push("");
+  lines.push(USER_REQUEST_SOURCE_LABEL_V1);
   lines.push("");
   lines.push(taskContent ?? "_No task.md content found._");
   lines.push("");

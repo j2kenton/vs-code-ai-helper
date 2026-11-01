@@ -319,11 +319,43 @@ export async function inspectRoundGitInterferenceV1(
   };
 }
 
+/** True when `value` contains an ASCII control character (U+0000–U+001F). */
+export function hasControlCharacterV1(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    if (value.charCodeAt(i) < 0x20) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * The one repository-relative path identity used for change tracking: forward
+ * slashes, no leading `./`, no empty or `.` segments. Returns `undefined` for
+ * anything that is not a safe repository-relative path (empty, absolute,
+ * drive-letter, UNC, containing a `..` segment or a control character) —
+ * callers must treat that as "not adoptable", never repair it.
+ */
+export function normalizeRepositoryRelativePathV1(candidate: string): string | undefined {
+  if (typeof candidate !== "string" || hasControlCharacterV1(candidate)) {
+    return undefined;
+  }
+  const slashed = candidate.replace(/\\/g, "/");
+  if (slashed.startsWith("/") || /^[A-Za-z]:(\/|$)/.test(slashed)) {
+    return undefined;
+  }
+  const segments = slashed.split("/").filter((part) => part !== "" && part !== ".");
+  if (segments.length === 0 || segments.some((part) => part === "..")) {
+    return undefined;
+  }
+  return segments.join("/");
+}
+
 /** Stage only the selected conflict path, preserving all unrelated index entries. */
 export async function keepWorkingTreeVersionForUnmergedPathV1(taskFolderPath: string, relativePath: string): Promise<void> {
   const folder = path.resolve(taskFolderPath);
-  const normalized = relativePath.replace(/\\/g, "/");
-  if (!normalized || path.isAbsolute(relativePath) || /^[A-Za-z]:\//.test(normalized) || normalized.split("/").some((part) => part === "..")) {
+  const normalized = normalizeRepositoryRelativePathV1(relativePath);
+  if (!normalized) {
     throw new Error("The selected conflict path is not a safe repository-relative path.");
   }
   const repositoryRoot = await resolveRepositoryRoot(folder);

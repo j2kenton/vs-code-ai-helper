@@ -1902,7 +1902,7 @@ void describe("runImplementationForModel", () => {
   // that also classifies failureKind "temporarily-unavailable" (here,
   // "service temporarily unavailable"), since the cascade is only reachable
   // at all when failureKind is quota or temporarily-unavailable.
-  void it("does not cascade to backup on a CLI auth failure the errorMessage text alone would not catch", async () => {
+  void it("cascades only to a backup from a different provider on a CLI auth failure the errorMessage text alone would not catch", async () => {
     const originalSpawn = childProcess.spawn;
     const spawnedCommands: string[] = [];
 
@@ -1957,7 +1957,7 @@ void describe("runImplementationForModel", () => {
           name: "Auto",
           sendRequest: () => {
             backupAttempted = true;
-            return Promise.reject(new Error("must not be reached"));
+            return Promise.reject(new Error("backup reached"));
           },
         } as unknown as vscode.LanguageModelChat,
       ]);
@@ -2030,11 +2030,12 @@ void describe("runImplementationForModel", () => {
         });
 
         assert.strictEqual(result.status, "failed");
-        assert.strictEqual(result.failureKind, "temporarily-unavailable");
+        // bugs4 item 28: the opencode sign-in failed, and Copilot is a different provider with
+        // its own sign-in, so it is still tried (it fails here by design of the stub).
         assert.strictEqual(
           backupAttempted,
-          false,
-          "the backup must never be attempted for an auth failure, regardless of what the bare error text says"
+          true,
+          "an authentication failure only holds back models that share the failed sign-in; a backup from another provider is still tried"
         );
         assert.deepStrictEqual(spawnedCommands, ["opencode"]);
       } finally {
@@ -3781,6 +3782,132 @@ void describe("runImplementationForModel", () => {
     }
   });
 
+  // bugs4 item 28 (review: later-backup branch): a backup's OWN authentication failure holds back
+  // only the candidates that share that sign-in. A same-sign-in candidate after it is skipped,
+  // and a different-provider candidate after it is still tried.
+  void it("holds back only the sign-in of a backup whose own authentication failed and still tries a different provider after it", async () => {
+    const originalSpawn = childProcess.spawn;
+    const spawnedCommands: string[] = [];
+
+    childProcess.spawn = ((command: string) => {
+      const child = new EventEmitter() as import("node:child_process").ChildProcess;
+      Object.defineProperty(child, "pid", { value: 4399 });
+      child.stdout = new EventEmitter() as import("node:child_process").ChildProcess["stdout"];
+      child.stderr = new EventEmitter() as import("node:child_process").ChildProcess["stderr"];
+      child.stdin = Object.assign(new EventEmitter(), {
+        write: () => true,
+        end: () => undefined,
+      }) as unknown as import("node:child_process").ChildProcess["stdin"];
+
+      if (/^(which|where\.exe)$/.test(command)) {
+        process.nextTick(() => child.emit("close", 0));
+        return child;
+      }
+
+      spawnedCommands.push(command);
+      const isOpencode = command.includes("opencode");
+      process.nextTick(() => {
+        child.stdout?.emit(
+          "data",
+          Buffer.from(
+            `${JSON.stringify(
+              isOpencode
+                ? { type: "error", error: { name: "APIError", data: { message: "Rate limit exceeded, try again later." } } }
+                : { type: "error", message: "403 Unable to verify organization membership" }
+            )}\n`
+          )
+        );
+        child.emit("close", 1);
+      });
+      return child;
+    }) as typeof childProcess.spawn;
+
+    const lm = lmStub();
+    const originalSelectChatModels = lm.selectChatModels;
+    let copilotBackupAttempted = false;
+    lm.selectChatModels = (): Promise<vscode.LanguageModelChat[]> =>
+      Promise.resolve([
+        {
+          id: "auto",
+          name: "Auto",
+          sendRequest: () => {
+            copilotBackupAttempted = true;
+            return Promise.reject(new Error("copilot backup reached"));
+          },
+        } as unknown as vscode.LanguageModelChat,
+      ]);
+
+    const workspace = vscode.workspace as unknown as {
+      fs: {
+        readFile: (uri: vscode.Uri) => Promise<Uint8Array>;
+        writeFile: (uri: vscode.Uri, bytes: Uint8Array) => Promise<void>;
+      };
+    };
+    const originalReadFile = workspace.fs.readFile;
+    const originalWriteFile = workspace.fs.writeFile;
+    workspace.fs.readFile = (uri: vscode.Uri): Promise<Uint8Array> => fs.promises.readFile(uri.fsPath);
+    workspace.fs.writeFile = (uri: vscode.Uri, bytes: Uint8Array): Promise<void> =>
+      fs.promises.writeFile(uri.fsPath, bytes);
+
+    const metaRoot = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-impl-backup-auth-scope-"));
+    const taskFolder = path.join(metaRoot, "tasks", "task-a");
+    fs.mkdirSync(taskFolder, { recursive: true });
+    const taskFolderUri = vscode.Uri.file(taskFolder);
+    childProcess.execSync("git init", { cwd: taskFolder, stdio: "ignore" });
+    const now = new Date().toISOString();
+    fs.writeFileSync(
+      path.join(taskFolder, "task-progress.json"),
+      JSON.stringify(
+        { taskFolder: "task-a", currentStage: "impl", status: "active", createdAt: now, updatedAt: now },
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    try {
+      const settings = installModelSettings({
+        impl: {
+          primary: "opencode-cli:default",
+          backups: ["claude-cli:default", "claude-cli:other-model", "auto"],
+          strategy: "switch-to-backup",
+        },
+      });
+      try {
+        const result = await runImplementationForModel({
+          modelId: "opencode-cli:default",
+          prompt: "Implement the requested change.",
+          workspaceUri: taskFolderUri,
+          token: new vscode.CancellationTokenSource().token,
+          onProgress: () => undefined,
+          correlation: { actionKey: "implementation.v1" },
+          allowCrossProviderBackups: true,
+          stage: "impl",
+          taskFolderUri,
+        });
+
+        assert.strictEqual(result.status, "failed");
+        assert.strictEqual(
+          copilotBackupAttempted,
+          true,
+          "a different provider after a failed backup sign-in must still be tried"
+        );
+        assert.ok(
+          spawnedCommands.filter((command) => !command.includes("opencode")).length <= 1,
+          `the second Claude model shares the failed sign-in and must not be dispatched (spawned: ${spawnedCommands.join(", ")})`
+        );
+      } finally {
+        settings.restore();
+      }
+    } finally {
+      childProcess.spawn = originalSpawn;
+      lm.selectChatModels = originalSelectChatModels;
+      workspace.fs.readFile = originalReadFile;
+      workspace.fs.writeFile = originalWriteFile;
+      safeRemoveDir(metaRoot);
+    }
+  });
+
   void it("explains authentication failure with full chain outcomes when disabled models are present in the chain", async () => {
     const originalSpawn = childProcess.spawn;
 
@@ -3868,7 +3995,7 @@ void describe("runImplementationForModel", () => {
         impl: {
           primary: "claude-cli:default",
           primaryEnabled: true,
-          backups: ["copilot-cli:default", "opencode-cli:default"],
+          backups: ["claude-cli:other-model", "opencode-cli:default"],
           backupsEnabled: [true, false],
           strategy: "switch-to-backup",
         },
@@ -3900,8 +4027,8 @@ void describe("runImplementationForModel", () => {
         );
         assert.match(
           result.errorMessage ?? "",
-          /Backup Copilot.*was held back: an authentication failure is not auto-retried against a different model\./,
-          "expected untried enabled models to be named as held back"
+          /Backup Claude.*was held back: it uses the same sign-in as the model whose authentication failed/,
+          "expected untried enabled models from the failed sign-in to be named as held back"
         );
       } finally {
         settings.restore();

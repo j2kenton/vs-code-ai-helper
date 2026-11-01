@@ -523,8 +523,10 @@ export function buildChurnEscalationReasonV1(
 ): string {
   const leadingClause =
     diagnosis.kind === "narrowing"
-      ? "The blocker count alone has not fallen, but the reviewer has declared real narrowing " +
-        "progress within this window — this is not churn."
+      ? "The blocker count alone has not fallen. The reviewer declared narrowing progress earlier in " +
+        "this window but not in the most recent rounds, so Fast Forward paused for your review: it " +
+        "pauses after this many rounds with no blocker cleared or narrowed " +
+        "(ensemble.resilience.churnCeilingRounds)."
       : diagnosis.kind === "shifting"
         ? "A different blocker has come up each round rather than one persisting, which may point " +
           "to an unstable or under-specified requirement rather than simple churn."
@@ -641,6 +643,30 @@ export function roundsWithoutTaskFixableDecrease(
     const current = scored[i];
     const previous = scored[i - 1];
     if (!current || !previous || previous.taskFixableCount <= 0 || current.taskFixableCount < previous.taskFixableCount) {
+      break;
+    }
+    // bugs4 item 22: a round in which the reviewer declared a task-fixable blocker
+    // `[narrowed:<id>]` is real progress the flat count cannot see. It resets the
+    // trailing run here, so only rounds AFTER the narrowing count toward the ceiling.
+    if (current.blockers?.some((b) => b.resolver === "task-fixable" && b.lineage?.kind === "narrowed")) {
+      break;
+    }
+    // Newly settled plan items and a shorter list of unbuilt steps are progress the
+    // flat blocker count cannot show (the grouped unbuilt-steps blocker stays one
+    // blocker until the last step is built). Both fields are absent on older
+    // entries, in which case the transition is judged by blocker count alone.
+    if (
+      current.settledItemCount !== undefined &&
+      previous.settledItemCount !== undefined &&
+      current.settledItemCount > previous.settledItemCount
+    ) {
+      break;
+    }
+    if (
+      current.unbuiltStepCount !== undefined &&
+      previous.unbuiltStepCount !== undefined &&
+      current.unbuiltStepCount < previous.unbuiltStepCount
+    ) {
       break;
     }
     rounds++;

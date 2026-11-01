@@ -63,10 +63,18 @@ import {
 } from "../utils/quota";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import {
+  buildChainAttemptListV1,
   chooseStopBehaviourV1,
   describeMidRoundOutcomeV1,
   type BackupAttemptRecordV1,
 } from "../utils/stopBehaviourV1";
+import {
+  authFailureRescueNoteV1,
+  crossProviderAuthCandidatesV1,
+  SAME_SIGN_IN_HELD_BACK_REASON_V1,
+  sameSignInScopeV1,
+  SignInScopeV1,
+} from "../utils/authFallbackScopeV1";
 import { beginImplementationRecoveryV1 } from "../commands/implementationRecoveryV1";
 import { deriveNextRecoverySourceV1 } from "../utils/implementationDispatchModeV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -1183,6 +1191,23 @@ export async function runImplementationForModel(options: {
     result.authFailure === true ||
     isAuthenticationFailure(result.authDiagnosticText ?? result.errorMessage);
   let terminalAuthFailure = authFailure;
+  // bugs4 item 28: an authentication failure only holds back models that share the failed
+  // model's provider and account; a backup from another provider has its own sign-in.
+  const signInScopeOfV1 = (model: string | undefined): SignInScopeV1 | undefined => {
+    try {
+      const resolved = resolveEffectiveProvider(model);
+      return {
+        providerId: String(resolved.kind === "cli" ? resolved.def.id : "copilot"),
+        accountKey: resolveQuotaAccountKeyV1(model),
+      };
+    } catch {
+      return undefined;
+    }
+  };
+  const failedSignInScopeV1: SignInScopeV1 = { providerId: primaryProviderId, accountKey: primaryAccountKey };
+  const crossProviderAuthCandidates = authFailure
+    ? crossProviderAuthCandidatesV1(failedSignInScopeV1, cascadeCandidates, signInScopeOfV1)
+    : [];
   // A failed run may already have written partial changes before it failed
   // (a timeout on a provider whose CLI keeps writing right up to the kill,
   // e.g. Cline/Antigravity's unenforced text/edit modes — or, less likely but
@@ -1224,9 +1249,14 @@ export async function runImplementationForModel(options: {
         : undefined)
     );
   };
-  const resolveFailureRemedyTextV1 = (): string => result.failureKind === "payment-required"
-    ? "Add credits or choose a free model. Payment-required failures do not have a quota reset schedule."
-    : buildQuotaRemedyTextV1(resolveKnownResetAt());
+  // A 402 whose own message gives a reset ("resets in 22 hours") must not also say there is no
+  // reset schedule: the provider's time is shown once, in its message (bugs4 item 31).
+  const resolveFailureRemedyTextV1 = (): string =>
+    result.failureKind === "payment-required"
+      ? /\bresets?\s+(?:in|at|on)\b/i.test(result.errorMessage ?? "")
+        ? "Add credits, wait for the reset time above, or choose a free model."
+        : "Add credits or choose a free model. Payment-required failures do not have a quota reset schedule."
+      : buildQuotaRemedyTextV1(resolveKnownResetAt());
   // RC4 item 1: one record per configured backup that did not rescue the
   // round, filled by the clean-tree cascade loop below.
   const backupRecords: BackupAttemptRecordV1[] = [];
@@ -1243,9 +1273,8 @@ export async function runImplementationForModel(options: {
   const headlineModelLabel = (): string | undefined =>
     options.modelId !== undefined && options.modelId.length > 0 ? labelForBackup(options.modelId) : undefined;
   if (
-    !authFailure &&
+    (authFailure ? crossProviderAuthCandidates.length > 0 : isCascadeEligibleFailureKind(result.failureKind)) &&
     primaryLeftTreeClean &&
-    isCascadeEligibleFailureKind(result.failureKind) &&
     options.stage &&
     cascadeCandidates.length > 0
   ) {
@@ -1278,7 +1307,27 @@ export async function runImplementationForModel(options: {
         roundOutcomesForHealthCheck = undefined;
       }
     }
+    // bugs4 item 28: every sign-in that failed so far (the primary's, then any backup's). A later
+    // candidate is held back only when it shares one of these; other providers are still tried.
+    const authFailedScopes: SignInScopeV1[] = authFailure ? [failedSignInScopeV1] : [];
+    const sharesFailedSignIn = (model: string): boolean => {
+      const scope = signInScopeOfV1(model);
+      return authFailedScopes.some((failedScope) => sameSignInScopeV1(failedScope, scope));
+    };
+    // The most recent backup authentication failure; it stays the headline unless a later backup
+    // ends the cascade with a failure of its own.
+    let lastBackupAuthFailure:
+      | { result: typeof result; providerLabel: string; model: string }
+      | undefined;
     for (const backupModel of cascadeCandidates) {
+      if (authFailedScopes.length > 0 && sharesFailedSignIn(backupModel)) {
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "held-back",
+          reason: SAME_SIGN_IN_HELD_BACK_REASON_V1,
+        });
+        continue;
+      }
       // Item 4: the stage's primary is skipped (and says why) while it is
       // known to be limited; a limit whose reset time has passed no longer
       // counts.
@@ -1388,24 +1437,17 @@ export async function runImplementationForModel(options: {
           reason: `unavailable: ${fallbackFailure.errorMessage}`,
         });
         if (isAuthenticationFailure(fallbackAvailability.availability.reason)) {
-          const currentIndex = cascadeCandidates.indexOf(backupModel);
-          if (currentIndex !== -1) {
-            for (let j = currentIndex + 1; j < cascadeCandidates.length; j++) {
-              const untriedModel = cascadeCandidates[j];
-              if (untriedModel !== undefined) {
-                backupRecords.push({
-                  label: labelForBackup(untriedModel),
-                  outcome: "held-back",
-                  reason: "preceding backup failed authentication",
-                });
-              }
-            }
-          }
-          await releaseReservation();
-          result = fallbackFailure;
-          primaryProviderLabel = fallbackAvailability.providerLabel;
-          options.modelId = backupModel;
-          break;
+          // Only this sign-in is spent: later candidates that share it are held back by the check
+          // at the top of the loop, and the rest are still tried.
+          authFailedScopes.push({
+            providerId: signInScopeOfV1(backupModel)?.providerId ?? backupProviderId ?? "unknown",
+            accountKey: backupAccountKey,
+          });
+          lastBackupAuthFailure = {
+            result: fallbackFailure,
+            providerLabel: fallbackAvailability.providerLabel,
+            model: backupModel,
+          };
         }
         continue;
       }
@@ -1421,15 +1463,21 @@ export async function runImplementationForModel(options: {
           options.stage,
           backupModel
         );
-        const rescueNote =
-          (result.providerCapacity === true
-            ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)`
-            : `${primaryProviderLabel} hit a usage limit`) +
-          (result.errorMessage ? ` (${result.errorMessage})` : "") +
-          `; this round ran on ${labelForBackup(backupModel)}.`;
-        options.onProgress(rescueNote);
+        const rescueNote = authFailure
+          ? authFailureRescueNoteV1(primaryProviderLabel, result.errorMessage, labelForBackup(backupModel))
+          : (result.providerCapacity === true
+              ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)`
+              : `${primaryProviderLabel} hit a usage limit`) +
+            (result.errorMessage ? ` (${result.errorMessage})` : "") +
+            `; this round ran on ${labelForBackup(backupModel)}.`;
+        // An earlier backup's own sign-in failure is part of the story too (bugs4 item 28).
+        const rescueNoteWithBackupAuth =
+          lastBackupAuthFailure !== undefined
+            ? `${rescueNote} ${lastBackupAuthFailure.providerLabel} sign-in also failed; sign in to ${lastBackupAuthFailure.providerLabel} again to use it.`
+            : rescueNote;
+        options.onProgress(rescueNoteWithBackupAuth);
         return withActualIdentity(
-          { ...fallbackResult, cascadeNoteV1: rescueNote },
+          { ...fallbackResult, cascadeNoteV1: rescueNoteWithBackupAuth },
           fallbackAvailability.providerLabel,
           backupModel
         );
@@ -1441,7 +1489,31 @@ export async function runImplementationForModel(options: {
         await releaseReservation();
         return withActualIdentity(fallbackResult, fallbackAvailability.providerLabel, backupModel);
       }
+      if (
+        (fallbackResult.authFailure === true ||
+          isAuthenticationFailure(fallbackResult.authDiagnosticText ?? fallbackResult.errorMessage)) &&
+        leftTreeCleanV1(fallbackResult)
+      ) {
+        // bugs4 item 28: this backup's own sign-in failed. Hold back only the later candidates that
+        // share it; a candidate from a different provider is still worth trying.
+        backupRecords.push({
+          label: labelForBackup(backupModel),
+          outcome: "tried-and-failed",
+          reason: fallbackResult.errorMessage ?? "it failed",
+        });
+        authFailedScopes.push({
+          providerId: signInScopeOfV1(backupModel)?.providerId ?? backupProviderId ?? "unknown",
+          accountKey: backupAccountKey,
+        });
+        lastBackupAuthFailure = {
+          result: fallbackResult,
+          providerLabel: fallbackAvailability.providerLabel,
+          model: backupModel,
+        };
+        continue;
+      }
       if (!isCascadeEligibleFailureKind(fallbackResult.failureKind)) {
+        lastBackupAuthFailure = undefined;
         backupRecords.push({
           label: labelForBackup(backupModel),
           outcome: "tried-and-failed",
@@ -1475,6 +1547,7 @@ export async function runImplementationForModel(options: {
       // attempt — primary or backup — may have mutated the workspace,
       // exactly as the primary's own gate does.
       if (!leftTreeCleanV1(fallbackResult)) {
+        lastBackupAuthFailure = undefined;
         backupRecords.push({
           label: labelForBackup(backupModel),
           outcome: "tried-and-failed",
@@ -1504,6 +1577,13 @@ export async function runImplementationForModel(options: {
         outcome: "tried-and-failed",
         reason: fallbackResult.errorMessage ?? "it failed",
       });
+    }
+    if (lastBackupAuthFailure !== undefined) {
+      // Nothing rescued the round: the sign-in failure is the actionable headline, as it was when
+      // an availability auth failure ended the cascade.
+      result = lastBackupAuthFailure.result;
+      primaryProviderLabel = lastBackupAuthFailure.providerLabel;
+      options.modelId = lastBackupAuthFailure.model;
     }
     await releaseReservation();
   } else if (
@@ -2058,7 +2138,9 @@ export async function runImplementationForModel(options: {
                   label,
                   outcome: "held-back",
                   isPrimary: model === retryPrimaryCandidate || model === chain.primary,
-                  reason: "an authentication failure is not auto-retried against a different model",
+                  reason: sameSignInScopeV1(failedSignInScopeV1, signInScopeOfV1(model))
+                    ? SAME_SIGN_IN_HELD_BACK_REASON_V1
+                    : "an authentication failure is not auto-retried against a different model",
                 });
               }
               return records.length > 0 ? records : undefined;
@@ -2102,8 +2184,26 @@ export async function runImplementationForModel(options: {
               : undefined;
     if (explanation !== undefined) {
       options.onProgress(explanation);
+      // bugs4 item 31/62: hand the card the structured, primary-inclusive attempt list so it never
+      // has to parse the sentences above back apart (and never lists the primary twice or not at all).
+      const chainAttemptsV1 =
+        backupRecords.length > 0
+          ? buildChainAttemptListV1(
+              primaryProviderLabel,
+              headlineModelLabel(),
+              result.errorMessage,
+              backupRecords.map((record) =>
+                record.label === stagePrimaryLabelV1 ? { ...record, isPrimary: true } : record
+              )
+            )
+          : undefined;
       return withActualIdentity(
-        { ...result, errorMessage: explanation, ...(terminalAuthFailure ? { authFailure: true } : {}) },
+        {
+          ...result,
+          errorMessage: explanation,
+          ...(chainAttemptsV1 !== undefined && chainAttemptsV1.length > 0 ? { chainAttemptsV1 } : {}),
+          ...(terminalAuthFailure ? { authFailure: true } : {}),
+        },
         primaryProviderLabel,
         options.modelId
       );

@@ -11,6 +11,7 @@ import { describeReviewStageScoreV1 } from "./taskTreeProvider";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { notifyDesktop } from "../utils/desktopNotifier";
 import { formatTaskNameForDisplay, taskOperations } from "../utils/taskOperations";
+import { operationChatLabelV1 } from "../utils/stepLabelsV1";
 import { NotificationRouter, getNotificationRouterStatus } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
@@ -57,14 +58,21 @@ import {
 } from "../types/structuredQuestionV1";
 import {
   WorkflowDecisionOptionEffectV1,
+  WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
   isWorkflowDecisionCommandResultV1,
 } from "../types/workflowDecisionV1";
+import {
+  armDeferredOptionRunV1,
+  describeDeferredOptionHeldV1,
+  describeDeferredOptionOutcomeV1,
+  type DeferredRunOutcomeV1,
+} from "../utils/deferredOptionRunV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { OperationEndedLineTrackerV1 } from "../utils/operationEndedLineV1";
 import { releaseOperationTerminalLineV1 } from "../utils/terminalLineEmitterV1";
 import { liveOperationBlockingOptionV1 } from "../commands/fastForwardResumeSuffixV1";
-import { describeLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
+import { describeLiveTaskOperationV1, getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
 import {
   acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
@@ -99,6 +107,7 @@ import { formatChecklistPercentV1, truncateChecklistItemTextV1 } from "../utils/
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
 import { isWaitingForHumanV1 } from "../utils/taskWatchdogV1";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
+import { setChatRevealHandlerV1 } from "./chatRevealV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import {
   formatNotificationTaskLabelV1,
@@ -558,6 +567,72 @@ function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): Readon
   return awaiting;
 }
 
+/**
+ * bugs4 item 17 / Step 15: whether a decision is headlined "Decision needed". It must be
+ * awaited (gating says so, or is unknown) AND offer a real choice: at least two options,
+ * one of which is a harmless "Not now" (a `doNothing` effect) whose consequence says what
+ * happens if nothing is done. Anything less is a notice with a button ("Optional"), never
+ * a "Decision needed". Exported for direct unit testing.
+ */
+export function isBlockingDecisionV1(
+  decision: Pick<WorkflowDecisionV1, "gating" | "options">
+): boolean {
+  if (decision.options.length < 2) {
+    return false;
+  }
+  const hasStatedNotNow = decision.options.some(
+    (option) => option.effect.kind === "doNothing" && option.consequence.trim().length > 0
+  );
+  if (!hasStatedNotNow) {
+    return false;
+  }
+  return (
+    decision.gating === undefined ||
+    decision.gating.holdsTaskPaused === true ||
+    decision.gating.unblocksProgress === true
+  );
+}
+
+/**
+ * bugs4 item 17: the idle "checklist is flagged unreliable" card offers exactly one
+ * action. A card headed "Decision needed" must offer a real choice, so a single action
+ * is shown as a notice with a button: it is not marked as blocking, and the panel
+ * headlines it "Optional" instead. Exported for direct unit testing.
+ */
+export function buildIdleReconcileDecisionV1(target: ChatTarget): WorkflowDecisionV1 {
+  return {
+    decisionId: `idle-reconcile:${encodeURIComponent(target.taskFolderPath)}:${encodeURIComponent(target.canonicalId)}`,
+    decisionKey: "reconcilePlanChecklist",
+    taskCanonicalId: target.canonicalId,
+    stage: target.stage,
+    state: "pending",
+    createdAt: new Date().toISOString(),
+    recommendation: { kind: "none", reasoning: "Marking reconciled restores plan completeness gating." },
+    whatHappened:
+      "This task's plan checklist is flagged unreliable, so completeness gating is stood down. The task is idle.",
+    whyUserNeeded:
+      "Marking the checklist reconciled restores gating for stage advancement. Leaving it as it is changes nothing else.",
+    gating: {
+      holdsTaskPaused: false,
+      unblocksProgress: false,
+      detail: "Nothing waits on this: the flag stays until you mark the checklist reconciled.",
+    },
+    options: [
+      {
+        optionId: "reconcile",
+        label: "Mark checklist reconciled",
+        resumeKind: "unpause",
+        consequence: "Clears the unreliable-checklist flag without dispatching a stage action.",
+        effect: {
+          kind: "command",
+          command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
+          args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
+        },
+      },
+    ],
+  };
+}
+
 /** Plain text a decision card puts on the clipboard: everything the card
  * shows that a person would want to paste elsewhere, one item per line. The
  * webview cannot import host code, so this is built here and posted as
@@ -704,10 +779,7 @@ export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, targ
   // regresses and omits it) is treated as blocking — absence is never
   // positive evidence, so an unknown gating state must not downgrade a
   // notification that might genuinely be holding the task paused.
-  const isBlocking =
-    decision.gating === undefined ||
-    decision.gating.holdsTaskPaused === true ||
-    decision.gating.unblocksProgress === true;
+  const isBlocking = isBlockingDecisionV1(decision);
   const actionCommand = {
     command: "vs-code-ai-helper.openWorkflowDecision",
     title: "Review decision in Chat",
@@ -727,6 +799,16 @@ export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, targ
   if (isBlocking) {
     NotificationRouter.showWarning(
       `Decision needed — ${taskLabel} (${stageName}): ${decision.whatHappened}`,
+      undefined,
+      undefined,
+      undefined,
+      actionCommand
+    );
+  } else if (decision.gating?.holdsTaskPaused === true) {
+    // A single-action card is not headed "Decision needed" (bugs4 item 17), but one that holds the
+    // task paused is still a warning: it must not be downgraded to an info notice.
+    NotificationRouter.showWarning(
+      `Action needed — ${taskLabel} (${stageName}): ${decision.whatHappened}`,
       undefined,
       undefined,
       undefined,
@@ -979,6 +1061,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   constructor(private readonly state: vscode.Memento) {
+    setChatRevealHandlerV1((decisionId) => this.revealForOwnerCardV1(decisionId));
     this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
     this.schedulingIntentStore = new SchedulingIntentStoreV1(state);
     // Same rationale as `decisionsSub` below: a ledger write from anywhere
@@ -1029,7 +1112,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     });
   }
 
+  /**
+   * bugs4 item 20: open the section if it is closed, collapsed or hidden, and scroll to the card,
+   * without taking keyboard focus. An already-visible view is only scrolled. When the view has not
+   * been resolved yet, the contributed `.open` command shows it without focusing it (never `.focus`).
+   */
+  private async revealForOwnerCardV1(decisionId: string): Promise<void> {
+    if (this.view) {
+      if (!this.view.visible) this.view.show(true);
+    } else {
+      await vscode.commands.executeCommand(`${ChatViewProvider.viewType}.open`);
+    }
+    void this.view?.webview.postMessage({ type: "scrollToDecision", decisionId });
+  }
+
   dispose(): void {
+    setChatRevealHandlerV1(undefined);
     this.operationsSub.dispose();
     this.decisionsSub.dispose();
     this.chatHistorySub.dispose();
@@ -3038,6 +3136,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
           return outcome;
         }
+        // bugs4 item 26: an answer that would continue the task while a round still runs is held,
+        // not run into that round. It is carried out when the task is free if the task is still
+        // where it was; otherwise the chat says so and the card comes back.
+        const runningNow = option.resumeKind === "continue" ? getLiveTaskOperationV1(decision.taskCanonicalId) : undefined;
+        if (runningNow && identity) {
+          await this.holdOptionUntilTaskFreeV1(decision, option, identity, describeLiveTaskOperationV1(runningNow));
+          await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
+          return outcome;
+        }
         const operationTrace = identity ? this.traceDecisionOperationV1(identity, decision.stage) : undefined;
         // The dispatched command is awaited, and the action it arranges can sit in
         // admission and preflight for minutes before it registers an operation (the
@@ -3109,6 +3216,73 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     return outcome;
+  }
+
+  /**
+   * bugs4 item 26: holds an answered decision's effect while a round runs on the task, says so in
+   * the chat, and carries it out when the task is free. Before running, the card's premise is
+   * checked again (the task is still on the stage the card was raised at, and nothing else has
+   * started); if it no longer holds, or the effect declines, the chat says why and the card is
+   * offered again.
+   */
+  private async holdOptionUntilTaskFreeV1(
+    decision: WorkflowDecisionV1,
+    option: WorkflowDecisionOptionV1,
+    identity: ChatIdentity,
+    runningDescription: string
+  ): Promise<void> {
+    if (option.effect.kind !== "command") return;
+    const effect = option.effect;
+    const taskPath = decision.taskCanonicalId;
+    const key = `${decision.decisionId}:${option.optionId}`;
+    const armedNow = armDeferredOptionRunV1({
+      key,
+      isTaskBusy: () => getLiveTaskOperationV1(taskPath) !== undefined,
+      subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
+      carryOut: async (): Promise<DeferredRunOutcomeV1> => {
+        const read = await readTaskProgressStrictV1(vscode.Uri.file(taskPath)).catch(() => undefined);
+        if (!read?.ok) {
+          return { kind: "notCarriedOut", reason: "the task's progress file could not be read." };
+        }
+        if (read.decoded.progress.currentStage !== decision.stage) {
+          return {
+            kind: "notCarriedOut",
+            reason: `the task is now at ${STAGE_DISPLAY_NAMES[read.decoded.progress.currentStage]}, not ${STAGE_DISPLAY_NAMES[decision.stage]} where this card was raised.`,
+          };
+        }
+        try {
+          const result = await vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
+          if (result === false) {
+            return { kind: "notCarriedOut", reason: "the action did not complete (see the notification)." };
+          }
+          if (isWorkflowDecisionCommandResultV1(result) && result.outcome === "refused") {
+            return { kind: "notCarriedOut", reason: result.message ?? "the action declined to run." };
+          }
+          return { kind: "done" };
+        } catch (error) {
+          return { kind: "notCarriedOut", reason: error instanceof Error ? error.message : String(error) };
+        }
+      },
+      report: async (outcome): Promise<void> => {
+        try {
+          if (outcome.kind !== "done") {
+            await this.workflowDecisionStore.reopenResolved(decision.decisionId, option.optionId);
+          }
+          await this.append("assistant", describeDeferredOptionOutcomeV1(option.label, outcome), decision.stage, identity);
+          if (sameIdentity(this.target, identity)) await this.render();
+        } catch {
+          // The chat is best-effort here; the answer itself is already durable.
+        }
+      },
+    });
+    if (armedNow) {
+      await this.append(
+        "assistant",
+        describeDeferredOptionHeldV1(runningDescription, option.label),
+        decision.stage,
+        identity
+      );
+    }
   }
 
   /**
@@ -3322,11 +3496,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     };
     const signatureOf = (operation: TaskOperationSnapshot): string =>
       `${operation.activity ?? ""}\n${operation.detail ?? ""}\n${operation.waitingForUser}`;
-    const labelFor = (operation: TaskOperationSnapshot): string => {
-      const stage = operation.stage ? STAGE_DISPLAY_NAMES[operation.stage] : STAGE_DISPLAY_NAMES[fallbackStage];
-      const detail = operation.detail ?? operation.activity;
-      return `${operation.label} — ${stage}${detail ? `: ${detail}` : ""}`;
-    };
+    const labelFor = (operation: TaskOperationSnapshot): string => operationChatLabelV1(operation, fallbackStage);
     // One "Ended" line per logical operation, carrying its settled outcome
     // (bugs3 Step 3); nested same-label operations do not each post their own.
     const endedLines = new OperationEndedLineTrackerV1();
@@ -3859,37 +4029,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           () => undefined
         );
         if (progressRead?.ok && progressRead.decoded.progress.checklistProgressUnreliable) {
-          activeDecisions.push({
-            decisionId: `idle-reconcile:${encodeURIComponent(target.taskFolderPath)}:${encodeURIComponent(target.canonicalId)}`,
-            decisionKey: "reconcilePlanChecklist",
-            taskCanonicalId: target.canonicalId,
-            stage: target.stage,
-            state: "pending",
-            createdAt: new Date().toISOString(),
-            recommendation: { kind: "none", reasoning: "Marking reconciled restores plan completeness gating." },
-            whatHappened:
-              "This task's plan checklist is flagged unreliable, and the task is currently idle with no active reconciliation card.",
-            whyUserNeeded:
-              "Completeness gating is suspended. Mark the checklist reconciled to restore gating for stage advancement.",
-            gating: {
-              holdsTaskPaused: false,
-              unblocksProgress: true,
-              detail: "Marking reconciled clears the unreliable-checklist flag without dispatching a stage action.",
-            },
-            options: [
-              {
-                optionId: "reconcile",
-                label: "Mark checklist reconciled",
-                resumeKind: "unpause",
-                consequence: "Clears the unreliable-checklist flag without dispatching a stage action.",
-                effect: {
-                  kind: "command",
-                  command: "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
-                  args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
-                },
-              },
-            ],
-          });
+          activeDecisions.push(buildIdleReconcileDecisionV1(target));
         }
       }
     }
@@ -3900,10 +4040,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         decision.gating !== undefined ? { gating: decision.gating } : undefined,
         "unknown"
       ).text;
-      const isBlockingDecision =
-        decision.gating === undefined ||
-        decision.gating.holdsTaskPaused === true ||
-        decision.gating.unblocksProgress === true;
+      const isBlockingDecision = isBlockingDecisionV1(decision);
       // Same time the timeline sorts by: the message that announced the
       // decision, else its own `createdAt`. An unparsable anchor falls back
       // to `createdAt`; both unparsable shows no time rather than "Invalid".
@@ -4519,6 +4656,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           intro.textContent='Choose what to do with each item. Items left open stay open. Nothing is written until you press Apply.';
           box.appendChild(intro);
           const rows=[];
+          // bugs4 item 27: one control sets every row at once; each row can still be adjusted after.
+          if(form.items.length>1){
+            const bulk=document.createElement('div'); bulk.className='interaction-help';
+            const bulkLabel=document.createElement('label');
+            bulkLabel.appendChild(document.createTextNode('Set all to: '));
+            const bulkSelect=document.createElement('select');
+            bulkSelect.setAttribute('aria-label','Set every item to the same choice');
+            for(const opt of [['','Choose…'],['tick','I did it — tick it'],['exclude','Exclude'],['leave','Leave open']]){
+              const o=document.createElement('option'); o.value=opt[0]; o.textContent=opt[1]; bulkSelect.appendChild(o);
+            }
+            bulkSelect.addEventListener('change',()=>{
+              const choice=bulkSelect.value;
+              if(!choice) return;
+              for(const r of rows){ for(const k of Object.keys(r.radios)){ r.radios[k].checked=(k===choice); } }
+            });
+            bulkLabel.appendChild(bulkSelect); bulk.appendChild(bulkLabel); box.appendChild(bulk);
+          }
           form.items.forEach((item,index)=>{
             const row=document.createElement('div'); row.className='interaction-question';
             const label=document.createElement('div'); label.className='interaction-prompt';
@@ -4618,6 +4772,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         root.style.display='block';
         for(const dcs of decisions){
           const card=document.createElement('div'); card.className='decision-card'+(dcs.isGating?' decision-card-gating':'');
+          card.setAttribute('data-decision-id',dcs.decisionId);
           const err=document.createElement('div'); err.className='interaction-error';
           card.appendChild(err);
           const title=document.createElement('div'); title.className='interaction-title';
@@ -4738,6 +4893,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       window.addEventListener('message', event=>{
         const s=event.data;
+        // Scroll to a card that just revealed this view. Never focuses anything:
+        // scrollIntoView moves the viewport only. Retried briefly because the
+        // card may not be painted yet when the message arrives.
+        if(s.type==='scrollToDecision'){
+          let tries=0;
+          const seek=()=>{
+            const found=Array.from(document.querySelectorAll('.decision-card')).find(c=>c.getAttribute('data-decision-id')===s.decisionId);
+            if(found){ found.scrollIntoView({block:'nearest'}); return; }
+            tries+=1;
+            if(tries<10){ setTimeout(seek,200); }
+          };
+          seek();
+          return;
+        }
         // String.fromCharCode(10) rather than a backslash escape: this whole
         // script is emitted from a TypeScript template literal, where such an
         // escape becomes a REAL line break inside the single-quoted JS string

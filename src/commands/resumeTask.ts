@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import { TaskInventory } from "../state/taskInventory";
 import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
+import { recordStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
 import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
@@ -305,7 +306,12 @@ export async function resumePausedTask(
     commandId: "resumeTask",
   });
   if (admission.outcome !== "acquired") {
-    NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(admission, taskLabel));
+    const busyRefusalWithTaskLabel = describeWorkAdmissionRefusalForUserV1(admission, taskLabel);
+    // Recorded so a caller that dispatched this resume (the open-items form's
+    // follow-up) can state the refusal in its own chat line, not leave the pop-up
+    // below as the only trace.
+    recordStageActionRefusalReasonV1(resolvedTask.taskFolderPath, busyRefusalWithTaskLabel);
+    NotificationRouter.showWarning(busyRefusalWithTaskLabel);
     offerBusyRefusalChoicesOnceV1(admission, taskLabel);
     return { outcome: "busy" };
   }

@@ -799,7 +799,11 @@ export class StageNode extends vscode.TreeItem {
       complete: number;
       total: number;
       verified?: number;
+      /** Items the owner settled through the open-items form (bugs4 item 7), apart from reviewer verification. */
+      ownerSettled?: number;
       provisional?: number;
+      /** Excluded items still waiting on a person (owner / post-deploy hand-offs), shown apart from unbuilt work (bugs4 item 49). */
+      openHandOffs?: number;
       unverified?: boolean;
       /** Items closed without doing before Implementation first started,
        * already left out of `complete`/`total` (RC8 item 6) — named in the tooltip. */
@@ -1192,9 +1196,20 @@ export class StageNode extends vscode.TreeItem {
         `\n\n${closedBefore} item${closedBefore === 1 ? "" : "s"} closed before Implementation started — ` +
         "not counted in the percentage.";
     }
-    if (stage === "impl" && (implementationProgress?.provisional ?? 0) > 0) {
+    if (stage === "impl" && ((implementationProgress?.provisional ?? 0) > 0 || (implementationProgress?.ownerSettled ?? 0) > 0)) {
+      // bugs4 item 7: the gate's own split, so a gap between boxes ticked and items
+      // settled is explained where the owner looks.
+      const ownerSettledText =
+        (implementationProgress!.ownerSettled ?? 0) > 0 ? `${implementationProgress!.ownerSettled} settled by you, ` : "";
+      const provisionalCount = implementationProgress!.provisional ?? 0;
       tooltipStr += `\n\n${implementationProgress!.verified ?? 0} reviewer-verified, ` +
-        `${implementationProgress!.provisional} provisional checklist item${implementationProgress!.provisional === 1 ? "" : "s"}.`;
+        `${ownerSettledText}${provisionalCount} provisional checklist item${provisionalCount === 1 ? "" : "s"}.`;
+    }
+    if (stage === "impl" && (implementationProgress?.openHandOffs ?? 0) > 0) {
+      // bugs4 item 49: waiting on a person is not the same as not built.
+      const handOffs = implementationProgress!.openHandOffs!;
+      tooltipStr += `\n\n${handOffs} open item${handOffs === 1 ? " is an" : "s are"} owner hand-off${handOffs === 1 ? "" : "s"} ` +
+        "(waiting on you, not unbuilt work).";
     }
     if (stage === "impl" && implementationProgress?.deferredNote) {
       tooltipStr += `\n\n${implementationProgress.deferredNote}`;
@@ -2172,7 +2187,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // task's count, flagged `unverified`, so the tree qualifies the number
       // instead of hiding it (merge of `ui 12` into `v1 f2`, 2026-09-21).
       let implementationProgress:
-        | { complete: number; total: number; verified?: number; provisional?: number; unverified?: boolean; closedBeforeImplementation?: number; deferredNote?: string }
+        | { complete: number; total: number; verified?: number; ownerSettled?: number; provisional?: number; openHandOffs?: number; unverified?: boolean; closedBeforeImplementation?: number; deferredNote?: string }
         | undefined;
       if (stage === "impl") {
         const display = await readDisplayPlanChecklistProgressV1(task.folderUri);
@@ -2183,12 +2198,18 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           // elsewhere keep the full `settled`/`total`. When every item was
           // closed before Implementation there is nothing to measure, so the
           // full counts are shown rather than a meaningless 0 of 0.
-          const shown = implementationDisplayCountsV1(display.counts);
+          // bugs4 item 7 / Step 11: the percentage is the gate's settled count
+          // (`verifiedCounts`), the same figure the review marker and the cards
+          // use. Live in-round ticks and other provisional ticks are explained
+          // by the tooltip's "N provisional" line instead of moving the figure.
+          const shown = implementationDisplayCountsV1(display.verifiedCounts);
           implementationProgress = {
             complete: shown.complete,
             total: shown.total,
             verified: display.verified,
+            ...(display.ownerSettled > 0 ? { ownerSettled: display.ownerSettled } : {}),
             provisional: display.provisional,
+            ...(display.openHandOffs > 0 ? { openHandOffs: display.openHandOffs } : {}),
             ...(display.unverified ? { unverified: true } : {}),
             ...(shown.closedBeforeImplementation > 0
               ? { closedBeforeImplementation: shown.closedBeforeImplementation }

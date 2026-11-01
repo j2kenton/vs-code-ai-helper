@@ -81,38 +81,41 @@ export function buildImplementationTypeCheckFailedDecisionInputV1(input: {
     whatHappened:
       "The Implementation round left the project failing its type-check. The errors and run log are attached below.",
     whyUserNeeded:
-      "A reviewer cannot continue until the build is fixed. Choose another Implementation round to pass these errors into its prompt, or keep the task waiting and fix them yourself.",
+      "A reviewer cannot continue until the type-check passes. The round itself finished, so the usual next step is to fix the reported errors and continue to review; run another Implementation round only if you want the model to fix them.",
     evidence: [
       { label: "First type-check errors", detail: input.errors },
       { label: "Implementation run log", detail: path.basename(input.logFilePath), openFilePath: input.logFilePath },
     ],
     options: [
       {
+        optionId: "fixBuildManually",
+        label: "I'll fix the type-check errors, then continue to review",
+        consequence:
+          "Leaves the task waiting and dispatches no work. Once the type-check passes, run Review (or Fast Forward) to continue.",
+        resumeKind: "unpause",
+        effect: { kind: "doNothing" },
+      },
+      {
         optionId: "runImplementationFix",
         label: "Run another Implementation round to fix the build",
-        consequence: "Starts an Implementation round with the reported type-check errors in its prompt.",
+        consequence:
+          "Starts a new Implementation round with the reported type-check errors in its prompt. This re-enters a full round over the files already changed.",
         resumeKind: "continue",
         effect: {
           kind: "command",
           // Exhausted recovery pauses the task before this card is
           // posted. Resume and dispatch through the existing combined
-          // command so the recommended action works in that state.
+          // command so this action works in that state.
           command: "vs-code-ai-helper.resumeAndDispatchImplementation",
           args: [{ taskFolderPath: input.taskFolderPath, implementationTypeCheckErrorsV1: input.errors }],
         },
       },
-      {
-        optionId: "fixBuildManually",
-        label: "I'll fix it myself",
-        consequence: "Leaves the task waiting for you and dispatches no work.",
-        resumeKind: "unpause",
-        effect: { kind: "doNothing" },
-      },
     ],
     recommendation: {
       kind: "option",
-      optionId: "runImplementationFix",
-      reasoning: "The reported build errors need to be cleared before review can continue.",
+      optionId: "fixBuildManually",
+      reasoning:
+        "The round completed; only the type-check blocks review. Fixing the reported errors and continuing is cheaper than re-entering a full Implementation round.",
     },
     gating: {
       holdsTaskPaused: false,

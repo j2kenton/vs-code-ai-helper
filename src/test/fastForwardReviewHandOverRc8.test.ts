@@ -501,10 +501,9 @@ void describe("RC8 item 5: reportFastForwardMovedOnV1", () => {
     assert.equal(run.dispatched.length, 1);
     const declined = warnings(run).filter((w) => /did not start/.test(w));
     assert.equal(declined.length, 1);
-    assert.match(
-      declined[0]!,
-      /queued command returned without starting a round but did not provide its refusal reason/
-    );
+    // bugs4 item 4: a decline always states what is known, never "did not provide its refusal reason".
+    assert.match(declined[0]!, /queued Run Review command returned without starting a round and recorded no cause/);
+    assert.doesNotMatch(declined[0]!, /did not provide its refusal reason/);
     assert.doesNotMatch(declined[0]!, /declined to start/);
   });
 
@@ -528,7 +527,9 @@ void describe("RC8 item 5: reportFastForwardMovedOnV1", () => {
     assert.match(texts[0]!, /Implementation round is queued and starts when this run ends/);
     // The record was consumed by the first report; nothing is left for impl.
     reportFastForwardMovedOnV1({ op, folderUri: run.folderUri, displayName: DISPLAY_NAME, landedStage: "impl" });
-    assert.match(texts[1]!, /Run Implementation on/);
+    // bugs4 item 4: the stage name is not repeated ("Run Implementation on Implementation").
+    assert.match(texts[1]!, /Run Implementation\.$/);
+    assert.doesNotMatch(texts[1]!, /Run Implementation on Implementation/);
   });
 
   void it("Implementation hand-over, record for a different stage: reports nothing was started and warns once", async () => {

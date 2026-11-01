@@ -302,6 +302,57 @@ export function distinctBackupRecordsV1(
   return kept;
 }
 
+/**
+ * One model the chain actually tried (or skipped), with its own outcome (bugs4 item 31/62). The
+ * structured counterpart of the "was tried and failed" sentences, so a card lists the primary and
+ * every backup from data instead of parsing the failure text back apart.
+ */
+export interface ChainAttemptV1 {
+  readonly label: string;
+  readonly isPrimary: boolean;
+  readonly outcome: "tried-and-failed" | "held-back" | "disabled";
+  readonly reason: string;
+}
+
+/**
+ * The primary-inclusive attempt list in order: the headline attempt first (the primary, whose own
+ * failure is the error message), then each distinct backup record. The same model is never listed
+ * twice, even when the headline and a record name it differently ("Codex" vs "Codex gpt-6.1…").
+ */
+export function buildChainAttemptListV1(
+  primaryProviderLabel: string,
+  headlineModelLabel: string | undefined,
+  headlineError: string | undefined,
+  backups: readonly BackupAttemptRecordV1[] | undefined
+): readonly ChainAttemptV1[] {
+  const records = distinctBackupRecordsV1(backups, headlineError, primaryProviderLabel, headlineModelLabel);
+  const primaryRecord = records.find((record) => record.isPrimary === true);
+  const attempts: ChainAttemptV1[] = [];
+  const keyOf = (label: string): string => label.trim().toLowerCase();
+  const headlineLabel = (headlineModelLabel ?? primaryProviderLabel).trim();
+  if (headlineLabel.length > 0 && primaryRecord === undefined) {
+    attempts.push({
+      label: headlineLabel,
+      isPrimary: true,
+      outcome: "tried-and-failed",
+      reason: headlineError?.trim() ?? "",
+    });
+  }
+  const seen = new Set(attempts.map((attempt) => keyOf(attempt.label)));
+  for (const record of records) {
+    const key = keyOf(record.label);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    attempts.push({
+      label: record.label,
+      isPrimary: record.isPrimary === true,
+      outcome: record.outcome,
+      reason: record.reason,
+    });
+  }
+  return attempts;
+}
+
 function describeBackupRecordV1(backup: BackupAttemptRecordV1): string {
   const subject = backup.isPrimary ? `The stage's primary ${backup.label}` : `Backup ${backup.label}`;
   return backup.outcome === "tried-and-failed"

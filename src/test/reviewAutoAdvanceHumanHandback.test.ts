@@ -123,7 +123,9 @@ void describe("automatic review advancement hand-back", () => {
         1,
         "a repeated terminal hand-back updates one stable decision"
       );
-      assert.match(decision.whatHappened, /auto-advance reached Implementation, but its Implementation round did not start because the queued command returned without starting a round but did not provide its refusal reason/);
+      assert.match(decision.whatHappened, /auto-advance reached Implementation, but its round did not start because the queued Run Implementation command returned without starting a round and recorded no cause/);
+      assert.doesNotMatch(decision.whatHappened, /did not provide its refusal reason/);
+      assert.doesNotMatch(decision.whatHappened, /Run Implementation on Implementation/);
       assert.deepEqual(decision.options.map((option) => option.label), ["Run Implementation", "Not now"]);
       assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
       assert.equal(decision.options.find((option) => option.optionId === "runAction")?.label, "Run Implementation");
@@ -155,19 +157,19 @@ void describe("automatic review advancement hand-back", () => {
     assert.match(source, /variables\.automationDispatch = "true"/);
     assert.match(
       source,
-      /onDropped: \(reason\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, reason, "implementation"\)/
+      /onDropped: \(reason\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, reason, "implementation", \{\s*since: handOverChainStartedAt,?\s*\}\)/
     );
     assert.match(
       source,
-      /onDeclined: \(\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, "declined", "implementation"\)/
+      /onDeclined: \(\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, "declined", "implementation", \{\s*since: handOverChainStartedAt,?\s*\}\)/
     );
     assert.match(
       source,
-      /onDropped: \(reason\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, reason\)/
+      /onDropped: \(reason\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, reason, "review", \{\s*since: handOverChainStartedAt,?\s*\}\)/
     );
     assert.match(
       source,
-      /onDeclined: \(\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, "declined"\)/
+      /onDeclined: \(\) => \{[\s\S]*?void warnHandOverNotStartedV1\(folderUri, handOverDisplayName, next, "declined", "review", \{\s*since: handOverChainStartedAt,?\s*\}\)/
     );
     assert.match(
       source,

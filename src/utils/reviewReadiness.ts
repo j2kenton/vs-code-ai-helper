@@ -1506,9 +1506,12 @@ export function parseReviewVerifiedCompleteV1(content: string): ReviewVerifiedCo
       continue;
     }
     const lineMatch = VERIFIED_COMPLETE_LINE_RE.exec(line);
-    if (lineMatch?.[1]) {
-      items.push(lineMatch[1]);
-      lastEntry = { text: lineMatch[1], evidence: undefined };
+    // A reviewer who copies the checklist line verbatim keeps its `[x]` / `[ ]`
+    // box; the plan item's own text never starts with one, so drop it before matching.
+    const itemText = lineMatch?.[1]?.replace(/^\[[ xX]\]\s+/, "").trim();
+    if (itemText) {
+      items.push(itemText);
+      lastEntry = { text: itemText, evidence: undefined };
       entries.push(lastEntry);
       continue;
     }

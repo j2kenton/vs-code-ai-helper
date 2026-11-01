@@ -130,6 +130,9 @@ import {
   showTaskBusyWarning,
 } from "../../utils/taskOperations";
 import { ChatViewProvider } from "../../views/chatView";
+import { describeCommitPushEndedForChatV1, describeCommitPushNotCommittedV1 } from "../../utils/commitPushFullListV1";
+import { recordOperationTerminalOutcomeV1 } from "../../utils/operationEndedLineV1";
+import { offerActionInChatV1 } from "../../utils/chatActionOfferV1";
 import { ResolvedTaskContext } from "../../utils/resolveTaskContext";
 import { checkGitPublishReadiness } from "../../utils/gitRepoInfo";
 import { NotificationRouter } from "../../utils/notificationRouter";
@@ -333,6 +336,10 @@ const COMMIT_PUSH_NOT_COMPLETED_LEVEL_V1: Readonly<
  * supplies the fixed text for reasons that never carry one, and is a
  * defensive backstop if `detail` is ever missing.
  */
+// bugs4 item 34: a run that ends at the owner's choice says so in plain words: what
+// did not happen, that nothing changed, and what to do next.
+const NOTHING_COMMITTED_TEXT_V1 = describeCommitPushNotCommittedV1("cancelled");
+
 const COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1: Readonly<Record<CommitAndPushNotCompletedReasonV1, string>> = {
   ineligibleStage: "Task is not at a stage where Commit and Push is available.",
   noGitRepository:
@@ -342,18 +349,18 @@ const COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1: Readonly<Record<CommitAndPushNo
     "Commit and push blocked: private/workflow-control file(s) are already staged in the git index. " +
     "See 'Ensemble: Commit Preview' for the list — unstage them and retry.",
   gitNotReady: "Commit and push failed: the repository is not ready to push.",
-  checksDeclined: "Commit and push cancelled.",
+  checksDeclined: NOTHING_COMMITTED_TEXT_V1,
   checksNoLongerCurrent:
     "Commit and push stopped: the recorded Publish Checks result no longer covers what would be committed. " +
     "Nothing was committed or pushed; choose Commit & Push again — the checks will run again.",
   fixWithAiUnavailable:
     'Fix with AI is unavailable here — run "Linting Fixes" from the task\'s Publish actions, then retry Commit and Push.',
-  taskFolderChangesDeclined: "Commit and push cancelled.",
-  runArtifactsDeclined: "Commit and push cancelled.",
+  taskFolderChangesDeclined: NOTHING_COMMITTED_TEXT_V1,
+  runArtifactsDeclined: NOTHING_COMMITTED_TEXT_V1,
   viewedFullFileList: "Full file list shown in 'Ensemble: Commit Preview'. Re-run the command to proceed.",
-  userCancelled: "Commit and push cancelled.",
+  userCancelled: NOTHING_COMMITTED_TEXT_V1,
   saveFailed: "Could not save one or more files. Please save all files before committing.",
-  commitMessageCancelled: "Commit and push cancelled.",
+  commitMessageCancelled: NOTHING_COMMITTED_TEXT_V1,
   gitCommitFailed: "Commit failed.",
   pushFailed: "Push failed. Your local commit was kept — it has NOT been rolled back automatically.",
   unexpectedError: "Commit and push failed.",
@@ -458,6 +465,34 @@ export function deriveCommitPushOperationEndStateV1(
   return "failed";
 }
 
+/**
+ * bugs4 item 34: the index/privacy and git-readiness endings happen before the
+ * tracked operation opens, so no "Ended" line exists for them. Say in the task
+ * chat that nothing was committed, why, and what to do next; the notification
+ * stays only as a pointer. Never throws: a chat that cannot be reached must not
+ * change the run's outcome.
+ */
+async function postPreOperationEndingInChatV1(
+  services: CommitPushServicesV1,
+  reason: CommitAndPushNotCompletedReasonV1,
+  detail: string | undefined
+): Promise<void> {
+  const text = describeCommitPushEndedForChatV1(reason, detail ?? COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1[reason]);
+  await offerActionInChatV1({
+    taskFolderPath: services.resolvedTask.taskFolderPath,
+    taskLabel: formatNotificationTaskLabelV1(services.resolvedTask.progress.displayName, services.resolvedTask.folderName),
+    actionLabel: "Commit & Push again",
+    command: "vs-code-ai-helper.commitAndPushTask",
+    args: [{ taskFolderPath: services.resolvedTask.taskFolderPath }],
+    noticeText: text,
+    actionConsequence: "Starts Commit & Push again; it first re-checks the repository and the index.",
+    doNothingOption: {
+      label: "Not now",
+      consequence: "Does nothing. Nothing is committed and the working tree and index stay as they are.",
+    },
+  }).catch(() => undefined);
+}
+
 /** @internal exported for testing */
 export async function executeCommitPushV1(
   context: LifecycleExecutionContextV1
@@ -484,6 +519,7 @@ export async function executeCommitPushV1(
   // first step.
   const indexCheck = await checkCommitPushIndexPrivacyV1(services.resolvedTask);
   if (!indexCheck.ok) {
+    await postPreOperationEndingInChatV1(services, indexCheck.reason, indexCheck.detail);
     return finishCommitPushV1(
       { kind: "notCompleted", reason: indexCheck.reason, detail: indexCheck.detail },
       context,
@@ -506,6 +542,11 @@ export async function executeCommitPushV1(
   // with no explanation at all.
   const gitReadinessCheck = await checkGitPublishReadiness(services.resolvedTask.taskFolderPath);
   if (!gitReadinessCheck.ok) {
+    await postPreOperationEndingInChatV1(
+      services,
+      "gitNotReady",
+      `Commit and push failed: ${gitReadinessCheck.reason}`
+    );
     return finishCommitPushV1(
       {
         kind: "notCompleted",
@@ -698,7 +739,19 @@ export async function executeCommitPushV1(
     result = { kind: "notCompleted", reason: result.reason, detail: stopText };
   }
 
-  taskOperations.end(op, deriveCommitPushOperationEndStateV1(op, result));
+  const endState = deriveCommitPushOperationEndStateV1(op, result);
+  if (result.kind === "notCompleted" && (endState === "cancelled" || endState === "failed")) {
+    // bugs4 item 34: the chat's one "Ended: Commit and Push" line carries why
+    // nothing was committed and what to do next, not only a notification.
+    recordOperationTerminalOutcomeV1(op.id, {
+      state: endState,
+      reason: describeCommitPushEndedForChatV1(
+        result.reason,
+        result.detail ?? COMMIT_PUSH_NOT_COMPLETED_DEFAULT_TEXT_V1[result.reason]
+      ),
+    });
+  }
+  taskOperations.end(op, endState);
   return finishCommitPushV1(result, context, taskLabel);
 }
 

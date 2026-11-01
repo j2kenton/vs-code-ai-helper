@@ -1,4 +1,10 @@
 import * as vscode from "vscode";
+import * as path from "path";
+import {
+  decideLatchAutoClearAfterReviewV1,
+  formatLatchAutoClearedLineV1,
+  VerifiedCompleteReviewOutcomeV1,
+} from "../utils/latchAutoClearV1";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import { TaskInventory } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
@@ -12,8 +18,12 @@ import {
   getCanonicalImplementationUri,
   readPlanOfRecordV1,
 } from "../utils/implementationArtifactResolver";
+import { loadLatchingClaimsV1 } from "../utils/latchingClaimsFromRunLogV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { readTextIfExists, statIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import {
+  countChecklistEvidenceProgressV1,
+  describeChecklistGateGapV1,
   listUncheckedChecklistItemTextsV1,
   filterAlreadyCheckedPlanItemsV1,
   normalizeChecklistItemTextV1,
@@ -28,8 +38,11 @@ import {
   STAGE_ARTIFACT_FILENAMES,
   STAGE_DISPLAY_NAMES,
   TaskStage,
+  type PlanItemEvidenceV1,
+  type PlanItemOwnerDecisionV1,
 } from "../types/taskProgress";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { withdrawStaleOpenItemsCardV1 } from "../utils/withdrawStaleOpenItemsCardV1";
 import { normalizePath } from "../utils/taskRoot";
 import {
   WorkflowDecisionCommandResultV1,
@@ -471,6 +484,12 @@ function boundedEvidenceListV1(lines: readonly string[], limit: number = 10, max
   const bounded = lines.slice(0, limit).map((line) => truncateChecklistItemTextV1(line, maxLineChars));
   const more = lines.length > bounded.length ? `\n…and ${lines.length - bounded.length} more.` : "";
   return bounded.join("\n") + more;
+}
+
+/** bugs4 item 25: the missed items by name, capped, for the "Not yet" consequence text. */
+function describeMissedItemsV1(items: readonly string[], limit: number = 5): string {
+  const named = items.slice(0, limit).map((item) => `"${truncateChecklistItemTextV1(item, 120)}"`);
+  return named.join("; ") + (items.length > named.length ? `; …and ${items.length - named.length} more` : "") + ".";
 }
 
 async function gatherReconcileEvidenceV1(
@@ -1563,12 +1582,19 @@ export async function postReconcilePlanChecklistDecisionV1(
      * explicit "not recorded" statement below rather than silence.
      */
     checklistProgressUnreliableReason?: string;
+    /** bugs4 item 15: the latch itself; when set and no round summary is in scope, the latching claims are loaded from the run log. */
+    checklistProgressUnreliable?: boolean;
+    /** bugs4 item 22: the claims stored on the latch record; read before the run log fallback. */
+    checklistProgressUnreliableClaims?: readonly string[];
     /** wf10 item 19: blockers a human has resolved via this task's own stage
      * chat — see `TaskProgress.blockerSupersessions`'s doc comment. Same
      * optionality rationale as `checklistProgressUnreliableReason` above. */
     blockerSupersessions?: readonly BlockerSupersessionRecordV1[];
+    /** bugs4 item 14: the evidence the completeness gate counts, so the card shows the gate's own numbers. */
+    planItemEvidence?: readonly PlanItemEvidenceV1[];
+    planItemOwnerDecisions?: readonly PlanItemOwnerDecisionV1[];
   },
-  roundSummaryChecklistClaim?: MergeChecklistProgressResultV1,
+  roundSummaryChecklistClaimInScope?: MergeChecklistProgressResultV1,
   pendingOperationEvidence?: readonly PendingOperationEvidenceItemV1[],
   /**
    * Pre-1.0.0 fixes register, item 16 / Part 4 Step 13: set only when THIS
@@ -1585,6 +1611,14 @@ export async function postReconcilePlanChecklistDecisionV1(
    */
   rejectionLeadNote?: string
 ): Promise<ReconcileDecisionPostResultV1> {
+  // bugs4 item 15: with no triggering summary in scope, the claims that set the latch
+  // are read back from the latching round's run log (complete lists only), so the card
+  // judges the real claims instead of "not available for this invocation".
+  const roundSummaryChecklistClaim: MergeChecklistProgressResultV1 | undefined =
+    roundSummaryChecklistClaimInScope ??
+    (progress.checklistProgressUnreliable === true
+      ? await loadLatchingClaimsV1(taskFolderPath, progress.checklistProgressUnreliableClaims)
+      : undefined);
   // Reads durable bytes, saving the user's unsaved ticks first — the shared
   // resolver owns that rule so this command and the completeness gate can
   // never disagree about what the plan says.
@@ -1598,6 +1632,11 @@ export async function postReconcilePlanChecklistDecisionV1(
     return { kind: "noChecklist" };
   }
 
+  const gateEvidence = countChecklistEvidenceProgressV1(
+    plan.text,
+    progress.planItemEvidence ?? [],
+    progress.planItemOwnerDecisions ?? []
+  );
   const { evidence, allUncheckedCovered, coveredItemsCount, coveredItems, perStage } = await gatherReconcileEvidenceV1(
     folderUri,
     plan.text,
@@ -1836,9 +1875,9 @@ export async function postReconcilePlanChecklistDecisionV1(
                 kind: "option",
                 optionId: "reconcile",
                 reasoning:
-                  `The last round's claim, once resolved by step number, names ${roundSummaryChecklistClaim && roundSummaryChecklistClaim.kind === "no-match" ? roundSummaryChecklistClaim.unmatchedAll.length : 0} item(s) that are already ` +
-                  "settled in plan-final.md — the mismatch that flagged this checklist unreliable was a " +
-                  "text-matching shorthand, not a false progress report, and no changed files are unrecorded. " +
+                  `The round restated ${roundSummaryChecklistClaim && roundSummaryChecklistClaim.kind === "no-match" ? roundSummaryChecklistClaim.unmatchedAll.length : 0} item(s) that were already ticked ` +
+                  "(or excluded), so they are already settled in plan-final.md; nothing was missed. The mismatch that flagged this checklist unreliable was a " +
+                  "text-matching shorthand or a restatement, not a false progress report, and no changed files are unrecorded. " +
                   (counted.remaining > 0
                     ? `${counted.remaining} item(s) remain genuinely outstanding and unaffected by this claim — ` +
                       "marking reconciled confirms the checklist's own counts are accurate and restores " +
@@ -2011,9 +2050,16 @@ export async function postReconcilePlanChecklistDecisionV1(
       whatHappened:
         (rejectionLeadNote ? `${rejectionLeadNote} Separately, this` : "This") +
         ` task's plan checklist is flagged unreliable: plan-final.md currently reads ` +
-        `${counted.settled}/${counted.total} items settled (${counted.checked} completed` +
-        (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
-        `), with ${counted.remaining} outstanding. ` +
+        // bugs4 item 14: the counts are the completeness gate's own, with ticked and
+        // verified apart, so this card never calls provisional ticks "settled".
+        (gateEvidence
+          ? `${gateEvidence.gate.settled}/${gateEvidence.gate.total} items settled for the completeness gate ` +
+            `(${describeChecklistGateGapV1(gateEvidence)}` +
+            (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
+            `), with ${counted.remaining} unticked. `
+          : `${counted.settled}/${counted.total} items settled (${counted.checked} completed` +
+            (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
+            `), with ${counted.remaining} outstanding. `) +
         (roundSummaryChecklistClaim?.kind === "no-match"
           ? `The last round's own report claimed ${roundSummaryChecklistClaim.unmatchedAll.length} item(s) that ` +
             `the checklist could not match by text (for example, "${roundSummaryChecklistClaim.unmatchedSample[0] ?? ""}")` +
@@ -2159,8 +2205,13 @@ export async function postReconcilePlanChecklistDecisionV1(
               // and were deliberately outside the count).
               "Does nothing. Completeness stays stood down until you mark reconciled — there is nothing " +
               "unticked left to tick; every remaining box (if any) is deliberately excluded from the count."
-            : "Does nothing. Completeness stays stood down until you tick the missed items in plan-final.md " +
-              "and run this again, or a candidate above is applied.",
+            : coveredItems.length > 0
+              ? // bugs4 item 25: "the missed items" only when this card has identified some, and by name.
+                "Does nothing. Completeness stays stood down until you tick the missed items in plan-final.md " +
+                `and run this again, or a candidate above is applied. Missed items an implementation review named as verified complete: ${describeMissedItemsV1(coveredItems)}`
+              : "Does nothing. Completeness stays stood down until you mark reconciled, or the unticked items " +
+                "are done and you run this again. No specific missed item was identified, so there is nothing " +
+                "named to tick.",
           effect: { kind: "doNothing" },
         },
       ],
@@ -2338,6 +2389,7 @@ async function reconcileChecklistHeldV1(
       ...current,
       checklistProgressUnreliable: undefined,
       checklistProgressUnreliableReason: undefined,
+      checklistProgressUnreliableClaims: undefined,
       updatedAt: new Date().toISOString(),
     };
   });
@@ -2370,7 +2422,85 @@ async function reconcileChecklistHeldV1(
   // Finding 17 / Step 9: Reconciling the checklist is an idle action that
   // clears the flag and acknowledges it without resuming or dispatching another
   // action (continuation is a separate option).
+  //
+  // bugs4 item 27: the notification above is a pop-up, so the chat would otherwise show
+  // nothing and the owner could not tell what to do next. One line says what happens next
+  // and offers the continuation; it dispatches nothing itself.
+  await offerActionInChatV1({
+    taskFolderPath: folderUri.fsPath,
+    taskLabel: formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName),
+    actionLabel: "Resume and continue stage",
+    command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+    args: [{ taskFolderPath: folderUri.fsPath }],
+    noticeText:
+      "Plan checklist marked reconciled: completeness gates advancement again. Nothing else will run now. " +
+      "Choose Resume and continue stage here, or use Fast Forward or Apply Current Stage Action, to continue.",
+    actionConsequence: "Dispatches this stage's next action now.",
+    optional: true,
+    doNothingOption: {
+      label: "Not now",
+      consequence: "Does nothing. The checklist stays reconciled and the task stays where it is.",
+    },
+  }).catch(() => undefined);
   return true;
+}
+
+/**
+ * bugs4 item 17 / Step 17: clear the unreliable-checklist flag after a review whose Verified
+ * Complete block was applied or found nothing to add (see {@link decideLatchAutoClearAfterReviewV1}),
+ * withdraw the now-stale reconcile card, and say so in chat. Returns whether the flag was cleared.
+ * Never throws: a failed clear leaves the flag and the card exactly as they were.
+ */
+export async function autoClearUnreliableChecklistLatchAfterReviewV1(
+  folderUri: vscode.Uri,
+  displayName: string | undefined,
+  outcome: VerifiedCompleteReviewOutcomeV1
+): Promise<boolean> {
+  const decision = decideLatchAutoClearAfterReviewV1(outcome);
+  if (!decision.clear) {
+    return false;
+  }
+  try {
+    let cleared = false;
+    await patchTaskProgressStrictV1(folderUri, (current) => {
+      if (current.checklistProgressUnreliable !== true) {
+        return current;
+      }
+      cleared = true;
+      return {
+        ...current,
+        checklistProgressUnreliable: undefined,
+        checklistProgressUnreliableReason: undefined,
+        checklistProgressUnreliableClaims: undefined,
+        updatedAt: new Date().toISOString(),
+      };
+    });
+    if (!cleared) {
+      return false;
+    }
+    await withdrawWorkflowDecisionsByKeyV1(
+      { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
+      "reconcilePlanChecklist",
+      "a review checked the code against the checklist, so Ensemble cleared the unreliable-checklist flag itself"
+    );
+    await offerActionInChatV1({
+      taskFolderPath: folderUri.fsPath,
+      taskLabel: formatNotificationTaskLabelV1(displayName, path.basename(folderUri.fsPath)),
+      actionLabel: "Resume and continue stage",
+      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+      args: [{ taskFolderPath: folderUri.fsPath }],
+      noticeText: formatLatchAutoClearedLineV1(decision),
+      actionConsequence: "Dispatches this stage's next action now.",
+      optional: true,
+      doNothingOption: {
+        label: "Not now",
+        consequence: "Does nothing. The checklist stays cleared and the task stays where it is.",
+      },
+    }).catch(() => undefined);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export type ApplyReconciliationTicksResultV1 =
@@ -2581,6 +2711,10 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     "applyReviewerVerifiedTicks",
     "plan-final.md's checklist ticks changed via reconciliation, superseding the pending tick-application card"
   );
+  {
+    const planAfterTicks = await readTextIfExists(vscode.Uri.joinPath(folderUri, "plan-final.md")).catch(() => undefined);
+    if (planAfterTicks !== undefined) await withdrawStaleOpenItemsCardV1(folderUri, planAfterTicks);
+  }
   await inventory.refresh();
   NotificationRouter.showInformation(
     `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`

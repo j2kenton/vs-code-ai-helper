@@ -217,6 +217,10 @@ export interface TaskProgress {
   roundLedger?: RoundLedgerEntryV1[];
   /** Per-item claim and review evidence; legacy checklist ticks stay visible if absent. */
   planItemEvidence?: PlanItemEvidenceV1[];
+  /** Owner form ticks and exclusions, with owner provenance (bugs4 item 7). Top-level so older builds keep it as opaque. */
+  planItemOwnerDecisions?: PlanItemOwnerDecisionV1[];
+  /** Test runs the owner recorded by hand, as test evidence with owner provenance (bugs4 item 21). */
+  planItemOwnerTestRuns?: PlanItemOwnerTestRunV1[];
   /** Durable record of a round that tried to add, remove, or renumber a
    * checklist item in `plan-final.md` (mirror of `src/types/taskProgress.ts`).
    * Capped at MAX_CHECKLIST_CHANGE_PROPOSALS (oldest dropped first). */
@@ -240,6 +244,9 @@ export interface TaskProgress {
    * not only the weaker unticked-item count. Absent on records written
    * before this field existed. */
   checklistProgressUnreliableReason?: string;
+  /** The claim texts the latching round reported that matched no plan item
+   * (bugs4 Step 15, item 22); bounded, written and cleared with the latch. */
+  checklistProgressUnreliableClaims?: string[];
   /** Consecutive completed implementation rounds (current stage) that changed
    * zero files — durable no-progress-breaker counter; persists across
    * reloads/rounds, reset on a file-changing round or stage transition. */
@@ -498,6 +505,12 @@ export interface ReviewScoreHistoryEntry {
   /** The `reviewPass` this round reserved at dispatch (mirror of
    * `src/types/taskProgress.ts`); absent on older entries. */
   reviewPass?: number;
+  /** Plan items the gate counted as settled when this review was recorded
+   * (mirror of `src/types/taskProgress.ts`, bugs4 Step 25). */
+  settledItemCount?: number;
+  /** Distinct plan steps this round's task-fixable completion blockers named
+   * as unbuilt (mirror of `src/types/taskProgress.ts`, bugs4 Step 25). */
+  unbuiltStepCount?: number;
 }
 
 /** See `ReviewScoreHistoryEntry.reviewer`. */
@@ -686,6 +699,35 @@ export interface PlanItemEvidenceV1 {
   readonly testReports?: readonly PlanItemTestReportV1[];
 }
 
+/** An explicit owner decision made through the open-items form (bugs4 item 7). */
+export interface PlanItemOwnerDecisionV1 {
+  readonly planRevision: string;
+  readonly itemKey: string;
+  readonly itemText: string;
+  readonly source: "owner";
+  readonly at: string;
+  readonly formId: string;
+  readonly decision: "tick" | "exclude";
+}
+export const MAX_PLAN_ITEM_OWNER_DECISIONS = 1000;
+
+/** A test run the owner recorded by hand (bugs4 item 21 / Step 19). */
+export interface PlanItemOwnerTestRunV1 {
+  readonly planRevision: string;
+  readonly source: "owner";
+  readonly at: string;
+  readonly formId: string;
+  readonly command: string;
+  readonly exitCode: number;
+  /** The owner's output or summary of the run (bounded). */
+  readonly summary: string;
+  /** Normalized keys of the plan items this run covers. */
+  readonly itemKeys: readonly string[];
+}
+export const MAX_PLAN_ITEM_OWNER_TEST_RUNS = 200;
+/** Bound on `checklistProgressUnreliableClaims`. */
+export const MAX_LATCHING_CLAIMS_V1 = 200;
+
 export interface PlanItemClaimEvidenceV1 {
   readonly source: "implementation" | "retroactive" | "reviewer";
   readonly at: string;
@@ -736,6 +778,8 @@ export interface RoundLedgerOutcomeV1 {
   filesChanged?: readonly string[];
   /** True when a round DID change files but the exact set could not be enumerated. */
   filesChangedUnknown?: boolean;
+  /** Paths in `filesChanged` the round's own report did not claim (bugs4 items 1/2). */
+  unattributedFiles?: readonly string[];
   /** A review round's score out of 10, when this row is a review. */
   score?: number;
   /** A review round's blocker count actually raised by the reviewer. */

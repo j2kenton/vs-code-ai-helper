@@ -196,6 +196,20 @@ void describe("durable running record and abandoned-run recovery (bugs3 Step 12)
     assert.equal(publishStatusLineForOutcomeV1(mid!), undefined, "a running record never rewrites the report status");
   });
 
+  void it("bugs4 item 33: publish-review.md says the checks are running, not still showing the previous run's result", async () => {
+    const task = taskFolder();
+    await ensurePublishReviewArtifactExistsV1(task.uri);
+    await recordPublishChecksRunningV1(task.uri, "op-run");
+    const report = fs.readFileSync(task.report, "utf8");
+    assert.match(report, /Publish Checks are running\*\* \(started \d{4}-\d{2}-\d{2}T/);
+    assert.match(report, /earlier run and is out of date/);
+    // A cancelled run replaces the running line with its own status.
+    await recordPublishChecksOutcomeV1(task.uri, { outcome: "cancelled", at: AT, cause: "cancelled from Notifications", operationId: "op-run" });
+    const after = fs.readFileSync(task.report, "utf8");
+    assert.doesNotMatch(after, /Publish Checks are running/);
+    assert.match(after, /Publish Checks were cancelled/);
+  });
+
   void it("a terminal outcome replaces the running record and a late command update cannot bring it back", async () => {
     const task = taskFolder();
     const hooks = await recordPublishChecksRunningV1(task.uri, "op-8");

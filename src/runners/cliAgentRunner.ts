@@ -27,6 +27,7 @@ import {
 import { createCliStdoutResultCaptureV1 } from "../services/cliStdoutResultCaptureV1";
 import { sanitizeChangeSetV1 } from "../services/workflowPrivacyClassifierV1";
 import { withAttribution, writeTextFile } from "../utils/fileUtils";
+import { dropGitIgnoredPathsV1 } from "../utils/gitIgnoredPathsV1";
 import { decideCliMajorV1, getCliMajorVersionV1 } from "../utils/cliMajorVersionV1";
 import { CheckExecutionFeedbackV1, ImplementationRunResult } from "./copilotImplementationRunner";
 import { CLINE_CLI_ARGV_PROMPT_PLACEHOLDER, cliDisplayLabel, CliProviderDefinition, CliRunMode } from "./providers";
@@ -1686,6 +1687,11 @@ function claudeCliAssistantMessageText(event: ClaudeCliEnvelope): string | undef
   return parts.length > 0 ? parts.join("") : undefined;
 }
 
+/** True when a message carries both `## Files Changed` and `## Verification` as real headings. */
+function claudeCliTextHasReportSections(text: string): boolean {
+  return /^#{1,6}\s*Files Changed\b/im.test(text) && /^#{1,6}\s*Verification\b/im.test(text);
+}
+
 /**
  * Claude Code CLI's LAST `assistant` message wins — same "last wins" choice
  * as extractCodexFinalOutput/extractKimiFinalOutput/extractClineFinalOutput:
@@ -1709,6 +1715,7 @@ function extractClaudeCliFinalOutput(
 
   let sawRecognizedEvent = false;
   let finalText: string | undefined;
+  let lastCompleteReport: string | undefined;
   for (const rawEvent of parsed.events) {
     const event = rawEvent as ClaudeCliEnvelope;
     if (typeof event.type === "string") {
@@ -1720,7 +1727,21 @@ function extractClaudeCliFinalOutput(
     const text = claudeCliAssistantMessageText(event);
     if (text !== undefined) {
       finalText = text;
+      if (claudeCliTextHasReportSections(text)) {
+        lastCompleteReport = text;
+      }
     }
+  }
+  // bugs4 item 23: a background-task notification can arrive after the summary, and Claude Code's
+  // reply to it ("that is the monitor I already reported") becomes the final message. A complete
+  // summary followed by a short afterthought is not a cut-short round: keep the last message that
+  // carries the required sections whenever the final one does not.
+  if (
+    lastCompleteReport !== undefined &&
+    finalText !== undefined &&
+    !claudeCliTextHasReportSections(finalText)
+  ) {
+    finalText = lastCompleteReport;
   }
 
   // Same rationale as extractCodexFinalOutput/extractKimiFinalOutput: an
@@ -5369,9 +5390,12 @@ export async function runImplementationWithCli(options: {
   // downstream consumer of `filesChanged` (review scope, the run log,
   // pendingImplReviewFiles quarantine) sees a change set that never
   // contained Ensemble's own bookkeeping in the first place.
+  // bugs4 item 23: a path git reports as ignored (a `.scratch/` the repository's
+  // .gitignore lists) is test or one-off-compile leftover, never a round edit,
+  // so it is dropped here for the same reason bookkeeping is.
   const rawFilesChanged = filesChangedUnknown
     ? []
-    : sanitizeChangeSetV1(changedPathsSince(before, after));
+    : await dropGitIgnoredPathsV1(cwd, sanitizeChangeSetV1(changedPathsSince(before, after)));
 
   const strayReservedNames = rawFilesChanged.filter((path) => {
     if (!RESERVED_ROOT_ARTIFACT_NAMES.has(path)) {

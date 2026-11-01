@@ -13,6 +13,11 @@ import { recordStageActionTerminalOutcomeV1 } from "../utils/stageActionRefusalV
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
+/** Only warnings and errors reveal the Notifications view; an info notice never moves the sidebar. */
+export function shouldRevealStatusViewForLevelV1(level: "info" | "warning" | "error"): boolean {
+  return level === "warning" || level === "error";
+}
+
 export interface StatusEntry {
   message: string;
   level: "info" | "warning" | "error";
@@ -306,7 +311,12 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
 
     this.persist();
     this.refresh();
-    void vscode.commands.executeCommand("vs-code-ai-helper.statusView.focus").then(undefined, () => undefined);
+    // bugs4 item 20: never take keyboard focus, and reveal only for warnings and errors. A routine
+    // info notice used to pull the sidebar away from the chat card on every entry. `.open` shows the
+    // view without focusing it (`.focus` does the opposite).
+    if (shouldRevealStatusViewForLevelV1(level)) {
+      void vscode.commands.executeCommand(`${STATUS_VIEW_ID}.open`).then(undefined, () => undefined);
+    }
   }
 
   /**

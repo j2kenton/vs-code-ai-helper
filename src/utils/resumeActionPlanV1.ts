@@ -354,7 +354,7 @@ async function loadUnusableSummaryFactV1(
   const plan = await readPlanOfRecordV1(taskFolderUri);
   const progress = await readTaskProgressStrictV1(taskFolderUri);
   const settled = plan.hasChecklist && plan.text !== undefined && progress.ok &&
-    countChecklistEvidenceProgressV1(plan.text, progress.decoded.progress.planItemEvidence ?? [])?.gate.remaining === 0;
+    countChecklistEvidenceProgressV1(plan.text, progress.decoded.progress.planItemEvidence ?? [], progress.decoded.progress.planItemOwnerDecisions ?? [])?.gate.remaining === 0;
   return { remedy: describeUnusableSummaryRemedyV1(canRestore, settled), canRestore };
 }
 

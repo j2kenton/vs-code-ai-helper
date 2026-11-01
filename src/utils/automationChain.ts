@@ -14,6 +14,7 @@ import {
   terminalizeRoundV1,
 } from "./roundLedgerV1";
 import { writeRunLog } from "./runLog";
+import { peekRecentStageActionRefusalReasonV1 } from "./stageActionRefusalV1";
 import {
   AutomationCommandOutcomeV1,
   clearAutomationCommandOutcomeV1,
@@ -418,11 +419,16 @@ function terminalizeDeclinedAutomationBestEffortV1(
     callbackError = error;
   }
   const state = callbackFailed ? "failed" : "dropped";
+  // The declined command may have recorded WHY (a typed preflight refusal, a
+  // guard clause): name that rather than the generic "declined to run".
+  const statedReason = callbackFailed ? undefined : peekRecentStageActionRefusalReasonV1(dispatch.taskKey);
   const reason = callbackFailed
     ? callbackError instanceof Error
       ? callbackError.message
       : String(callbackError)
-    : "the dispatched command declined to run and no round was started";
+    : statedReason !== undefined
+      ? `the dispatched command declined to run and no round was started: ${statedReason}`
+      : "the dispatched command declined to run and no round was started";
   void recordTerminalIntentBestEffortV1(intentId, callbackFailed ? "failed" : "cancelled");
   terminalizeGenericAutomationRoundBestEffortV1(
     dispatch.taskKey,

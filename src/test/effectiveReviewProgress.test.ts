@@ -31,7 +31,11 @@ import {
   initNotificationRouter,
 } from "../utils/notificationRouter";
 import { readyToAdvanceStage } from "../utils/reviewReadiness";
-import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
+import {
+  getPlanRevisionV1,
+  implementationDisplayCountsV1,
+  normalizeChecklistItemTextV1,
+} from "../utils/implementationChecklist";
 import { safeRemoveDir } from "./testFsUtils";
 
 // ---------------------------------------------------------------------------
@@ -491,6 +495,32 @@ void describe("readDisplayPlanChecklistProgressV1", () => {
     } finally {
       fsStub.restore();
     }
+  });
+
+  void it("bugs4 Step 11: the Tasks pane percentage is the gate's settled count, not the ticked boxes", async () => {
+    const uri = makeTask("display-pane-gate", {
+      plan: PLAN_TWO_OF_FIVE,
+      progressRaw: validProgressRaw("display-pane-gate"),
+    });
+    const fsStub = installRealFs();
+    try {
+      const display = await readDisplayPlanChecklistProgressV1(uri);
+      assert.ok(display);
+      // Two boxes are ticked but nothing is verified: the pane shows 0 of 5.
+      assert.equal(display.counts.settled, 2);
+      assert.deepEqual(
+        { ...implementationDisplayCountsV1(display.verifiedCounts) },
+        { complete: 0, total: 5, closedBeforeImplementation: 0 }
+      );
+    } finally {
+      fsStub.restore();
+    }
+    const providerSource = nodeFs.readFileSync(
+      nodePath.join(__dirname, "..", "..", "src", "views", "taskTreeProvider.ts"),
+      "utf8"
+    );
+    assert.match(providerSource, /implementationDisplayCountsV1\(display\.verifiedCounts\)/);
+    assert.doesNotMatch(providerSource, /implementationDisplayCountsV1\(display\.counts\)/);
   });
 
   void it("returns undefined (not applicable) for a plan with no checklist, even when latched", async () => {

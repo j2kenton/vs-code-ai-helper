@@ -146,6 +146,7 @@ const INVENTORY: readonly InventoryRow[] = [
   // in document order after the two plateau-card branches above.
   { file: "utils/reviewEscalation.ts", optionId: "keepIterating", occurrence: 2, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: keepIterating (generic escalation card, decisionKey reviewEscalation:plateau) dispatches resumeAndDispatchImplementation" },
   { file: "utils/reviewEscalation.ts", optionId: "checkAfterInstall", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: checkAfterInstall advances the stage" },
+  { file: "utils/reviewEscalation.ts", optionId: "applyReviewerVerifiedTicks", occurrence: 0, resumeKind: "unpause", dispatchProof: "breakerCardRecommendationV1.test.ts: the breaker card's Apply Reviewer-Verified Ticks runs the ticks command and leaves the task paused" },
 
   // src/commands/reconcilePlanChecklist.ts
   { file: "commands/reconcilePlanChecklist.ts", optionId: "applyVerifiedTicks", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: applyVerifiedTicks dispatches the stage's next action after ticking" },
@@ -370,6 +371,7 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("utils/reviewEscalation.ts", "handleMyself", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepIterating", 2), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "checkAfterInstall", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "applyReviewerVerifiedTicks", 0), { kind: "runtime-test", proofFiles: ["breakerCardRecommendationV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "acceptNarrowing", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepItemOpen", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "moveOn", 0), { kind: "runtime-test", proofFiles: ["latchedCleanReviewAdvanceV1.test.ts"] }],

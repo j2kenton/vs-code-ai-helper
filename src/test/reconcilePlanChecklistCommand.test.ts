@@ -32,7 +32,9 @@ import { createHash } from "node:crypto";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
+import { decideLatchAutoClearAfterReviewV1 } from "../utils/latchAutoClearV1";
 import {
+  autoClearUnreliableChecklistLatchAfterReviewV1,
   applyReconciliationReviewVerifiedTicksConfirmedV1,
   applyReconciliationReviewVerifiedTicksV1,
   linkManualChecksToBlockerConfirmedV1,
@@ -330,7 +332,14 @@ async function run(
   taskOptions: { latched: boolean; plan?: string },
   confirmOptions: { confirm?: boolean; interference?: (folder: string) => void },
   arg?: unknown
-): Promise<{ captured: Captured[]; folder: string; refreshes: number; decision?: WorkflowDecisionV1 }> {
+): Promise<{
+  captured: Captured[];
+  folder: string;
+  refreshes: number;
+  decision?: WorkflowDecisionV1;
+  /** bugs4 item 27: the chat line posted after a confirmed reconcile, when one was. */
+  nextStepOffer?: WorkflowDecisionV1;
+}> {
   const { folder, progress } = makeTask(name, taskOptions);
   const canonicalId = `canonical-${name}`;
   const { inventory, refreshCount } = makeInventory(canonicalId, folder, progress);
@@ -370,7 +379,10 @@ async function run(
         });
       }
     }
-    return { captured: win.captured, folder, refreshes: refreshCount(), decision };
+    const nextStepOffer = store
+      .listPending(folder)
+      .find((d) => d.decisionKey === "chatActionOffer:resumeAndApplyCurrentStageAction");
+    return { captured: win.captured, folder, refreshes: refreshCount(), decision, nextStepOffer };
   } finally {
     win.restore();
     fs.restore();
@@ -509,12 +521,14 @@ void describe("reconcilePlanChecklist — confirmation", () => {
   void it("clears the latch, refreshes, and reports the counts it acted on", async () => {
     const result = await run("happy", { latched: true }, { confirm: true });
     const modal = result.captured.find((m) => m.method === "modal")?.message ?? "";
+    // bugs4 item 14: the card uses the completeness gate's own numbers, with ticked and
+    // reviewer-verified shown apart, so a provisional tick is never called "settled".
     assert.match(
       modal,
-      /reads 1\/2 items settled/,
+      /reads 0\/2 items settled for the completeness gate \(1 ticked, 0 verified by review, 1 awaiting review verification\)/,
       "the decision must state the counts the user is approving"
     );
-    assert.match(modal, /1 outstanding/);
+    assert.match(modal, /1 unticked/);
     assert.equal(readProgress(result.folder).checklistProgressUnreliable, undefined);
     assert.equal(result.refreshes, 1);
     // The last "info" entry, not the first: posting the reconcile decision
@@ -533,6 +547,98 @@ void describe("reconcilePlanChecklist — confirmation", () => {
       0,
       "reconcile confirmation must not dispatch resumeAndApplyCurrentStageAction"
     );
+  });
+
+  void it("bugs4 item 27: after Mark reconciled the chat says what happens next and offers the continuation with a Not now", async () => {
+    const result = await run("next-step-line", { latched: true }, { confirm: true });
+    const offer = result.nextStepOffer;
+    assert.ok(offer, "a chat line must follow a reconcile that dispatched nothing");
+    assert.match(offer.whatHappened, /Nothing else will run now/);
+    assert.match(offer.whatHappened, /Fast Forward or Apply Current Stage Action/);
+    assert.ok(offer.options.length >= 2, "the offer must include a harmless Not now beside the action");
+    assert.ok(offer.options.some((o) => o.label === "Not now"));
+  });
+
+  void it("bugs4 item 25: with unticked items no review named, Not yet does not tell the owner to tick missed items", async () => {
+    const result = await run("not-yet-unnamed", { latched: true }, { confirm: false });
+    const notYet = result.decision?.options.find((o) => o.optionId === "notYet");
+    assert.ok(notYet, "a Not yet option must be offered");
+    assert.doesNotMatch(notYet.consequence, /tick the missed items/);
+    assert.match(notYet.consequence, /No specific missed item was identified/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bugs4 item 17 / Step 17: a review that checked the code against the checklist clears the
+// latch itself, with a chat line, rather than leaving a one-option "Decision needed".
+// ---------------------------------------------------------------------------
+
+void describe("autoClearUnreliableChecklistLatchAfterReviewV1 (bugs4 item 17)", () => {
+  async function autoClear(
+    name: string,
+    outcome: Parameters<typeof autoClearUnreliableChecklistLatchAfterReviewV1>[2]
+  ): Promise<{ cleared: boolean; latchAfter: unknown; chatLine?: WorkflowDecisionV1 }> {
+    const { folder } = makeTask(name, { latched: true });
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const win = installWindowStub({});
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const cleared = await autoClearUnreliableChecklistLatchAfterReviewV1(vscode.Uri.file(folder), "Auto Clear Task", outcome);
+      const progress = JSON.parse(nodeFs.readFileSync(nodePath.join(folder, "task-progress.json"), "utf8")) as {
+        checklistProgressUnreliable?: boolean;
+      };
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const chatLine = store
+        .listPending(folder)
+        .find((d) => d.decisionKey === "chatActionOffer:resumeAndApplyCurrentStageAction");
+      return { cleared, latchAfter: progress.checklistProgressUnreliable, chatLine };
+    } finally {
+      win.restore();
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  }
+
+  void it("clears the latch and says so in chat after a review whose Verified Complete block was applied", async () => {
+    const result = await autoClear("auto-clear-applied", { blockPresent: true, appliedCount: 3, withheldTestItems: 0 });
+    assert.equal(result.cleared, true);
+    assert.notEqual(result.latchAfter, true);
+    assert.ok(result.chatLine, "a chat line must say the flag was cleared");
+    assert.match(result.chatLine.whatHappened, /no longer flagged unreliable/);
+    assert.match(result.chatLine.whatHappened, /3 verified ticks were applied/);
+    assert.ok(result.chatLine.options.length >= 2 && result.chatLine.options.some((o) => o.label === "Not now"));
+  });
+
+  void it("clears it when the review checked the checklist and found nothing to add", async () => {
+    const result = await autoClear("auto-clear-nothing", { blockPresent: true, appliedCount: 0, withheldTestItems: 0, blockedSeverity: "info" });
+    assert.equal(result.cleared, true);
+    assert.match(result.chatLine?.whatHappened ?? "", /found nothing to add/);
+  });
+
+  void it("keeps the latch when the review had no Verified Complete block", async () => {
+    const result = await autoClear("auto-clear-noblock", { blockPresent: false, appliedCount: 0, withheldTestItems: 0, blockedSeverity: "info" });
+    assert.equal(result.cleared, false);
+    assert.equal(result.latchAfter, true);
+    assert.equal(result.chatLine, undefined);
+  });
+
+  void it("keeps the latch while named items still wait for a test report, or the derivation warned", async () => {
+    const withheld = await autoClear("auto-clear-withheld", { blockPresent: true, appliedCount: 0, withheldTestItems: 2, blockedSeverity: "warning" });
+    assert.equal(withheld.cleared, false);
+    assert.equal(withheld.latchAfter, true);
+    const warned = await autoClear("auto-clear-warned", { blockPresent: true, appliedCount: 0, withheldTestItems: 0, blockedSeverity: "warning" });
+    assert.equal(warned.cleared, false);
+  });
+});
+
+void describe("decideLatchAutoClearAfterReviewV1", () => {
+  void it("names why it clears or stays", () => {
+    assert.equal(decideLatchAutoClearAfterReviewV1({ blockPresent: false, appliedCount: 0, withheldTestItems: 0 }).clear, false);
+    assert.match(decideLatchAutoClearAfterReviewV1({ blockPresent: true, appliedCount: 1, withheldTestItems: 0 }).reason, /1 verified tick was applied/);
+    assert.match(decideLatchAutoClearAfterReviewV1({ blockPresent: true, appliedCount: 0, withheldTestItems: 1 }).reason, /1 item the review named still wait/);
   });
 });
 
@@ -1416,6 +1522,67 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
         decision.whatHappened,
         /already ticked in plan-final\.md, so the checklist matches what was claimed/
       );
+    } finally {
+      fs.restore();
+      workspace.restore();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  // bugs4 item 15 / Step 15: no triggering summary is in scope (the latch is old); the claims
+  // that set it are read back from the latch record. Both restate items that are already
+  // ticked, so the card recommends Mark reconciled and says nothing was missed, instead of
+  // "Not yet — tick the missed items".
+  void it("loads the stored latching claims and recommends Mark reconciled when every one restates an already-ticked item (bugs4 item 15)", async () => {
+    const name = "evidence-latch-record-restated";
+    const folder = nodePath.join(ROOT, ".ensemble", name);
+    const canonicalId = `canonical-${name}`;
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "plan-final.md"),
+      [
+        "# Final Plan",
+        "",
+        "<!-- ensemble:implementation-checklist -->",
+        "",
+        "- [x] Key a single terminal chat emitter by operation ID.",
+        "- [x] Bridge duplicate command and notification endings into the single terminal emitter.",
+        "- [ ] Build the next thing.",
+        "",
+      ].join("\n"),
+      "utf8"
+    );
+    const progress = {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: BASE_UPDATED_AT,
+      updatedAt: BASE_UPDATED_AT,
+      checklistProgressUnreliable: true,
+      checklistProgressUnreliableClaims: [
+        "Key a single terminal chat emitter by operation ID.",
+        "Bridge duplicate command and notification endings into the single terminal emitter.",
+      ],
+    } as TaskProgress;
+    writeProgress(folder, progress);
+
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const result = await postReconcilePlanChecklistDecisionV1(vscode.Uri.file(folder), canonicalId, folder, progress);
+      assert.equal(result.kind, "posted");
+      const store = new WorkflowDecisionStoreV1(context.workspaceState);
+      const decision = store.listPending(canonicalId).find((d) => d.decisionKey === "reconcilePlanChecklist");
+      assert.ok(decision, "a decision must be posted");
+      assert.equal(decision.recommendation.kind, "option");
+      if (decision.recommendation.kind === "option") {
+        assert.equal(decision.recommendation.optionId, "reconcile");
+        assert.match(decision.recommendation.reasoning, /restated 2 item\(s\) that were already ticked/);
+        assert.match(decision.recommendation.reasoning, /nothing was missed/);
+      }
+      assert.ok(decision.options.length >= 2, "a decision always has a real choice");
     } finally {
       fs.restore();
       workspace.restore();

@@ -443,6 +443,10 @@ export interface TaskProgress {
   roundLedger?: RoundLedgerEntryV1[];
   /** Per-item claim and review evidence; legacy checklist ticks stay visible if absent. */
   planItemEvidence?: PlanItemEvidenceV1[];
+  /** Owner form ticks and exclusions, with owner provenance (bugs4 item 7). Top-level so older builds keep it as opaque. */
+  planItemOwnerDecisions?: PlanItemOwnerDecisionV1[];
+  /** Test runs the owner recorded by hand, as test evidence with owner provenance (bugs4 item 21). */
+  planItemOwnerTestRuns?: PlanItemOwnerTestRunV1[];
   /**
    * Durable record of a round that tried to add, remove, or renumber a
    * checklist item in `plan-final.md` (wf "make the stage chat a record of
@@ -535,6 +539,15 @@ export interface TaskProgress {
    * record)" statement rather than silently omitting the citation.
    */
   checklistProgressUnreliableReason?: string;
+
+  /**
+   * bugs4 Step 15 (item 22): the claim texts the latching round reported that matched no
+   * plan item (bounded; complete only when the latching round's full list fit). Written
+   * with the latch by the two claim-based latch sites and cleared with it, so the
+   * reconcile card can judge the real claims long after the round's summary is gone.
+   * Absent for latches set for other reasons and on records that predate the field.
+   */
+  checklistProgressUnreliableClaims?: string[];
 
   /**
    * Consecutive completed implementation rounds (for the task's current
@@ -1058,6 +1071,21 @@ export interface ReviewScoreHistoryEntry {
    */
   fixRoundIds?: string[];
   /**
+   * bugs4 Step 25 (item 22): how many plan items the completeness gate counted as
+   * settled when this review was recorded. A later round with a higher value than
+   * the one before it made real progress even when the blocker count stayed flat, so
+   * the churn ceiling does not count it. Absent on entries written before this field
+   * existed (such a transition is then compared by blocker count alone).
+   */
+  settledItemCount?: number;
+  /**
+   * bugs4 Step 25 (item 22): how many distinct plan steps this round's task-fixable
+   * `[completion]` blockers named as unbuilt. The grouped unbuilt-steps blocker stays
+   * one blocker until the last step is built, so a smaller number here is progress the
+   * flat blocker count cannot show. Absent when the round named no steps.
+   */
+  unbuiltStepCount?: number;
+  /**
    * `"open-editors"` when this review fell back to the files open in the
    * editor because the task had no tracked implementation file set (v1 fixes
    * 2, item 21). Recorded durably here so a high score can never be read as a
@@ -1362,6 +1390,50 @@ export interface PlanItemEvidenceV1 {
   readonly testReports?: readonly PlanItemTestReportV1[];
 }
 
+/**
+ * bugs4 item 7: an explicit owner decision made through the open-items form.
+ * An owner tick settles the item for the completeness gate, with this
+ * provenance, and is never mistaken for reviewer verification.
+ *
+ * Stored in the top-level `TaskProgress.planItemOwnerDecisions` list, NOT
+ * inside `planItemEvidence` entries: shipped builds reject unknown properties
+ * inside an evidence entry (failing the whole file), but keep an unknown
+ * top-level non-`ensemble*` field as an opaque entry, so an older build still
+ * reads a progress file that carries owner decisions.
+ */
+export interface PlanItemOwnerDecisionV1 {
+  readonly planRevision: string;
+  readonly itemKey: string;
+  readonly itemText: string;
+  readonly source: "owner";
+  readonly at: string;
+  readonly formId: string;
+  readonly decision: "tick" | "exclude";
+}
+export const MAX_PLAN_ITEM_OWNER_DECISIONS = 1000;
+
+/**
+ * bugs4 item 21 / Step 19: a test run the owner ran by hand (a Docker drill, a full suite) and
+ * recorded in the chat. It counts as test evidence for the items it names, with owner provenance,
+ * and is never mistaken for an editing round's report or a reviewer verification. Top-level for
+ * the same older-build reason as `PlanItemOwnerDecisionV1`.
+ */
+export interface PlanItemOwnerTestRunV1 {
+  readonly planRevision: string;
+  readonly source: "owner";
+  readonly at: string;
+  readonly formId: string;
+  readonly command: string;
+  readonly exitCode: number;
+  /** The owner's output or summary of the run (bounded). */
+  readonly summary: string;
+  /** Normalized keys of the plan items this run covers. */
+  readonly itemKeys: readonly string[];
+}
+export const MAX_PLAN_ITEM_OWNER_TEST_RUNS = 200;
+/** Bound on `checklistProgressUnreliableClaims`; a longer latching list is not stored (it would be partial). */
+export const MAX_LATCHING_CLAIMS_V1 = 200;
+
 export interface PlanItemClaimEvidenceV1 {
   readonly source: "implementation" | "retroactive" | "reviewer";
   readonly at: string;
@@ -1422,6 +1494,14 @@ export interface RoundLedgerOutcomeV1 {
   /** True when a round DID change files but the exact set could not be
    * enumerated — distinct from `filesChanged` being empty (no changes). */
   filesChangedUnknown?: boolean;
+  /**
+   * Snapshot paths in `filesChanged` that the round's own `## Files Changed`
+   * report did not claim (bugs4 items 1/2): concurrent hand edits and other
+   * unattributed workspace changes. They stay in `filesChanged` (the observed
+   * change set) but are never task-owned review scope: ledger-based scope
+   * reconstruction subtracts them.
+   */
+  unattributedFiles?: readonly string[];
   /** A review round's score out of 10, when this row is a review. */
   score?: number;
   /** A review round's blocker count actually raised by the reviewer

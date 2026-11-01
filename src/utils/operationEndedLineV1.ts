@@ -21,7 +21,13 @@ import type { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeTaskActionFailureV1 } from "./taskActionOutcomeTextV1";
 import { claimTerminalLineV1, ledgerOwnsTerminalLineV1, reserveLedgerTerminalLineV1 } from "./terminalLineEmitterV1";
 
-export type EndedOperationStateV1 = "succeeded" | "failed" | "cancelled" | "interrupted" | "refused";
+export type EndedOperationStateV1 =
+  | "succeeded"
+  | "failed"
+  | "cancelled"
+  | "interrupted"
+  | "refused"
+  | "stopped";
 
 export interface TrackedOperationV1 {
   readonly id: string;
@@ -47,6 +53,8 @@ const STATE_WORDS_V1: Readonly<Record<string, string>> = {
   cancelled: "cancelled",
   interrupted: "interrupted",
   refused: "refused — it did not start",
+  // bugs4 item 36: a deliberate stop (the no-progress breaker), never "succeeded".
+  stopped: "stopped",
 };
 
 function describeSettledOutcomeV1(label: string, outcome: SettledOutcomeV1): string {
@@ -57,7 +65,7 @@ function describeSettledOutcomeV1(label: string, outcome: SettledOutcomeV1): str
 
 /** What an operation's round actually ended as, as recorded by whoever settled it. */
 export interface OperationTerminalOutcomeV1 {
-  readonly state: "succeeded" | "failed" | "cancelled" | "refused";
+  readonly state: "succeeded" | "failed" | "cancelled" | "refused" | "stopped";
   readonly reason?: string;
   /**
    * True when the round ledger posts this round's terminal "Ended: …" line

@@ -426,6 +426,33 @@ void describe("the open-items form card (RC3 item 5)", () => {
     });
   });
 
+  void it("Set all to: tick selects every row, and each row can still be adjusted before Apply (bugs4 item 27)", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: false, openPlanItemsForms: [form] }));
+    const card = panel.byId("interaction");
+    const selects = collect(card, "select");
+    assert.equal(selects.length, 1, "the form has one Set all control");
+    const bulk = selects[0] as unknown as { value: string; listeners: Map<string, ((event: unknown) => void)[]> };
+    bulk.value = "tick";
+    bulk.listeners.get("change")![0]!({});
+    const radios = collect(card, "input") as unknown as { value: string; checked: boolean }[];
+    // Every row's "tick" radio is selected; "leave" is no longer the choice anywhere.
+    assert.deepEqual(
+      radios.filter((r) => r.checked).map((r) => r.value),
+      ["tick", "tick"]
+    );
+    // Adjust the first row back to Exclude, then Apply: the rows really are independent afterwards.
+    radios[0]!.checked = true; // exclude, item 1
+    radios[1]!.checked = false; // tick, item 1
+    const apply = collect(card, "button").find((b) => b.textContent === "Apply")!;
+    apply.listeners.get("click")![0]!({});
+    const posted = JSON.parse(JSON.stringify(panel.outbound.at(-1))) as { answers: { itemId: string; choice: string }[] };
+    assert.deepEqual(
+      posted.answers.map((a) => [a.itemId, a.choice]),
+      [["id-1", "exclude"], ["id-2", "tick"]]
+    );
+  });
+
   void it("a repaint keeps a prefilled note the owner cleared", () => {
     const panel = runPanel();
     panel.post(stateMessage({ busy: false, openPlanItemsForms: [form] }));

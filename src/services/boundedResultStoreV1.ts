@@ -57,7 +57,42 @@ export type SpoolClaimFailureCodeV1 =
 
 export type SpoolClaimResultV1 =
   | { readonly ok: true; readonly utf8Text: string; readonly ref: ResultSpoolRefV1 }
-  | { readonly ok: false; readonly code: SpoolClaimFailureCodeV1 };
+  | {
+      readonly ok: false;
+      readonly code: SpoolClaimFailureCodeV1;
+      /** bugs4 item 9: for `spoolCorrelationMismatch`, every field that differed, with both values. */
+      readonly mismatches?: readonly SpoolCorrelationMismatchV1[];
+    };
+
+/** One correlation field whose claimed value differed from the spool's stored value. */
+export interface SpoolCorrelationMismatchV1 {
+  readonly field: "action" | "operation" | "attempt" | "task binding" | "chat document" | "reservation" | "store";
+  readonly expected: string;
+  readonly actual: string;
+}
+
+/**
+ * bugs4 item 9: which comparison `claimSpoolOnce` failed. Pure, so the caller
+ * and tests can name the field instead of reporting a bare mismatch.
+ */
+export function describeSpoolCorrelationMismatchV1(
+  expected: ActionCorrelationV1,
+  stored: ActionCorrelationV1 & { readonly reservationId: string; readonly storeId: string },
+  claimed: { readonly reservationId: string; readonly storeId: string }
+): SpoolCorrelationMismatchV1[] {
+  const pairs: [SpoolCorrelationMismatchV1["field"], string, string][] = [
+    ["operation", expected.operationId, stored.operationId],
+    ["attempt", expected.attemptId, stored.attemptId],
+    ["reservation", claimed.reservationId, stored.reservationId],
+    ["store", claimed.storeId, stored.storeId],
+    ["action", expected.actionKey, stored.actionKey],
+    ["task binding", expected.taskBindingId, stored.taskBindingId],
+    ["chat document", expected.chatDocumentId, stored.chatDocumentId],
+  ];
+  return pairs
+    .filter(([, want, have]) => want !== have)
+    .map(([field, want, have]) => ({ field, expected: want, actual: have }));
+}
 
 /**
  * Marks WHY a spool was written, since the broker (large in-flight/completed
@@ -326,7 +361,14 @@ export function createBoundedResultStoreV1(options: {
         meta.reservationId !== ref.reservationId ||
         meta.storeId !== storeId
       ) {
-        return { ok: false, code: "spoolCorrelationMismatch" };
+        return {
+          ok: false,
+          code: "spoolCorrelationMismatch",
+          mismatches: describeSpoolCorrelationMismatchV1(expectedCorrelation, meta, {
+            reservationId: ref.reservationId,
+            storeId,
+          }),
+        };
       }
       if (now().getTime() > Date.parse(meta.expiresAt)) {
         await removeSpoolInternal(ref);

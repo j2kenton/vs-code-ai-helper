@@ -39,14 +39,28 @@ import {
 import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { createAdmissionHeldNotifierV1 } from "./releaseStuckAdmissionMarkers";
 import {
+  describeHandOverRoundFindingV1,
+  findHandOverRoundFindingV1,
+  findPendingDecisionForRoundV1,
+} from "../utils/handOverLedgerAgreementV1";
+import {
   clearStageActionRefusalReasonV1,
   clearStageActionTerminalOutcomeV1,
+  peekRecentStageActionRefusalReasonV1,
+  peekRecentTypedStageActionRefusalV1,
   recordStageActionRefusalReasonV1,
   recordStageActionTerminalOutcomeV1,
   takeStageActionRefusalReasonV1,
   takeStageActionTerminalOutcomeV1,
+  type TypedStageActionRefusalV1,
 } from "../utils/stageActionRefusalV1";
 import { recordOperationTerminalOutcomeV1, terminalOutcomeFromTaskActionOutcomeV1 } from "../utils/operationEndedLineV1";
+import {
+  describeBreakerFastForwardEndV1,
+  describeBreakerStopV1,
+  recordBreakerStopV1,
+  takeBreakerStopSinceV1,
+} from "../utils/breakerStopReportV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import {
   EffectivePauseSnapshotV1,
@@ -119,7 +133,6 @@ import {
   markFastForwardRunActiveV1,
   clearFastForwardRunActiveV1,
   updateFastForwardRunStateV1,
-  getFastForwardRunStateV1,
   recordFastForwardRunPausedV1,
   clearFastForwardRunPausedProvenanceV1,
 } from "../utils/activeFastForwardRunsV1";
@@ -193,7 +206,7 @@ import {
 } from "../utils/implementationTypeCheckHandOffV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { loadRetryFailedReviewOptionFieldsV1 } from "../utils/resumeActionPlanV1";
-import { stepNameV1, stepProgressLabelV1 } from "../utils/stepLabelsV1";
+import { applyReviewActivityV1, stepNameV1, stepProgressLabelV1 } from "../utils/stepLabelsV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   AUTO_REVIEW_TRANSITIONS,
@@ -223,26 +236,37 @@ import {
   accountImplementationReportCorrectionClaimsV1,
   ChecklistProgressV1,
   classifyUncheckedChecklistItemsV1,
-  collectPlanItemReasonsV1,
   countChecklistEvidenceProgressV1,
+  describeOpenAndHandOffsV1,
   detectChecklistItemSetMutationV1,
   formatChecklistItemGlyphV1,
+  formatExclusionMarkerPlacementForReviewerV1,
   formatChecklistProgressForReviewerV1,
   formatChecklistEvidenceForReviewerV1,
+  formatProvisionalTickedItemsForReviewerV1,
   formatOpenPlanItemsForRoundV1,
   hasImplementationChecklistV1,
   IMPLEMENTATION_CHECKLIST_MARKER,
   listUncheckedChecklistItemTextsV1,
+  listProvisionalTickedItemsV1,
   mergeChecklistProgressV1,
   listNewlyCheckedChecklistItemsV1,
   listProvisionalTestDependentChecklistItemsV1,
   getApplicablePassingTestReportForItemV1,
+  listUncountedTestReportClaimsV1,
+  formatUncountedTestReportClaimsSectionV1,
   getPlanRevisionV1,
+  countOpenNestedChecklistItemsV1,
   normalizeChecklistItemTextV1,
   parseDeclinedBlockersV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
-import { buildOpenPlanItemsNeedDecisionCardInputV1 } from "./decideOpenPlanItemsV1";
+import { formatAllowedTestCommandGuidanceV1, resolveAllowedTargetedTestCommandV1 } from "../utils/allowedTestCommandV1";
+import type { VerifiedCompleteReviewOutcomeV1 } from "../utils/latchAutoClearV1";
+import { collectRoundClaimedItemsV1, formatClaimVerificationSectionV1 } from "../utils/claimVerificationReportV1";
+import { detectTestsRefusedV1, formatTestsRefusedRemedyV1, formatTestsRefusedSectionV1 } from "../utils/testsRefusedV1";
+import { buildNotReachedRetryNoticeV1, findNotReachedOpenItemsV1 } from "../utils/notReachedRetryV1";
+import { postOpenPlanItemsCardV1 } from "./postOpenPlanItemsCardV1";
 import { generateContextPack, writeContextPack, writeContextPackContent, writeImplReviewContextPack } from "../utils/contextPack";
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
@@ -277,12 +301,15 @@ import {
   resolveModelForStage,
 } from "../utils/modelSelection";
 import {
-  attributeImplementationRoundFilesV1,
+  resolveCompletedRoundAttributionV1,
   buildSyntheticImplementationSummaryV1,
   buildUnusableImplementationSummaryV1,
+  mergeNoChangeRoundIntoSummaryV1,
   withDeterministicZeroFilesChangedNoteV1,
   describeImplementationSummaryShapeIssue,
   parseReportedFilesChangedV1,
+  describeUnparsedFilesChangedReportV1,
+  describeUnattributedWorkspaceChangesSectionV1,
   describeIncompleteImplementationRoundV1,
   IncompleteImplementationRoundV1,
   getCanonicalImplementationUri,
@@ -306,6 +333,18 @@ import * as fs from "fs";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { withdrawStaleOpenItemsCardV1 } from "../utils/withdrawStaleOpenItemsCardV1";
+import {
+  detectOwnerEvidenceContradictionV1,
+  formatOwnerEvidenceContradictionLineV1,
+  formatOwnerEvidenceVerdictForRoundV1,
+} from "../utils/ownerEvidenceVerdictV1";
+import {
+  buildReviewPreflightRefusalV1,
+  shouldWarnFastForwardStalledV1,
+  describeReviewPreflightRefusalV1,
+  type ReviewPreflightRefusalV1,
+} from "../utils/reviewPreflightRefusalV1";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import {
   advanceAnywayLabelV1,
@@ -360,7 +399,13 @@ import { NEXT_STAGE_ACTION_KEY_V1 } from "../actions/rows/nextStageRowV1";
 import { outcomeCorrelationV1, ProviderChainExhaustionV1, TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeResumeNotSettledV1 } from "../utils/storedAnswerResumeV1";
 import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
-import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider } from "../views/chatView";
+import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider, isBlockingDecisionV1 } from "../views/chatView";
+import {
+  describeFastForwardHoldV1,
+  findBlockingDecisionSinceRunStartV1,
+  latestApplyReviewChangedNothingV1,
+  unproducibleTestEvidenceHoldV1,
+} from "../utils/fastForwardHoldV1";
 import {
   missingCompletionArtifactsV1,
   stageActionRequirementMessageV1,
@@ -377,9 +422,14 @@ import {
   postReconcilePlanChecklistDecisionV1,
   runAutomaticChecklistReconciliationV1,
   AutomaticChecklistReconciliationOutcomeV1,
+  autoClearUnreliableChecklistLatchAfterReviewV1,
 } from "./reconcilePlanChecklist";
 import { postHandoffChecksDecisionV1 } from "./handoffChecksV1";
-import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import {
+  listPendingWorkflowDecisionsForTaskV1,
+  postWorkflowDecisionV1,
+  withdrawWorkflowDecisionsByKeyV1,
+} from "../utils/workflowDecisionDispatchV1";
 import {
   describeOversizedInputRemedyV1,
   IMPL_REVIEW_MAX_TOTAL_CHARS,
@@ -390,6 +440,7 @@ import {
   applyResumedReviewScopeRoutingV1,
   shouldClearImplReviewFilesAfterReviewV1,
 } from "../utils/implReviewFileSelection";
+import { backupUsedNoteV1, backupUsedRunLogNoteV1, formatProviderErrorV1 } from "../utils/providerErrorFormatterV1";
 import {
   WorkflowDecisionOptionEffectV1,
   WorkflowDecisionOptionV1,
@@ -424,6 +475,7 @@ import {
   splitTaskFixableBlockersByOriginV1,
   partitionStageUnsatisfiableBlockersV1,
   reclassifyDeclinedBlockersV1,
+  parseReviewVerifiedCompleteV1,
 } from "../utils/reviewReadiness";
 import {
   refreshStaleReviewBannerForArtifactV1,
@@ -506,6 +558,7 @@ import {
   runningImplementationRecommendedOptionV1,
   STALE_REVIEW_RECONCILIATION_COMMIT_THRESHOLD,
 } from "../utils/reviewRouting";
+import { computeChurnProgressSignalsV1, type ChurnProgressSignalsV1 } from "../utils/churnProgressSignalsV1";
 import {
   fixRoundIdsSincePreviousReviewV1,
   historyAfterFixCyclesV1,
@@ -513,7 +566,14 @@ import {
   reviewPredatesRoundNeedsFreshReviewV1,
 } from "../utils/plateauFixCycleV1";
 import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
-import { recordReviewInputsV1, reviewInputsChangedSinceV1, reviewWorkspaceChangedSinceV1 } from "../utils/reviewInputsChangedV1";
+import {
+  recordReviewInputsV1,
+  reviewInputsChangedSinceV1,
+  reviewWorkspaceChangedSinceV1,
+  staleReviewInputsV1,
+} from "../utils/reviewInputsChangedV1";
+import { buildStaleReviewVerdictTextV1 } from "../utils/staleReviewVerdictV1";
+import { latchingClaimsForRecordV1 } from "../utils/latchingClaimsFromRunLogV1";
 import { measureKimiPromptV1 } from "../utils/kimiReadCapacityV1";
 import { getKimiReadCapacityV1 } from "../utils/kimiReadCapacityNodeV1";
 import { offerKimiReadConfigInChatV1 } from "./kimiReadConfigOfferV1";
@@ -636,42 +696,149 @@ export type HandOverNotStartedCauseV1 =
   | "duplicate-chain"
   | "automation-disabled"
   | "root-operation-unsuccessful"
-  | "declined";
+  | "declined"
+  /**
+   * A gate deliberately scheduled no follow-up (a failing type-check, for
+   * example). Nothing declined; the gate's own reason and next step are the
+   * explanation, taken from the round ledger rather than from this cause alone.
+   */
+  | "gated-no-follow-up";
 
 type HandOverKindV1 = "review" | "implementation";
 
-const HAND_OVER_CAUSE_TEXT_V1: Record<HandOverNotStartedCauseV1, string> = {
+const HAND_OVER_CAUSE_TEXT_V1: Record<Exclude<HandOverNotStartedCauseV1, "declined">, string> = {
   "duplicate-chain": "another automatic follow-up is already pending for this task",
   "automation-disabled": "automation was turned off before it could start",
   "root-operation-unsuccessful": "the run it was queued behind did not finish successfully",
-  declined: "the queued command returned without starting a round but did not provide its refusal reason",
+  "gated-no-follow-up": "a check deliberately held the follow-up back",
 };
 
+/**
+ * A `declined` hand-over always says WHY when anything is known: the downstream
+ * command's stated refusal reason, else what is known about the command that
+ * returned. It never blames a missing reason on the command.
+ */
+/** @internal exported for testing */
+export function describeDeclinedHandOverV1(
+  kind: HandOverKindV1,
+  downstreamReason: string | undefined,
+  typed?: TypedStageActionRefusalV1
+): string {
+  const commandName = kind === "implementation" ? "Run Implementation" : "Run Review";
+  if (typed) {
+    // The downstream command's own typed refusal: its reason and the recovery it named.
+    const typedReason = typed.reason.trim().replace(/[.\s]+$/, "");
+    const recovery = typed.recovery ? `; to recover: ${typed.recovery.label}` : "";
+    return `the queued ${commandName} command did not run (${typed.cause}): ${typedReason}${recovery}`;
+  }
+  const stated = downstreamReason?.trim().replace(/[.\s]+$/, "");
+  return stated
+    ? `the queued ${commandName} command refused to start: ${stated}`
+    : `the queued ${commandName} command returned without starting a round and recorded no cause; check the run log in the task's runs folder`;
+}
+
+/** The manual step, naming the stage only when the action's own name does not already. */
 function handOverManualStepV1(stage: TaskStage, kind: HandOverKindV1): string {
-  return kind === "implementation"
-    ? `Run Implementation on ${STAGE_DISPLAY_NAMES[stage]}.`
-    : `Run Review with AI on ${STAGE_DISPLAY_NAMES[stage]}.`;
+  const action = kind === "implementation" ? "Run Implementation" : "Run Review with AI";
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  return action.includes(stageName) ? `${action}.` : `${action} on ${stageName}.`;
 }
 
 /**
  * The one warning for an automatic hand-over into the next stage that did not
  * start. Names the task, the stage, the real cause and the manual step.
+ *
+ * bugs4 item 4: it first consults the round ledger. When a round at the stage
+ * ended a moment ago it reports what happened to that round; a completed round
+ * whose follow-up a gate withheld on purpose is not "a round that never
+ * started", and a failing type-check defers to the type-check decision (one
+ * event, one decision).
  */
 export async function warnHandOverNotStartedV1(
   folderUri: vscode.Uri,
   displayName: string | undefined,
   stage: TaskStage,
   cause: HandOverNotStartedCauseV1,
-  kind: HandOverKindV1 = "review"
+  kind: HandOverKindV1 = "review",
+  options: {
+    readonly downstreamReason?: string;
+    readonly now?: number;
+    /**
+     * ISO start of the chain's root operation. Only rounds that ended since
+     * then are evidence about this hand-over; an earlier round at the stage
+     * belongs to a previous event.
+     */
+    readonly since?: string;
+  } = {}
 ): Promise<void> {
   const actionLabel = kind === "implementation" ? "Run Implementation" : "Run Review";
   const command = kind === "implementation"
     ? "vs-code-ai-helper.runImplementationWithAI"
     : "vs-code-ai-helper.runReviewWithAI";
-  const noticeText =
-    `${formatNotificationTaskLabelV1(displayName, folderUri.fsPath)}: auto-advance reached ${STAGE_DISPLAY_NAMES[stage]}, ` +
-    `but its ${kind === "implementation" ? "Implementation round" : "review"} did not start because ` +
-    `${HAND_OVER_CAUSE_TEXT_V1[cause]}. ${handOverManualStepV1(stage, kind)}`;
+  const taskLabel = formatNotificationTaskLabelV1(displayName, folderUri.fsPath);
+  const finding = findHandOverRoundFindingV1(
+    await readTaskProgressAdvisoryV1(folderUri).catch(() => undefined),
+    stage,
+    { now: options.now, since: options.since }
+  );
+  if (finding?.kind === "gated"&& finding.gate.kind === "type-check") {
+    // The gate's own decision names the type-check as the blocker and
+    // recommends the fix. Posting it here is idempotent by decision key, so a
+    // gate that already raised it stays the single card.
+    try {
+      const canonicalId = normalizePath(folderUri.fsPath);
+      const progress = await readTaskProgressAdvisoryV1(folderUri);
+      await postWorkflowDecisionV1(
+        buildImplementationTypeCheckFailedDecisionInputV1({
+          taskCanonicalId: canonicalId,
+          taskFolderPath: folderUri.fsPath,
+          stage,
+          errors: progress?.implementationTypeCheckFailure?.output ?? "The type-check reported errors.",
+          logFilePath: finding.row.outcome?.runLogPath ?? path.join(folderUri.fsPath, "task-progress.json"),
+        }),
+        { canonicalId, taskFolderPath: folderUri.fsPath, stage }
+      );
+    } catch (error) {
+      console.warn("Could not post the type-check recovery decision from the hand-over:", error);
+    }
+    return;
+  }
+  if (finding) {
+    // One event, one decision: a card the round's own ending already raised is the
+    // one to answer. Defer to it rather than posting a second, contradicting card.
+    let existing: ReturnType<typeof findPendingDecisionForRoundV1>;
+    try {
+      existing = findPendingDecisionForRoundV1(
+        listPendingWorkflowDecisionsForTaskV1(normalizePath(folderUri.fsPath)),
+        finding.row
+      );
+    } catch (error) {
+      console.warn("Could not look up the round's existing decision for the hand-over:", error);
+    }
+    if (existing) {
+      return;
+    }
+  }
+  const causeText =
+    cause === "declined"
+      ? describeDeclinedHandOverV1(
+          kind,
+          options.downstreamReason ?? peekRecentStageActionRefusalReasonV1(folderUri.fsPath),
+          peekRecentTypedStageActionRefusalV1(folderUri.fsPath)
+        )
+      : HAND_OVER_CAUSE_TEXT_V1[cause];
+  // A gated round's own sentence IS the cause. For any other terminal round the
+  // hand-over's genuine drop or decline reason is kept alongside it: what
+  // happened to an earlier round must never hide why the follow-up did not run.
+  const followUpCause =
+    finding?.kind === "terminal-round"
+      ? ` The automatic ${kind === "implementation" ? "Implementation round" : "review"} did not start because ${causeText}.`
+      : "";
+  const noticeText = finding
+    ? `${taskLabel}: auto-advance reached ${STAGE_DISPLAY_NAMES[stage]}. ${describeHandOverRoundFindingV1(finding)}${followUpCause} ${handOverManualStepV1(stage, kind)}`
+    : `${taskLabel}: auto-advance reached ${STAGE_DISPLAY_NAMES[stage]}, ` +
+      `but its ${kind === "implementation" ? "round" : "review"} did not start because ` +
+      `${causeText}. ${handOverManualStepV1(stage, kind)}`;
   let chatPointer: Awaited<ReturnType<typeof offerActionInChatV1>>;
   try {
     chatPointer = await offerActionInChatV1({
@@ -682,6 +849,16 @@ export async function warnHandOverNotStartedV1(
       noticeText,
       optional: true,
       taskLabel: displayName,
+      // A round already ran: re-running it is the owner's call, not the
+      // card's recommendation.
+      ...(finding
+        ? {
+            recommend: {
+              target: "none" as const,
+              reasoning: "The round already ran; choose the next step from its result above.",
+            },
+          }
+        : {}),
     });
   } catch (error) {
     console.warn("Could not post the automatic hand-over action in chat:", error);
@@ -1365,6 +1542,12 @@ interface ApplyReviewOptions {
     coordinatorOutcome?: TaskActionOutcomeV1;
     runnerFailure?: RunnerFailureProbeV1;
     failedStepV1?: "Review" | "Apply Review";
+    /**
+     * bugs4 item 3: set when the chained re-review was refused before any
+     * provider ran. The refusal has already settled its own outcome; Fast
+     * Forward reads this only to stop rather than re-dispatch.
+     */
+    preflightRefusal?: ReviewPreflightRefusalV1;
   };
 }
 
@@ -1469,6 +1652,12 @@ interface ExecuteImplementationRunOptions {
     coordinatorOutcome?: TaskActionOutcomeV1;
     runnerFailure?: RunnerFailureProbeV1;
     failedStepV1?: "Review" | "Apply Review";
+    /**
+     * bugs4 item 3: set when the chained re-review was refused before any
+     * provider ran. The refusal has already settled its own outcome; Fast
+     * Forward reads this only to stop rather than re-dispatch.
+     */
+    preflightRefusal?: ReviewPreflightRefusalV1;
   };
 }
 
@@ -2400,6 +2589,25 @@ export async function resolveChecklistCountQualifierV1(
 }
 
 /**
+ * bugs4 item 7: the count "X of Y plan steps are implemented" with explicitly
+ * excluded steps removed from both sides, so they are named once (in the
+ * "additional step(s) marked excluded" suffix) and never also counted as
+ * implemented.
+ *
+ * @internal exported for testing
+ */
+export function withoutExcludedFromCountV1(
+  progress: { complete: number; total: number },
+  excluded: number
+): { complete: number; total: number } {
+  if (excluded <= 0) return progress;
+  return {
+    complete: Math.max(0, progress.complete - excluded),
+    total: Math.max(0, progress.total - excluded),
+  };
+}
+
+/**
  * The "high score but plan incomplete" notification, factored out so the
  * unverified-count qualifier's presence is testable without driving the whole
  * review flow.
@@ -2533,6 +2741,17 @@ export function computeSyntheticRoundChecklistLatchV1(input: {
 }
 
 /**
+ * bugs4 Step 15 (item 22): the latch-record patch carrying the latching round's unmatched
+ * claims, spread into each claim-based latch write so the claims travel with the latch.
+ */
+function latchingClaimsRecordPatchV1(
+  result: Parameters<typeof latchingClaimsForRecordV1>[0]
+): { checklistProgressUnreliableClaims?: string[] } {
+  const claims = latchingClaimsForRecordV1(result);
+  return claims === undefined ? {} : { checklistProgressUnreliableClaims: claims };
+}
+
+/**
  * Renders a round's `## Checklist merge diagnostics` run-log section (plan
  * Part 4, item 2) — pulled out of the round-completion write path so the
  * three merge outcomes it must visibly distinguish (no echo at all
@@ -2546,13 +2765,28 @@ export function computeSyntheticRoundChecklistLatchV1(input: {
 export function buildChecklistMergeDiagnosticsNoteV1(input: {
   readonly mergeKind: "no-report" | "unchanged" | "no-match" | "unverified-test-evidence" | "merged";
   readonly unmatchedSample?: readonly string[];
+  /**
+   * Total number of unmatched claims (bugs4 item 15). Written so a later
+   * reader (the reconcile card, when the triggering summary is no longer in
+   * scope) can tell a complete list from a truncated one, and never judges
+   * "everything was already ticked" from a partial list.
+   */
+  readonly unmatchedTotal?: number;
+  /** Claims that restated items already ticked or excluded in the plan (bugs4 item 14). */
+  readonly alreadyRecorded?: readonly string[];
   readonly latchSet: boolean;
   readonly automaticChecklistReconciliation?: AutomaticChecklistReconciliationOutcomeV1;
 }): string {
   const unmatchedNote =
-    input.mergeKind === "no-match" && input.unmatchedSample && input.unmatchedSample.length > 0
-      ? ` Unmatched claim text: ${input.unmatchedSample.map((text) => `"${text}"`).join(", ")}.`
-      : "";
+    (input.mergeKind === "no-match" && input.unmatchedSample && input.unmatchedSample.length > 0
+      ? ` Unmatched claim text: ${input.unmatchedSample.map((text) => `"${text}"`).join(", ")}.` +
+        (input.unmatchedTotal !== undefined ? ` Unmatched claims in total: ${input.unmatchedTotal}.` : "")
+      : "") +
+    (input.alreadyRecorded && input.alreadyRecorded.length > 0
+      ? ` Already recorded (restated items the plan already shows as ticked or excluded; not unmatched): ${input.alreadyRecorded
+          .map((text) => `"${text}"`)
+          .join(", ")}.`
+      : "");
   const reconciliation = input.automaticChecklistReconciliation;
   const describePending = (items: readonly { item: string; evidence: string }[]): string =>
     `${items.length} item(s) have applied-operation evidence pending human attestation (lexical corroboration ` +
@@ -3982,6 +4216,22 @@ export async function handleReviewRoutingOutcome(options: {
       priorBlockersAndSuperseded,
       `${reviewAttemptId}-db`
     );
+    // bugs4 Step 25 (item 22): progress signals the churn ceiling reads, so settled
+    // items and a shrinking unbuilt-steps list reset its trailing run. Impl-review
+    // stages only: the plan of record has no counterpart at the plan-review stages.
+    let churnProgressSignals: ChurnProgressSignalsV1 = {};
+    if (IMPL_REVIEW_STAGES_V1.includes(targetStage)) {
+      try {
+        churnProgressSignals = computeChurnProgressSignalsV1({
+          planOfRecord: (await readPlanOfRecordV1(folderUri)).text,
+          planItemEvidence: progressBefore.planItemEvidence,
+          planItemOwnerDecisions: progressBefore.planItemOwnerDecisions,
+          blockers,
+        });
+      } catch {
+        // Best-effort: without the signals the churn ceiling falls back to blocker counts.
+      }
+    }
     const historyEntry = {
       stage: targetStage,
       score,
@@ -4002,6 +4252,7 @@ export async function handleReviewRoutingOutcome(options: {
         : progressBefore.stageReviewPasses?.[targetStage] !== undefined
           ? { reviewPass: progressBefore.stageReviewPasses[targetStage] }
           : {}),
+      ...churnProgressSignals,
       ...(reviewer ? { reviewer } : {}), ...(reviewScope ? { scope: reviewScope } : {}),
       ...(challengedIdentities.length > 0 ? { supersededBlockers: challengedIdentities } : {}),
       ...(stageUnsatisfiableIdentities.length > 0
@@ -4160,7 +4411,7 @@ export async function handleReviewRoutingOutcome(options: {
       },
       {
         taskFolderUri: folderUri,
-        ...(fallbackReason ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${fallbackReason}` } : {}),
+        ...(fallbackReason ? { chatAttributionNote: backupUsedNoteV1(fallbackReason, reviewer?.storedModelId) } : {}),
         ...(coordinatorOperationId ? { operationId: coordinatorOperationId } : {}),
         ...(coordinatorAttemptId ? { attemptId: coordinatorAttemptId } : {}),
         ...(coordinatorExtraAttemptIds?.length ? { extraAttemptIds: coordinatorExtraAttemptIds } : {}),
@@ -4619,7 +4870,7 @@ export async function closeImplementationRoundFailureV1(
     await terminalizeRoundV1(
       roundId,
       "failed",
-      { rejectionReason: reason.slice(0, 300) },
+      { rejectionReason: formatProviderErrorV1(reason, { maxChars: 300, keepInternalCodes: true }) ?? reason.slice(0, 300) },
       { taskFolderUri: folderUri }
     );
   } catch {
@@ -4679,7 +4930,10 @@ export async function closeUnsettledReviewRowV1(
     await terminalizeRoundV1(
       reviewAttemptId,
       "failed",
-      { rejectionReason: (thrownReason ?? "the review dispatch ended before an outcome was recorded").slice(0, 300) },
+      {
+        rejectionReason: formatProviderErrorV1(thrownReason ?? "", { maxChars: 300, keepInternalCodes: true }) ??
+          "the review dispatch ended before an outcome was recorded",
+      },
       { taskFolderUri: folderUri }
     );
   } catch {
@@ -4908,7 +5162,7 @@ export async function writeReviewRunLogV1(
           }
         }
         if (outcome.fallbackReason) {
-          blockerSection += `\nBackup used; primary was skipped or failed: ${outcome.fallbackReason.slice(0, 300)}\n`;
+          blockerSection += `\n${backupUsedRunLogNoteV1(outcome.fallbackReason, outcome.provider?.storedModelId)}\n`;
         }
       } catch {
         // Best-effort enrichment only — the bare outcome line above already
@@ -5266,8 +5520,19 @@ async function routeReviewOutcomeV1(
         let verifiedTicksHandled = false;
         if (checklistLatched) {
           const derivedTicks = await deriveApplicableVerifiedTicksV1(folderUri, targetStage);
+          // bugs4 item 17: a review that checked the code against the checklist (its Verified
+          // Complete block was applied or found nothing to add) clears the unreliable flag
+          // itself, with a chat line, instead of leaving a one-option "Decision needed".
+          const reviewHasVerifiedBlock = parseReviewVerifiedCompleteV1(content).blockPresent;
+          let latchOutcome: VerifiedCompleteReviewOutcomeV1 | undefined;
           if (derivedTicks.kind !== "ok") {
             verifiedTicksHandled = true; // Nothing applicable: no card either way.
+            latchOutcome = {
+              blockPresent: reviewHasVerifiedBlock,
+              appliedCount: 0,
+              withheldTestItems: derivedTicks.withheldTestItems?.length ?? 0,
+              blockedSeverity: derivedTicks.severity,
+            };
           } else {
             try {
               const appliedTicks = await writeVerifiedTicksToPlanV1(folderUri, derivedTicks.derivation);
@@ -5276,10 +5541,22 @@ async function routeReviewOutcomeV1(
                 NotificationRouter.showInformation(
                   `Applied ${appliedTicks.count} reviewer-verified tick(s) to plan-final.md.`
                 );
+                latchOutcome = {
+                  blockPresent: reviewHasVerifiedBlock,
+                  appliedCount: appliedTicks.count,
+                  withheldTestItems: derivedTicks.derivation.withheldTestItems.length,
+                };
               }
             } catch {
               // Best-effort: a failed write falls back to offering the card.
             }
+          }
+          if (latchOutcome !== undefined) {
+            await autoClearUnreliableChecklistLatchAfterReviewV1(
+              folderUri,
+              outcomeRoutingProgress?.displayName,
+              latchOutcome
+            );
           }
         }
         if (!verifiedTicksHandled) {
@@ -5603,7 +5880,8 @@ async function routeReviewOutcomeV1(
                     taskFolderPath: folderUri.fsPath,
                     taskName: outcomeRoutingProgress?.displayName,
                   },
-                  split ? { deferred: split.deferred, gated: split.gated } : undefined
+                  split ? { deferred: split.deferred, gated: split.gated } : undefined,
+                  planAfterTicks ? describeOpenAndHandOffsV1(planAfterTicks) : undefined
                 );
                 if (!cardPosted) {
                   NotificationRouter.showWarning(
@@ -5645,7 +5923,11 @@ async function routeReviewOutcomeV1(
               score,
               // The raw count (deferred work shown as unfinished); `gateProgress`
               // is only non-null here, and equals it when nothing is deferred.
-              progress ?? gateProgress,
+              // bugs4 item 7: `complete`/`total` include the excluded steps
+              // (they are settled without doing), so the "implemented" count
+              // would list them twice — here and in the "additional step(s)
+              // marked excluded" suffix. Take them out of both sides.
+              withoutExcludedFromCountV1(progress ?? gateProgress, planChecklistProgress?.excluded ?? 0),
               excludedSuffix,
               checklistCountUnverified,
               hasOutstandingChecklistItems
@@ -5784,6 +6066,14 @@ async function routeReviewOutcomeV1(
                 }
               }
               const handOverDisplayName = outcomeRoutingProgress?.displayName;
+              // The chain root's start, read while the root is still live: the
+              // hand-over warning only treats rounds that ended since then as
+              // evidence about this event. Falls back to now, which can only
+              // under-count (it never adopts an earlier round).
+              const handOverChainRootStartedMs = followUpAnchor
+                ? taskOperations.getTaskOperations(folderUri.fsPath).find((op) => op.id === followUpAnchor.id)?.startedAt
+                : undefined;
+              const handOverChainStartedAt = new Date(handOverChainRootStartedMs ?? Date.now()).toISOString();
               const trackHandOver = (kind: "review" | "implementation"): FastForwardHandOverRecordV1 | undefined =>
                 followUpAnchor ? recordFastForwardHandOverV1(followUpAnchor.id, next, kind) : undefined;
               let implementationHandOver: FastForwardHandOverRecordV1 | undefined;
@@ -5801,10 +6091,14 @@ async function routeReviewOutcomeV1(
                       implementationHandOver.state = "dropped";
                       implementationHandOver.warned = true;
                     }
-                    void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason, "implementation");
+                    void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason, "implementation", {
+                      since: handOverChainStartedAt,
+                    });
                   },
                   onDeclined: () => {
-                    void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined", "implementation");
+                    void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined", "implementation", {
+                      since: handOverChainStartedAt,
+                    });
                   },
                 }
               );
@@ -5962,10 +6256,14 @@ async function routeReviewOutcomeV1(
                         reviewHandOver.state = "dropped";
                         reviewHandOver.warned = true;
                       }
-                      void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason);
+                      void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, reason, "review", {
+                        since: handOverChainStartedAt,
+                      });
                     },
                     onDeclined: () => {
-                      void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined");
+                      void warnHandOverNotStartedV1(folderUri, handOverDisplayName, next, "declined", "review", {
+                        since: handOverChainStartedAt,
+                      });
                     },
                     intent: {
                       trigger: "auto-review after advancing to the next stage",
@@ -6541,7 +6839,7 @@ async function isPlanChecklistFullySettledV1(folderUri: vscode.Uri): Promise<boo
   const plan = await readPlanOfRecordV1(folderUri);
   if (!plan.hasChecklist || plan.text === undefined) return false;
   const progress = await readTaskProgressAdvisoryV1(folderUri);
-  return countChecklistEvidenceProgressV1(plan.text, progress?.planItemEvidence ?? [])?.gate.remaining === 0;
+  return countChecklistEvidenceProgressV1(plan.text, progress?.planItemEvidence ?? [], progress?.planItemOwnerDecisions ?? [])?.gate.remaining === 0;
 }
 
 /**
@@ -6654,6 +6952,80 @@ export function describePublishScopeRebuildForLogV1(
   );
 }
 
+/**
+ * bugs4 item 3: settle a review refused before any provider was invoked.
+ *
+ * One authoritative outcome for every caller: the stage-action refusal reason
+ * (read by the automation chain, Resume and Fast Forward callers), the tracked
+ * operation (which ends `refused` with the reason and recovery — the one chat
+ * terminal line), the probe (so Fast Forward stops), and — when the recovery is
+ * a command — a chat card offering it next to a harmless "Not now". No verdict,
+ * score, readiness or stage advance is produced, and no notification stands in
+ * for the chat outcome.
+ */
+/** @internal exported for testing */
+export async function settleReviewPreflightRefusalV1(input: {
+  readonly refusal: ReviewPreflightRefusalV1;
+  readonly folderUri: vscode.Uri;
+  readonly operation?: TaskOperationHandle;
+  readonly dispatchProbe?: { preflightRefusal?: ReviewPreflightRefusalV1 };
+  readonly taskDisplayName?: string;
+}): Promise<string> {
+  const text = describeReviewPreflightRefusalV1(input.refusal);
+  recordStageActionRefusalReasonV1(input.folderUri.fsPath, text, {
+    kind: "not-run",
+    cause: input.refusal.cause,
+    reason: input.refusal.reason,
+    recovery: input.refusal.recovery,
+  });
+  if (input.dispatchProbe) {
+    input.dispatchProbe.preflightRefusal = input.refusal;
+  }
+  if (input.operation) {
+    recordOperationTerminalOutcomeV1(input.operation.id, { state: "refused", reason: text });
+    input.operation.settleAs("refused", text);
+  }
+  const recovery = input.refusal.recovery;
+  const openFile = recovery.openTaskFile;
+  const command = recovery.command ?? (openFile !== undefined ? "vscode.open" : undefined);
+  const args: unknown[] =
+    recovery.command !== undefined
+      ? [{ taskFolderPath: input.folderUri.fsPath }]
+      : openFile !== undefined
+        ? [vscode.Uri.file(path.join(input.folderUri.fsPath, openFile))]
+        : [];
+  let cardPosted = false;
+  if (command !== undefined) {
+    const pointer = await offerActionInChatV1({
+      taskFolderPath: input.folderUri.fsPath,
+      taskLabel: formatNotificationTaskLabelV1(input.taskDisplayName, input.folderUri.fsPath),
+      actionLabel: recovery.command === undefined && openFile !== undefined ? `Open ${openFile}` : recovery.label,
+      command,
+      args,
+      noticeText: text,
+      actionConsequence:
+        recovery.command !== undefined
+          ? `${recovery.detail} Choosing it runs it now.`
+          : `${recovery.detail} Choosing it opens the file; nothing else runs.`,
+      doNothingOption: {
+        label: "Not now",
+        consequence: `Does nothing. ${input.refusal.stageLabel} stays unrun until its changed-file scope can be established.`,
+      },
+    }).catch(() => undefined);
+    cardPosted = pointer !== undefined;
+  }
+  // Callers with no tracked operation (retry-with-backup, the unchanged-tree
+  // re-run card, the missing-artifact retry) have no "Ended" line to carry the
+  // reason, so the chat card is their only outcome. When the chat cannot post
+  // it either (an unreadable progress record gives it no target), state the
+  // refusal through the one remaining channel rather than returning silently.
+  if (input.operation === undefined && !cardPosted) {
+    const taskLabel = formatNotificationTaskLabelV1(input.taskDisplayName, input.folderUri.fsPath);
+    NotificationRouter.showWarning(`${taskLabel}: ${text}`);
+  }
+  return text;
+}
+
 export async function runReviewForFolder(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
@@ -6729,7 +7101,12 @@ export async function runReviewForFolder(
      * releasing admission — mirroring how the Resume handlers hand their
      * outcome back via `coordinatorOutcome` on their own result objects.
      */
-    dispatchProbe?: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 };
+    dispatchProbe?: {
+      dispatched: boolean;
+      coordinatorOutcome?: TaskActionOutcomeV1;
+      /** Set when the review was refused before any provider was invoked (bugs4 item 3). */
+      preflightRefusal?: ReviewPreflightRefusalV1;
+    };
   } = {}
 ): Promise<void> {
   const targetStage = REVIEW_TARGETS[currentStage];
@@ -6895,6 +7272,7 @@ export async function runReviewForFolder(
   const variables: Record<string, string> = {
     taskFolderPath: artifactPaths.taskFolderPath,
     openPlanItems: "No implementation checklist is available for this plan review.",
+    provisionalTickedItems: "No implementation checklist is available for this plan review.",
     planFinalPath: planPathForStage,
     planPath: planUri.fsPath,
     roundProgressPath: artifactPaths.roundProgressPath,
@@ -7185,7 +7563,8 @@ export async function runReviewForFolder(
         // reviewer-verified completion.
         variables.checklistProgress = formatChecklistProgressForReviewerV1(
           planFinalContent,
-          progressEvidence?.planItemEvidence ?? []
+          progressEvidence?.planItemEvidence ?? [],
+          progressEvidence?.planItemOwnerDecisions ?? []
         );
         const evidenceRecords = progressEvidence?.planItemEvidence ?? [];
         const reportRows = evidenceRecords.flatMap((record) =>
@@ -7198,8 +7577,19 @@ export async function runReviewForFolder(
         const failureRows = (progressEvidence?.lintPayload?.failedChecks ?? []).map((failure) =>
           `- \`${failure.command}\` exited ${failure.exitCode}: ${failure.output.slice(0, 1000)}`
         );
+        // bugs4 item 21: the reviewer is told WHICH ticked items are still provisional, so it can
+        // name the ones it confirmed. Counts alone gave it nothing to verify.
+        variables.provisionalTickedItems = formatProvisionalTickedItemsForReviewerV1(
+          planFinalContent,
+          evidenceRecords,
+          progressEvidence?.planItemOwnerDecisions ?? []
+        );
         variables.checklistEvidence = [
-          formatChecklistEvidenceForReviewerV1(planFinalContent, evidenceRecords),
+          [
+            formatChecklistEvidenceForReviewerV1(planFinalContent, evidenceRecords, progressEvidence?.planItemOwnerDecisions ?? []),
+            planFinalContent ? describeOpenAndHandOffsV1(planFinalContent) : undefined,
+            formatExclusionMarkerPlacementForReviewerV1(planFinalContent),
+          ].filter((part): part is string => typeof part === "string" && part.length > 0).join("\n"),
           reportRows.length > 0
             ? `Durable editing-round test reports available for reviewer acceptance (the review must not rerun them):\n${reportRows.join("\n")}`
             : "No durable editing-round test reports are available.",
@@ -7352,9 +7742,15 @@ export async function runReviewForFolder(
           targetStage,
           "Scope unavailable: this task's progress record is missing or unreadable; no open-editor fallback was used."
         ).catch(() => undefined);
-        NotificationRouter.showWarning(
-          `${STAGE_DISPLAY_NAMES[targetStage]} was not run: this task's changed-file scope could not be established because its progress record is missing or unreadable.`
-        );
+        await settleReviewPreflightRefusalV1({
+          refusal: buildReviewPreflightRefusalV1({
+            cause: "progress-unreadable",
+            stageLabel: STAGE_DISPLAY_NAMES[targetStage],
+          }),
+          folderUri,
+          operation: options.operation,
+          dispatchProbe: options.dispatchProbe,
+        });
         return;
       }
       const ledgerScope = resolveImplementationReviewScopeV1(
@@ -7379,9 +7775,16 @@ export async function runReviewForFolder(
               : "")
         ).catch(() => undefined);
         if (rebuilt.length === 0) {
-          NotificationRouter.showWarning(
-            `${STAGE_DISPLAY_NAMES[targetStage]} was not run: the task ledger proves that no reviewable implementation files changed. Run an Implementation round before reviewing.`
-          );
+          await settleReviewPreflightRefusalV1({
+            refusal: buildReviewPreflightRefusalV1({
+              cause: "ledger-proves-empty",
+              stageLabel: STAGE_DISPLAY_NAMES[targetStage],
+            }),
+            folderUri,
+            operation: options.operation,
+            dispatchProbe: options.dispatchProbe,
+            taskDisplayName: taskProgress.displayName,
+          });
           return;
         }
       } else if (ledgerScope.kind === "unavailable") {
@@ -7391,9 +7794,17 @@ export async function runReviewForFolder(
           targetStage,
           `Scope unavailable: no tracked files and the task-owned ledger could not prove a complete set. ${ledgerScope.reason}`
         ).catch(() => undefined);
-        NotificationRouter.showWarning(
-          `${STAGE_DISPLAY_NAMES[targetStage]} was not run: changed-file scope could not be established, so open editors were not used. ${ledgerScope.reason}`
-        );
+        await settleReviewPreflightRefusalV1({
+          refusal: buildReviewPreflightRefusalV1({
+            cause: "ledger-unproven",
+            stageLabel: STAGE_DISPLAY_NAMES[targetStage],
+            ledgerReason: ledgerScope.reason,
+          }),
+          folderUri,
+          operation: options.operation,
+          dispatchProbe: options.dispatchProbe,
+          taskDisplayName: taskProgress.displayName,
+        });
         return;
       } else {
         await writeRunLog(
@@ -9670,7 +10081,11 @@ export async function applyReviewWithAI(
       // this later invocation's process could still be running. The
       // re-review's outcome is authoritative for release once it dispatches:
       // it is strictly the later of the two invocations this call makes.
-      const reReviewDispatchProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
+      const reReviewDispatchProbe: {
+        dispatched: boolean;
+        coordinatorOutcome?: TaskActionOutcomeV1;
+        preflightRefusal?: ReviewPreflightRefusalV1;
+      } = {
         dispatched: false,
       };
       await runTrackedOperation(
@@ -9710,6 +10125,9 @@ export async function applyReviewWithAI(
       // outcome (not the earlier apply's) is what `finally` below must feed
       // to recordAdmissionReleaseTriggerV1 so a timeout/cancellation here is
       // not masked by the apply step's already-settled "completed" outcome.
+      if (reReviewDispatchProbe.preflightRefusal !== undefined && options.dispatchProbe) {
+        options.dispatchProbe.preflightRefusal = reReviewDispatchProbe.preflightRefusal;
+      }
       if (reReviewDispatchProbe.dispatched) {
         coordinatorOutcomeForAdmissionV1 = reReviewDispatchProbe.coordinatorOutcome;
         if (options.dispatchProbe) {
@@ -10091,6 +10509,10 @@ export async function fastForwardReviewWithAI(
   // RC6 item 2: which step the last failed outcome belongs to ("Review" for
   // the initial review or a chained re-review, else "Apply Review").
   let ffFailedStepV1: "Review" | "Apply Review" = "Apply Review";
+  // bugs4 item 3: set when an attempt's chained re-review was refused before
+  // any reviewer ran. The refusal already settled its own outcome and card;
+  // the loop must stop rather than re-dispatch over an unchanged artifact.
+  let ffPreflightRefusedV1 = false;
 
   try {
   // §7.5 provider-path gate (AC-HOST-03): task/model-INDEPENDENT — it never
@@ -10518,7 +10940,11 @@ export async function fastForwardReviewWithAI(
       return;
     }
 
-    const ffInitialReviewProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
+    const ffInitialReviewProbe: {
+      dispatched: boolean;
+      coordinatorOutcome?: TaskActionOutcomeV1;
+      preflightRefusal?: ReviewPreflightRefusalV1;
+    } = {
       dispatched: false,
     };
     // RC9 item 2: at Publish, note which review attempts were already recorded
@@ -10558,6 +10984,13 @@ export async function fastForwardReviewWithAI(
       ffFailedStepV1 = "Review";
     }
     ffCoordinatorOutcomeForAdmissionV1 = ffInitialReviewProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
+    // bugs4 item 3: a review refused before any provider ran has already
+    // settled its own outcome (reason, recovery card, refused operation) in
+    // runReviewForFolder. Fast Forward stops here — it must neither re-read an
+    // older review as if one had just run nor offer a second, generic card.
+    if (ffInitialReviewProbe.preflightRefusal !== undefined) {
+      return false;
+    }
     // Disk, not the editor buffer: the review just dispatched is promoted on
     // disk, and an open document may still hold the pre-promotion content.
     initialContent = await readReviewArtifactFromDiskV1(reviewUri);
@@ -10995,11 +11428,15 @@ export async function fastForwardReviewWithAI(
               coordinatorOutcome?: TaskActionOutcomeV1;
               runnerFailure?: RunnerFailureProbeV1;
               failedStepV1?: "Review" | "Apply Review";
+              preflightRefusal?: ReviewPreflightRefusalV1;
             } = {};
             await applyForTarget(extensionUri, context, concreteArg, {
               ...buildFastForwardApplyReviewOptions(attemptNumber, op, chatViewProvider),
               dispatchProbe: ffAttemptProbe,
             });
+            if (ffAttemptProbe.preflightRefusal !== undefined) {
+              ffPreflightRefusedV1 = true;
+            }
             ffCoordinatorOutcomeForAdmissionV1 = ffAttemptProbe.coordinatorOutcome ?? ffCoordinatorOutcomeForAdmissionV1;
             // RC4 item 1: a CLI-resolved failure never reaches the coordinator;
             // keep this attempt's runner failure (cleared when it succeeded).
@@ -11130,11 +11567,78 @@ export async function fastForwardReviewWithAI(
           },
           continueThroughEscalation: resilience.fastForwardSurvivesEscalation,
           zeroFixableTerminates: resilience.zeroFixableTerminatesFastForward,
+          // bugs4 item 19: a round whose summary contradicted the review on an owner-evidence
+          // gate says nothing about whether building makes progress.
+          roundExcludedFromStallCount: () => takeOwnerEvidenceContradictionFlagV1(resolved.folderUri.fsPath),
+          // bugs4 item 25: Fast Forward obeys its own cards. An open card that
+          // waits on the owner holds the run; an Apply Review that changed
+          // nothing and raised one ends it; a clean review never dispatches an
+          // Apply Review (impl-review stages, where Apply Review edits code).
+          pendingBlockingDecision: () =>
+            findBlockingDecisionSinceRunStartV1(
+              listPendingWorkflowDecisionsForTaskV1(normalizePath(resolved.folderUri.fsPath)),
+              ffRunStartedAtV1,
+              isBlockingDecisionV1
+            ),
+          holdAfterApply: async () => {
+            const fresh = await readTaskProgressAdvisoryV1(resolved.folderUri).catch(() => undefined);
+            if (!latestApplyReviewChangedNothingV1(fresh?.roundLedger, ffRunStartedAtV1)) {
+              return undefined;
+            }
+            return findBlockingDecisionSinceRunStartV1(
+              listPendingWorkflowDecisionsForTaskV1(normalizePath(resolved.folderUri.fsPath)),
+              ffRunStartedAtV1,
+              isBlockingDecisionV1
+            );
+          },
+          cleanReviewNeverApplies: IMPL_REVIEW_STAGES.includes(targetStage),
+          // bugs4 item 11: a clean review whose open items wait only for test evidence that no
+          // editing round can produce (tests refused, or no allowed test command) holds the run
+          // instead of dispatching an Apply Review that changes nothing.
+          buildMandateCannotProgress: async () => {
+            try {
+              const planText = await readTextIfExists(getCanonicalImplementationUri(resolved.folderUri));
+              const fresh = await readTaskProgressAdvisoryV1(resolved.folderUri).catch(() => undefined);
+              if (planText === undefined || fresh === undefined) {
+                return undefined;
+              }
+              const summaryUri = vscode.Uri.joinPath(resolved.folderUri, IMPLEMENTATION_SUMMARY_FILENAME);
+              const summaryText = await readTextIfExists(summaryUri).catch(() => undefined);
+              const summaryMtime = summaryText
+                ? await vscode.workspace.fs.stat(summaryUri).then((stat) => stat.mtime, () => 0)
+                : 0;
+              // Any code-bearing round that changed files after the refusing summary may have
+              // changed what a test run would see.
+              const changedSinceRefusal = (fresh.roundLedger ?? []).some(
+                (row) =>
+                  (row.mode === "implementation" || row.mode === "apply-review" || row.mode === "continuation") &&
+                  Date.parse(row.startedAt) > summaryMtime &&
+                  ((row.outcome?.filesChanged?.length ?? 0) > 0 || row.outcome?.filesChangedUnknown === true)
+              );
+              const workspaceFolder = vscode.workspace.getWorkspaceFolder(resolved.folderUri);
+              return unproducibleTestEvidenceHoldV1({
+                uncheckedCount: listUncheckedChecklistItemTextsV1(planText, 1).total,
+                provisional: listProvisionalTickedItemsV1(
+                  planText,
+                  fresh.planItemEvidence ?? [],
+                  fresh.planItemOwnerDecisions ?? []
+                ),
+                lastRoundTestsRefused: summaryText !== undefined && detectTestsRefusedV1(summaryText) !== undefined,
+                hasAllowedTestCommand:
+                  workspaceFolder === undefined ||
+                  resolveAllowedTargetedTestCommandV1(workspaceFolder.uri.fsPath) !== undefined,
+                changedSinceRefusal,
+              });
+            } catch {
+              // Never block a run on a failed look; the normal path stands.
+              return undefined;
+            }
+          },
           preLoopEvidence,
           baselineReviewer: baselineHistoryEntry?.reviewer,
           baselineTaskFixableCount: baselineHistoryEntry?.taskFixableCount,
           review: async () => {
-            if (await ffStageHasLeftV1()) {
+            if (await ffStageHasLeftV1() || ffPreflightRefusedV1) {
               return null;
             }
             // Disk, not the editor buffer: `previousContent` is seeded from the
@@ -11288,7 +11792,40 @@ export async function fastForwardReviewWithAI(
         `once you've decided how to proceed.${overriddenList.length > 0 ? `\n\n${overriddenList}` : ""}`
     );
   }
-  if (outcome.improved) {
+  if (outcome.held && outcome.held.kind !== "clean-review") {
+    // bugs4 item 25: stopped on purpose before dispatching a round, waiting on
+    // the owner. One chat terminal line gives the reason and the way on. A
+    // clean review is NOT handled here: it flows through the zero-fixable
+    // branch below so the sibling-stage blocker check still runs before any
+    // success is reported.
+    recordOperationTerminalOutcomeV1(op.id, {
+      state: "stopped",
+      reason: describeFastForwardHoldV1(outcome.held, STAGE_DISPLAY_NAMES[targetStage] ?? targetStage, outcome.attempts),
+    });
+    // bugs4 item 46 / Step 20: the open items wait only for test evidence no editing round can
+    // produce, so raise the classified open-items card (which names the cause and the way on)
+    // instead of leaving the owner with a bare stop line. Best effort: the stop line stands alone
+    // when the card cannot be built.
+    if (outcome.held.kind === "test-evidence-unproducible") {
+      try {
+        const holdWorkspace = resolveOwnerWorkspace(resolved.progress);
+        const holdPlan = await readTextIfExists(getCanonicalImplementationUri(resolved.folderUri));
+        const holdProgress = await readTaskProgressAdvisoryV1(resolved.folderUri).catch(() => undefined);
+        if (holdWorkspace && holdPlan !== undefined) {
+          await postOpenPlanItemsCardV1({
+            folderUri: resolved.folderUri,
+            workspaceRootFsPath: holdWorkspace.uri.fsPath,
+            planChecklist: holdPlan,
+            stage: targetStage,
+            displayName: resolved.progress.displayName,
+            planItemEvidence: holdProgress?.planItemEvidence,
+          });
+        }
+      } catch {
+        // The stop line above already told the owner why the run stopped.
+      }
+    }
+  } else if (outcome.improved) {
     NotificationRouter.showInformation(
       `Fast Forward Review: score improved to ${outcome.score}/10 after ${outcome.attempts} attempt(s).`
     );
@@ -11344,8 +11881,11 @@ export async function fastForwardReviewWithAI(
         taskName: resolved.progress.displayName,
       };
       const whatHappened =
-        `Fast Forward Review stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
-        `${stageName} rounds found nothing left to fix (last score ${outcome.score}/10). ` +
+        `Fast Forward Review stopped after ${outcome.attempts} attempt(s) — ` +
+        (outcome.held?.kind === "clean-review"
+          ? `the ${stageName} review found nothing left to fix, so no Apply Review was dispatched `
+          : `two consecutive ${stageName} rounds found nothing left to fix `) +
+        `(last score ${outcome.score}/10). ` +
         `The task is NOT finished, though: the ${STAGE_DISPLAY_NAMES[siblingImplStage]} still lists ` +
         `${describeTaskFixableBlockersV1(siblingBlockers, siblingHistoryEntry?.blockers)}.`;
       const posted = await postWorkflowDecisionV1(
@@ -11408,6 +11948,14 @@ export async function fastForwardReviewWithAI(
       if (!posted) {
         NotificationRouter.showWarning(`${whatHappened} Use Apply Review to fix those.`);
       }
+    } else if (outcome.held?.kind === "clean-review") {
+      // The review reported no task-fixable blockers, the plan has no unbuilt
+      // steps (the loop never takes this hold otherwise) and the sibling stage
+      // has nothing outstanding: the ordinary success path, one chat line.
+      recordOperationTerminalOutcomeV1(op.id, {
+        state: "succeeded",
+        reason: describeFastForwardHoldV1(outcome.held, stageName ?? String(targetStage), outcome.attempts),
+      });
     } else {
       NotificationRouter.showInformation(
         `Fast Forward Review: stopped after ${outcome.attempts} attempt(s) — two consecutive ` +
@@ -11417,6 +11965,15 @@ export async function fastForwardReviewWithAI(
     }
   } else if (outcome.paused) {
     ffEndedViaPauseV1 = true;
+    // bugs4 item 36: a Fast Forward stopped by the no-progress breaker ends
+    // "stopped" with the breaker named, never "succeeded".
+    const breakerStop = takeBreakerStopSinceV1(resolved.folderUri.fsPath, ffRunStartedAtV1);
+    if (breakerStop) {
+      recordOperationTerminalOutcomeV1(op.id, {
+        state: "stopped",
+        reason: describeBreakerFastForwardEndV1(breakerStop.stage, breakerStop.zeroChangeRounds),
+      });
+    }
     // The escalation that paused the task already showed its own
     // notification (and chat question) with the actual reason — this just
     // frames the Fast Forward stop correctly instead of falling through to
@@ -11445,14 +12002,20 @@ export async function fastForwardReviewWithAI(
         : undefined
     );
   } else if (
-    outcome.stalled &&
     // RC2 item 13, Step 50: a detached Implementation round already posted
     // the "nothing more to build" open-items card for this exact task
     // during this Fast Forward run — that card already lists every open
     // item and its reason, so this generic stalled warning would be a
     // second, less actionable surface for the SAME observation ("plan work
     // remains, nothing landed"). See `consumeOpenItemsCardPostedSinceV1`.
-    !consumeOpenItemsCardPostedSinceV1(resolved.folderUri.fsPath, ffRunStartedAtV1)
+    // bugs4 item 3: a chained re-review refused before any reviewer ran has
+    // already settled its own typed not-run outcome and chat line, so the
+    // generic warning is skipped for it too.
+    shouldWarnFastForwardStalledV1({
+      stalled: outcome.stalled === true,
+      openItemsCardPostedSinceRunStart: () => consumeOpenItemsCardPostedSinceV1(resolved.folderUri.fsPath, ffRunStartedAtV1),
+      preflightRefused: ffPreflightRefusedV1,
+    })
   ) {
     const buildRoundsStalled = outcome.buildRoundsWithoutProgress ?? 0;
     // RC3 item 9: a genuine Apply Review dispatch failure (every attempt
@@ -11629,6 +12192,16 @@ function truncateTextToBudgetV1(text: string, maxChars: number, whatWasTrimmed: 
   );
 }
 
+/**
+ * Appends the project's allowed targeted test command (bugs4 item 16) to a round's artifact
+ * guidance. The workspace root is two levels above the task folder (`<root>/.ensemble/<task>`);
+ * read-only, and empty when the project has no targeted test script.
+ */
+function withAllowedTestCommandGuidanceV1(guidance: string, taskFolderPath: string): string {
+  const testCommandGuidance = formatAllowedTestCommandGuidanceV1(path.resolve(taskFolderPath, "..", ".."));
+  return testCommandGuidance ? `${guidance} ${testCommandGuidance}` : guidance;
+}
+
 async function buildApplyReviewPromptPartsV1(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
@@ -11675,10 +12248,13 @@ async function buildApplyReviewPromptPartsV1(
     maxImplementationChars !== undefined
       ? truncateTextToBudgetV1(implementationNotesFull, maxImplementationChars, "the implementation notes")
       : implementationNotesFull;
+  // bugs4 item 19: the latest review's verdict on an owner-evidence gate rides with the review
+  // text, appended after the cap so a shrunk review still carries it.
+  const ownerEvidenceVerdictBlock = formatOwnerEvidenceVerdictForRoundV1(reviewContent);
   const reviewContentCapped =
-    maxReviewChars !== undefined
+    (maxReviewChars !== undefined
       ? truncateTextToBudgetV1(reviewContent, maxReviewChars, "the review")
-      : reviewContent;
+      : reviewContent) + ownerEvidenceVerdictBlock;
 
   let approvedPlan: string | undefined;
   let planName = "plan.md";
@@ -11707,7 +12283,10 @@ async function buildApplyReviewPromptPartsV1(
     planFinalPath: artifactPaths.planFinalPath,
     roundProgressPath: artifactPaths.roundProgressPath,
     implSummaryPath: artifactPaths.implSummaryPath,
-    taskArtifactGuidance: formatAuthoritativeTaskArtifactGuidanceV1(artifactPaths),
+    taskArtifactGuidance: withAllowedTestCommandGuidanceV1(
+      formatAuthoritativeTaskArtifactGuidanceV1(artifactPaths),
+      folderUri.fsPath
+    ),
   };
   const prompt = await renderPromptTemplate(
     extensionUri,
@@ -12009,7 +12588,7 @@ async function applyImplementationReviewWithAI(
   // suppressAutoReviewDispatch: the caller (applyReviewWithAI) re-reviews
   // inline under the lock it already holds — see that option's doc comment
   // for why the deferred dispatch here would otherwise be refused as busy.
-  return executeImplementationRun(
+  const applyRoundRan = await executeImplementationRun(
     extensionUri,
     folderUri,
     workspaceRoot,
@@ -12031,7 +12610,55 @@ async function applyImplementationReviewWithAI(
       dispatchedBlockerIds,
     }
   );
+  await flagOwnerEvidenceContradictionAfterRoundV1(folderUri, reviewContent, applyReviewEditProgress?.displayName);
+  return applyRoundRan;
   }, stage);
+}
+
+/**
+ * Task folders whose latest Apply Review round contradicted the review on an owner-evidence gate
+ * (bugs4 item 19). Fast Forward's stall guard asks for it once per round and clears it, so the
+ * round is left out of the stall count.
+ */
+const ownerEvidenceContradictionFoldersV1 = new Set<string>();
+
+export function takeOwnerEvidenceContradictionFlagV1(taskFolderPath: string): boolean {
+  return ownerEvidenceContradictionFoldersV1.delete(normalizePath(taskFolderPath));
+}
+
+/**
+ * bugs4 item 19: when the review marked an owner-evidence gate satisfied but the round's summary
+ * says it is unmet, say so in chat and flag the round so it is not counted as a stall. Best-effort:
+ * a failure here never changes the round's outcome.
+ */
+async function flagOwnerEvidenceContradictionAfterRoundV1(
+  folderUri: vscode.Uri,
+  reviewContent: string,
+  displayName: string | undefined
+): Promise<void> {
+  try {
+    const summary = await readNonEmptyText(getImplementationSummaryUri(folderUri));
+    if (!summary) return;
+    const contradiction = detectOwnerEvidenceContradictionV1(reviewContent, summary);
+    if (contradiction === undefined) return;
+    ownerEvidenceContradictionFoldersV1.add(normalizePath(folderUri.fsPath));
+    await offerActionInChatV1({
+      taskFolderPath: folderUri.fsPath,
+      taskLabel: formatNotificationTaskLabelV1(displayName, folderUri.fsPath),
+      actionLabel: "Run the next stage action",
+      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+      args: [{ taskFolderPath: folderUri.fsPath }],
+      noticeText: formatOwnerEvidenceContradictionLineV1(contradiction),
+      actionConsequence: "Dispatches this stage's next action; the round is told the review found the evidence satisfied.",
+      optional: true,
+      doNothingOption: {
+        label: "Not now",
+        consequence: "Does nothing. The task stays where it is.",
+      },
+    });
+  } catch {
+    // Best-effort: the contradiction note is advisory.
+  }
 }
 
 /**
@@ -12505,6 +13132,65 @@ export async function nextStage(
         }
       }
       skippedBlockersForOverride = outstandingForAdvance;
+    }
+  }
+
+  // bugs4 Step 13 (item 29): a verdict about code is not a verdict about a plan or task
+  // description edited after the review started. This is a different question from the blocker
+  // gate above, so the hand-off card's Advance (`completeStageAnywayV1`, which bypasses that
+  // gate) asks it too: overriding a blocker is not having seen that the plan changed.
+  if (IMPL_REVIEW_STAGES.includes(resolved.progress.currentStage)) {
+    const reviewFilename = STAGE_ARTIFACT_FILENAMES[resolved.progress.currentStage];
+    const staleCheck = reviewFilename
+      ? await staleReviewInputsV1(resolved.folderUri.fsPath, path.join(resolved.folderUri.fsPath, reviewFilename))
+      : undefined;
+    const advanceDestination = computeNextStage(
+      resolved.progress.currentStage,
+      await resolveConfiguredReviewStages(resolved.folderUri)
+    );
+    if (staleCheck !== undefined && staleCheck.stale.length > 0 && advanceDestination) {
+      const currentPlan = await readTextIfExists(vscode.Uri.joinPath(resolved.folderUri, "plan-final.md"));
+      const text = buildStaleReviewVerdictTextV1({
+        reviewStageName: STAGE_DISPLAY_NAMES[resolved.progress.currentStage],
+        stale: staleCheck.stale,
+        openNestedItems: currentPlan ? countOpenNestedChecklistItemsV1(currentPlan) : 0,
+        nestedItemsAdded: staleCheck.nestedItemsAdded,
+        nextStageName: STAGE_DISPLAY_NAMES[advanceDestination],
+      });
+      const staleChoice = await askChatChoiceV1({
+        decisionKey: "confirmAdvanceOnStaleReviewV1",
+        target: {
+          canonicalId: normalizePath(resolved.folderUri.fsPath),
+          taskFolderPath: resolved.folderUri.fsPath,
+          stage: resolved.progress.currentStage,
+          taskName: resolved.progress.displayName ?? path.basename(resolved.folderUri.fsPath),
+        },
+        whatHappened: text.whatHappened,
+        whyUserNeeded: text.whyUserNeeded,
+        options: [
+          { optionId: "rerunReview", label: "Re-run the review", consequence: text.rerunConsequence },
+          {
+            optionId: "advanceAnyway",
+            label: advanceAnywayLabelV1(STAGE_DISPLAY_NAMES[advanceDestination]),
+            consequence: text.advanceConsequence,
+          },
+          { optionId: "notNow", label: "Not now", consequence: text.notNowConsequence },
+        ],
+        recommendedOptionId: "rerunReview",
+        recommendationReasoning: "The review did not see the current plan or task description.",
+        holdsProgress: true,
+        detail: "Answering continues the advance you started; Not now leaves the stage unchanged.",
+        restartGuidance: "Choose Complete Stage & Move On on this task again.",
+      });
+      if (staleChoice === "rerunReview") {
+        await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
+          taskFolderPath: resolved.folderUri.fsPath,
+        });
+        return;
+      }
+      if (staleChoice !== "advanceAnyway") {
+        return;
+      }
     }
   }
 
@@ -14044,7 +14730,11 @@ async function executeImplementationRun(
           await observeCandidateModelInvocationV1(
             folderUri,
             "impl",
-            options.editActionKey === "lint.v1" ? "Fix Linting & Code Errors" : "Implementation",
+            options.editActionKey === "lint.v1"
+              ? "Fix Linting & Code Errors"
+              : options.editActionKey === "applyReviewEdit.v1" && isReviewStage(postRunReviewStage)
+                ? applyReviewActivityV1(STAGE_DISPLAY_NAMES[postRunReviewStage])
+                : "Implementation",
             options.parentOperation,
             info
           );
@@ -14179,6 +14869,24 @@ async function executeImplementationRun(
   let effectivePlanChecklist: string | undefined;
   let incompleteRound: IncompleteImplementationRoundV1 | undefined;
   let summaryIssue: string | undefined;
+  // A model-authored report whose `## Files Changed` entries all failed to
+  // parse while the round changed files cannot attribute any of them: that is
+  // a report-correction / scope-recovery case (the report is rejected and the
+  // delta quarantined, naming the entries), never a successful hand-off that
+  // silently loses the round's known edits.
+  const describeUnreadableFilesChangedReport = (
+    reportText: string,
+    changed: { readonly filesChanged: readonly string[]; readonly filesChangedUnknown?: boolean }
+  ): string | undefined =>
+    changed.filesChangedUnknown
+      ? undefined
+      : describeUnparsedFilesChangedReportV1(
+          parseReportedFilesChangedV1(reportText, {
+            planChecklist,
+            workspaceRoot: workspaceRoot.uri.fsPath,
+          }),
+          changed.filesChanged
+        );
   // Post-run delta gate, first half (Part 2 step 3): a `summary-only`
   // continuation's premise is "no edits". Any delta — or an unenumerable one,
   // which cannot prove the tree clean — violates the mode: the round's report
@@ -14235,7 +14943,9 @@ async function executeImplementationRun(
       };
       incompleteRound = describeIncompleteImplementationRoundV1(summary, expectations);
       if (!incompleteRound) {
-        summaryIssue = describeImplementationSummaryShapeIssue(summary, expectations);
+        summaryIssue =
+          describeImplementationSummaryShapeIssue(summary, expectations) ??
+          describeUnreadableFilesChangedReport(summary, result);
       }
     }
   }
@@ -14326,7 +15036,7 @@ async function executeImplementationRun(
           summaryIssue = incompleteRound?.reason ?? describeImplementationSummaryShapeIssue(summary, {
                 planChecklist,
                 roundChangedFiles: roundChangedKnownFiles,
-              });
+              }) ?? describeUnreadableFilesChangedReport(summary, result);
           if (!summaryIssue) {
             reportCorrectionNote =
               `Report correction accepted: ${claimed} claimed, ${matched} matched, ${unmatched} unmatched, ${newlyRecorded} newly recorded items.`;
@@ -14416,7 +15126,7 @@ async function executeImplementationRun(
     options.parentOperation?.setModel?.(result.storedModelId);
   }
   if (result.cascadeNoteV1) {
-    options.parentOperation?.report?.(result.cascadeNoteV1.slice(0, 300));
+    options.parentOperation?.report?.(formatProviderErrorV1(result.cascadeNoteV1) ?? result.cascadeNoteV1.slice(0, 300));
   }
   let recovery: BegunImplementationRecoveryV1 | undefined;
   // bugs3 Step 6: a provider that never received its prompt owes no continuation
@@ -14605,7 +15315,7 @@ async function executeImplementationRun(
     result.filesChanged.length > 0
       ? result.filesChanged.map((f) => `- ${f}`).join("\n")
       : "_none recorded_"
-  }\n\n${result.cascadeNoteV1 ? `Backup used; primary was skipped or failed: ${result.cascadeNoteV1.slice(0, 300)}\n\n` : ""}${result.summary ?? result.errorMessage ?? ""}${
+  }\n\n${result.cascadeNoteV1 ? `${backupUsedRunLogNoteV1(result.cascadeNoteV1, result.storedModelId)}\n\n` : ""}${result.summary ?? result.errorMessage ?? ""}${
     incompleteRound && recovery
       ? `\n\n## Incomplete round\n\nThis round was recorded incomplete: ${incompleteRound.reason}.\n\n` +
         `Recovery record: \`${recovery.sourceAttemptId}\` (${
@@ -14732,6 +15442,23 @@ async function executeImplementationRun(
     // below is such a closure, so it captures this narrowed copy instead of
     // reading `result` directly.
     const completedResult = result;
+    // bugs4: the ledger row keeps the observed change list but also records
+    // which of those paths the round's own report did not claim, so
+    // ledger-based scope reconstruction never adopts a concurrent owner edit.
+    const ledgerFilesOutcomeV1 = (): RoundLedgerOutcomeV1 => {
+      if (completedResult.filesChangedUnknown) return { filesChangedUnknown: true };
+      const { unattributed } = resolveCompletedRoundAttributionV1({
+        summary,
+        planChecklist,
+        workspaceRoot: workspaceRoot.uri.fsPath,
+        filesChanged: completedResult.filesChanged,
+        summaryIsSynthetic: completedResult.summaryIsSynthetic,
+      });
+      return {
+        filesChanged: [...completedResult.filesChanged],
+        ...(unattributed.length > 0 ? { unattributedFiles: unattributed } : {}),
+      };
+    };
     // Filled in below, only for a runner-synthesized round with a plan
     // checklist — read by the run log write and by the reconcile-decision
     // post to surface it for explicit human selection (workflow 8, item 2 /
@@ -14763,13 +15490,14 @@ async function executeImplementationRun(
       // BEFORE that outer computation exists) — pure and deterministic over
       // `result`/`summary`/`planChecklist`, none of which change between the
       // two call sites.
-      const { attributed: bankedAttributedFilesChanged, unattributed: _bankedUnattributedFilesChanged } =
-        completedResult.summaryIsSynthetic || completedResult.filesChangedUnknown
-          ? { attributed: [...completedResult.filesChanged], unattributed: [] as string[] }
-          : attributeImplementationRoundFilesV1(
-              completedResult.filesChanged,
-              parseReportedFilesChangedV1(summary, { planChecklist })
-            );
+      const { attributed: bankedAttributedFilesChanged } = resolveCompletedRoundAttributionV1({
+        summary,
+        planChecklist,
+        workspaceRoot: workspaceRoot.uri.fsPath,
+        filesChanged: completedResult.filesChanged,
+        summaryIsSynthetic: completedResult.summaryIsSynthetic,
+        filesChangedUnknown: completedResult.filesChangedUnknown,
+      });
       // Signed with the reservation actually invoked (never the requested
       // primary) — same helper and header format review artifacts use
       // (reviewRowV1.ts), so impl-summary.md is indistinguishable in format
@@ -14787,7 +15515,21 @@ async function executeImplementationRun(
           )
         : summaryText;
       options.parentOperation?.reportActivity("writing summary", { stageToken: options.stageToken });
-      await writeTextFile(summaryUri, `${signedSummary}\n`);
+      // bugs4 item 12: a model-authored round that changed nothing must not
+      // replace the substantive summary the review checks plan items against;
+      // its note is appended under a marker instead (and replaced by the next
+      // no-change round, so repeated no-op rounds leave the summary stable).
+      // A summary-only continuation changes nothing by mandate: its report IS
+      // the summary of the existing diff, so it replaces the file.
+      const roundChangedNothing =
+        claimedRecovery.record?.mode !== "summary-only" &&
+        !completedResult.summaryIsSynthetic &&
+        !completedResult.filesChangedUnknown &&
+        completedResult.filesChanged.length === 0;
+      const summaryToWrite = roundChangedNothing
+        ? mergeNoChangeRoundIntoSummaryV1(await readTextIfExists(summaryUri).catch(() => undefined), signedSummary)
+        : signedSummary;
+      await writeTextFile(summaryUri, `${summaryToWrite}\n`);
 
       // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): once this
       // round's report is accepted and banked, its in-round bookkeeping file
@@ -14856,6 +15598,9 @@ async function executeImplementationRun(
               "applyReviewerVerifiedTicks",
               "plan-final.md's checklist ticks changed this round, superseding the pending tick-application card"
             );
+            if (mergeResult.kind === "merged") {
+              await withdrawStaleOpenItemsCardV1(folderUri, mergeResult.content);
+            }
             if (mergeResult.retroactiveTicks && mergeResult.retroactiveTicks.length > 0) {
               const existingLog = await readTextIfExists(logUri);
               if (existingLog !== undefined) {
@@ -14887,7 +15632,11 @@ async function executeImplementationRun(
         } else if (mergeResult.kind === "unverified-test-evidence") {
           NotificationRouter.showWarning(
             "⚠️ The implementation round claimed test-dependent plan items without an applicable passing test report for the post-edit source state. Those items remain unchecked: " +
-              mergeResult.unverifiedSample.map((text) => `"${text}"`).join(", ")
+              mergeResult.unverifiedSample.map((text) => `"${text}"`).join(", ") +
+              (() => {
+                const why = listUncountedTestReportClaimsV1(effectivePlanChecklist ?? planChecklist ?? "", summary).slice(0, 2);
+                return why.length > 0 ? ". Why: " + why.map((entry) => entry.reason).join("; ") : "";
+              })()
           );
         }
         if (mergeResult.kind === "merged" && mergeResult.unverifiedTestItems?.length) {
@@ -14911,6 +15660,82 @@ async function executeImplementationRun(
             const report = getApplicablePassingTestReportForItemV1(reportPlan, itemText, summary);
             return report ? [{ itemText, report }] : [];
           });
+          // A claimed test item whose evidence did not count says so (bugs4 item 21):
+          // the run log names each item and the reason, never a silent zero.
+          const uncountedClaims = listUncountedTestReportClaimsV1(reportPlan, summary);
+          if (uncountedClaims.length > 0) {
+            const logBeforeDiagnostics = await readTextIfExists(logUri);
+            if (logBeforeDiagnostics !== undefined) {
+              // skipBackup: appends to the just-written log; a `_prev` sibling in
+              // runs/ would read as a second run.
+              await writeTextFile(logUri, `${logBeforeDiagnostics}${formatUncountedTestReportClaimsSectionV1(uncountedClaims)}`, {
+                skipBackup: true,
+              });
+            }
+          }
+          // bugs4 item 16: a test command the provider refused is its own result, not a
+          // failed test. Record it in the run log and tell the owner in chat what to do.
+          const refusedTests = detectTestsRefusedV1(summary);
+          // bugs4 item 21: say how many of this round's claims are verified and why the rest are
+          // not, so a verified count that is not moving always has a stated reason.
+          // Claims the test-evidence rule withheld are claims too: they are exactly the case
+          // ("N claimed; 0 verified: no test report parsed") the report exists to explain.
+          const claimedThisRound = collectRoundClaimedItemsV1(
+            mergeResult.kind === "merged" ? listNewlyCheckedChecklistItemsV1(planChecklist, mergeResult.content) : [],
+            mergeResult.kind === "merged"
+              ? (mergeResult.unverifiedTestItems ?? [])
+              : mergeResult.kind === "unverified-test-evidence"
+                ? mergeResult.unverifiedAll
+                : [],
+            normalizeChecklistItemTextV1
+          );
+          if (claimedThisRound.length > 0) {
+            const progressForClaims = await readTaskProgressAdvisoryV1(folderUri);
+            const verifiedKeys = new Set(
+              (progressForClaims?.planItemEvidence ?? [])
+                .filter((entry) => entry.planRevision === planRevision && (entry.verifications?.length ?? 0) > 0)
+                .map((entry) => normalizeChecklistItemTextV1(entry.itemText))
+            );
+            const claimSection = formatClaimVerificationSectionV1({
+              claimed: claimedThisRound.length,
+              verified: claimedThisRound.filter((text) => verifiedKeys.has(normalizeChecklistItemTextV1(text))).length,
+              testReportsParsed: applicableReports.length,
+              uncounted: uncountedClaims,
+              testsRefused: refusedTests !== undefined,
+            });
+            const logBeforeClaims = await readTextIfExists(logUri);
+            if (claimSection.length > 0 && logBeforeClaims !== undefined) {
+              await writeTextFile(logUri, `${logBeforeClaims}${claimSection}`, { skipBackup: true });
+            }
+          }
+          if (refusedTests !== undefined) {
+            const logBeforeRefusal = await readTextIfExists(logUri);
+            if (logBeforeRefusal !== undefined) {
+              await writeTextFile(logUri, `${logBeforeRefusal}${formatTestsRefusedSectionV1(refusedTests)}`, { skipBackup: true });
+            }
+            await offerActionInChatV1({
+              taskFolderPath: folderUri.fsPath,
+              taskLabel: formatNotificationTaskLabelV1(executeImplRunProgress?.displayName, folderUri.fsPath),
+              actionLabel: "Run the next stage action",
+              command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+              args: [{ taskFolderPath: folderUri.fsPath }],
+              noticeText: formatTestsRefusedRemedyV1(
+                refusedTests,
+                resolveAllowedTargetedTestCommandV1(workspaceRoot.uri.fsPath)
+              ),
+              actionConsequence:
+                "Dispatches this stage's next action. A round that can run the named tests through an allowed command produces the missing report.",
+              recommend: {
+                target: "none",
+                reasoning: "Choose after the test command is allowed or you have run the tests yourself.",
+              },
+              optional: true,
+              doNothingOption: {
+                label: "Not now",
+                consequence: "Does nothing. Test-dependent items stay provisional and the checklist is unchanged.",
+              },
+            }).catch(() => undefined);
+          }
           if (applicableReports.length > 0) {
             const progressBeforeEvidence = await readTaskProgressAdvisoryV1(folderUri);
             const sourceFiles = [...new Set([
@@ -15202,7 +16027,7 @@ async function executeImplementationRun(
                     }),
                 }
               : {}),
-            ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
+            ...(result.cascadeNoteV1 ? { chatAttributionNote: backupUsedNoteV1(result.cascadeNoteV1, result.storedModelId) } : {}),
             ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
             roundOutcomeClassification: {
               classification: gateClassification,
@@ -15278,8 +16103,26 @@ async function executeImplementationRun(
             persistedGateRounds ?? priorProgress ?? undefined
           );
         } else {
+          // bugs4 item 43: a round that itself listed open items as "not reached" left buildable
+          // work; a review of the unchanged tree cannot build it, so retry Implementation instead.
+          const notReachedItems =
+            uncheckedItemsWithoutClearingReview && planChecklist !== undefined
+              ? findNotReachedOpenItemsV1(summary, planChecklist)
+              : [];
+          const notReachedRetry =
+            notReachedItems.length > 0
+              ? buildNotReachedRetryNoticeV1({
+                  notReachedCount: notReachedItems.length,
+                  modelId: gateActualModelId,
+                  modelLabel: gateActualModelId
+                    ? (attributionModelLabel(gateActualModelId) ?? gateActualModelId)
+                    : undefined,
+                })
+              : undefined;
           NotificationRouter.showWarning(
-            uncheckedItemsWithoutClearingReview
+            notReachedRetry
+              ? notReachedRetry.warning
+              : uncheckedItemsWithoutClearingReview
               ? "Implementation reported nothing to fix, but the plan checklist still has " +
                   `${remainingChecklistProgress?.remaining} unticked item(s) and no review has cleared this ` +
                   "stage yet. Run this stage's review next: if it clears (meets the auto-advance threshold " +
@@ -15302,7 +16145,15 @@ async function executeImplementationRun(
             undefined,
             undefined,
             undefined,
-            uncheckedItemsWithoutClearingReview
+            notReachedRetry
+              ? await offerActionInChatV1({
+                  taskFolderPath: folderUri.fsPath,
+                  actionLabel: notReachedRetry.actionLabel,
+                  command: "vs-code-ai-helper.runImplementationWithAI",
+                  args: [{ taskFolderPath: folderUri.fsPath }],
+                  noticeText: notReachedRetry.noticeText,
+                })
+              : uncheckedItemsWithoutClearingReview
               ? await offerActionInChatV1({
                   taskFolderPath: folderUri.fsPath,
                   actionLabel: "Run Review",
@@ -15385,7 +16236,7 @@ async function executeImplementationRun(
         { filesChanged: [] },
         {
           taskFolderUri: folderUri,
-          ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
+          ...(result.cascadeNoteV1 ? { chatAttributionNote: backupUsedNoteV1(result.cascadeNoteV1, result.storedModelId) } : {}),
           ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
           extraPatch: (current) => {
             const withStreak = setZeroChangeImplRounds(
@@ -15698,46 +16549,21 @@ async function executeImplementationRun(
         // round's story was already told once.
         markOpenItemsCardPostedV1(folderUri.fsPath);
         const openItemsStage = priorProgress?.currentStage ?? postRunReviewStage;
-        const openItemsTarget: ChatTarget = {
-          canonicalId: folderUri.fsPath,
-          taskFolderPath: folderUri.fsPath,
-          stage: openItemsStage,
-          taskName: priorProgress?.displayName,
-        };
-        const openItemTexts = listUncheckedChecklistItemTextsV1(planChecklist, Number.MAX_SAFE_INTEGER).items;
-        const roundReasonsByKey = new Map(
-          collectPlanItemReasonsV1(summary).map((entry) => [
-            normalizeChecklistItemTextV1(entry.itemText),
-            entry.reason,
-          ])
-        );
-        const openItemsCardInput = buildOpenPlanItemsNeedDecisionCardInputV1({
-          taskFolderPath: folderUri.fsPath,
-          taskCanonicalId: folderUri.fsPath,
+        const openItemsCard = await postOpenPlanItemsCardV1({
+          folderUri,
+          workspaceRootFsPath: workspaceRoot.uri.fsPath,
+          planChecklist,
           stage: openItemsStage,
           displayName: priorProgress?.displayName,
-          items: openItemTexts.map((itemText) => ({
-            itemText,
-            reason: roundReasonsByKey.get(normalizeChecklistItemTextV1(itemText)) ?? "",
-          })),
-          createdAt: new Date().toISOString(),
-          // RC2 item 13, Step 52: captured NOW, at card-build time, for the
-          // same reason `buildAdvanceOptionV1`/`buildPlateauKeepIteratingOptionV1`
-          // capture it — by the time the owner answers the "Decide item by
-          // item" QuickPick flow (seconds or days later), the Fast Forward
-          // call stack that may have raised this very card is long gone. When
-          // set, applying the owner's decisions resumes Fast Forward from
-          // Apply Review with these live counters instead of dispatching a
-          // single ordinary continuing action.
-          resumeFastForwardV1: getFastForwardRunStateV1(folderUri.fsPath),
+          planItemEvidence: priorProgress?.planItemEvidence,
+          roundSummary: summary,
         });
-        const openItemsCardPosted = await postWorkflowDecisionV1(openItemsCardInput, openItemsTarget);
-        if (!openItemsCardPosted) {
+        if (!openItemsCard.posted) {
           // No decision was persisted (missing extension context) — same
           // fallback shape as the sibling branch above.
           NotificationRouter.showWarning(
-            `Implementation changed no files. The plan checklist still has ${openItemTexts.length} open ` +
-              "item(s) this round could not build. Decide each one (exclude with a reason, tick it because " +
+            `Implementation changed no files. The plan checklist still has ${openItemsCard.openItemCount} open ` +
+              "item(s) this round did not settle. Decide each one (exclude with a reason, tick it because " +
               "it is already done, or leave it open) in plan-final.md."
           );
         }
@@ -15765,11 +16591,19 @@ async function executeImplementationRun(
           qualifyingThreshold: getAutoAdvanceScoreThreshold(),
         })
       ) {
+        // bugs4 item 36: the stop is reported before, and in the same line as, the
+        // decision it raises, so the cause never reads after the effect. The
+        // refusal reason is recorded first for the same reason; it is cleared
+        // below if the escalation did not apply.
+        const breakerStage: TaskStage = priorProgress?.currentStage ?? postRunReviewStage;
+        const breakerStopText = describeBreakerStopV1(breakerStage, zeroChangeRounds);
+        recordStageActionRefusalReasonV1(folderUri.fsPath, breakerStopText);
         const escalated = await escalateReviewToHuman(
           folderUri,
-          priorProgress?.currentStage ?? postRunReviewStage,
+          breakerStage,
           "plateau",
-          `${zeroChangeRounds} consecutive implementation round(s) changed zero files and made no ` +
+          `${breakerStopText} ` +
+            `${zeroChangeRounds} consecutive implementation round(s) changed zero files and made no ` +
             "checklist progress (no-progress breaker, ensemble.resilience.noProgressBreakerRounds). " +
             "Automated iteration is no longer producing edits." +
             (checklistClaimedButUnmerged
@@ -15821,13 +16655,24 @@ async function executeImplementationRun(
                   checklistProgressUnreliable: true,
                   checklistProgressUnreliableReason:
                     "an implementation round claimed checklist items that could not be merged, leaving unticked work",
+                  ...latchingClaimsRecordPatchV1(checklistMergeResult),
                 }
               : cleared;
-          }
+          },
+          undefined,
+          // bugs4 item 47: the card agrees with the gate and the review rather than
+          // recommending another round after rounds that changed nothing.
+          zeroChangeRounds
         );
         if (escalated) {
+          // The breaker is a deliberate stop, not a bare decline: the reason
+          // recorded above stays on the shared refusal channel so the ending the
+          // caller derives from this `false` says why and what is next. Fast
+          // Forward reads this record to end as "stopped", never "succeeded".
+          recordBreakerStopV1(folderUri.fsPath, breakerStage, zeroChangeRounds);
           return false;
         }
+        clearStageActionRefusalReasonV1(folderUri.fsPath);
       }
       // Review finding (2026-08-20): the round-level accounting above
       // (streak increment, latch-if-a-review-already-cleared, the
@@ -15849,6 +16694,7 @@ async function executeImplementationRun(
                 checklistProgressUnreliable: true,
                 checklistProgressUnreliableReason:
                   "an implementation round claimed checklist items that did not match any plan item, and no review has cleared the stage",
+                ...latchingClaimsRecordPatchV1(checklistMergeResult),
                 updatedAt: new Date().toISOString(),
               }
         );
@@ -15904,10 +16750,10 @@ async function executeImplementationRun(
         await terminalizeRoundV1(
           implRoundId,
           "completed",
-          { filesChanged: [...result.filesChanged] },
+          ledgerFilesOutcomeV1(),
           {
             taskFolderUri: folderUri,
-            ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
+            ...(result.cascadeNoteV1 ? { chatAttributionNote: backupUsedNoteV1(result.cascadeNoteV1, result.storedModelId) } : {}),
             ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
             extraPatch: (current) => {
               const withoutStreak = setZeroChangeImplRounds(current, undefined);
@@ -15958,7 +16804,7 @@ async function executeImplementationRun(
       await terminalizeRoundV1(
         implRoundId,
         "completed",
-        result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
+        ledgerFilesOutcomeV1(),
         {
           taskFolderUri: folderUri,
           ...(result.typeCheckFailed
@@ -15970,7 +16816,7 @@ async function executeImplementationRun(
                   }),
               }
             : {}),
-          ...(result.cascadeNoteV1 ? { chatAttributionNote: `Backup used; primary was skipped or failed: ${result.cascadeNoteV1}` } : {}),
+          ...(result.cascadeNoteV1 ? { chatAttributionNote: backupUsedNoteV1(result.cascadeNoteV1, result.storedModelId) } : {}),
           ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
           roundOutcomeClassification: {
             classification: noEditsClassification,
@@ -16031,13 +16877,18 @@ async function executeImplementationRun(
     // review scope (the exact leak this attribution exists to close). Those
     // paths are surfaced in the run log as unattributed instead, and the
     // round's real edits re-enter scope when a later round reports properly.
-    const { attributed: attributedFilesChanged, unattributed: unattributedFilesChanged } =
-      result.summaryIsSynthetic || result.filesChangedUnknown
-        ? { attributed: [...result.filesChanged], unattributed: [] as string[] }
-        : attributeImplementationRoundFilesV1(
-            result.filesChanged,
-            parseReportedFilesChangedV1(summary, { planChecklist })
-          );
+    const {
+      reported: reportedFilesChanged,
+      attributed: attributedFilesChanged,
+      unattributed: unattributedFilesChanged,
+    } = resolveCompletedRoundAttributionV1({
+      summary,
+      planChecklist,
+      workspaceRoot: workspaceRoot.uri.fsPath,
+      filesChanged: result.filesChanged,
+      summaryIsSynthetic: result.summaryIsSynthetic,
+      filesChangedUnknown: result.filesChangedUnknown,
+    });
 
     if (!summaryIssue) {
       await bankValidImplementationSummaryV1();
@@ -16370,12 +17221,10 @@ async function executeImplementationRun(
     if (unattributedFilesChanged.length > 0) {
       const existingLog = await readTextIfExists(logUri);
       if (existingLog !== undefined) {
-        const unattributedSection =
-          "\n\n## Unattributed workspace changes\n\n" +
-          "These paths changed in the workspace during this round but are not in the " +
-          "round's own `## Files Changed` report, so they were EXCLUDED from review scope " +
-          "(they are most likely edits made by hand in the same workspace while the round ran):\n\n" +
-          unattributedFilesChanged.map((file) => `- ${file}`).join("\n");
+        const unattributedSection = describeUnattributedWorkspaceChangesSectionV1(
+          unattributedFilesChanged,
+          reportedFilesChanged
+        );
         // skipBackup: this append preserves every byte of the just-written
         // log, and a `_prev` sibling in runs/ would read as a second run.
         await writeTextFile(logUri, `${existingLog}${unattributedSection}\n`, {
@@ -16408,9 +17257,17 @@ async function executeImplementationRun(
           // lets a reader tell a corrupted/reworded echo from a round that
           // said nothing (plan Part 4, item 2).
           unmatchedSample:
-            checklistMergeResult?.kind === "no-match" ? checklistMergeResult.unmatchedSample :
+            checklistMergeResult?.kind === "no-match" ? checklistMergeResult.unmatchedAll :
               checklistMergeResult?.kind === "unverified-test-evidence" ? checklistMergeResult.unverifiedSample : undefined,
+          ...(checklistMergeResult?.kind === "no-match" ? { unmatchedTotal: checklistMergeResult.unmatchedAll.length } : {}),
           latchSet: persistedAfterRun?.checklistProgressUnreliable === true,
+          // bugs4 item 14: claims that restated already-ticked or excluded items are
+          // their own category, never "unmatched".
+          ...(checklistMergeResult !== undefined &&
+          "alreadyRecorded" in checklistMergeResult &&
+          checklistMergeResult.alreadyRecorded !== undefined
+            ? { alreadyRecorded: checklistMergeResult.alreadyRecorded }
+            : {}),
           // The automatic reconciliation pass (only ever run for a synthetic
           // round — see the call site) is recorded here too, marked
           // evidence-derived, so a reader can tell "no echo, and nothing
@@ -17560,7 +18417,8 @@ export async function runImplementationWithAI(
       ? preRunPlanOfRecord.counts?.remaining ?? 0
       : countChecklistEvidenceProgressV1(
           preRunPlanOfRecord.text,
-          resolved.progress.planItemEvidence ?? []
+          resolved.progress.planItemEvidence ?? [],
+          resolved.progress.planItemOwnerDecisions ?? []
         )?.gate.remaining ?? 0;
     const preRunDecision = decidePostReviewActionV1({
       history: resolved.progress.reviewScoreHistory,
@@ -17849,7 +18707,10 @@ export async function runImplementationWithAI(
       planFinalPath: artifactPaths.planFinalPath,
       roundProgressPath: artifactPaths.roundProgressPath,
       implSummaryPath: artifactPaths.implSummaryPath,
-      taskArtifactGuidance: formatAuthoritativeTaskArtifactGuidanceV1(artifactPaths),
+      taskArtifactGuidance: withAllowedTestCommandGuidanceV1(
+        formatAuthoritativeTaskArtifactGuidanceV1(artifactPaths),
+        resolved.folderUri.fsPath
+      ),
     };
     let dispatchedBlockerIds: readonly ReviewBlockerIdentity[] | undefined;
     const applyReviewContinuationStage = shouldContinueAsApplyReviewV1(recoveryRecord);
@@ -18211,6 +19072,7 @@ export async function applyReviewEditWithAI(
     coordinatorOutcome?: TaskActionOutcomeV1;
     runnerFailure?: RunnerFailureProbeV1;
     failedStepV1?: "Review" | "Apply Review";
+    preflightRefusal?: ReviewPreflightRefusalV1;
   } = {};
 
   try {
@@ -18441,6 +19303,8 @@ export async function applyReviewEditWithAI(
         parent: op,
         label: "Applying implementation review",
         stage: "impl",
+        // bugs4 item 32: chat lines name the review stage being applied.
+        ...(isReviewStage(stage) ? { appliesStage: stage } : {}),
         kind: "run-implementation",
         // Part 4 (item 8) audit: applyImplementationReviewWithAI warns and
         // returns false on its own guard-clause declines (host gate closed,
@@ -18493,7 +19357,11 @@ export async function applyReviewEditWithAI(
       // against the stale "edit succeeded" outcome while this later
       // invocation's process could still be running. Mirrors the identical
       // fix in the apply-review (plan) branch above at `reReviewDispatchProbe`.
-      const reReviewDispatchProbe: { dispatched: boolean; coordinatorOutcome?: TaskActionOutcomeV1 } = {
+      const reReviewDispatchProbe: {
+        dispatched: boolean;
+        coordinatorOutcome?: TaskActionOutcomeV1;
+        preflightRefusal?: ReviewPreflightRefusalV1;
+      } = {
         dispatched: false,
       };
       await runTrackedOperation(
@@ -18530,6 +19398,9 @@ export async function applyReviewEditWithAI(
       // outcome (not the earlier edit's) is what the outer `finally` must
       // feed to recordAdmissionReleaseTriggerV1 so a timeout/cancellation
       // here is not masked by the edit step's already-settled outcome.
+      if (reReviewDispatchProbe.preflightRefusal !== undefined) {
+        applyReviewEditDispatchProbeV1.preflightRefusal = reReviewDispatchProbe.preflightRefusal;
+      }
       if (reReviewDispatchProbe.dispatched) {
         applyReviewEditDispatchProbeV1.coordinatorOutcome = reReviewDispatchProbe.coordinatorOutcome;
         applyReviewEditDispatchProbeV1.failedStepV1 = "Review";
@@ -18624,6 +19495,7 @@ export async function applyReviewEditWithAI(
         applyReviewEditDispatchProbeV1.coordinatorOutcome ?? options.dispatchProbe.coordinatorOutcome;
       options.dispatchProbe.runnerFailure = applyReviewEditDispatchProbeV1.runnerFailure;
       options.dispatchProbe.failedStepV1 = applyReviewEditDispatchProbeV1.failedStepV1;
+      options.dispatchProbe.preflightRefusal = applyReviewEditDispatchProbeV1.preflightRefusal;
     }
     recordAdmissionReleaseTriggerV1(safeReleaseStateV1, applyReviewEditDispatchProbeV1.coordinatorOutcome);
     await releaseAdmissionV1();
@@ -19310,6 +20182,7 @@ export async function buildReviewResumeVariablesV1(
   const planPathForStage = isPlanReview ? planUri.fsPath : artifactPaths.planFinalPath;
   const variables: Record<string, string> = {
     taskFolderPath: artifactPaths.taskFolderPath,
+    provisionalTickedItems: "No implementation checklist is available for this plan review.",
     planFinalPath: planPathForStage,
     planPath: planUri.fsPath,
     roundProgressPath: artifactPaths.roundProgressPath,
@@ -19337,6 +20210,15 @@ export async function buildReviewResumeVariablesV1(
     variables.openPlanItems = canonicalPlan
       ? formatOpenPlanItemsForRoundV1(canonicalPlan, latestEditingRoundReport)
       : "The implementation checklist could not be read from the plan of record.";
+    // bugs4 item 21: a resumed review lists the provisional ticked items too, exactly like a fresh one.
+    {
+      const resumedEvidence = await readTaskProgressAdvisoryV1(folderUri);
+      variables.provisionalTickedItems = formatProvisionalTickedItemsForReviewerV1(
+        canonicalPlan,
+        resumedEvidence?.planItemEvidence ?? [],
+        resumedEvidence?.planItemOwnerDecisions ?? []
+      );
+    }
     // Publish freshness gate (plan PART 2, step 7): a resumed review must be
     // refused exactly like a fresh one when Publish Checks are absent or
     // stale — resuming is still "building a Publish review prompt", just via

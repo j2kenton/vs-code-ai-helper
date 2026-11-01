@@ -9,6 +9,7 @@ import { parseModelSelection } from "../runners/providers";
 import { getResilienceSettings, resolveQuotaAccountKeyV1 } from "../config/settings";
 import { awaitWorkflowDecisionAnswerV1 } from "./workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
+import { formatProviderErrorV1 } from "./providerErrorFormatterV1";
 
 export interface PendingResumeOperation {
   request: Omit<AgentRunRequest, "taskFolderUri" | "workspaceUri" | "outputFile"> & {
@@ -591,6 +592,24 @@ export function buildQuotaRemedyTextV1(
   );
 }
 
+const PAYMENT_REMEDY_V1 = "Add credits or choose a free model.";
+
+/**
+ * The payment-required failure text: the provider's own message in readable form (cut at a
+ * word boundary, not mid-word), then the remedy once. Re-classifying a message that already
+ * carries the wrapper or the remedy never stacks either again (bugs4 item 31: "Add credits or
+ * choose a free model" appeared three times, behind a message cut off mid-word).
+ */
+export function paymentRequiredMessageV1(rawMessage: string | undefined): string {
+  const readable =
+    formatProviderErrorV1(rawMessage ?? "", { maxChars: 500 }) ?? "insufficient provider funds or credits";
+  const providerText = readable
+    .replace(/(?:HTTP 402 payment required:\s*)+/gi, "")
+    .replace(/\s*Add credits or choose a free model\.?/gi, "")
+    .replace(/[\s.]+$/, "");
+  return `HTTP 402 payment required: ${providerText || "insufficient provider funds or credits"}. ${PAYMENT_REMEDY_V1}`;
+}
+
 export function classifyFailure<T extends { errorMessage?: string; authDiagnosticText?: string; structuredQuotaSignal?: boolean }>(result: T): T & { failureKind: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic" } {
   const message = (result.errorMessage ?? "").toLowerCase();
   // Payment-required first, then quota: an HTTP 402 with provider.quota-shaped
@@ -653,9 +672,7 @@ export function classifyFailure<T extends { errorMessage?: string; authDiagnosti
     ...result,
     ...(failureKind === "payment-required"
       ? {
-          errorMessage:
-            `HTTP 402 payment required: ${(result.errorMessage ?? "insufficient provider funds or credits").slice(0, 240)}. ` +
-            "Add credits or choose a free model.",
+          errorMessage: paymentRequiredMessageV1(result.errorMessage),
         }
       : {}),
     failureKind,

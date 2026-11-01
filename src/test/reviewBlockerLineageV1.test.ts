@@ -339,8 +339,11 @@ void describe("buildChurnEscalationReasonV1", () => {
       kind: "narrowing",
     });
     assert.doesNotMatch(reason, /churning, not converging/i);
-    assert.match(reason, /not churn/i);
-    assert.match(reason, /progress/i);
+    // bugs4 item 22: the card's stated reason must agree with the pause it explains.
+    assert.doesNotMatch(reason, /not churn/i);
+    assert.match(reason, /narrowing progress/i);
+    assert.match(reason, /pauses after this many rounds/);
+    assert.match(reason, /ensemble\.resilience\.churnCeilingRounds/);
   });
 
   void it("does NOT label a shifting diagnosis as churning, and names an unstable requirement", () => {

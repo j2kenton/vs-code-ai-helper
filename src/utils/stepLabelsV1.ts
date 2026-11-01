@@ -12,6 +12,8 @@
  * Pure: no vscode, no fs.
  */
 
+import { STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
+
 export type StepKindV1 = "review" | "re-review" | "apply-review" | "implementation" | "continuation";
 
 interface StepWordingV1 {
@@ -49,4 +51,44 @@ export function stepProgressLabelV1(step: StepKindV1): string {
 export function stepOutcomeNameV1(step: StepKindV1, stageDisplayName: string): string {
   const name = stepNameV1(step);
   return name === stageDisplayName ? name : step === "implementation" ? stageDisplayName : `${name} (${stageDisplayName})`;
+}
+
+/**
+ * bugs4 item 32: an Apply Review runs with the Implementation stage's role and
+ * model chain, but it belongs to the review stage it applies. Progress and
+ * "Started" lines name that stage, so a Low-Level Code Review Apply Review is
+ * never read as the task having been sent back to Implementation.
+ */
+export function applyReviewTargetLabelV1(reviewStageDisplayName: string): string {
+  return `Applying ${reviewStageDisplayName} findings (Implementation model)`;
+}
+
+/** The activity noun for a model-invocation line: "Running <activity> with <provider> — <model>.". */
+export function applyReviewActivityV1(reviewStageDisplayName: string): string {
+  return `Apply Review of ${reviewStageDisplayName} findings`;
+}
+
+/**
+ * The chat's "Started / Progress / Resumed" label for a tracked operation:
+ * "<label> — <stage>[: <detail>]". An Apply Review child names the review stage
+ * it applies instead of the Implementation stage whose model chain it borrows,
+ * and no line says "Implementation" alone unless that is the task's stage.
+ */
+export function operationChatLabelV1(
+  operation: {
+    readonly label: string;
+    readonly stage?: TaskStage;
+    readonly appliesStage?: TaskStage;
+    readonly detail?: string;
+    readonly activity?: string;
+  },
+  fallbackStage: TaskStage
+): string {
+  const detail = operation.detail ?? operation.activity;
+  const suffix = detail ? `: ${detail}` : "";
+  if (operation.appliesStage) {
+    return `${applyReviewTargetLabelV1(STAGE_DISPLAY_NAMES[operation.appliesStage])}${suffix}`;
+  }
+  const stage = operation.stage ? STAGE_DISPLAY_NAMES[operation.stage] : STAGE_DISPLAY_NAMES[fallbackStage];
+  return `${operation.label} — ${stage}${suffix}`;
 }

@@ -24,6 +24,7 @@ import { checkAndReviewPublishV1 } from "../commands/checkAndReviewPublish";
 import { ExtensionFolderRemovedErrorV1 } from "../utils/extensionResourcesV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { __chainModelReadinessProbeTestOnly } from "../utils/chainModelReadinessV1";
 import {
   classifyPublishChecksFreshnessV1,
   computePublishScopeId,
@@ -33,6 +34,7 @@ import {
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
+const settingsModule = require("../config/settings") as Record<string, unknown>;
 const runEditActionModule = require("../commands/runEditActionV1") as Record<string, unknown>;
 const publishScopeCheckModule = require("../utils/publishScopeCheck") as Record<string, unknown>;
 const completionLintModule = require("../utils/completionLint") as Record<string, unknown>;
@@ -87,6 +89,29 @@ function makeInventory(taskFolderPath: string, progress: TaskProgress): TaskInve
   } as unknown as TaskInventory;
 }
 
+/**
+ * Runs `body` with a Publish chain whose second backup (a Codex model) is configured but switched
+ * off, and with the readiness check answering `probe`, so the Enable option can be tested without a
+ * real CLI.
+ */
+async function withPublishChainV1<T>(probe: { ready: boolean; reason?: string }, body: () => Promise<T>): Promise<T> {
+  const originalGetModelSettings = settingsModule.getModelSettings;
+  settingsModule.getModelSettings = () => ({
+    publish: {
+      primary: "antigravity-cli:claude-sonnet-5-5-high",
+      backups: ["devpass-cli:llmgateway-devpass/claude-sonnet-5-5@high", "codex-cli:gpt-6.1-terra@high"],
+      backupsEnabled: [true, false],
+    },
+  });
+  __chainModelReadinessProbeTestOnly.set(() => Promise.resolve(probe));
+  try {
+    return await body();
+  } finally {
+    __chainModelReadinessProbeTestOnly.reset();
+    settingsModule.getModelSettings = originalGetModelSettings;
+  }
+}
+
 async function runFix(
   name: string,
   testScript: string,
@@ -96,7 +121,7 @@ async function runFix(
     scopeCheckThrows?: boolean;
     staleScope?: boolean;
     /** Drive the AI pass: `fixes` makes the stubbed edit action repair the checks. */
-    ai?: { fixes: boolean; cancels?: boolean; invokeCandidate?: boolean; cancelAt?: "prompt-size" | "consent" };
+    ai?: { fixes: boolean; cancels?: boolean; invokeCandidate?: boolean; cancelAt?: "prompt-size" | "consent"; failedWith?: string };
     /** Run as the commit-and-push flow's child under a live parent operation. */
     nested?: boolean;
     /**
@@ -259,6 +284,9 @@ async function runFix(
         const operation = taskOperations.getLocalTaskOperations(taskFolderPath).find((item) => item.label === "Linting Fixes");
         if (operation) taskOperations.cancelOperation(operation.id, "viewer");
         return Promise.resolve({ status: "cancelled", filesChanged: ["src/example.ts"] });
+      }
+      if (ai.failedWith !== undefined) {
+        return Promise.resolve({ status: "failed", errorMessage: ai.failedWith, filesChanged: ["src/example.ts"] });
       }
       return Promise.resolve({ status: "completed" });
     });
@@ -453,16 +481,23 @@ void describe("runLintingFixes — RC6 item 5 execution paths", () => {
       assert.equal(ended[0]?.state, "cancelled");
       assert.match(ended[0]?.cancelReasonV1 ?? "", /src\/example\.ts/);
       assert.match(terminalEntryFor(ended[0])?.message ?? "", /cancelled.*src\/example\.ts/i);
-      const recovery = result.decisions.find((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks");
+      // bugs4 item 31: the checks were already failing, so the cancel leaves them failing and
+      // unverified: the left-failing card (another fix round), not Run Publish Checks on an
+      // unchanged tree.
+      const recovery = result.decisions.find((decision) => decision.decisionKey === "chatActionOffer:runLintingFixes");
       assert.ok(recovery, "cancellation leaves an explicit task-chat recovery choice");
-      assert.match(recovery.whatHappened, /was cancelled[\s\S]*src\/example\.ts[\s\S]*Review any retained edits/);
+      assert.match(recovery.whatHappened, /was cancelled[\s\S]*src\/example\.ts[\s\S]*have not been re-verified/);
       assert.deepEqual(recovery.options.map((option) => option.label), [
-        "Run Publish Checks", "Back to Implementation", "Not now",
+        "Fix Linting & Code Errors again",
+        "Back to Implementation",
+        "Choose a stronger Publish model",
+        "Run Publish Checks",
+        "Not now",
       ]);
       assert.equal(recovery.recommendation.kind === "option" ? recovery.recommendation.optionId : undefined, "runAction");
       assert.deepEqual(recovery.options[0]?.effect, {
         kind: "command",
-        command: "vs-code-ai-helper.runPublishChecks",
+        command: "vs-code-ai-helper.runLintingFixes",
         args: [{ taskFolderPath: result.taskFolderPath }],
       });
       assert.equal(await readPublishChecksFreshnessStampV1(vscode.Uri.file(result.taskFolderPath)), undefined);
@@ -643,6 +678,60 @@ void describe("runLintingFixes — RC6 item 5 execution paths", () => {
       args: [{ taskFolderPath: result.taskFolderPath }],
     });
     assert.match(decision.options[3]?.consequence ?? "", /useful after you change something yourself/);
+  });
+
+  void it("a fix run that changed files, ended failed with HTTP 402 and whose rerun still fails posts the left-failing card recommending the backup (bugs4 item 31, plan item 68)", async () => {
+    const message =
+      "devpass-code hit a usage limit: HTTP 402 payment required: devpass-code CLI failed: APIError: daily pacing allowance reached — resets in 22 hours. " +
+      "Backup devpass-code llmgateway-devpass/claude-sonnet-5-5@high was tried and failed: HTTP 402 payment required: daily pacing allowance reached. " +
+      "Backup gpt-6.1-terra@high is disabled in the stage's chain; enable it to use it here. " +
+      "Payment-required failures do not have a quota reset schedule.";
+    const result = await withPublishChainV1({ ready: true }, () =>
+      runFix("bugs4-item31-402-left-failing", 'node -e "process.exit(1)"', { ai: { fixes: false, failedWith: message } })
+    );
+    assert.equal(result.aiCalls, 1, "the fix round ran once");
+    assert.equal(
+      result.decisions.filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks").length,
+      0,
+      "the old card that recommends re-running known-failing checks is not posted"
+    );
+    const decisions = result.decisions.filter((decision) => decision.decisionKey === "chatActionOffer:enablePublishBackupAndRerunFix");
+    assert.equal(decisions.length, 1, "exactly one card, the left-failing one with the Enable action");
+    const decision = decisions[0];
+    assert.ok(decision);
+    assert.match(decision.whatHappened, /AI final fixes failed/);
+    assert.match(decision.whatHappened, /Models tried: devpass-code llmgateway-devpass\/claude-sonnet-5-5@high \(payment required\)\./);
+    assert.equal((decision.whatHappened.match(/resets in 22 hours/g) ?? []).length, 1);
+    assert.doesNotMatch(decision.whatHappened, /reset schedule/);
+    assert.deepEqual(decision.options.map((option) => option.label), [
+      "Enable gpt-6.1-terra@high and rerun the fix",
+      "Choose a different Publish model",
+      "Back to Implementation",
+      "Run Publish Checks",
+      "Not now",
+    ]);
+    const recommended = decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined;
+    assert.equal(decision.options.find((option) => option.optionId === recommended)?.label, "Enable gpt-6.1-terra@high and rerun the fix");
+    assert.equal(decision.gating?.unblocksProgress, true, "not an Optional card");
+  });
+
+  void it("does not offer to enable a switched-off backup whose provider is not signed in, and says why (item 66)", async () => {
+    const message =
+      "devpass-code hit a usage limit: HTTP 402 payment required: daily pacing allowance reached. " +
+      "Backup gpt-6.1-terra@high is disabled in the stage's chain; enable it to use it here.";
+    const result = await withPublishChainV1({ ready: false, reason: "Codex: not signed in" }, () =>
+      runFix("bugs4-item31-402-backup-not-signed-in", 'node -e "process.exit(1)"', { ai: { fixes: false, failedWith: message } })
+    );
+    assert.equal(
+      result.decisions.filter((decision) => decision.decisionKey === "chatActionOffer:enablePublishBackupAndRerunFix").length,
+      0,
+      "a model that would fail again is not offered"
+    );
+    assert.equal(result.decisions.filter((decision) => decision.decisionKey === "chatActionOffer:runPublishChecks").length, 0);
+    const card = result.decisions.find((decision) => decision.decisionKey === "chatActionOffer:runLintingFixes");
+    assert.ok(card, "the left-failing card is still posted");
+    const chooseModel = card.options.find((option) => option.label === "Choose a different Publish model");
+    assert.match(chooseModel?.consequence ?? "", /gpt-6\.1-terra@high is configured as a backup but switched off, and it would not run yet: Codex: not signed in/);
   });
 
   for (const scenario of [

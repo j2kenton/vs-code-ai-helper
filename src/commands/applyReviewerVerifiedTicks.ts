@@ -20,11 +20,16 @@ import {
   mergeChecklistProgressV1,
   normalizeChecklistItemTextV1,
   getPlanRevisionV1,
+  isTestDependentChecklistItemV1,
+  POST_EDIT_STATEMENT_V1,
+  reportCommandCoversTestIdentityV1,
+  TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1,
 } from "../utils/implementationChecklist";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
 import { writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
-import { PlanItemEvidenceV1, PlanItemTestReportV1, STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
+import { PlanItemEvidenceV1, PlanItemOwnerTestRunV1, PlanItemTestReportV1, STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import { withdrawStaleOpenItemsCardV1 } from "../utils/withdrawStaleOpenItemsCardV1";
 import { ChatTarget } from "../views/chatView";
 import { normalizePath } from "../utils/taskRoot";
 import { WorkflowDecisionCommandResultV1 } from "../types/workflowDecisionV1";
@@ -34,6 +39,8 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { invalidatePlanItemEvidenceForPlanRevisionV1 } from "../utils/taskProgressTransforms";
 import { recordPlanItemReviewerVerificationV1 } from "../utils/taskProgressTransforms";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { isFormContinuationPendingV1 } from "../utils/formPlanWriteMarkerV1";
 
 type ApplyArg =
   | { task?: IncompleteTask }
@@ -147,19 +154,8 @@ export interface VerifiedTicksDerivationV1 {
   /** Passing editing-round reports accepted for each applicable item. */
   readonly applicableTestReportRoundIds: readonly (readonly string[])[];
   readonly withheldTestItems: readonly string[];
-}
-
-function isTestDependentItemV1(itemText: string): boolean {
-  return /\b(?:tests?|test cases?|fixtures?|regressions?|coverage)\b/i.test(itemText);
-}
-
-function commandRunsTestV1(command: string, testIdentity: string): boolean {
-  const normalized = testIdentity.replace(/\\/g, "/").replace(/^\.\//, "");
-  const basename = normalized.split("/").pop() ?? normalized;
-  return command.split(/[\s'"`;=,]+/).some((part) => {
-    const token = part.replace(/^[([{]+|[),\]}]+$/g, "").replace(/\\/g, "/").replace(/^\.\//, "");
-    return token === normalized || token.split("/").pop() === basename;
-  });
+  /** Why each withheld item is held (normalized item key to a plain reason). */
+  readonly withheldReasons: ReadonlyMap<string, string>;
 }
 
 /**
@@ -233,7 +229,88 @@ export type DeriveVerifiedTicksResultV1 =
        * of a bare information message.
        */
       readonly alreadyAppliedCount?: number;
+      /** Items the review named verified that stay provisional for a missing test report (bugs4 item 32). */
+      readonly withheldTestItems?: readonly string[];
+      readonly withheldReasons?: ReadonlyMap<string, string>;
     };
+
+// Shared with the reviewer-facing list (implementationChecklist.ts) so the review and the card
+// name the same satisfying command (bugs4 item 11).
+export { TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1 };
+
+export const WITHHELD_NO_REPORT_REASON_V1 = "no test report is recorded for this item";
+export const WITHHELD_REPORT_DOES_NOT_COUNT_REASON_V1 =
+  "a test report is recorded but does not count (it did not pass cleanly, did not state it ran on the edited tree, or its command does not cover this item's test)";
+export const WITHHELD_REPORT_STALE_REASON_V1 = "its test report predates later edits to the tested files, so it no longer applies";
+
+/**
+ * Readable list of items held provisional for a missing test report, with the
+ * command that would satisfy each (one bullet per item, not one long paragraph).
+ */
+export function describeWithheldTestItemsV1(
+  items: readonly string[],
+  maxListed: number = 12,
+  reasons?: ReadonlyMap<string, string>
+): string {
+  const listed = items.slice(0, maxListed);
+  const more = items.length > listed.length ? `\n  - …and ${items.length - listed.length} more` : "";
+  const bullets =
+    listed
+      .map((item) => {
+        const reason = reasons?.get(normalizeChecklistItemTextV1(item));
+        return reason ? `  - ${item} — ${reason}` : `  - ${item}`;
+      })
+      .join("\n") + more;
+  return `${items.length} test-dependent item${items.length === 1 ? "" : "s"} wait${items.length === 1 ? "s" : ""} for a passing test report and stay provisional:\n${bullets}\n${TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1}`;
+}
+
+/**
+ * bugs4 item 32: the "review named test-dependent items without a passing report" outcome
+ * belongs in the task chat as a readable list with the report form that was needed, not in
+ * one pop-up paragraph. Returns false when the chat could not take it (the caller then falls
+ * back to the notification).
+ */
+export async function postWithheldTestEvidenceOutcomeInChatV1(
+  taskFolderPath: string,
+  taskLabel: string,
+  withheldTestItems: readonly string[],
+  withheldReasons?: ReadonlyMap<string, string>
+): Promise<boolean> {
+  const pointer = await offerActionInChatV1({
+    taskFolderPath,
+    taskLabel,
+    actionLabel: "Run the next stage action",
+    command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+    args: [{ taskFolderPath }],
+    noticeText:
+      `The review named ${withheldTestItems.length} item${withheldTestItems.length === 1 ? "" : "s"} as verified, but no ticks were applied: ` +
+      describeWithheldTestItemsV1(withheldTestItems, 12, withheldReasons),
+    actionConsequence:
+      "Dispatches this stage's next action. It only produces the missing report if that round can run the named tests and lists them under ## Verification.",
+    recommend: {
+      target: "none",
+      reasoning:
+        "A round that runs the named tests would produce the report. Run one only if its test command is allowed; otherwise record the run yourself or settle the items by hand.",
+    },
+    optional: true,
+    doNothingOption: {
+      label: "Not now",
+      consequence: "Does nothing. The items stay provisional and the checklist is unchanged.",
+    },
+  }).catch(() => undefined);
+  return pointer !== undefined;
+}
+
+/** True when the owner recorded a passing (exit 0) hand-run covering this item in this plan revision. */
+export function ownerRecordedPassingRunCoversItemV1(
+  ownerTestRuns: readonly PlanItemOwnerTestRunV1[],
+  planRevision: string,
+  itemKey: string
+): boolean {
+  return ownerTestRuns.some(
+    (run) => run.planRevision === planRevision && run.exitCode === 0 && run.itemKeys.includes(itemKey)
+  );
+}
 
 /**
  * The test-evidence gate a reviewer's verification passes through: an item
@@ -246,13 +323,24 @@ async function gateTestDependentItemsV1(
   items: readonly string[],
   evidenceRecords: readonly PlanItemEvidenceV1[],
   planRevision: string,
-  workspaceRoot: string | undefined
-): Promise<{ accepted: string[]; testReportRoundIds: string[][]; withheld: string[] }> {
+  workspaceRoot: string | undefined,
+  ownerTestRuns: readonly PlanItemOwnerTestRunV1[] = []
+): Promise<{
+  accepted: string[];
+  testReportRoundIds: string[][];
+  withheld: string[];
+  /** Normalized item key to the plain reason that item is withheld (bugs4 Step 20). */
+  withheldReasons: Map<string, string>;
+}> {
   const accepted: string[] = [];
   const testReportRoundIds: string[][] = [];
   const withheld: string[] = [];
+  const withheldReasons = new Map<string, string>();
   for (const itemText of items) {
-    if (!isTestDependentItemV1(itemText)) {
+    // bugs4 item 11/21: the SAME classifier the gate uses. A private word-regex copy here held
+    // back every item that merely mentioned "test", so a populated Verified Complete block
+    // produced zero verifications.
+    if (!isTestDependentChecklistItemV1(itemText)) {
       accepted.push(itemText);
       testReportRoundIds.push([]);
       continue;
@@ -264,8 +352,11 @@ async function gateTestDependentItemsV1(
       .filter((report) =>
         report.passed > 0 &&
         report.failed === 0 &&
-        /post[- ]edit/i.test(report.sourceState) &&
-        commandRunsTestV1(report.command, report.testIdentity)
+        // bugs4 item 21: the SAME statement the report parser accepted ("post-edit run", "final
+        // source", a tree fingerprint). A narrower copy here withheld every report the parser had
+        // just accepted when the round wrote "on the final source".
+        POST_EDIT_STATEMENT_V1.test(report.sourceState) &&
+        reportCommandCoversTestIdentityV1(report.command, report.testIdentity)
       );
     const currentReports: PlanItemTestReportV1[] = [];
     for (const report of candidateReports) {
@@ -275,13 +366,33 @@ async function gateTestDependentItemsV1(
       currentReports.push(report);
     }
     if (currentReports.length === 0) {
+      // bugs4 item 21 / Step 19: a passing run the owner recorded by hand is test evidence for
+      // the items it names (an explicit owner decision, with owner provenance). Unlike an
+      // editing round's report it is not tied to a source fingerprint: the owner ran it.
+      if (ownerRecordedPassingRunCoversItemV1(ownerTestRuns, planRevision, itemKey)) {
+        accepted.push(itemText);
+        testReportRoundIds.push([]);
+        continue;
+      }
       withheld.push(itemText);
+      // bugs4 Step 20: say which obstacle held this item, so the card never has to guess.
+      const recordedReports = evidenceRecords
+        .filter((record) => record.planRevision === planRevision && record.itemKey === itemKey)
+        .flatMap((record) => record.testReports ?? []);
+      withheldReasons.set(
+        itemKey,
+        recordedReports.length === 0
+          ? WITHHELD_NO_REPORT_REASON_V1
+          : candidateReports.length === 0
+            ? WITHHELD_REPORT_DOES_NOT_COUNT_REASON_V1
+            : WITHHELD_REPORT_STALE_REASON_V1
+      );
       continue;
     }
     accepted.push(itemText);
     testReportRoundIds.push([...new Set(currentReports.map((report) => report.roundId))]);
   }
-  return { accepted, testReportRoundIds, withheld };
+  return { accepted, testReportRoundIds, withheld, withheldReasons };
 }
 
 /**
@@ -324,7 +435,8 @@ export async function recordReviewerVerificationOfTickedItemsV1(
     ticked,
     evidenceRecords,
     planRevision,
-    resolveWorkspaceRootForTaskV1(folderUri)
+    resolveWorkspaceRootForTaskV1(folderUri),
+    progressRead.decoded.progress.planItemOwnerTestRuns ?? []
   );
   if (accepted.length === 0) return 0;
   const evidenceByKey = new Map<string, string | undefined>(
@@ -430,7 +542,14 @@ export async function deriveApplicableVerifiedTicksV1(
     accepted: applicable,
     testReportRoundIds: applicableTestReportRoundIds,
     withheld: withheldTestItems,
-  } = await gateTestDependentItemsV1(candidates, evidenceRecords, planRevision, resolveWorkspaceRootForTaskV1(folderUri));
+    withheldReasons,
+  } = await gateTestDependentItemsV1(
+    candidates,
+    evidenceRecords,
+    planRevision,
+    resolveWorkspaceRootForTaskV1(folderUri),
+    progressRead.ok ? progressRead.decoded.progress.planItemOwnerTestRuns ?? [] : []
+  );
   const evidenceByKeyV1 = new Map<string, string | undefined>(
     verified.entries.map((entry) => [normalizeChecklistItemTextV1(entry.text), entry.evidence])
   );
@@ -441,8 +560,9 @@ export async function deriveApplicableVerifiedTicksV1(
       return {
         kind: "blocked",
         severity: "warning",
-        message: "The review named test-dependent item(s) without an applicable passing Implementation or Apply Review test report. " +
-          `They remain provisional: ${withheldTestItems.join("; ")}`,
+        message: `The review named test-dependent item(s) without an applicable passing Implementation or Apply Review test report. ${describeWithheldTestItemsV1(withheldTestItems, 12, withheldReasons)}`,
+        withheldTestItems,
+        withheldReasons,
       };
     }
     return {
@@ -462,13 +582,20 @@ export async function deriveApplicableVerifiedTicksV1(
       applicableEvidence,
       applicableTestReportRoundIds,
       withheldTestItems,
+      withheldReasons,
     },
   };
 }
 
 export type ApplyTicksDecisionPostResultV1 =
   | { readonly kind: "posted" }
-  | { readonly kind: "blocked"; readonly message: string; readonly severity: "info" | "warning" }
+  | {
+      readonly kind: "blocked";
+      readonly message: string;
+      readonly severity: "info" | "warning";
+      readonly withheldTestItems?: readonly string[];
+      readonly withheldReasons?: ReadonlyMap<string, string>;
+    }
   | { readonly kind: "noContext" };
 
 /**
@@ -491,11 +618,17 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
 ): Promise<ApplyTicksDecisionPostResultV1> {
   const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage);
   if (derived.kind === "blocked") {
-    return { kind: "blocked", message: derived.message, severity: derived.severity };
+    return {
+      kind: "blocked",
+      message: derived.message,
+      severity: derived.severity,
+      ...(derived.withheldTestItems ? { withheldTestItems: derived.withheldTestItems } : {}),
+      ...(derived.withheldReasons ? { withheldReasons: derived.withheldReasons } : {}),
+    };
   }
-  const { reviewFilename, applicable, applicableEvidence, withheldTestItems } = derived.derivation;
+  const { reviewFilename, applicable, applicableEvidence, withheldTestItems, withheldReasons } = derived.derivation;
   const withheldNote = withheldTestItems.length > 0
-    ? `\nWithheld and still provisional because no applicable passing Implementation or Apply Review test report was found: ${withheldTestItems.join("; ")}`
+    ? `\nWithheld and still provisional because no applicable passing Implementation or Apply Review test report was found. ${describeWithheldTestItemsV1(withheldTestItems, 12, withheldReasons)}`
     : "";
 
   const target: ChatTarget = {
@@ -630,6 +763,18 @@ export async function applyReviewerVerifiedTicks(
     resolved.progress.displayName
   );
   if (result.kind === "blocked") {
+    if (
+      result.withheldTestItems &&
+      result.withheldTestItems.length > 0 &&
+      (await postWithheldTestEvidenceOutcomeInChatV1(
+        resolved.taskFolderPath,
+        taskLabel,
+        result.withheldTestItems,
+        result.withheldReasons
+      ))
+    ) {
+      return;
+    }
     if (result.severity === "warning") {
       NotificationRouter.showWarning(`${taskLabel}: ${result.message}`);
     } else {
@@ -707,6 +852,7 @@ export async function writeVerifiedTicksToPlanV1(
     "applyReviewerVerifiedTicks",
     "plan-final.md's checklist ticks changed, superseding the pending tick-application card"
   );
+  await withdrawStaleOpenItemsCardV1(folderUri, merged.content);
   return { kind: "applied", count: applicable.length };
 }
 
@@ -756,7 +902,18 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   const reviewStage = normalized?.reviewStage ?? resolved.progress.currentStage;
   const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage, normalized?.offeredItems);
   if (derived.kind === "blocked") {
-    NotificationRouter.showInformation(`${taskLabel}: ${derived.message}`);
+    const postedInChat =
+      derived.withheldTestItems !== undefined &&
+      derived.withheldTestItems.length > 0 &&
+      (await postWithheldTestEvidenceOutcomeInChatV1(
+        resolved.taskFolderPath,
+        taskLabel,
+        derived.withheldTestItems,
+        derived.withheldReasons
+      ));
+    if (!postedInChat) {
+      NotificationRouter.showInformation(`${taskLabel}: ${derived.message}`);
+    }
     // RC2 item 8, Step 37: idempotent re-press (e.g. via the reconcile
     // card's duplicate option, or clicking Apply twice) reports structurally
     // so the SAME card's thread says "Already done", not just a bare
@@ -800,6 +957,16 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   // it") — same note as reconcilePlanChecklist.ts's identical dispatch.
   // RC3 item 4, Step 3: forwards the provenance baked into this card at post
   // time — present only when Fast Forward was genuinely active then.
+  //
+  // bugs4 item 6: when the open-items form's own follow-up for this task is
+  // still pending it owns the dispatch; a second one would race it for the
+  // task's work admission and be refused. Stand down and say so.
+  if (isFormContinuationPendingV1(folderUri.fsPath)) {
+    NotificationRouter.showInformation(
+      `${taskLabel}: the ticks are applied; the open-items form is already arranging what runs next, so no second dispatch was started.`
+    );
+    return;
+  }
   await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
     taskFolderPath: folderUri.fsPath,
     resumeFastForwardV1: normalized?.resumeFastForwardV1,

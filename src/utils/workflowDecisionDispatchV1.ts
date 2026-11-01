@@ -35,6 +35,7 @@ import {
 import { HandoffGatingV1 } from "../types/handoffGuidanceV1";
 import type { TaskStage } from "../types/taskProgress";
 import { ChatTarget, notifyPendingWorkflowDecision } from "../views/chatView";
+import { revealChatForOwnerCardV1 } from "../views/chatRevealV1";
 import * as nodeFs from "node:fs";
 import * as nodePath from "node:path";
 import { appendChatMessageV1, CHAT_HISTORY_FILENAME } from "./chatHistoryStore";
@@ -194,7 +195,16 @@ export function assertGatingRequirementV1(decisionKey: string, gating: HandoffGa
   throw new Error(`workflow decision "${decisionKey}" must supply "gating" (PART 5 creation-time guard)`);
 }
 
-export type PostWorkflowDecisionInputV1 = Omit<CreateWorkflowDecisionInputV1, "decisionId" | "createdAt"> & {
+/** The task's pending decisions, read-only; empty when there is no extension context. */
+export function listPendingWorkflowDecisionsForTaskV1(taskCanonicalId: string): readonly WorkflowDecisionV1[] {
+  const context = getExtensionContextV1();
+  if (!context) {
+    return [];
+  }
+  return new WorkflowDecisionStoreV1(decisionStoreStateV1(context)).listPending(taskCanonicalId);
+}
+
+export type PostWorkflowDecisionInputV1 =Omit<CreateWorkflowDecisionInputV1, "decisionId" | "createdAt"> & {
   /**
    * Pre-generated id, for a caller that needs to reference its own decision's
    * future id BEFORE posting (e.g. embedding it in an option's command args
@@ -308,6 +318,8 @@ export async function postWorkflowDecisionV1(
   if (!input.suppressNotification) {
     notifyPendingWorkflowDecision(result.decision, target);
   }
+  // bugs4 item 20: a card that waits on the owner opens the chat once, without taking focus.
+  void revealChatForOwnerCardV1(result.decision, context.workspaceState);
   return result.decision;
 }
 
@@ -440,6 +452,8 @@ export async function awaitWorkflowDecisionOutcomeV1(
     throw new Error(`workflow decision "${input.decisionKey}" failed validation: ${posted.reason}`);
   }
   notifyPendingWorkflowDecision(posted.decision, target);
+  // bugs4 item 20: an awaited card blocks the caller on the owner, so it opens the chat once too.
+  void revealChatForOwnerCardV1(posted.decision, context.workspaceState);
   const decisionId = posted.decision.decisionId;
 
   return new Promise<AwaitedDecisionOutcomeV1>((resolve) => {
@@ -576,14 +590,18 @@ function outcomeOfSettledDecisionV1(decision: WorkflowDecisionV1): AwaitedDecisi
 export async function withdrawWorkflowDecisionsByKeyV1(
   target: Pick<ChatTarget, "taskFolderPath" | "canonicalId">,
   decisionKey: string,
-  reason: string
+  reason: string,
+  /** When given, only pending decisions it accepts are withdrawn (bugs4 item 13: stale open-items card). */
+  shouldWithdraw?: (decision: { readonly whatHappened: string }) => boolean
 ): Promise<void> {
   const context = getExtensionContextV1();
   if (!context) {
     return;
   }
   const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
-  const matches = store.listPending(target.canonicalId).filter((d) => d.decisionKey === decisionKey);
+  const matches = store
+    .listPending(target.canonicalId)
+    .filter((d) => d.decisionKey === decisionKey && (shouldWithdraw === undefined || shouldWithdraw(d)));
   for (const decision of matches) {
     try {
       const result = await store.withdraw(decision.decisionId, reason);

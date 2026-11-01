@@ -51,7 +51,7 @@ void describe("RC5 source wiring", () => {
 
   void it("returns before the stalled branch once the stage has left", () => {
     const left = reviewActions.indexOf("if (ffStageLeftForV1) {");
-    const stalled = reviewActions.indexOf("outcome.stalled &&");
+    const stalled = reviewActions.indexOf("stalled: outcome.stalled === true");
     assert.ok(left > 0 && stalled > left, "the stage-left hand-over must precede the stalled branch");
   });
 

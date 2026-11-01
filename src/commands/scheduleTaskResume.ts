@@ -482,7 +482,19 @@ export interface OwedContinuationDecisionOptionsV1 {
   readonly liveHolder?: string;
   readonly failedProvider?: string;
   readonly failedModel?: string;
+  /**
+   * bugs4 item 23: the recovery's trigger. A report-format trigger (deferred, incomplete,
+   * rejected summary) means the provider answered; its report could not be used. That is not
+   * "the attempt failed", and another model would not help, so the card says so and offers a retry.
+   */
+  readonly trigger?: string;
 }
+
+const REPORT_FORMAT_RECOVERY_TRIGGERS_V1: ReadonlySet<string> = new Set([
+  "roundDeferred",
+  "roundIncomplete",
+  "summaryRejected",
+]);
 
 export function buildOwedContinuationDecisionV1(
   target: ChatTarget,
@@ -502,8 +514,15 @@ export function buildOwedContinuationDecisionV1(
   const nextAttempt = dueAt
     ? `the next automatic attempt is due ${dueAt.toLocaleString()}`
     : "the recovery sweep retries automatically every few minutes";
+  const reportFormatOnly = options?.trigger !== undefined && REPORT_FORMAT_RECOVERY_TRIGGERS_V1.has(options.trigger);
+  const modelFailed = !reportFormatOnly && Boolean(options?.failedProvider || options?.failedModel);
+  const attemptLabel = options?.failedProvider
+    ? `${options.failedProvider}${options.failedModel ? ` (${options.failedModel})` : ""}`
+    : "";
   const failureDetail = options?.failedProvider
-    ? ` The previous attempt on ${options.failedProvider}${options.failedModel ? ` (${options.failedModel})` : ""} failed.`
+    ? reportFormatOnly
+      ? ` The previous attempt on ${attemptLabel} ran normally, but its report could not be used as written; retrying is what helps, not another model.`
+      : ` The previous attempt on ${attemptLabel} failed.`
     : "";
   return {
     decisionKey: "owedContinuationRunNow",
@@ -522,7 +541,7 @@ export function buildOwedContinuationDecisionV1(
         consequence: `Does nothing. The continuation is retried by itself; ${nextAttempt}.`,
         effect: { kind: "doNothing" },
       },
-      ...(options?.failedProvider || options?.failedModel
+      ...(modelFailed
         ? [
             {
               optionId: "changeModel",
@@ -560,10 +579,11 @@ export function buildOwedContinuationDecisionV1(
     ],
     recommendation: {
       kind: "option",
-      optionId: options?.failedProvider || options?.failedModel ? "changeModel" : "waitForRetry",
-      reasoning:
-        options?.failedProvider || options?.failedModel
-          ? "The configured model failed; switching models allows the continuation to retry immediately."
+      optionId: modelFailed ? "changeModel" : "waitForRetry",
+      reasoning: modelFailed
+        ? "The configured model failed; switching models allows the continuation to retry immediately."
+        : reportFormatOnly
+          ? "The model ran normally and only its report was unusable; the automatic retry re-reads it, and changing the model would not help."
           : "The automatic retry needs nothing from you; waiting costs only time.",
     },
     gating: {
@@ -2120,6 +2140,7 @@ export class TaskActionScheduler implements vscode.Disposable {
             liveHolder,
             failedProvider: task.progress.implRecovery?.failedProvider,
             failedModel: task.progress.implRecovery?.failedModel,
+            trigger: task.progress.implRecovery?.trigger,
           }),
           // The decision store updates a standing condition in place. Keep
           // its transcript projection stable too when the condition changes

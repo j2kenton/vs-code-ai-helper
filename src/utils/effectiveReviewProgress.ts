@@ -12,7 +12,13 @@ import * as vscode from "vscode";
 
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { isPlanReviewStage, TaskProgress, TaskStage } from "../types/taskProgress";
-import { ChecklistProgressV1, countChecklistEvidenceProgressV1, countChecklistProgressV1, mergeChecklistProgressV1 } from "./implementationChecklist";
+import {
+  ChecklistProgressV1,
+  countChecklistEvidenceProgressV1,
+  countChecklistProgressV1,
+  countOpenOwnerHandOffsV1,
+  mergeChecklistProgressV1,
+} from "./implementationChecklist";
 import { readPlanOfRecordForDisplayV1, readPlanOfRecordV1 } from "./implementationArtifactResolver";
 import { NotificationRouter } from "./notificationRouter";
 import { readTextIfExists } from "./fileUtils";
@@ -138,7 +144,7 @@ export async function readEffectivePlanChecklistProgressV1(
   if (advisory.kind === "unreadable") {
     return undefined;
   }
-  return countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? [])?.gate ?? counted;
+  return countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? [], advisory.progress?.planItemOwnerDecisions ?? [])?.gate ?? counted;
 }
 
 /**
@@ -184,7 +190,7 @@ export async function readPlanChecklistTickProgressV1(
 export async function readDisplayPlanChecklistProgressV1(
   folderUri: vscode.Uri,
   policy: EffectiveReviewProgressPolicyV1 = "lenient"
-): Promise<{ counts: ChecklistProgressV1; verifiedCounts: ChecklistProgressV1; verified: number; provisional: number; unverified: boolean } | undefined> {
+): Promise<{ counts: ChecklistProgressV1; verifiedCounts: ChecklistProgressV1; verified: number; ownerSettled: number; provisional: number; unverified: boolean; openHandOffs: number } | undefined> {
   const plan = await readPlanOfRecordForDisplayV1(folderUri);
   const counted = plan.counts;
   if (!plan.hasChecklist || !counted || plan.text === undefined) {
@@ -195,13 +201,16 @@ export async function readDisplayPlanChecklistProgressV1(
     return undefined;
   }
   const withRoundProgress = await applyRoundProgressBestEffortV1(folderUri, plan.text, counted);
-  const evidence = countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? []);
+  const evidence = countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? [], advisory.progress?.planItemOwnerDecisions ?? []);
   return {
     counts: withRoundProgress,
     verifiedCounts: evidence?.gate ?? withRoundProgress,
     verified: evidence?.verified ?? 0,
-    provisional: Math.max(0, withRoundProgress.checked - (evidence?.verified ?? 0)),
+    ownerSettled: evidence?.ownerSettled ?? 0,
+    provisional: Math.max(0, withRoundProgress.checked - (evidence?.verified ?? 0) - (evidence?.ownerSettled ?? 0)),
     unverified: advisory.progress?.checklistProgressUnreliable === true,
+    // bugs4 item 49: excluded items whose box is unticked are owner hand-offs, not unbuilt work.
+    openHandOffs: countOpenOwnerHandOffsV1(plan.text),
   };
 }
 
@@ -234,7 +243,7 @@ export async function readEffectivePlanChecklistProgressForDisplayV1(
     return undefined;
   }
   const display = await applyRoundProgressBestEffortV1(folderUri, plan.text, counted);
-  const evidence = countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? []);
+  const evidence = countChecklistEvidenceProgressV1(plan.text, advisory.progress?.planItemEvidence ?? [], advisory.progress?.planItemOwnerDecisions ?? []);
   return {
     ...display,
     verified: evidence?.verified ?? 0,

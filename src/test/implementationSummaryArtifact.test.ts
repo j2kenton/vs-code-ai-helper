@@ -4092,7 +4092,7 @@ void describe("parseReportedFilesChangedV1", () => {
       "",
       "- ran tests",
     ].join("\n");
-    assert.deepEqual(parseReportedFilesChangedV1(summary), [
+    assert.deepEqual(parseReportedFilesChangedV1(summary)?.paths, [
       "src/a.ts",
       "src/b.ts",
       "src/c.ts",
@@ -4107,7 +4107,7 @@ void describe("parseReportedFilesChangedV1", () => {
 
   void it("returns an empty list for a present-but-empty section, distinct from undefined", () => {
     const summary = ["## Files Changed", "", "## Verification", "", "- checked"].join("\n");
-    assert.deepEqual(parseReportedFilesChangedV1(summary), []);
+    assert.deepEqual(parseReportedFilesChangedV1(summary)?.paths, []);
   });
 
   void it("skips checkbox bullets and parenthesized prose entries", () => {
@@ -4118,7 +4118,7 @@ void describe("parseReportedFilesChangedV1", () => {
       "- (the runner reported no changed paths)",
       "- `src/real.ts` — the only actual file entry",
     ].join("\n");
-    assert.deepEqual(parseReportedFilesChangedV1(summary), ["src/real.ts"]);
+    assert.deepEqual(parseReportedFilesChangedV1(summary)?.paths, ["src/real.ts"]);
   });
 
   void it("normalizes backslashes and a leading ./ in reported paths", () => {
@@ -4128,7 +4128,7 @@ void describe("parseReportedFilesChangedV1", () => {
       "- `src\\utils\\thing.ts` — windows separators",
       "- ./src/other.ts — leading dot-slash",
     ].join("\n");
-    assert.deepEqual(parseReportedFilesChangedV1(summary), [
+    assert.deepEqual(parseReportedFilesChangedV1(summary)?.paths, [
       "src/utils/thing.ts",
       "src/other.ts",
     ]);

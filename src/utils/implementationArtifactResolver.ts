@@ -52,6 +52,7 @@ import { appendChatMessageV1, readChatHistory } from "./chatHistoryStore";
 import { withdrawWorkflowDecisionsByKeyV1 } from "./workflowDecisionDispatchV1";
 import { normalizePath } from "./taskRoot";
 import { writeAtomic } from "../state/writeAtomic";
+import { hasControlCharacterV1, normalizeRepositoryRelativePathV1 } from "./roundGitStateV1";
 // Deliberately circular with `stageEntryJournalV1.ts` (which imports several
 // artifact-resolution helpers from this module) — safe for the same reason
 // `stageTransition.ts`'s own circular import with that module is safe (see
@@ -497,6 +498,258 @@ function reportedPathKeyV1(path: string): string {
   return path.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
 }
 
+/** One `## Files Changed` entry the parser looked at and refused to adopt. */
+export interface RejectedReportedFileEntryV1 {
+  /** The entry's leading token as written (never the description after it). */
+  readonly entry: string;
+  /** Plain-words reason the entry was not adopted. */
+  readonly reason: string;
+}
+
+/**
+ * Structured result of {@link parseReportedFilesChangedV1}: the paths the
+ * report names in the repository-relative identity change tracking uses, plus
+ * every entry that was recognised as a file entry but not adopted, each with
+ * a reason. `entryCount` is the number of file-entry bullets looked at, so a
+ * caller can tell "the report named nothing" from "nothing it named could be
+ * understood".
+ */
+export interface ReportedFilesChangedV1 {
+  readonly paths: string[];
+  readonly rejected: RejectedReportedFileEntryV1[];
+  readonly entryCount: number;
+}
+
+/** Options for {@link parseReportedFilesChangedV1}. */
+export interface ParseReportedFilesChangedOptionsV1 extends ImplementationSummaryExpectationsV1 {
+  /**
+   * Selected workspace root. Absolute destinations (plain, Markdown link or
+   * `file://`) are resolved against it and adopted only when they sit inside
+   * it; without a root, absolute destinations are rejected, never guessed.
+   */
+  readonly workspaceRoot?: string;
+}
+
+type ResolvedReportedPathV1 = { readonly path: string } | { readonly reject: string };
+
+const MARKDOWN_ESCAPABLE_V1 = /\\([!-/:-@[-`{-~])/g;
+const WINDOWS_DRIVE_PATH_V1 = /^\/?([A-Za-z]):(?:[\\/]|$)/;
+
+/** `:12`, `:12:5` or `#L12`, `#L12-L20`, `#L12C3` — the only annotations adopted. */
+function stripLineAnnotationV1(destination: string): string | { readonly reject: string } {
+  let out = destination;
+  const hash = out.indexOf("#");
+  if (hash !== -1) {
+    const fragment = out.slice(hash + 1);
+    if (!/^L\d+(?:C\d+)?(?:-L?\d+(?:C\d+)?)?$/.test(fragment)) {
+      return { reject: "the link destination has a fragment that is not a line annotation" };
+    }
+    out = out.slice(0, hash);
+  }
+  if (out.includes("?")) {
+    return { reject: "the link destination has a query string" };
+  }
+  return out.replace(/(?::\d+){1,2}$/, "");
+}
+
+function normalizeWindowsDriveForCompareV1(value: string): string {
+  const slashed = value.replace(/\\/g, "/").replace(/^\/(?=[A-Za-z]:)/, "");
+  return /^[A-Za-z]:/.test(slashed) ? `${slashed[0]!.toLowerCase()}${slashed.slice(1)}` : slashed;
+}
+
+/**
+ * Resolve an ABSOLUTE destination against the workspace root, purely on
+ * strings so a Windows-form destination behaves the same on every host. The
+ * drive letter is compared case-insensitively (as are the segments after it —
+ * Windows file systems are case-insensitive); POSIX roots compare exactly.
+ */
+function relativizeAgainstRootV1(absolute: string, workspaceRoot: string | undefined): ResolvedReportedPathV1 {
+  if (!workspaceRoot) {
+    return { reject: "the path is absolute and no workspace root is known to resolve it against" };
+  }
+  const target = normalizeWindowsDriveForCompareV1(absolute);
+  const root = normalizeWindowsDriveForCompareV1(workspaceRoot).replace(/\/+$/, "");
+  const targetIsDrive = /^[A-Za-z]:/.test(target);
+  const rootIsDrive = /^[A-Za-z]:/.test(root);
+  if (targetIsDrive !== rootIsDrive) {
+    return { reject: "the path is outside the selected workspace" };
+  }
+  const caseFold = (value: string): string => (rootIsDrive ? value.toLowerCase() : value);
+  const prefix = `${root}/`;
+  if (!caseFold(target).startsWith(caseFold(prefix))) {
+    return { reject: "the path is outside the selected workspace" };
+  }
+  const relative = target.slice(prefix.length);
+  const normalized = normalizeRepositoryRelativePathV1(relative);
+  return normalized !== undefined
+    ? { path: normalized }
+    : { reject: "the path does not resolve to a file inside the workspace" };
+}
+
+/**
+ * Turn one destination (already unquoted) into the repository-relative
+ * identity, or a refusal. `decode` is true for Markdown link and `file://`
+ * destinations (percent-encoding and backslash escapes are part of that
+ * syntax) and false for plain/backticked paths, where `%` is a literal.
+ */
+function resolveReportedDestinationV1(
+  rawDestination: string,
+  options: { readonly decode: boolean; readonly workspaceRoot?: string }
+): ResolvedReportedPathV1 {
+  let decode = options.decode;
+  let destination = rawDestination.trim();
+  if (destination.length === 0) {
+    return { reject: "the destination is empty" };
+  }
+  const looksWindows = WINDOWS_DRIVE_PATH_V1.test(destination);
+  if (decode && !looksWindows) {
+    destination = destination.replace(MARKDOWN_ESCAPABLE_V1, "$1");
+  }
+  // A scheme is `name://…` or one of the known non-path schemes; a bare
+  // `foo.ts:12` is a file with a line annotation, not a URL.
+  const scheme =
+    /^([A-Za-z][A-Za-z0-9+.-]+):(?=\/\/)/.exec(destination) ??
+    /^(file|mailto|data|javascript|vscode|vscode-insiders|command):/i.exec(destination);
+  if (scheme) {
+    if (scheme[1]!.toLowerCase() !== "file") {
+      return { reject: `the destination is a ${scheme[1]!.toLowerCase()}: link, not a local file` };
+    }
+    destination = destination.slice(scheme[0].length);
+    if (destination.startsWith("//")) {
+      const authority = /^\/\/([^/]*)/.exec(destination)?.[1] ?? "";
+      if (authority !== "" && authority.toLowerCase() !== "localhost") {
+        return { reject: "the file:// destination names another host" };
+      }
+      destination = destination.slice(2 + authority.length);
+    }
+    decode = true;
+  } else if (/^\\\\|^\/\//.test(destination)) {
+    return { reject: "the destination is a network path" };
+  }
+  const stripped = stripLineAnnotationV1(destination);
+  if (typeof stripped !== "string") {
+    return stripped;
+  }
+  destination = stripped;
+  if (decode) {
+    try {
+      destination = decodeURIComponent(destination);
+    } catch {
+      return { reject: "the destination has invalid percent-encoding" };
+    }
+  }
+  if (destination.trim().length === 0) {
+    return { reject: "the destination is empty" };
+  }
+  if (hasControlCharacterV1(destination)) {
+    return { reject: "the destination contains control characters" };
+  }
+  const slashed = destination.replace(/\\/g, "/");
+  if (slashed.split("/").some((part) => part === "..")) {
+    return { reject: "the destination uses `..` traversal" };
+  }
+  if (slashed.startsWith("/") || /^\/?[A-Za-z]:(?:\/|$)/.test(slashed)) {
+    return relativizeAgainstRootV1(slashed, options.workspaceRoot);
+  }
+  const normalized = normalizeRepositoryRelativePathV1(slashed);
+  return normalized !== undefined
+    ? { path: normalized }
+    : { reject: "the destination is not a repository-relative file path" };
+}
+
+/** Index just past the `)` that closes the `(` at `open`, honouring nesting; -1 when unclosed. */
+function findClosingParenV1(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === "\\") {
+      i += 1;
+    } else if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return i + 1;
+      }
+    }
+  }
+  return -1;
+}
+
+/** Index of the `]` closing the `[` at 0, honouring escapes, nesting and code spans; -1 when unclosed. */
+function findClosingBracketV1(text: string): number {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === "\\") {
+      i += 1;
+    } else if (ch === "`") {
+      const close = text.indexOf("`", i + 1);
+      if (close === -1) {
+        return -1;
+      }
+      i = close;
+    } else if (ch === "[") {
+      depth += 1;
+    } else if (ch === "]") {
+      depth -= 1;
+      if (depth === 0) {
+        return i;
+      }
+    }
+  }
+  return -1;
+}
+
+type FileEntryParseV1 =
+  | { readonly kind: "path"; readonly token: string; readonly candidate: string; readonly decode: boolean }
+  | { readonly kind: "rejected"; readonly token: string; readonly reason: string }
+  | { readonly kind: "skip" };
+
+/** Split a `## Files Changed` bullet into its leading destination token. */
+function parseFileEntryV1(entry: string): FileEntryParseV1 {
+  if (entry.startsWith("[")) {
+    const close = findClosingBracketV1(entry);
+    if (close === -1 || entry[close + 1] !== "(") {
+      return { kind: "rejected", token: entry.slice(0, 80), reason: "not a path or a Markdown file link" };
+    }
+    const end = findClosingParenV1(entry, close + 1);
+    if (end === -1) {
+      return { kind: "rejected", token: entry.slice(0, 120), reason: "the Markdown link is not closed" };
+    }
+    const token = entry.slice(0, end);
+    // The destination is whatever sits between the link's own parentheses.
+    // Literal spaces are accepted (models write them without `<...>`), and
+    // an optional trailing "title" is dropped.
+    let destination = entry.slice(close + 2, end - 1).trim();
+    if (destination.startsWith("<")) {
+      const closeAngle = destination.indexOf(">");
+      if (closeAngle === -1) {
+        return { kind: "rejected", token, reason: "the Markdown link destination is not closed" };
+      }
+      destination = destination.slice(1, closeAngle);
+    } else {
+      destination = destination.replace(/\s+(?:"[^"]*"|'[^']*')$/, "");
+    }
+    // A second destination in the leading part of the entry (before the
+    // description separator) makes the entry ambiguous: never pick one.
+    const lead = entry.slice(end).split(/\s[—–-]\s|\s*:\s/, 1)[0] ?? "";
+    if (/\]\(|`[^`]+`/.test(lead)) {
+      return { kind: "rejected", token, reason: "the entry names more than one destination" };
+    }
+    return { kind: "path", token, candidate: destination, decode: true };
+  }
+  const backticked = /^`([^`]+)`/.exec(entry);
+  const raw = backticked
+    ? backticked[1]!
+    : (/^\S+/.exec(entry)?.[0] ?? "").replace(/[,:;]+$/, "");
+  const candidate = raw.trim();
+  if (candidate.length === 0) {
+    return { kind: "skip" };
+  }
+  return { kind: "path", token: candidate, candidate, decode: false };
+}
+
 /**
  * The file paths a completed response reports under its own `## Files
  * Changed` section, or `undefined` when the response carries no such section
@@ -520,8 +773,8 @@ function reportedPathKeyV1(path: string): string {
  */
 export function parseReportedFilesChangedV1(
   content: string,
-  expectations: ImplementationSummaryExpectationsV1 = {}
-): string[] | undefined {
+  expectations: ParseReportedFilesChangedOptionsV1 = {}
+): ReportedFilesChangedV1 | undefined {
   const trimmed = content.trim();
   if (!trimmed) {
     return undefined;
@@ -548,7 +801,9 @@ export function parseReportedFilesChangedV1(
       break;
     }
   }
-  const files: string[] = [];
+  const paths: string[] = [];
+  const rejected: RejectedReportedFileEntryV1[] = [];
+  let entryCount = 0;
   for (let i = heading.line + 1; i < next; i++) {
     const line = lines[i];
     if (!line || line.fenced) {
@@ -564,16 +819,99 @@ export function parseReportedFilesChangedV1(
     if (/^\[[ xX]\]/.test(entry) || entry.startsWith("(")) {
       continue;
     }
-    const backticked = /^`([^`]+)`/.exec(entry);
-    const raw = backticked
-      ? backticked[1]!
-      : (/^\S+/.exec(entry)?.[0] ?? "").replace(/[,:;]+$/, "");
-    const candidatePath = raw.trim();
-    if (candidatePath.length > 0) {
-      files.push(candidatePath.replace(/\\/g, "/").replace(/^\.\//, ""));
+    const parsed = parseFileEntryV1(entry);
+    if (parsed.kind === "skip") {
+      continue;
+    }
+    entryCount += 1;
+    if (parsed.kind === "rejected") {
+      rejected.push({ entry: parsed.token, reason: parsed.reason });
+      continue;
+    }
+    const resolved = resolveReportedDestinationV1(parsed.candidate, {
+      decode: parsed.decode,
+      workspaceRoot: expectations.workspaceRoot,
+    });
+    if ("reject" in resolved) {
+      rejected.push({ entry: parsed.token, reason: resolved.reject });
+    } else {
+      paths.push(resolved.path);
     }
   }
-  return files;
+  return { paths, rejected, entryCount };
+}
+
+/**
+ * When a round's report named file entries, NONE could be understood, and the
+ * snapshot shows the round changed files, return the plain-words issue that
+ * makes the round a report-correction / scope-recovery case instead of a
+ * successful hand-off that silently loses every known edit. `undefined` when
+ * the report is fine, named nothing at all (the shape gate owns that), or
+ * simply named files the round did not change (a legitimate empty
+ * intersection).
+ */
+export function describeUnparsedFilesChangedReportV1(
+  reported: ReportedFilesChangedV1 | undefined,
+  snapshotFiles: readonly string[]
+): string | undefined {
+  if (
+    reported === undefined ||
+    reported.paths.length > 0 ||
+    reported.rejected.length === 0 ||
+    snapshotFiles.length === 0
+  ) {
+    return undefined;
+  }
+  const named = reported.rejected
+    .slice(0, 5)
+    .map((item) => `\`${item.entry}\` (${item.reason})`)
+    .join("; ");
+  const more = reported.rejected.length > 5 ? `; and ${reported.rejected.length - 5} more` : "";
+  return (
+    `the report's \`## Files Changed\` entries could not be understood as file paths in this workspace — ${named}${more} — ` +
+    `while the round changed ${snapshotFiles.length} file(s), so none of them could be attributed to it`
+  );
+}
+
+/**
+ * The run-log section listing snapshot paths that were not attributed to a
+ * round. Its wording follows what is actually known: a report with entries it
+ * could not understand is never described as having left the paths out, and a
+ * report with no parseable section says so instead of claiming absence.
+ */
+export function describeUnattributedWorkspaceChangesSectionV1(
+  unattributed: readonly string[],
+  reported: ReportedFilesChangedV1 | undefined
+): string {
+  const list = unattributed.map((file) => `- ${file}`).join("\n");
+  if (reported !== undefined && reported.rejected.length > 0) {
+    const entries = reported.rejected
+      .map((item) => `- \`${item.entry}\` — ${item.reason}`)
+      .join("\n");
+    return (
+      "\n\n## Unattributed workspace changes\n\n" +
+      "These paths changed in the workspace during this round, but the round's `## Files Changed` " +
+      "report contained entries this extension could not understand as file paths in this workspace " +
+      "(listed below). The paths were NOT adopted into review scope because none of them could be tied " +
+      "to a clearly reported path — they are reported-but-not-understood, not necessarily edits made by hand:\n\n" +
+      `${list}\n\nEntries that were not understood:\n\n${entries}`
+    );
+  }
+  if (reported === undefined) {
+    return (
+      "\n\n## Unattributed workspace changes\n\n" +
+      "These paths changed in the workspace during this round, but the round's response has no parseable " +
+      "`## Files Changed` section to attribute them from, so they were EXCLUDED from review scope:\n\n" +
+      list
+    );
+  }
+  return (
+    "\n\n## Unattributed workspace changes\n\n" +
+    "These paths changed in the workspace during this round but are not in the " +
+    "round's own `## Files Changed` report, so they were EXCLUDED from review scope " +
+    "(they are most likely edits made by hand in the same workspace while the round ran):\n\n" +
+    list
+  );
 }
 
 /** Result of {@link attributeImplementationRoundFilesV1}. */
@@ -623,6 +961,47 @@ export function attributeImplementationRoundFilesV1(
     (reported.has(reportedPathKeyV1(file)) ? attributed : unattributed).push(file);
   }
   return { attributed, unattributed };
+}
+
+/** Inputs to {@link resolveCompletedRoundAttributionV1}. */
+export interface CompletedRoundAttributionInputV1 {
+  /** The round's final model-authored (or synthesized) summary text. */
+  readonly summary: string;
+  /** The frozen plan checklist, when one exists (isolates the echo). */
+  readonly planChecklist?: string;
+  readonly workspaceRoot: string;
+  /** The git snapshot's repository-relative change list for the round. */
+  readonly filesChanged: readonly string[];
+  readonly summaryIsSynthetic?: boolean;
+  readonly filesChangedUnknown?: boolean;
+}
+
+/** What a completed Implementation round hands to the ledger and the tracked review scope. */
+export interface CompletedRoundAttributionV1 extends AttributedRoundFilesV1 {
+  /** Parsed `## Files Changed` report; undefined when synthetic, unknown, or absent. */
+  readonly reported: ReportedFilesChangedV1 | undefined;
+}
+
+/**
+ * The one attribution formula the completed-Implementation hand-off uses (the
+ * bank-on-valid-summary path and the post-round bookkeeping both call it, so
+ * the run log, the ledger's `outcome.filesChanged` and `implReviewFiles` stay
+ * on one path identity — the snapshot's own repository-relative strings).
+ * A runner-synthesized summary banks the snapshot as-is (tool-call receipts);
+ * a round whose changes are unknown banks the snapshot list untouched too;
+ * a model-authored report is intersected with the snapshot.
+ */
+export function resolveCompletedRoundAttributionV1(
+  input: CompletedRoundAttributionInputV1
+): CompletedRoundAttributionV1 {
+  if (input.summaryIsSynthetic || input.filesChangedUnknown) {
+    return { reported: undefined, attributed: [...input.filesChanged], unattributed: [] };
+  }
+  const reported = parseReportedFilesChangedV1(input.summary, {
+    planChecklist: input.planChecklist,
+    workspaceRoot: input.workspaceRoot,
+  });
+  return { reported, ...attributeImplementationRoundFilesV1(input.filesChanged, reported?.paths) };
 }
 
 /**
@@ -787,6 +1166,52 @@ export function buildSyntheticImplementationSummaryV1(
  */
 export function withDeterministicZeroFilesChangedNoteV1(summaryText: string): string {
   return `${summaryText}\n\n> **Files changed: none.** This round's real change set was empty; recorded here as a fact rather than left to depend on this summary's own account of it.`;
+}
+
+/**
+ * Marks the one tail section of impl-summary.md that holds the latest
+ * no-change round's note. Everything above it is the substantive summary and is
+ * never touched by a no-change round.
+ */
+export const NO_CHANGE_ROUND_NOTE_MARKER_V1 = "<!-- ensemble:no-change-round-note -->";
+
+/**
+ * bugs4 item 12: how a round's report becomes the task's current
+ * impl-summary.md. `bankValidImplementationSummaryV1` (reviewActions.ts) wrote
+ * every accepted report over the file, so an Apply Review that changed nothing
+ * ("nothing to change") replaced the full before-and-after summary the review
+ * checks plan items against. The next review then raised "restore the table"
+ * as a blocker, the next no-op round restored it, and the score see-sawed.
+ *
+ * A round that changed no files keeps the substantive summary and appends its
+ * own note under {@link NO_CHANGE_ROUND_NOTE_MARKER_V1}. A later no-change round
+ * replaces only that tail, so the file does not grow and two consecutive no-op
+ * rounds leave the substantive content identical. Headings in the note become
+ * bold lines and `ensemble:` markers are dropped, so the note cannot be mistaken
+ * for the summary's own `## Files Changed` / `## Verification` sections or for a
+ * checklist echo.
+ *
+ * With no existing summary, or one that is blank or the unusable-round stamp,
+ * the round's report is returned unchanged (there is nothing to preserve).
+ */
+export function mergeNoChangeRoundIntoSummaryV1(existingSummary: string | undefined, roundSummary: string): string {
+  if (existingSummary === undefined || existingSummary.trim().length === 0) {
+    return roundSummary;
+  }
+  if (isUnusableImplementationSummaryV1(existingSummary)) {
+    return roundSummary;
+  }
+  const markerIndex = existingSummary.indexOf(NO_CHANGE_ROUND_NOTE_MARKER_V1);
+  const base = (markerIndex === -1 ? existingSummary : existingSummary.slice(0, markerIndex)).trimEnd();
+  if (base.length === 0) {
+    return roundSummary;
+  }
+  const note = roundSummary
+    .replace(/<!--\s*ensemble:[^>]*-->/g, "")
+    .replace(/^#{1,6}\s+(.+?)\s*$/gm, "**$1**")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return `${base}\n\n${NO_CHANGE_ROUND_NOTE_MARKER_V1}\n**Latest round changed no files** (the summary above is unchanged):\n\n${note}`;
 }
 
 /**

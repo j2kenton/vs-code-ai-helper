@@ -2,6 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { validatePersistedTaskProgress } from "./persistedSchema";
+import { recordExtensionTaskArtifactWriteV1 } from "../utils/extensionTaskWriteRegistryV1";
 
 // Unique session ID for this extension activation
 const sessionId = `${process.pid}_${Math.random().toString(36).substring(2, 10)}`;
@@ -184,6 +185,11 @@ export async function writeAtomic(targetUri: vscode.Uri, content: string): Promi
     error.durableTargetUnchanged = false;
     throw error;
   }
+
+  // bugs4 item 8: remember what the extension itself wrote, so foreign-folder
+  // containment never mistakes a pin/archive/rename/watchdog write for a
+  // round's misplaced artifact.
+  recordExtensionTaskArtifactWriteV1(targetPath, content);
 }
 
 /**

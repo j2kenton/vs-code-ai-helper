@@ -1431,6 +1431,15 @@ void describe("StageNode — implementation row percentage", () => {
     assert.match((node.tooltip as vscode.MarkdownString).value, /4 reviewer-verified, 2 provisional checklist items/);
   });
 
+  void it("bugs4 item 7: names the items the owner settled through the form apart from reviewer verification", () => {
+    const task = makeTask("impl");
+    const node = new StageNode(
+      task, "impl", "current", undefined, undefined, false, false, false, false, undefined,
+      { complete: 10, total: 10, verified: 0, ownerSettled: 10, provisional: 0 }
+    );
+    assert.match((node.tooltip as vscode.MarkdownString).value, /0 reviewer-verified, 10 settled by you, 0 provisional checklist items/);
+  });
+
   void it("renders nothing when the impl stage has no checklist yet", () => {
     const task = makeTask("impl");
     const node = new StageNode(task, "impl", "current", undefined, undefined, false, false, false, false, undefined, undefined);

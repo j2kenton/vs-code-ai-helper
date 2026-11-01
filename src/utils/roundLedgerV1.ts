@@ -493,6 +493,63 @@ export type TerminalizeRoundNoLiveRowResultV1 =
       readonly progress: TaskProgress | undefined;
     };
 
+/** Why a completed Implementation round left no follow-up scheduled. */
+export interface ImplementationNoFollowUpGateV1 {
+  /**
+   * `type-check`: the round's post-round type-check failed, so review must not
+   * continue until the errors are fixed. `handed-back`: nothing was scheduled
+   * and nothing blocked it; the owner reviews or runs another round.
+   */
+  readonly kind: "type-check" | "handed-back";
+  /** The sentence the round's terminal line and any hand-over warning both use. */
+  readonly sentence: string;
+}
+
+/**
+ * bugs4 item 4: the single description of "a completed Implementation round
+ * whose follow-up was deliberately not queued". The round's "Ended" line and
+ * the auto-advance hand-over warning both read it, so a deliberate suppression
+ * is worded once and can never be reported as a round that never started.
+ * `undefined` when the round is not a completed `impl` Implementation round or
+ * a follow-up is in fact scheduled.
+ */
+export function describeImplementationNoFollowUpGateV1(
+  entry: Pick<RoundLedgerEntryV1, "stage" | "mode" | "state" | "startedAt" | "endedAt">,
+  progress?: Partial<Pick<
+    TaskProgress,
+    | "implementationTypeCheckFailure"
+    | "status"
+    | "nextActor"
+    | "currentStage"
+    | "implRecovery"
+    | "scheduledRun"
+    | "scheduledResumeTime"
+    | "roundLedger"
+  >>
+): ImplementationNoFollowUpGateV1 | undefined {
+  const noFollowUpScheduled =
+    progress?.status === "active" &&
+    progress.nextActor === "human" &&
+    progress.currentStage === entry.stage &&
+    progress.implRecovery === undefined &&
+    progress.scheduledRun === undefined &&
+    progress.scheduledResumeTime === undefined &&
+    !(progress.roundLedger ?? []).some((row) => row.state === "scheduled" || row.state === "open");
+  if (!(entry.state === "completed" && entry.mode === "implementation" && entry.stage === "impl" && noFollowUpScheduled)) {
+    return undefined;
+  }
+  const typeCheckFailureAt = progress?.implementationTypeCheckFailure?.at;
+  return typeCheckFailureAt && entry.endedAt && typeCheckFailureAt >= entry.startedAt && typeCheckFailureAt <= entry.endedAt
+    ? {
+        kind: "type-check",
+        sentence: "No follow-up was scheduled; fix the type-check errors before review can continue.",
+      }
+    : {
+        kind: "handed-back",
+        sentence: "Review the changes or run another Implementation round if automatic review does not start.",
+      };
+}
+
 /** The `_Ended: …_` line rendered into the chat transcript for a
  * terminalized round — Part 9 (step 25) owns the FULL rendering contract for
  * this in the webview; this is the durable message TEXT stored in
@@ -572,20 +629,9 @@ export function formatRoundOutcomeMessageV1(
       );
     }
   }
-  const noFollowUpScheduled =
-    progress?.status === "active" &&
-    progress.nextActor === "human" &&
-    progress.currentStage === entry.stage &&
-    progress.implRecovery === undefined &&
-    progress.scheduledRun === undefined &&
-    progress.scheduledResumeTime === undefined &&
-    !(progress.roundLedger ?? []).some((row) => row.state === "scheduled" || row.state === "open");
-  if (entry.state === "completed" && entry.mode === "implementation" && entry.stage === "impl" && noFollowUpScheduled) {
-    parts.push(
-      typeCheckFailureAt && entry.endedAt && typeCheckFailureAt >= entry.startedAt && typeCheckFailureAt <= entry.endedAt
-        ? "No follow-up was scheduled; fix the type-check errors before review can continue."
-        : "Review the changes or run another Implementation round if automatic review does not start."
-    );
+  const noFollowUpGate = describeImplementationNoFollowUpGateV1(entry, progress);
+  if (noFollowUpGate) {
+    parts.push(noFollowUpGate.sentence);
   }
   // What the round did is part of the terminal record, not merely metadata in
   // task-progress.json.  A reader needs it to distinguish checklist-driven
@@ -788,6 +834,12 @@ export async function terminalizeRoundV1(
   }
 
   const entry = finalEntry as RoundLedgerEntryV1;
+  // bugs4 item 8 / 26: foreign-folder containment can only ADD A NOTE. The row's
+  // terminal state was chosen and persisted above, before containment runs, and
+  // `foreignArtifactNote` is read only as chat text below. It never cancels a
+  // round, drops its summary, leaves its changed files unrecorded, ends Fast
+  // Forward or sets the checklist latch; a "cancelled" outcome seen next to such
+  // a note had another cause.
   let foreignArtifactNote = "";
   const artifactSnapshot = [entry.roundId, ...entry.attemptIds]
     .map((identity) => roundArtifactSnapshotsV1.get(roundArtifactSnapshotKeyV1(options.taskFolderUri.fsPath, identity)))
@@ -837,7 +889,9 @@ export async function terminalizeRoundV1(
           ? [
               "Task-artifact changes were detected under another task folder. Recovery was limited to artifacts whose ownership could be established:",
               ...result.chatNotices,
-              ...result.actions.filter((action) => action.outcome !== "moved").map((action) => `${action.reason} Source: ${action.foreignPath}; destination: ${action.destPath}.`),
+              // Only an occupied destination involves two real copies; an
+              // ambiguous note already says everything in its own line.
+              ...result.actions.filter((action) => action.outcome === "preserved-occupied").map((action) => `${action.reason} Source: ${action.foreignPath}; destination: ${action.destPath}.`),
             ].join("\n")
           : "";
       }

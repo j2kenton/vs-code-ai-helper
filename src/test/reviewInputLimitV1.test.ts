@@ -180,6 +180,7 @@ void describe("resolveLedgerImplReviewFilesV1", () => {
   const implRow = (
     overrides: Partial<ImplReviewLedgerRowV1> & { roundId: string }
   ): ImplReviewLedgerRowV1 => ({
+    stage: "impl",
     mode: "implementation",
     state: "completed",
     outcome: { filesChanged: [] },
@@ -295,6 +296,7 @@ void describe("resolveLedgerImplReviewFilesV1", () => {
 void describe("resolveImplementationReviewScopeV1", () => {
   const row = (roundId: string, files: string[]): ImplReviewLedgerRowV1 => ({
     roundId,
+    stage: "impl",
     mode: "implementation",
     state: "completed",
     outcome: { filesChanged: files },
@@ -318,6 +320,7 @@ void describe("resolveImplementationReviewScopeV1", () => {
     const completed = row("accepted", ["src/accepted.ts"]);
     const quarantined = ["rejected", "failed", "cancelled", "interrupted"].map((state, index) => ({
       roundId: `q${index}`,
+      stage: "impl",
       mode: "implementation" as const,
       state: state as "rejected" | "failed" | "cancelled" | "interrupted",
       outcome: { filesChanged: [`src/quarantined-${state}.ts`] },
@@ -376,6 +379,7 @@ void describe("resumed implementation review scope wiring (Step 14)", () => {
     const progressFiles: string[] = [];
     const acceptedLedgerChanges: ImplReviewLedgerRowV1[] = [{
       roundId: "round-after-question",
+      stage: "impl",
       mode: "implementation",
       state: "completed",
       outcome: { filesChanged: ["src/accepted-change.ts"] },

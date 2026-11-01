@@ -35,6 +35,10 @@ import {
   MAX_CHECKLIST_CHANGE_PROPOSALS,
   MAX_OVERRIDDEN_ESCALATIONS,
   MAX_PLAN_ITEM_EVIDENCE_ENTRIES,
+  MAX_LATCHING_CLAIMS_V1,
+  MAX_PLAN_ITEM_OWNER_DECISIONS,
+  MAX_PLAN_ITEM_OWNER_TEST_RUNS,
+  PlanItemOwnerTestRunV1,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
@@ -42,6 +46,7 @@ import {
   MAX_ROUND_OUTCOMES,
   PlanRevisionStateV1,
   PlanItemEvidenceV1,
+  PlanItemOwnerDecisionV1,
   QuotaParkRecordV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
@@ -150,6 +155,8 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "roundOutcomes",
   "roundLedger",
   "planItemEvidence",
+  "planItemOwnerDecisions",
+  "planItemOwnerTestRuns",
   "blockerSupersessions",
   "checklistChangeProposals",
   "planRevision",
@@ -158,6 +165,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "implementationTypeCheckFailure",
   "checklistProgressUnreliable",
   "checklistProgressUnreliableReason",
+  "checklistProgressUnreliableClaims",
   "zeroChangeImplRounds",
   "pendingImplReviewFiles",
   "reviewInvalidatedByRound",
@@ -859,6 +867,8 @@ function validateReviewScoreHistory(
       "reviewerChallengedNonGoal",
       "reviewPass",
       "fixRoundIds",
+      "settledItemCount",
+      "unbuiltStepCount",
       "scope",
     ]);
     for (const key of Object.keys(entry)) {
@@ -945,6 +955,12 @@ function validateReviewScoreHistory(
         !fixRoundIds.every((id) => typeof id === "string" && id.length > 0 && id.length <= MAX_ID_LENGTH))
     ) {
       return "reviewScoreHistory entry fixRoundIds must be a bounded list of non-empty ids";
+    }
+    for (const countKey of ["settledItemCount", "unbuiltStepCount"] as const) {
+      const countValue = entry[countKey];
+      if (countValue !== undefined && !isNonNegativeInteger(countValue)) {
+        return `reviewScoreHistory entry ${countKey} must be a non-negative integer`;
+      }
     }
     const historyScope = entry["scope"];
     if (historyScope !== undefined && historyScope !== "open-editors") {
@@ -1318,6 +1334,7 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
   const allowed = new Set([
     "filesChanged",
     "filesChangedUnknown",
+    "unattributedFiles",
     "score",
     "reviewerBlockers",
     "mechanicalBlockers",
@@ -1346,6 +1363,16 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
   }
   if (value["filesChangedUnknown"] !== undefined && typeof value["filesChangedUnknown"] !== "boolean") {
     return "roundLedger entry outcome filesChangedUnknown must be a boolean";
+  }
+  if (value["unattributedFiles"] !== undefined) {
+    if (!Array.isArray(value["unattributedFiles"]) || value["unattributedFiles"].length > MAX_IMPL_REVIEW_FILES) {
+      return "roundLedger entry outcome unattributedFiles must be a bounded array";
+    }
+    for (const entry of value["unattributedFiles"] as unknown[]) {
+      if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_PATH_LENGTH) {
+        return "roundLedger entry outcome unattributedFiles entries must be bounded non-empty strings";
+      }
+    }
   }
   if (
     value["score"] !== undefined &&
@@ -1588,13 +1615,85 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
   return undefined;
 }
 
+/**
+ * bugs4 item 7: top-level owner-decision records. Kept outside `planItemEvidence`
+ * entries so shipped builds (which reject unknown entry properties) still read
+ * the file and keep this field as an opaque entry.
+ */
+function validatePlanItemOwnerDecisions(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_PLAN_ITEM_OWNER_DECISIONS) {
+    return "planItemOwnerDecisions must be a bounded array";
+  }
+  for (const record of value as unknown[]) {
+    if (!isPlainObject(record)) return "planItemOwnerDecisions entries must be objects";
+    const keys = new Set(["planRevision", "itemKey", "itemText", "source", "at", "formId", "decision"]);
+    if (Object.keys(record).some((key) => !keys.has(key)) || record["source"] !== "owner" ||
+        !boundedString(record["planRevision"], 128) || !boundedString(record["itemKey"], 4000) ||
+        !boundedString(record["itemText"], 4000) || !boundedString(record["at"], 64) ||
+        !boundedString(record["formId"], 200) ||
+        (record["decision"] !== "tick" && record["decision"] !== "exclude")) {
+      return "planItemOwnerDecisions entry has an invalid field";
+    }
+  }
+  return undefined;
+}
+
+/** bugs4 item 21: top-level owner test-run records (Step 19). */
+function validatePlanItemOwnerTestRuns(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > MAX_PLAN_ITEM_OWNER_TEST_RUNS) {
+    return "planItemOwnerTestRuns must be a bounded array";
+  }
+  for (const record of value as unknown[]) {
+    if (!isPlainObject(record)) return "planItemOwnerTestRuns entries must be objects";
+    const keys = new Set(["planRevision", "source", "at", "formId", "command", "exitCode", "summary", "itemKeys"]);
+    const itemKeys = record["itemKeys"];
+    if (Object.keys(record).some((key) => !keys.has(key)) || record["source"] !== "owner" ||
+        !boundedString(record["planRevision"], 128) || !boundedString(record["at"], 64) ||
+        !boundedString(record["formId"], 200) || !boundedString(record["command"], 4000) ||
+        record["command"].trim().length === 0 ||
+        !Number.isInteger(record["exitCode"]) || typeof record["summary"] !== "string" ||
+        record["summary"].length > 8000 ||
+        !Array.isArray(itemKeys) || itemKeys.length === 0 || itemKeys.length > 200 ||
+        itemKeys.some((key) => !boundedString(key, 4000))) {
+      return "planItemOwnerTestRuns entry has an invalid field";
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Builds from before this fix stored owner decisions inside `planItemEvidence`
+ * entries (`ownerDecisions`). Hoists them to the top-level list and strips the
+ * property, so the next write produces a file older builds can read.
+ */
+function hoistLegacyOwnerDecisions(entries: PlanItemEvidenceV1[]): {
+  readonly entries: PlanItemEvidenceV1[];
+  readonly hoisted: PlanItemOwnerDecisionV1[];
+} {
+  const hoisted: PlanItemOwnerDecisionV1[] = [];
+  const stripped = entries.map((entry) => {
+    const { ownerDecisions: legacy, ...rest } = entry as PlanItemEvidenceV1 & {
+      ownerDecisions?: readonly { at: string; formId: string; decision: "tick" | "exclude" }[];
+    };
+    if (legacy === undefined) return entry;
+    for (const row of legacy) {
+      hoisted.push({
+        planRevision: entry.planRevision, itemKey: entry.itemKey, itemText: entry.itemText,
+        source: "owner", at: row.at, formId: row.formId, decision: row.decision,
+      });
+    }
+    return rest as PlanItemEvidenceV1;
+  });
+  return { entries: stripped, hoisted };
+}
+
 function validatePlanItemEvidence(value: unknown): string | undefined {
   if (!Array.isArray(value) || value.length > MAX_PLAN_ITEM_EVIDENCE_ENTRIES) {
     return "planItemEvidence must be a bounded array";
   }
   for (const entry of value as unknown[]) {
     if (!isPlainObject(entry)) return "planItemEvidence entries must be objects";
-    const allowed = new Set(["planRevision", "itemKey", "itemText", "claims", "verifications", "testReports"]);
+    const allowed = new Set(["planRevision", "itemKey", "itemText", "claims", "verifications", "testReports", "ownerDecisions"]);
     if (Object.keys(entry).some((key) => !allowed.has(key))) {
       return "planItemEvidence entry has an unknown property";
     }
@@ -1625,6 +1724,20 @@ function validatePlanItemEvidence(value: unknown): string | undefined {
             (verification["roundId"] !== undefined && !boundedString(verification["roundId"], MAX_ID_LENGTH)) ||
             (verification["testReportRoundIds"] !== undefined && (!Array.isArray(verification["testReportRoundIds"]) || verification["testReportRoundIds"].length > 100 || verification["testReportRoundIds"].some((id) => !boundedString(id, 200))))) {
           return "planItemEvidence verification has an invalid field";
+        }
+      }
+    }
+    if (entry["ownerDecisions"] !== undefined) {
+      if (!Array.isArray(entry["ownerDecisions"]) || entry["ownerDecisions"].length > 100) {
+        return "planItemEvidence ownerDecisions must be a bounded array";
+      }
+      for (const decision of entry["ownerDecisions"] as unknown[]) {
+        if (!isPlainObject(decision)) return "planItemEvidence ownerDecisions must be objects";
+        const keys = new Set(["source", "at", "formId", "decision"]);
+        if (Object.keys(decision).some((key) => !keys.has(key)) || decision["source"] !== "owner" ||
+            !boundedString(decision["at"], 64) || !boundedString(decision["formId"], 200) ||
+            (decision["decision"] !== "tick" && decision["decision"] !== "exclude")) {
+          return "planItemEvidence owner decision has an invalid field";
         }
       }
     }
@@ -2173,6 +2286,7 @@ export function decodeTaskProgressTextV1(
   const draft: Partial<TaskProgress> = {};
   const entries: TaskProgressDocumentEntryV1[] = [];
   const opaqueNames = new Set<string>();
+  const legacyOwnerDecisions: PlanItemOwnerDecisionV1[] = [];
   const flags: DecodeFlags = {
     legacyCompletedStage: false,
     statusWasAlias: false,
@@ -2236,6 +2350,21 @@ export function decodeTaskProgressTextV1(
           );
         }
         draft.checklistProgressUnreliableReason = value;
+        break;
+      }
+      case "checklistProgressUnreliableClaims": {
+        if (
+          !Array.isArray(value) ||
+          value.length === 0 ||
+          value.length > MAX_LATCHING_CLAIMS_V1 ||
+          value.some((claim) => typeof claim !== "string" || claim.length === 0 || claim.length > 4000)
+        ) {
+          return recovery(
+            "invalidFieldValue",
+            "checklistProgressUnreliableClaims must be a bounded non-empty array of bounded strings"
+          );
+        }
+        draft.checklistProgressUnreliableClaims = [...(value as string[])];
         break;
       }
       case "zeroChangeImplRounds": {
@@ -2607,7 +2736,21 @@ export function decodeTaskProgressTextV1(
       case "planItemEvidence": {
         const error = validatePlanItemEvidence(value);
         if (error !== undefined) return recovery("invalidFieldValue", error);
-        draft.planItemEvidence = value as PlanItemEvidenceV1[];
+        const hoisting = hoistLegacyOwnerDecisions(value as PlanItemEvidenceV1[]);
+        draft.planItemEvidence = hoisting.entries;
+        if (hoisting.hoisted.length > 0) legacyOwnerDecisions.push(...hoisting.hoisted);
+        break;
+      }
+      case "planItemOwnerDecisions": {
+        const error = validatePlanItemOwnerDecisions(value);
+        if (error !== undefined) return recovery("invalidFieldValue", error);
+        draft.planItemOwnerDecisions = value as PlanItemOwnerDecisionV1[];
+        break;
+      }
+      case "planItemOwnerTestRuns": {
+        const error = validatePlanItemOwnerTestRuns(value);
+        if (error !== undefined) return recovery("invalidFieldValue", error);
+        draft.planItemOwnerTestRuns = value as PlanItemOwnerTestRunV1[];
         break;
       }
       case "blockerSupersessions": {
@@ -2691,6 +2834,17 @@ export function decodeTaskProgressTextV1(
       }
     }
     entries.push({ kind: "product", name: fieldName });
+  }
+
+  if (legacyOwnerDecisions.length > 0) {
+    const merged = [...(draft.planItemOwnerDecisions ?? [])];
+    for (const row of legacyOwnerDecisions) {
+      if (!merged.some((m) => m.planRevision === row.planRevision && m.itemKey === row.itemKey &&
+          m.formId === row.formId && m.decision === row.decision)) {
+        merged.push(row);
+      }
+    }
+    draft.planItemOwnerDecisions = merged.slice(-MAX_PLAN_ITEM_OWNER_DECISIONS);
   }
 
   // --- required fields ----------------------------------------------------

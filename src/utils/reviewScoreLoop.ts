@@ -160,6 +160,19 @@ export interface ImproveReviewScoreResult {
    * whenever blocker-fix rounds actually changed files.
    */
   buildRoundsWithoutProgress?: number;
+  /**
+   * bugs4 item 25: set when the loop stopped on purpose, before dispatching a
+   * round it would otherwise have run, because a card is waiting on the owner,
+   * the last review was already clean, or an Apply Review changed nothing and
+   * raised a decision. Never set together with `stalled`.
+   */
+  held?: FastForwardHoldV1;
+}
+
+/** Why Fast Forward stopped dispatching rounds without being paused or stalled. */
+export interface FastForwardHoldV1 {
+  kind: "pending-decision" | "clean-review" | "no-change-decision" | "test-evidence-unproducible";
+  detail: string;
 }
 
 /**
@@ -216,6 +229,38 @@ export async function improveReviewScore(options: {
    * The score gate remains an ADDITIONAL way to succeed, never the only one.
    */
   zeroFixableTerminates?: boolean;
+  /**
+   * bugs4 item 19 / Step 27: asked after each apply(). True means the round that just ran is
+   * left out of the build-round stall count (its summary contradicted the review on an
+   * owner-evidence gate, so the round says nothing about whether building makes progress).
+   */
+  roundExcludedFromStallCount?: () => boolean;
+  /**
+   * bugs4 item 25: asked before every dispatch. A string means a card that
+   * waits on the owner is open (the string says which), and nothing more is
+   * dispatched until it is answered, dismissed or Fast Forward is stopped.
+   * Not asked once a round has ridden through its own escalation.
+   */
+  pendingBlockingDecision?: () => Promise<string | undefined> | string | undefined;
+  /**
+   * bugs4 item 25: asked right after an apply() returned, before the re-review.
+   * A string means the round changed nothing and a decision is now pending, so
+   * re-reviewing the same tree can only repeat the card; the run stops there.
+   */
+  holdAfterApply?: () => Promise<string | undefined> | string | undefined;
+  /**
+   * bugs4 item 25: a review with no task-fixable blockers never leads to an
+   * Apply Review — there is nothing for it to act on. With this set the loop
+   * follows the clean-review path (terminal success for the stage) instead of
+   * dispatching, even when the plan counter still shows open items.
+   */
+  cleanReviewNeverApplies?: boolean;
+  /**
+   * bugs4 item 11: asked when a review had no task-fixable blockers but the plan still shows open
+   * items (a build mandate). A string means the only hold is test evidence no editing round can
+   * produce, so the run stops instead of dispatching an Apply Review that changes nothing.
+   */
+  buildMandateCannotProgress?: () => Promise<string | undefined> | string | undefined;
   token?: vscode.CancellationToken;
   /** Maximum apply/review cycles for this run. */
   maxAttempts?: number;
@@ -326,13 +371,78 @@ export async function improveReviewScore(options: {
     };
   }
 
+  // The latest review's own evidence: the baseline for attempt 1, then each round.
+  let lastReviewWasClean = options.preLoopEvidence?.zeroFixableEvidence === true;
+  // A clean review whose plan still has unbuilt steps is a build mandate, not
+  // "nothing to act on": the Apply Review that follows is the one that builds
+  // them. Only a clean review with a COMPLETE plan takes the clean-review hold.
+  let lastReviewPlanIncomplete = options.preLoopEvidence?.planIncomplete === true;
+  let lastScore: number | null = options.baselineScore;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (options.token?.isCancellationRequested) {
       throw new vscode.CancellationError();
     }
+    if (options.cleanReviewNeverApplies === true && lastReviewWasClean && !lastReviewPlanIncomplete) {
+      return {
+        score: best ?? lastScore,
+        attempts: attempt - 1,
+        improved: false,
+        stalled: false,
+        paused: false,
+        escalationDeferred,
+        zeroFixableSuccess: true,
+        held: {
+          kind: "clean-review",
+          detail: "the review reported no task-fixable blockers, so an Apply Review has nothing to act on",
+        },
+      };
+    }
+    if (options.cleanReviewNeverApplies === true && lastReviewWasClean && lastReviewPlanIncomplete) {
+      const cannotProgress = await options.buildMandateCannotProgress?.();
+      if (cannotProgress !== undefined) {
+        return {
+          score: best ?? lastScore,
+          attempts: attempt - 1,
+          improved: false,
+          stalled: false,
+          paused: false,
+          escalationDeferred,
+          zeroFixableSuccess: false,
+          held: { kind: "test-evidence-unproducible", detail: cannotProgress },
+        };
+      }
+    }
+    if (!escalationDeferred) {
+      const waitingOn = await options.pendingBlockingDecision?.();
+      if (waitingOn !== undefined) {
+        return {
+          score: best,
+          attempts: attempt - 1,
+          improved: false,
+          stalled: false,
+          paused: false,
+          escalationDeferred,
+          zeroFixableSuccess: false,
+          held: { kind: "pending-decision", detail: waitingOn },
+        };
+      }
+    }
     await options.apply();
     if (options.token?.isCancellationRequested) {
       throw new vscode.CancellationError();
+    }
+    const holdAfter = await options.holdAfterApply?.();
+    if (holdAfter !== undefined) {
+      return {
+        score: best,
+        attempts: attempt,
+        improved: false,
+        stalled: false,
+        paused: false,
+        escalationDeferred,
+        zeroFixableSuccess: false,
+        held: { kind: "no-change-decision", detail: holdAfter },
+      };
     }
     const raw = await options.review();
     const round: ReviewRoundOutcome | null =
@@ -342,6 +452,9 @@ export async function improveReviewScore(options: {
           ? { score: raw, taskFixableCount: null, zeroFixableEvidence: false }
           : raw;
     const score = round?.score ?? null;
+    lastReviewWasClean = round?.zeroFixableEvidence === true;
+    lastReviewPlanIncomplete = isPlanIncomplete(round?.progress ?? null);
+    lastScore = score ?? lastScore;
     if (score !== null) {
       best = Math.max(best ?? Number.NEGATIVE_INFINITY, score);
       await recordBestReviewScore(options.context, options.stage, score);
@@ -376,7 +489,11 @@ export async function improveReviewScore(options: {
     if (progress !== null) {
       if (previousComplete !== null && thisRoundWasBuildMandate) {
         roundsWithoutProgressAdvance =
-          progress.complete > previousComplete ? 0 : roundsWithoutProgressAdvance + 1;
+          progress.complete > previousComplete
+            ? 0
+            : options.roundExcludedFromStallCount?.() === true
+              ? roundsWithoutProgressAdvance
+              : roundsWithoutProgressAdvance + 1;
       }
       previousComplete = progress.complete;
     }

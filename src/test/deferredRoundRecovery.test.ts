@@ -1358,6 +1358,83 @@ void describe("round file attribution (end to end)", () => {
     const logs = readRunLogs(folderPath);
     assert.doesNotMatch(logs[0]!, /## Unattributed workspace changes/);
   });
+
+  // bugs4 item 1: the captured 2026-10-28 shape — clickable Markdown links
+  // with absolute destinations and :line suffixes.
+  const linkSummary = (rows: string[]): string =>
+    [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Add the resolver",
+      "- [ ] Wire the decoder",
+      "",
+      "## Files Changed",
+      "",
+      ...rows,
+      "",
+      "## Plan Item Checklist",
+      "",
+      "- [x] Add the resolver",
+      "- [ ] Wire the decoder",
+      "",
+      "## Verification",
+      "",
+      "- ran the unit tests",
+    ].join("\n");
+
+  void it("bugs4 item 1: Markdown-link Files Changed entries attribute the round's real edits through the real hand-off; concurrent edits and reported-only paths stay out", async () => {
+    const { folderPath, progress } = makeTaskFolder("attribution_links");
+    await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["apps/mobile/hand-edit.ts", "src/resolver.ts", "src/utils/linked.ts"],
+      filesChangedUnknown: false,
+      summary: linkSummary([
+        `- [resolver.ts](${REAL_ROOT}/src/resolver.ts:1) — added the resolver`,
+        `- [linked.ts](<${REAL_ROOT}/src/utils/linked.ts#L3-L9>) — linked`,
+        `- [round-progress.md](${REAL_ROOT}/.ensemble/x/round-progress.md) — reported only`,
+      ]),
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.deepEqual(
+      [...(persisted?.implReviewFiles ?? [])].sort(),
+      ["src/prior.ts", "src/resolver.ts", "src/utils/linked.ts"],
+      "both linked source files enter review scope; the hand edit and the reported-only path do not"
+    );
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /- apps\/mobile\/hand-edit\.ts/);
+    assert.doesNotMatch(logs[0]!, /## Unattributed workspace changes[\s\S]*src\/resolver\.ts/);
+    assert.doesNotMatch(logs[0]!, /## Unattributed workspace changes[\s\S]*src\/utils\/linked\.ts/);
+  });
+
+  void it("bugs4 item 1: a report whose every entry is unreadable is a named report problem — nothing is banked and the round's edits stay quarantined", async () => {
+    const { folderPath, progress } = makeTaskFolder("attribution_unparseable");
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/resolver.ts"],
+      filesChangedUnknown: false,
+      summary: linkSummary(["- [resolver.ts](https://example.com/src/resolver.ts) — added the resolver"]),
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    const persisted = readProgress(folderPath);
+    assert.deepEqual(persisted?.implReviewFiles, ["src/prior.ts"], "an unreadable report banks nothing");
+    assert.deepEqual(
+      persisted?.pendingImplReviewFiles,
+      ["src/resolver.ts"],
+      "the round's real edit is quarantined, not dropped"
+    );
+    const logs = readRunLogs(folderPath);
+    assert.match(logs[0]!, /could not be understood as file paths/);
+    assert.match(logs[0]!, /resolver\.ts\]\(https:\/\/example\.com/);
+    assert.doesNotMatch(logs[0]!, /most likely edits made by hand/);
+    void run;
+  });
 });
 
 /**
@@ -3364,10 +3441,10 @@ void describe("a zero-change round with unticked plan items is refused without a
 
     const openItemsDecision = run.pendingDecisions?.find((d) => d.decisionKey === "openPlanItemsNeedDecision");
     assert.ok(openItemsDecision, "a clean review with unticked items and zero file changes must raise the card");
-    assert.match(openItemsDecision.whatHappened, /Add the resolver — needs an owner deployment step/);
+    assert.match(openItemsDecision.whatHappened, /Add the resolver — the round said: needs an owner deployment step/);
     assert.match(
       openItemsDecision.whatHappened,
-      /Wire the decoder — needs a hardware fixture only the owner has/
+      /Wire the decoder — the round said: needs a hardware fixture only the owner has/
     );
     assert.doesNotMatch(
       openItemsDecision.whatHappened,
@@ -3381,8 +3458,8 @@ void describe("a zero-change round with unticked plan items is refused without a
         taskFolderPath: folderPath,
         displayName: progress.displayName,
         items: [
-          { itemText: "Add the resolver", reason: "needs an owner deployment step" },
-          { itemText: "Wire the decoder", reason: "needs a hardware fixture only the owner has" },
+          { itemText: "Add the resolver", reason: "the round said: needs an owner deployment step" },
+          { itemText: "Wire the decoder", reason: "the round said: needs a hardware fixture only the owner has" },
         ],
         stage: openItemsDecision.stage,
       });
@@ -4664,7 +4741,7 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
     assert.equal(decisions.length, 1);
     const decision = decisions[0]!;
     assert.equal(decision.recommendation.kind, "option");
-    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : "", "runImplementationFix");
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : "", "fixBuildManually");
     assert.match(decision.evidence?.find((item) => item.label === "First type-check errors")?.detail ?? "", /src\/broken\.ts\(7,3\).*TS2322/);
     assert.ok(decision.evidence?.find((item) => item.label === "Implementation run log")?.openFilePath?.includes(`${path.sep}runs${path.sep}`));
     const dispatchOptions = decision.options.filter((option) => option.effect.kind === "command");

@@ -27,8 +27,9 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
     // RC2 item 13, Step 50: the branch condition grew a second clause
     // (`&& !consumeOpenItemsCardPostedSinceV1(...)`) so the literal
     // single-line `else if (outcome.stalled) {` no longer appears — anchor
-    // on the still-stable `outcome.stalled &&` clause opener instead.
-    const stalledBranch = source.indexOf("outcome.stalled &&");
+    // on `stalled: outcome.stalled === true`, the first input of the
+    // `shouldWarnFastForwardStalledV1` condition that replaced it, instead.
+    const stalledBranch = source.indexOf("stalled: outcome.stalled === true");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
     const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
 
@@ -47,7 +48,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
   });
 
   void it("derives the rendered stalled-round count from outcome.buildRoundsWithoutProgress, not a hardcoded or unrelated value", () => {
-    const stalledBranch = source.indexOf("outcome.stalled &&");
+    const stalledBranch = source.indexOf("stalled: outcome.stalled === true");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
     const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
 
@@ -80,7 +81,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
    * machinery that produces `ffCoordinatorOutcomeForAdmissionV1`.
    */
   void it("names 'Apply Review failed: <reason>' for a genuine dispatch failure, ahead of the generic 'did not produce a new, comparable result' fallback", () => {
-    const stalledBranch = source.indexOf("outcome.stalled &&");
+    const stalledBranch = source.indexOf("stalled: outcome.stalled === true");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
     const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
 
@@ -129,7 +130,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
    * per-attempt `runnerFailure` probe over the generic fallback.
    */
   void it("prefers the Apply Review runner failure (provider + message) over the generic fallback", () => {
-    const stalledBranch = source.indexOf("outcome.stalled &&");
+    const stalledBranch = source.indexOf("stalled: outcome.stalled === true");
     assert.ok(stalledBranch >= 0, "reviewActions.ts must still handle outcome.stalled");
     const branchSlice = source.slice(stalledBranch, stalledBranch + 3200);
 
@@ -165,7 +166,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
   // never reported as a stalled review.
   void it("returns the stage-left hand-over before the stalled branch can say no comparable result", () => {
     const stageLeft = source.indexOf("if (ffStageLeftForV1) {");
-    const stalledBranch = source.indexOf("outcome.stalled &&");
+    const stalledBranch = source.indexOf("stalled: outcome.stalled === true");
     const generic = source.indexOf('"the review did not produce a new, comparable result"');
     assert.ok(stageLeft >= 0, "the post-loop stage-left exit must exist");
     assert.ok(stageLeft < stalledBranch, "the stage-left return must precede the stalled branch");

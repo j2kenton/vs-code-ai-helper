@@ -28,7 +28,13 @@ import {
   findNarrowingBlockerV1,
   findPlanStageNarrowingBlockerV1,
 } from "./planItemNarrowingV1";
-import { taskFixableAreAllUnbuiltWorkV1 } from "./reviewRouting";
+import { taskFixableAreAllUnbuiltWorkV1, isUnbuiltWorkBlockerV1 } from "./reviewRouting";
+import {
+  APPLY_REVIEW_NO_PROGRESS_ROUNDS_V1,
+  applyReviewRoundsClosedNoneV1,
+  describeApplyReviewNoProgressV1,
+  isVerificationStallV1,
+} from "./applyReviewProgressV1";
 import { fixRoundSummaryV1 } from "./stageActionWordingV1";
 import {
   classifyDeferredPlanScopeV1,
@@ -41,11 +47,19 @@ import {
   type DeferredPlanScopeV1,
   type ScopedItemListV1,
 } from "./deferredPlanScopeV1";
-import { resolveBlockerPlanReferencesV1, resolveExcludedOwnerHandoffV1 } from "./implementationChecklist";
+import {
+  countChecklistEvidenceProgressV1,
+  describeChecklistGateGapV1,
+  describeOpenAndHandOffsV1,
+  listProvisionalTickedItemsV1,
+  normalizeChecklistItemTextV1,
+  resolveBlockerPlanReferencesV1,
+  resolveExcludedOwnerHandoffV1,
+} from "./implementationChecklist";
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import * as path from "path";
-import { BlockerResolver, ReviewBlocker } from "./reviewReadiness";
+import { BlockerResolver, parseReviewVerifiedCompleteV1, ReviewBlocker } from "./reviewReadiness";
 import { KEEP_ITERATING_SEQUENCE_NOTE_V1 } from "./plateauFixCycleV1";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
 import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "./effectiveReviewProgress";
@@ -721,6 +735,25 @@ export interface EscalationPlateauContextV1 {
    * (`taskFixableAreAllUnbuiltWorkV1`).
    */
   readonly taskFixableAllUnbuiltWork?: boolean;
+  /**
+   * bugs4 item 18: a task-fixable blocker names unbuilt plan work (possibly beside a genuine
+   * landed-work defect), so `taskFixableAllUnbuiltWork` is false but unbuilt work is still part of
+   * the reason the stage is open.
+   */
+  readonly taskFixableIncludesUnbuiltWork?: boolean;
+  /**
+   * bugs4 items 18/21: how many of the most recent consecutive Apply Review rounds closed none of
+   * the open plan items (`applyReviewRoundsClosedNoneV1`). Absent when not measured.
+   */
+  readonly applyReviewRoundsClosedNone?: number;
+  /** Plan items ticked by a model but not yet verified; with a flat count this is a verification stall. */
+  readonly provisionalTicks?: number;
+  /**
+   * bugs4 item 53: the latest review's own `## Verified Complete` block names every provisional
+   * ticked item as built. A model tick alone is a claim, not evidence, so "nothing left to build"
+   * needs this reviewer assertion; without it the open items are treated as possibly unbuilt.
+   */
+  readonly reviewAffirmsOpenItemsBuilt?: boolean;
   /** The specific open plan items (`Step N` or item text) that qualified
    * `taskFixableAllUnbuiltWork`; named in the recommendation's reason. */
   readonly unbuiltWorkReferences?: readonly string[];
@@ -758,6 +791,91 @@ export function describeFixableSplitV1(fixable: number, total: number): string {
 }
 
 /**
+ * bugs4 item 53: true only when the review's own `## Verified Complete` block names every one of
+ * `itemTexts` (and there is at least one). A model tick is a claim; this is the reviewer's
+ * assertion that the work is built, so it is the only thing that lets a card say "nothing left
+ * to build".
+ */
+export function reviewNamesAllItemsBuiltV1(reviewContent: string, itemTexts: readonly string[]): boolean {
+  if (itemTexts.length === 0) return false;
+  const named = new Set(
+    parseReviewVerifiedCompleteV1(reviewContent).items.map((text) => normalizeChecklistItemTextV1(text))
+  );
+  return itemTexts.every((text) => named.has(normalizeChecklistItemTextV1(text)));
+}
+
+/**
+ * bugs4 item 47: what the no-progress breaker card needs to agree with the gate
+ * and the review instead of recommending more of the rounds that just changed
+ * nothing. `planItemsOpen` is the gate's own open count.
+ */
+export interface BreakerCardContextV1 {
+  readonly zeroChangeRounds: number;
+  readonly planItemsOpen: number;
+  /** The latest review's Verified Complete block names every ticked item the gate holds provisional. */
+  readonly reviewAffirmsOpenItemsBuilt: boolean;
+  /** Open items with no tick at all (neither a model claim nor an owner decision). */
+  readonly unclaimedOpenItems: number;
+  /**
+   * The gate's own count, worded once for every card: "N open, of which M are owner hand-offs;
+   * T ticked, V verified by review, …". Absent when the plan has no countable checklist.
+   */
+  readonly gateCountNote?: string;
+}
+
+/**
+ * The breaker's recommendation. Iteration has just been shown to produce no edits, so "Keep
+ * iterating" and "Back to Implementation" are never recommended. A review that met the pass mark
+ * recommends advancing unless an open item is genuinely buildable (no claim, and not affirmed
+ * built by the review); then it needs the owner.
+ */
+export function recommendForBreakerCardV1(
+  breaker: BreakerCardContextV1,
+  nextStageName: string | undefined
+): WorkflowDecisionRecommendationV1 {
+  const genuinelyBuildable = breaker.unclaimedOpenItems > 0 && !breaker.reviewAffirmsOpenItemsBuilt;
+  if (nextStageName !== undefined && !genuinelyBuildable) {
+    return {
+      kind: "option",
+      optionId: "advance",
+      reasoning:
+        `${breaker.zeroChangeRounds} implementation ${breaker.zeroChangeRounds === 1 ? "round" : "rounds"} in a row ` +
+        `changed no files, so another one would not either. The latest review met the pass mark` +
+        (breaker.planItemsOpen > 0
+          ? `, and the ${breaker.planItemsOpen} open plan ${breaker.planItemsOpen === 1 ? "item is" : "items are"} ` +
+            "already built and waiting only for verification"
+          : "") +
+        `, so advancing to ${nextStageName} is the way on.`,
+    };
+  }
+  return {
+    kind: "option",
+    optionId: "handleMyself",
+    reasoning:
+      `${breaker.zeroChangeRounds} implementation ${breaker.zeroChangeRounds === 1 ? "round" : "rounds"} in a row ` +
+      `changed no files, and ${breaker.unclaimedOpenItems} open plan ${breaker.unclaimedOpenItems === 1 ? "item has" : "items have"} ` +
+      "no tick and no review confirmation that they are built. More automated rounds will not edit anything; " +
+      "this needs your decision about those items.",
+  };
+}
+
+function buildBreakerVerifiedTicksOptionV1(taskFolderPath: string): WorkflowDecisionOptionV1 {
+  return {
+    optionId: "applyReviewerVerifiedTicks",
+    label: "Apply Reviewer-Verified Ticks",
+    resumeKind: "unpause",
+    consequence:
+      "Records the items the latest review named as verified complete in plan-final.md, so the gate counts them. " +
+      "The task stays paused; choose Advance afterwards.",
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.applyReviewerVerifiedTicks",
+      args: [{ taskFolderPath }],
+    },
+  };
+}
+
+/**
  * The bounded, durable escalation shape every `EscalationKind` posts through
  * — the plain generic card (no `plateauContext`) for implementation-side and
  * environmental escalations, and the same rich, evidence-led
@@ -781,7 +899,9 @@ export function buildEscalationDecisionV1(
    * switchStageModel/reconsiderRequirement/keepIterating), so only the
    * consequence text needs the open-items note, not a routing change.
    */
-  genericPlanItemsOpen?: number
+  genericPlanItemsOpen?: number,
+  /** bugs4 item 47: set when the no-progress breaker raised this card. */
+  breakerContext?: BreakerCardContextV1
 ): PostWorkflowDecisionInputV1 {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStage = nextStageInOrderV1(stage);
@@ -806,9 +926,34 @@ export function buildEscalationDecisionV1(
       allBlockersNeedOwnerDecision = false,
       allBlockersCarriedGates = false,
       taskFixableAllUnbuiltWork = false,
+      taskFixableIncludesUnbuiltWork = false,
+      applyReviewRoundsClosedNone = 0,
+      provisionalTicks = 0,
+      reviewAffirmsOpenItemsBuilt = false,
       unbuiltWorkReferences = [],
       ownerChecksOwed = [],
     } = plateauContext;
+    // bugs4 item 18: unbuilt work is among the task-fixable blockers and recent Apply Reviews closed
+    // no open item, so another Apply Review is not the step that moves this task. Specific defects
+    // are carried into the Implementation round's guidance or left to the review that follows.
+    const applyReviewNotMoving =
+      planItemsOpen > 0 &&
+      taskFixableCount > 0 &&
+      taskFixableIncludesUnbuiltWork &&
+      applyReviewRoundsClosedNone >= APPLY_REVIEW_NO_PROGRESS_ROUNDS_V1;
+    // bugs4 item 21/53: every open item carries a model claim, no blocker names unbuilt work, AND
+    // the review itself named each of those items as built, so the gap is verification.
+    // Implementation cannot close it, so it is not recommended. A model tick alone never
+    // qualifies: it is a claim, and the reviewer's verification requirement is not loosened.
+    const nothingLeftToBuild =
+      planItemsOpen > 0 &&
+      provisionalTicks >= planItemsOpen &&
+      !taskFixableIncludesUnbuiltWork &&
+      reviewAffirmsOpenItemsBuilt;
+    const verificationStall = isVerificationStallV1({
+      provisional: provisionalTicks,
+      roundsClosedNone: applyReviewRoundsClosedNone,
+    });
     const options: WorkflowDecisionOptionV1[] = [
       ...(nextStage
         ? [
@@ -984,11 +1129,30 @@ export function buildEscalationDecisionV1(
                 : "") +
               ", which Implementation builds and another review round does not.",
           }
+        : applyReviewNotMoving
+        ? {
+            kind: "option",
+            optionId: "buildRemaining",
+            reasoning:
+              `${describeApplyReviewNoProgressV1(planItemsOpen, applyReviewRoundsClosedNone)}. Unbuilt plan ` +
+              "work is among the blockers, which Implementation builds and another Apply Review does not.",
+          }
         : taskFixableCount > 0
         ? {
             kind: "option",
             optionId: "keepIterating",
             reasoning: `${taskFixableCountLabel} are still task-fixable, so another round has real work to do.`,
+          }
+        : // bugs4 item 53: nothing is left to build; the open items wait for verification, which a build
+          // round does not provide.
+          nothingLeftToBuild && nextStage
+        ? {
+            kind: "option",
+            optionId: "advance",
+            reasoning:
+              `All ${planItemsOpen} open plan ${planItemsOpen === 1 ? "item is" : "items are"} already built and ` +
+              `ticked, waiting only for verification, and no blocker names unbuilt work. An Implementation round ` +
+              `has nothing to build here, so advancing to ${nextStageName} is the way on.`,
           }
         : // RC2 item 3: with open plan items and nothing task-fixable here,
           // recommend building them rather than Advance or "leave it paused" —
@@ -1053,6 +1217,26 @@ export function buildEscalationDecisionV1(
       recommendation,
       evidence: [
         { label: "What clears this", detail: clearingNote },
+        ...(verificationStall
+          ? [
+              {
+                label: "Kind of stall",
+                detail:
+                  `Verification stall: ${provisionalTicks} ticked ${provisionalTicks === 1 ? "item has" : "items have"} ` +
+                  `only a model claim, and the last ${applyReviewRoundsClosedNone} Apply Review rounds verified or ` +
+                  "settled none. More of the same rounds will not move this count; a review that names the items " +
+                  "it confirmed, a passing test report, or your own decision will.",
+              },
+            ]
+          : []),
+        ...(applyReviewNotMoving
+          ? [
+              {
+                label: "Progress",
+                detail: describeApplyReviewNoProgressV1(planItemsOpen, applyReviewRoundsClosedNone),
+              },
+            ]
+          : []),
         ...(narrowing
           ? [
               { label: "Plan item", detail: narrowing.itemText },
@@ -1143,6 +1327,9 @@ export function buildEscalationDecisionV1(
         ]
       : []),
     keepIterating,
+    ...(breakerContext?.reviewAffirmsOpenItemsBuilt && breakerContext.planItemsOpen > 0
+      ? [buildBreakerVerifiedTicksOptionV1(target.taskFolderPath)]
+      : []),
     {
       optionId: "handleMyself",
       label: "Leave it paused — I'll fix it",
@@ -1160,7 +1347,9 @@ export function buildEscalationDecisionV1(
         "resume it (or choose Keep Iterating) once you've made the change."
     ),
   ];
-  const recommendation: WorkflowDecisionRecommendationV1 = environmental
+  const recommendation: WorkflowDecisionRecommendationV1 = breakerContext
+    ? recommendForBreakerCardV1(breakerContext, nextStageName)
+    : environmental
     ? {
         kind: "option",
         optionId: "switchStageModel",
@@ -1185,6 +1374,9 @@ export function buildEscalationDecisionV1(
     whyUserNeeded: "Automation paused this task and cannot choose how to proceed on your behalf.",
     options,
     recommendation,
+    ...(breakerContext?.gateCountNote
+      ? { evidence: [{ label: "Plan checklist (the gate's count)", detail: breakerContext.gateCountNote }] }
+      : {}),
     gating: {
       holdsTaskPaused: true,
       unblocksProgress: true,
@@ -1504,7 +1696,9 @@ export async function postLatchedOpenItemsDecisionV1(
    * behind an open owner gate. Listed apart from the open items, never counted
    * in them, and never a reason to recommend Back to Implementation.
    */
-  carried?: { readonly deferred: ScopedItemListV1; readonly gated: ScopedItemListV1 }
+  carried?: { readonly deferred: ScopedItemListV1; readonly gated: ScopedItemListV1 },
+  /** bugs4 item 30: the plan's "N open, of which M are owner hand-offs" line. */
+  openSummary?: string
 ): Promise<boolean> {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStageName = STAGE_DISPLAY_NAMES[nextStage];
@@ -1551,7 +1745,7 @@ export async function postLatchedOpenItemsDecisionV1(
       taskCanonicalId: target.canonicalId,
       stage,
       whatHappened:
-        `${stageName} is clean, but this task's plan checklist is flagged as behind and ${open.total} ${noun} still open:\n\n` +
+        `${stageName} is clean, but this task's plan checklist is flagged as behind and ${open.total} ${noun} still open${openSummary ? ` (plan-wide: ${openSummary})` : ""}:\n\n` +
         `${listed}${more}${carriedSections}`,
       whyUserNeeded:
         "A clean review no longer holds the stage while the checklist is flagged as behind, but moving on with plan items " +
@@ -2144,6 +2338,55 @@ async function postReviewPlateauDecisionV1(
           ),
         ]
       : [];
+  // bugs4 items 18/21: unbuilt work among the blockers, and whether recent Apply Reviews moved anything.
+  const taskFixableIncludesUnbuiltWork =
+    planItemsOpen > 0 &&
+    planOfRecordText !== undefined &&
+    normalized.blockers.some(
+      (b) =>
+        b.resolver === "task-fixable" &&
+        b.origin !== "mechanical" &&
+        b.category === "completion" &&
+        isUnbuiltWorkBlockerV1(b.description ?? "", planOfRecordText)
+    );
+  let applyReviewRoundsClosedNone = 0;
+  let provisionalTicks = 0;
+  let reviewAffirmsOpenItemsBuilt = false;
+  try {
+    const progressForMotion = await readTaskProgressStrictV1(folderUri, {
+      expectedTaskFolder: path.basename(target.taskFolderPath),
+    });
+    if (progressForMotion.ok && !isPlanReviewStage(stage)) {
+      const motion = progressForMotion.decoded.progress;
+      applyReviewRoundsClosedNone = applyReviewRoundsClosedNoneV1({
+        stage,
+        ledger: motion.roundLedger,
+        roundOutcomes: motion.roundOutcomes,
+        planItemEvidence: motion.planItemEvidence,
+        ownerDecisions: motion.planItemOwnerDecisions,
+      });
+      if (planOfRecordText !== undefined) {
+        provisionalTicks =
+          countChecklistEvidenceProgressV1(
+            planOfRecordText,
+            motion.planItemEvidence ?? [],
+            motion.planItemOwnerDecisions ?? []
+          )?.provisional ?? 0;
+        // bugs4 item 53: only the reviewer's own Verified Complete block can say "built".
+        const provisionalItems = listProvisionalTickedItemsV1(
+          planOfRecordText,
+          motion.planItemEvidence ?? [],
+          motion.planItemOwnerDecisions ?? []
+        );
+        reviewAffirmsOpenItemsBuilt = reviewNamesAllItemsBuiltV1(
+          evidence.content,
+          provisionalItems.map((item) => item.text)
+        );
+      }
+    }
+  } catch {
+    applyReviewRoundsClosedNone = 0;
+  }
   const ownerDecisionClearing = carriedEvidence.allCarried
     ? describeCarriedGateClearingV1(carriedEvidence, stageName)
     : allBlockersNeedOwnerDecision
@@ -2162,6 +2405,10 @@ async function postReviewPlateauDecisionV1(
         ? `Clears via: choose "Build the ${planItemsOpen} open plan ${planItemsOpen === 1 ? "item" : "items"}" ` +
           `below — the remaining ${evidence.taskFixableCount === 1 ? "blocker is" : "blockers are"} work not yet ` +
           `built, which Implementation does and another ${stageName} round does not.`
+    : taskFixableIncludesUnbuiltWork && applyReviewRoundsClosedNone >= APPLY_REVIEW_NO_PROGRESS_ROUNDS_V1
+      ? `Clears via: choose "Build the ${planItemsOpen} open plan ${planItemsOpen === 1 ? "item" : "items"}" ` +
+        `below. ${describeApplyReviewNoProgressV1(planItemsOpen, applyReviewRoundsClosedNone)}, so another ` +
+        `Apply Review will not close them; any specific defect is left to the review that follows.`
     : evidence.taskFixableCount > 0
       ? `Clears via: choose "Keep iterating" below — it resumes the task and runs Apply Review against the ` +
         `${evidence.taskFixableCount} task-fixable ${evidence.taskFixableCount === 1 ? "blocker" : "blockers"}, ` +
@@ -2225,6 +2472,10 @@ async function postReviewPlateauDecisionV1(
       allBlockersNeedOwnerDecision,
       allBlockersCarriedGates: carriedEvidence.allCarried,
       taskFixableAllUnbuiltWork,
+      taskFixableIncludesUnbuiltWork,
+      applyReviewRoundsClosedNone,
+      provisionalTicks,
+      reviewAffirmsOpenItemsBuilt,
       unbuiltWorkReferences,
       ownerChecksOwed,
       ...(narrowing ? { narrowing } : {}),
@@ -2304,7 +2555,9 @@ export async function escalateReviewToHuman(
    * escalation must never go silent just because the richer surface could
    * not be posted.
    */
-  reviewPlateauEvidence?: ReviewPlateauEvidenceV1
+  reviewPlateauEvidence?: ReviewPlateauEvidenceV1,
+  /** bugs4 item 47: the no-progress breaker raised this escalation after N rounds that changed no files. */
+  breakerZeroChangeRounds?: number
 ): Promise<boolean> {
   try {
     let applied = false;
@@ -2413,6 +2666,10 @@ export async function escalateReviewToHuman(
             (await readDeferredOpenPlanItemCountV1(folderUri))
         )
       : 0;
+    const breakerContext =
+      breakerZeroChangeRounds !== undefined
+        ? await readBreakerCardContextV1(folderUri, stage, breakerZeroChangeRounds, genericPlanItemsOpen)
+        : undefined;
     const genericDecisionInput = buildEscalationDecisionV1(
       kind,
       stage,
@@ -2423,7 +2680,8 @@ export async function escalateReviewToHuman(
         taskName: progressHint?.displayName,
       },
       undefined,
-      genericPlanItemsOpen
+      genericPlanItemsOpen,
+      breakerContext
     );
     const genericDecision = await postWorkflowDecisionV1(genericDecisionInput, {
       canonicalId: normalizePath(folderUri.fsPath),
@@ -2554,6 +2812,57 @@ export async function escalateReviewToHuman(
     // pause would strand the round with no visible outcome at all.
     return false;
   }
+}
+
+/**
+ * Gathers the breaker card's evidence from the task's own files, best-effort: any unreadable
+ * input leaves the conservative answer (nothing affirmed built, every open item unclaimed).
+ */
+async function readBreakerCardContextV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  zeroChangeRounds: number,
+  planItemsOpen: number
+): Promise<BreakerCardContextV1> {
+  let reviewAffirmsOpenItemsBuilt = false;
+  let provisional = 0;
+  let gateCountNote: string | undefined;
+  try {
+    const planText = await readTextIfExists(getCanonicalImplementationUri(folderUri));
+    const read = await readTaskProgressStrictV1(folderUri, { expectedTaskFolder: path.basename(folderUri.fsPath) });
+    if (planText !== undefined && read.ok) {
+      const motion = read.decoded.progress;
+      const gate = countChecklistEvidenceProgressV1(
+        planText,
+        motion.planItemEvidence ?? [],
+        motion.planItemOwnerDecisions ?? []
+      );
+      provisional = gate?.provisional ?? 0;
+      if (gate) {
+        gateCountNote = `${describeOpenAndHandOffsV1(planText) ?? `${planItemsOpen} open`}; ${describeChecklistGateGapV1(gate)}.`;
+      }
+      const filename = STAGE_ARTIFACT_FILENAMES[stage];
+      const reviewText = filename ? await readTextIfExists(vscode.Uri.joinPath(folderUri, filename)) : undefined;
+      if (reviewText !== undefined) {
+        reviewAffirmsOpenItemsBuilt = reviewNamesAllItemsBuiltV1(
+          reviewText,
+          listProvisionalTickedItemsV1(planText, motion.planItemEvidence ?? [], motion.planItemOwnerDecisions ?? []).map(
+            (item) => item.text
+          )
+        );
+      }
+    }
+  } catch {
+    reviewAffirmsOpenItemsBuilt = false;
+    provisional = 0;
+  }
+  return {
+    zeroChangeRounds,
+    planItemsOpen,
+    reviewAffirmsOpenItemsBuilt,
+    unclaimedOpenItems: Math.max(0, planItemsOpen - provisional),
+    ...(gateCountNote !== undefined ? { gateCountNote } : {}),
+  };
 }
 
 async function postOwnerEvidenceQuestionV1(

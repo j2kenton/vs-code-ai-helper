@@ -234,7 +234,8 @@ async function applyCurrentStageActionCore(
             ? (record.counts?.remaining ?? 0) > 0
             : (countChecklistEvidenceProgressV1(
                 record.text,
-                resolvedTask.progress.planItemEvidence ?? []
+                resolvedTask.progress.planItemEvidence ?? [],
+                resolvedTask.progress.planItemOwnerDecisions ?? []
               )?.gate.remaining ?? 0) > 0
         ),
       continuationOwed: resolvedTask.progress.implRecovery !== undefined,

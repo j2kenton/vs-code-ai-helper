@@ -21,6 +21,7 @@ import { executeCommitPushV1, COMMIT_PUSH_ACTION_KEY_V1 } from "../actions/rows/
 import { LifecycleExecutionContextV1 } from "../actions/taskActionRegistryV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { TaskInventory } from "../state/taskInventory";
+import { describeCommitPushEndedForChatV1 } from "../utils/commitPushFullListV1";
 import { ResolvedTaskContext } from "../utils/resolveTaskContext";
 import {
   deactivateNotificationRouter,
@@ -37,6 +38,16 @@ import { safeRemoveDir } from "./testFsUtils";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const commitAndPushTaskModule = require("../commands/commitAndPushTask") as {
   saveCommitPushDocumentsV1: (...args: unknown[]) => Promise<unknown>;
+};
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const chatActionOfferModule = require("../utils/chatActionOfferV1") as {
+  offerActionInChatV1: (input: {
+    noticeText: string;
+    actionLabel: string;
+    command: string;
+    taskFolderPath: string;
+  }) => Promise<undefined>;
 };
 
 function git(cwd: string, args: string[]): void {
@@ -134,5 +145,69 @@ void describe("executeCommitPushV1 — git readiness short-circuit (§10.2 step 
       deactivateNotificationRouter();
       safeRemoveDir(repoRoot);
     }
+  });
+
+  void it("bugs4 item 34: the git-readiness short-circuit posts one chat offer saying nothing was committed, why, and what to do next", async () => {
+    // These two pre-operation endings (index/privacy, git readiness) have no tracked
+    // operation, so no Ended line exists: the chat gets its own plain outcome card.
+    const { repoRoot, taskFolderPath } = makeDetachedHeadFixture();
+    initNotificationRouter(new RecordingSurface());
+    const original = chatActionOfferModule.offerActionInChatV1;
+    const offers: { noticeText: string; actionLabel: string; command: string; taskFolderPath: string }[] = [];
+    chatActionOfferModule.offerActionInChatV1 = (input): Promise<undefined> => {
+      offers.push(input);
+      return Promise.resolve(undefined);
+    };
+    try {
+      await executeCommitPushV1(contextFor(taskFolderPath));
+      assert.equal(offers.length, 1, "exactly one chat outcome");
+      const offer = offers[0];
+      assert.ok(offer);
+      assert.match(offer.noticeText, /detached HEAD/);
+      assert.match(offer.noticeText, /Nothing was committed or pushed/);
+      assert.match(offer.noticeText, /choose Commit & Push again/i);
+      assert.equal(offer.command, "vs-code-ai-helper.commitAndPushTask");
+      assert.equal(offer.taskFolderPath, taskFolderPath);
+    } finally {
+      chatActionOfferModule.offerActionInChatV1 = original;
+      deactivateNotificationRouter();
+      safeRemoveDir(repoRoot);
+    }
+  });
+
+  void it("bugs4 item 34: a chat that cannot be reached does not change the run's outcome", async () => {
+    const { repoRoot, taskFolderPath } = makeDetachedHeadFixture();
+    initNotificationRouter(new RecordingSurface());
+    const original = chatActionOfferModule.offerActionInChatV1;
+    chatActionOfferModule.offerActionInChatV1 = (): Promise<undefined> => Promise.reject(new Error("no chat"));
+    try {
+      const outcome = await executeCommitPushV1(contextFor(taskFolderPath));
+      assert.equal(outcome.kind, "failed");
+    } finally {
+      chatActionOfferModule.offerActionInChatV1 = original;
+      deactivateNotificationRouter();
+      safeRemoveDir(repoRoot);
+    }
+  });
+});
+
+void describe("describeCommitPushEndedForChatV1 (bugs4 item 34)", () => {
+  void it("keeps a decline that already says nothing was committed", () => {
+    const text = "Commit and push cancelled. Nothing was committed or pushed. Choose Commit & Push when you want to continue.";
+    assert.equal(describeCommitPushEndedForChatV1("userCancelled", text), text);
+  });
+
+  void it("adds 'nothing was committed' and a next step to a failure that does not say it", () => {
+    assert.equal(
+      describeCommitPushEndedForChatV1("gitCommitFailed", "Commit failed."),
+      "Commit failed. Nothing was committed or pushed. Fix that, then choose Commit & Push again."
+    );
+  });
+
+  void it("does not claim nothing was committed after a failed push", () => {
+    const text = describeCommitPushEndedForChatV1("pushFailed", "Push failed. Your local commit was kept.");
+    assert.doesNotMatch(text, /Nothing was committed/);
+    assert.match(text, /local commit/);
+    assert.match(text, /choose Commit & Push again/);
   });
 });

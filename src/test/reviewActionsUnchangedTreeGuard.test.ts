@@ -23,7 +23,14 @@ import * as path from "node:path";
 import { after, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { fastForwardReviewWithAI, runReviewForFolder } from "../commands/reviewActions";
+import {
+  fastForwardReviewWithAI,
+  runReviewForFolder,
+  runReviewWithAI,
+  settleReviewPreflightRefusalV1,
+} from "../commands/reviewActions";
+import { buildReviewPreflightRefusalV1 } from "../utils/reviewPreflightRefusalV1";
+import { OperationEndedLineTrackerV1 } from "../utils/operationEndedLineV1";
 import { rerunReviewAfterUnchangedTreeCardV1 } from "../commands/rerunReviewAfterUnchangedTreeCardV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
@@ -55,6 +62,8 @@ import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/task
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
 import { PUBLISH_CHECKS_NO_REASON_V1 } from "../utils/notificationTaskContextV1";
 import { copyPromptResources } from "./helpers/copyPromptResources";
+import { takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
+import type { ReviewPreflightRefusalV1 } from "../utils/reviewPreflightRefusalV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const modelSelectionModule = require("../utils/modelSelection") as Record<string, unknown>;
@@ -1382,6 +1391,7 @@ void describe("fastForwardReviewWithAI — a resumed run whose captured offset a
       throw new Error("must not resolve a provider when the resumed budget is already exhausted");
     });
 
+    __extensionContextV1TestOnly.set(context);
     try {
       await fastForwardReviewWithAI(
         vscode.Uri.file(REAL_ROOT),
@@ -1390,11 +1400,23 @@ void describe("fastForwardReviewWithAI — a resumed run whose captured offset a
         undefined
       );
 
+      // This fixture has no tracked changed-file scope and no ledger, so the
+      // stale review's re-review is (correctly, bugs4 item 3) refused by the
+      // scope preflight before any provider runs, and Fast Forward stops there
+      // with the typed refusal in chat instead of falling through to the
+      // budget check as it did when that refusal returned silently. Either
+      // way no further attempt runs: the opener patch above would have thrown.
+      // The exhausted-budget arithmetic itself is covered in
+      // activeFastForwardRunsV1.test.ts.
+      const stoppedOnBudget = recorder.notifications.some(
+        (n) => n.message.includes("already used all 10 attempt(s)") && n.message.includes("resuming it would exceed its own budget")
+      );
+      const stoppedOnPreflightRefusal = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .some((d) => d.decisionKey === "chatActionOffer:runImplementationWithAI" && /was not run \(no reviewer was invoked\)/.test(d.whatHappened));
       assert.ok(
-        recorder.notifications.some(
-          (n) => n.message.includes("already used all 10 attempt(s)") && n.message.includes("resuming it would exceed its own budget")
-        ),
-        `expected the exhausted-budget warning naming the spent total; got: ${JSON.stringify(recorder.notifications)}`
+        stoppedOnBudget || stoppedOnPreflightRefusal,
+        `expected the exhausted-budget warning or the typed preflight refusal; got: ${JSON.stringify(recorder.notifications)}`
       );
 
       const artifactAfter = fs.readFileSync(path.join(folderPath, "impl-high-review.md"), "utf8");
@@ -1403,6 +1425,7 @@ void describe("fastForwardReviewWithAI — a resumed run whose captured offset a
         "no apply/re-review cycle must have run — the existing review artifact must be untouched"
       );
     } finally {
+      __extensionContextV1TestOnly.reset();
       openerPatch.restore();
       for (const p of modelPatches.reverse()) { p.restore(); }
       for (const p of gatePatches.reverse()) { p.restore(); }
@@ -1421,4 +1444,370 @@ void describe("fastForwardReviewWithAI — a resumed run whose captured offset a
   // runner CLI spawn (applyReviewEditWithAI's edit path, distinct from the
   // review-only V1 runner selection stubbed above), which is out of
   // proportion for what this boundary needs proven.
+});
+
+// ---------------------------------------------------------------------------
+// bugs4 item 3: a review refused by the scope preflight (before any provider
+// is invoked) settles as a typed not-run outcome — never `completed`, never a
+// verdict, and always with its reason and recovery in task chat.
+// ---------------------------------------------------------------------------
+
+const PLAN_ROW_NO_CHANGE_LIST = {
+  roundId: "d51eb029-plan-row",
+  attemptIds: [] as string[],
+  stage: "plan" as TaskStage,
+  mode: "implementation" as const,
+  startedAt: "2026-10-27T10:00:00.000Z",
+  state: "completed" as const,
+  endedAt: "2026-10-27T10:05:00.000Z",
+};
+const IMPL_ROW_THREE_PATHS = {
+  roundId: "9422f594-impl-row",
+  attemptIds: [] as string[],
+  stage: "impl" as TaskStage,
+  mode: "implementation" as const,
+  startedAt: "2026-10-28T06:00:00.000Z",
+  state: "completed" as const,
+  endedAt: "2026-10-28T06:33:43.000Z",
+  outcome: {
+    filesChanged: ["src/test/gitIndexLockV1.test.ts", "src/utils/gitIndexLockV1.ts", "src/utils/roundGitStateV1.ts"],
+  },
+};
+
+function makeScopeTaskFolderV1(
+  name: string,
+  extra: Partial<TaskProgress> & { currentStage?: TaskStage }
+): { folderPath: string } {
+  const { folderPath } = makeUnusableSummaryTaskFolder(name);
+  fs.rmSync(getImplementationSummaryUri(vscode.Uri.file(folderPath)).fsPath, { force: true });
+  fs.rmSync(previousVersionUri(getImplementationSummaryUri(vscode.Uri.file(folderPath))).fsPath, { force: true });
+  const progressPath = path.join(folderPath, "task-progress.json");
+  const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as TaskProgress;
+  fs.writeFileSync(progressPath, JSON.stringify({ ...progress, ...extra }, null, 2), "utf8");
+  fs.writeFileSync(path.join(folderPath, "context-pack.md"), "# Context\n", "utf8");
+  return { folderPath };
+}
+
+function fakeOperationV1(): {
+  op: import("../utils/taskOperations").TaskOperationHandle;
+  settled: { state: string; reason?: string }[];
+  operationId: string;
+} {
+  const settled: { state: string; reason?: string }[] = [];
+  const operationId = `op-${Math.floor(Math.random() * 1e9)}`;
+  const base: Record<string, unknown> = {
+    id: operationId,
+    settleAs: (state: string, reason?: string): void => {
+      settled.push({ state, reason });
+    },
+  };
+  const op = new Proxy(base, {
+    get: (target, prop: string) => (prop in target ? target[prop] : (): undefined => undefined),
+  }) as unknown as import("../utils/taskOperations").TaskOperationHandle;
+  return { op, settled, operationId };
+}
+
+void describe("runReviewForFolder — scope preflight refusal is a typed not-run outcome (bugs4 item 3)", () => {
+  async function runRefused(
+    name: string,
+    extra: Partial<TaskProgress>,
+    mode: "manual" | "automation" = "automation",
+    withOperation = true
+  ): Promise<{
+    folderPath: string;
+    probe: { dispatched: boolean; preflightRefusal?: ReviewPreflightRefusalV1 };
+    settled: { state: string; reason?: string }[];
+    operationId: string;
+    providerInvocations: number;
+    notifications: { message: string; level: string }[];
+    decisions: ReturnType<WorkflowDecisionStoreV1["listPending"]>;
+  }> {
+    const { folderPath } = makeScopeTaskFolderV1(name, extra);
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    let providerInvocations = 0;
+    const countingTransport: AgentTransportV1 = {
+      runnerId: "stub-review-runner",
+      invoke: (request, output) => {
+        providerInvocations += 1;
+        return markdownTransportV1("Readiness: 9/10\n\n- Looks fine.\n").invoke(request, output);
+      },
+    };
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      stubV1RunnerSelection([countingTransport]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () =>
+        Promise.resolve(vscode.Uri.file(path.join(folderPath, "context-pack.md")))),
+    ];
+    const context = makeFastForwardExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const { op, settled, operationId } = fakeOperationV1();
+    const probe: { dispatched: boolean; preflightRefusal?: ReviewPreflightRefusalV1 } = { dispatched: false };
+    try {
+      await runReviewForFolder(
+        vscode.Uri.file(REAL_ROOT),
+        vscode.Uri.file(folderPath),
+        { uri: vscode.Uri.file(REAL_ROOT), name: "root", index: 0 },
+        "impl" as TaskStage,
+        true,
+        {
+          ...(withOperation ? { operation: op } : {}),
+          dispatchProbe: probe,
+          automationDispatch: mode === "automation",
+        }
+      );
+      return {
+        folderPath,
+        probe,
+        settled,
+        operationId,
+        providerInvocations,
+        notifications: recorder.notifications.map((n) => ({ message: n.message, level: n.level })),
+        decisions: new WorkflowDecisionStoreV1(context.workspaceState).listPending(),
+      };
+    } finally {
+      __extensionContextV1TestOnly.reset();
+      for (const p of patches.reverse()) { p.restore(); }
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  }
+
+  void it("the captured condition (only a Plan row with no change list, no tracked scope) refuses: zero provider invocations, a refused operation carrying the reason, and a recovery card", async () => {
+    const run = await runRefused("preflight-ledger-unproven", { roundLedger: [PLAN_ROW_NO_CHANGE_LIST] });
+    assert.equal(run.providerInvocations, 0, "no provider may be invoked");
+    assert.equal(run.probe.dispatched, false);
+    assert.equal(run.probe.preflightRefusal?.kind, "not-run");
+    assert.equal(run.probe.preflightRefusal?.cause, "ledger-unproven");
+    assert.equal(run.settled.length, 1, "exactly one settlement");
+    assert.equal(run.settled[0]!.state, "refused", "never completed or succeeded");
+    assert.match(run.settled[0]!.reason ?? "", /High-Level Code Review was not run \(no reviewer was invoked\)/);
+    assert.match(run.settled[0]!.reason ?? "", /Run an Implementation round/);
+    assert.equal(
+      fs.existsSync(path.join(run.folderPath, "impl-high-review.md")),
+      false,
+      "no review artifact, verdict or score may be created"
+    );
+    assert.equal(
+      run.notifications.some((n) => /was not run/.test(n.message)),
+      false,
+      "the refusal must not be a notification-only warning"
+    );
+    const card = run.decisions.find((d) => d.decisionKey === "chatActionOffer:runImplementationWithAI");
+    assert.ok(card, `a recovery card must be posted in chat; got: ${JSON.stringify(run.decisions.map((d) => d.decisionKey))}`);
+    assert.equal(card.options.find((o) => o.optionId === "runAction")?.label, "Run Implementation");
+    assert.ok(card.options.length >= 2, "a decision card always offers a real choice");
+    assert.match(card.options.find((o) => o.optionId === "notNow")?.consequence ?? "", /stays unrun/);
+    assert.match(takeStageActionRefusalReasonV1(run.folderPath) ?? "", /was not run/);
+    // The rendered terminal line: the operation observer speaks exactly once,
+    // as a refusal carrying the reason — never "completed" or "succeeded".
+    const tracker = new OperationEndedLineTrackerV1();
+    const operation = { id: run.operationId, label: "Review (High-Level Code Review)", state: "succeeded" };
+    tracker.register(operation);
+    const line = tracker.ended(operation);
+    assert.match(line ?? "", /^Ended Review \(High-Level Code Review\) — refused/);
+    assert.match(line ?? "", /was not run \(no reviewer was invoked\)/);
+    assert.doesNotMatch(line ?? "", /completed|succeeded/);
+    assert.equal(tracker.ended(operation), undefined, "a second delivery of the same end must not post a second line");
+  });
+
+  void it("a manual retry refuses the same way (not only automation)", async () => {
+    const run = await runRefused("preflight-manual", { roundLedger: [PLAN_ROW_NO_CHANGE_LIST] }, "manual");
+    assert.equal(run.probe.preflightRefusal?.cause, "ledger-unproven");
+    assert.equal(run.settled[0]?.state, "refused");
+    assert.equal(run.providerInvocations, 0);
+  });
+
+  void it("a caller with no tracked operation (backup retry, unchanged-tree re-run, missing-artifact retry) still gets one chat card carrying the reason, and no notification", async () => {
+    const run = await runRefused("preflight-no-operation", { roundLedger: [PLAN_ROW_NO_CHANGE_LIST] }, "manual", false);
+    assert.equal(run.providerInvocations, 0);
+    assert.equal(run.probe.preflightRefusal?.cause, "ledger-unproven");
+    assert.equal(run.settled.length, 0, "there is no operation to settle");
+    const cards = run.decisions.filter((d) => d.decisionKey === "chatActionOffer:runImplementationWithAI");
+    assert.equal(cards.length, 1, "the chat card is the one outcome for a caller with no operation");
+    assert.match(cards[0]!.whatHappened, /High-Level Code Review was not run/);
+    assert.equal(
+      run.notifications.some((n) => /was not run/.test(n.message)),
+      false,
+      "the chat took the outcome, so no fallback notification"
+    );
+  });
+
+  void it("settling a progress-unreadable refusal with no tracked operation is never silent: chat has no target, so the refusal is stated once through the fallback channel", async () => {
+    const folderPath = fs.mkdtempSync(path.join(os.tmpdir(), "preflight-unreadable-"));
+    const recorder = installNotificationRecorder();
+    const probe: { dispatched: boolean; preflightRefusal?: ReviewPreflightRefusalV1 } = { dispatched: false };
+    try {
+      const text = await settleReviewPreflightRefusalV1({
+        refusal: buildReviewPreflightRefusalV1({ cause: "progress-unreadable", stageLabel: "High-Level Code Review" }),
+        folderUri: vscode.Uri.file(folderPath),
+        dispatchProbe: probe,
+      });
+      assert.equal(probe.preflightRefusal?.cause, "progress-unreadable");
+      assert.match(text, /High-Level Code Review was not run/);
+      assert.equal(recorder.notifications.filter((n) => /was not run/.test(n.message)).length, 1);
+      assert.equal(probe.preflightRefusal?.recovery.openTaskFile, "task-progress.json");
+    } finally {
+      recorder.restore();
+      fs.rmSync(folderPath, { recursive: true, force: true });
+    }
+  });
+
+  void it("a ledger that proves nothing changed refuses with its own cause and the same recovery", async () => {
+    const run = await runRefused("preflight-empty", {
+      roundLedger: [{ ...IMPL_ROW_THREE_PATHS, outcome: { filesChanged: [] } }],
+    });
+    assert.equal(run.probe.preflightRefusal?.cause, "ledger-proves-empty");
+    assert.equal(run.settled[0]?.state, "refused");
+    assert.match(run.settled[0]?.reason ?? "", /no reviewable implementation files changed/);
+    assert.equal(run.providerInvocations, 0);
+  });
+
+  void it("control: with the captured Plan row AND the real impl row the scope is established from implementation history and the review runs", async () => {
+    const run = await runRefused(
+      "preflight-control",
+      { roundLedger: [PLAN_ROW_NO_CHANGE_LIST, IMPL_ROW_THREE_PATHS] },
+      "automation",
+      false
+    );
+    assert.equal(run.probe.preflightRefusal, undefined, "the real implementation history must not be refused");
+    assert.equal(
+      run.probe.dispatched,
+      true,
+      `the review must be dispatched past the scope guard; notifications: ${JSON.stringify(run.notifications)}`
+    );
+    assert.equal(run.settled.filter((s) => s.state === "refused").length, 0);
+    const progress = JSON.parse(fs.readFileSync(path.join(run.folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+    assert.deepEqual(
+      [...(progress.implReviewFiles ?? [])].sort(),
+      [
+        "src/test/gitIndexLockV1.test.ts",
+        "src/utils/gitIndexLockV1.ts",
+        "src/utils/roundGitStateV1.ts",
+      ],
+      "tracked scope is rebuilt from the task's own implementation history"
+    );
+  });
+});
+
+void describe("runReviewWithAI — the entry Resume dispatches settles a scope preflight refusal as not-run (bugs4 item 3)", () => {
+  void it("refuses with zero provider invocations, no review artifact, one refused-state reason and the recovery card; no notification stands in for it", async () => {
+    const { folderPath } = makeScopeTaskFolderV1(`resume-preflight-${Math.floor(Math.random() * 1e9)}`, {
+      currentStage: "impl-high-review" as TaskStage,
+      roundLedger: [PLAN_ROW_NO_CHANGE_LIST],
+    });
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
+    const gatePatches = installEditActionGatesAlwaysOkV1();
+    const context = makeFastForwardExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    let providerInvocations = 0;
+    const transport: AgentTransportV1 = {
+      runnerId: "stub-review-runner",
+      invoke: (request, output) => {
+        providerInvocations += 1;
+        return markdownTransportV1("Readiness: 9/10\n").invoke(request, output);
+      },
+    };
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      stubV1RunnerSelection([transport]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () =>
+        Promise.resolve(vscode.Uri.file(path.join(folderPath, "context-pack.md")))),
+    ];
+    try {
+      await runReviewWithAI(vscode.Uri.file(REAL_ROOT), context, { taskFolderPath: folderPath }, undefined);
+      assert.equal(providerInvocations, 0, "no provider may be invoked");
+      assert.equal(fs.existsSync(path.join(folderPath, "impl-high-review.md")), false, "no verdict or score was invented");
+      assert.match(takeStageActionRefusalReasonV1(folderPath) ?? "", /High-Level Code Review was not run/);
+      assert.equal(
+        recorder.notifications.some((n) => /was not run/.test(n.message)),
+        false,
+        "the refusal is a chat outcome, not a notification-only warning"
+      );
+      const cards = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .filter((d) => d.decisionKey === "chatActionOffer:runImplementationWithAI");
+      assert.equal(cards.length, 1, "exactly one recovery card");
+    } finally {
+      __extensionContextV1TestOnly.reset();
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const p of gatePatches.reverse()) { p.restore(); }
+      admissionPatch.restore();
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+});
+
+void describe("fastForwardReviewWithAI — a preflight-refused initial review stops Fast Forward with the one refusal (bugs4 item 3)", () => {
+  void it("posts no second 'did not produce usable output' message and invokes no provider", async () => {
+    const { folderPath } = makeScopeTaskFolderV1(`ff-preflight-${Math.floor(Math.random() * 1e9)}`, {
+      currentStage: "impl-high-review" as TaskStage,
+      roundLedger: [PLAN_ROW_NO_CHANGE_LIST],
+    });
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const recorder = installNotificationRecorder();
+    const admissionPatch = installAlwaysAcquiredWorkAdmissionV1();
+    const gatePatches = installEditActionGatesAlwaysOkV1();
+    const context = makeFastForwardExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    let providerInvocations = 0;
+    const transport: AgentTransportV1 = {
+      runnerId: "stub-review-runner",
+      invoke: (request, output) => {
+        providerInvocations += 1;
+        return markdownTransportV1("Readiness: 9/10\n").invoke(request, output);
+      },
+    };
+    const patches: Patched[] = [
+      patch(modelSelectionModule, "resolveModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      patch(modelSelectionModule, "resolveFreshModelForStage", () =>
+        Promise.resolve({ source: "settings", modelId: "claude-cli:sonnet@high" })),
+      stubV1RunnerSelection([transport]),
+      patch(promptTemplatesModule, "renderPromptTemplate", () => Promise.resolve("stub prompt")),
+      patch(runLogModule, "writeRunLog", () => Promise.resolve(undefined)),
+      patch(contextPackModule, "writeContextPack", () =>
+        Promise.resolve(vscode.Uri.file(path.join(folderPath, "context-pack.md")))),
+    ];
+    try {
+      await fastForwardReviewWithAI(vscode.Uri.file(REAL_ROOT), context, { taskFolderPath: folderPath }, undefined);
+      assert.equal(providerInvocations, 0);
+      assert.equal(
+        recorder.notifications.some((n) => /did not produce usable output/i.test(n.message)),
+        false,
+        `no generic second message; got: ${JSON.stringify(recorder.notifications)}`
+      );
+      assert.equal(fs.existsSync(path.join(folderPath, "impl-high-review.md")), false, "no review was invented");
+      const cards = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .filter((d) => d.decisionKey === "chatActionOffer:runImplementationWithAI");
+      assert.equal(cards.length, 1, "exactly one recovery card");
+    } finally {
+      __extensionContextV1TestOnly.reset();
+      for (const p of patches.reverse()) { p.restore(); }
+      for (const p of gatePatches.reverse()) { p.restore(); }
+      admissionPatch.restore();
+      recorder.restore();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
 });

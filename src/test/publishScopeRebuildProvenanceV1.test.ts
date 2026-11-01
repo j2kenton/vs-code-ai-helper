@@ -51,6 +51,7 @@ after(() => {
 
 const IMPL_ROW: ImplReviewLedgerRowV1 = {
   roundId: "round-live",
+  stage: "impl",
   mode: "implementation",
   state: "open",
   // Deliberately no `outcome` — a live row never carries one, which is
@@ -90,7 +91,7 @@ void describe("rebuildPublishImplReviewFilesV1 refusal provenance", () => {
     if (result.kind !== "refused") return;
     assert.equal(result.reason, PUBLISH_SCOPE_REFUSAL_REASON_V1);
     assert.equal(result.skipReasons.length, 2);
-    assert.match(result.skipReasons[0]!, /ledger skipped: round round-live \(implementation\) is still open/);
+    assert.match(result.skipReasons[0]!, /ledger skipped: round round-live \(stage impl, mode implementation\) is still open/);
     assert.match(result.skipReasons[1]!, /baseline skipped: sidecar missing/);
 
     const log = describePublishScopeRebuildForLogV1(result);
@@ -136,6 +137,7 @@ void describe("rebuildPublishImplReviewFilesV1 refusal provenance", () => {
   void it("an established ledger result never needs baseline provenance, and the log carries no skip section", async () => {
     const settledRow: ImplReviewLedgerRowV1 = {
       roundId: "round-done",
+      stage: "impl",
       mode: "implementation",
       state: "completed",
       outcome: { filesChanged: ["src/a.ts"] },
@@ -214,6 +216,7 @@ void describe("rebuildPublishImplReviewFilesV1 refusal provenance", () => {
     // one most likely evicted) was not missed.
     const paddedLedger: ImplReviewLedgerRowV1[] = Array.from({ length: MAX_ROUND_LEDGER_ENTRIES }, (_, i) => ({
       roundId: `pad-${i}`,
+      stage: "impl",
       mode: "implementation",
       state: "completed",
       outcome: { filesChanged: [] },

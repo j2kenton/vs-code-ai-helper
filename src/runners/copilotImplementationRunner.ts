@@ -635,6 +635,12 @@ export interface ImplementationRunResult {
    */
   summaryIsSynthetic?: boolean;
   errorMessage?: string;
+  /**
+   * bugs4 item 31/62: when a stage's chain failed after trying more than one model, every model
+   * it tried or skipped in order — the primary first — each with its own outcome. Cards read this
+   * instead of parsing `errorMessage`.
+   */
+  chainAttemptsV1?: readonly import("../utils/stopBehaviourV1").ChainAttemptV1[];
   /** Stable provider-neutral failure classification; set on failed results only. */
   failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
   /**

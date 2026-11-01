@@ -4,6 +4,7 @@ import {
   CreateWorkflowDecisionInputV1,
   WorkflowDecisionCommandResultV1,
   WorkflowDecisionOptionV1,
+  WorkflowDecisionRecommendationV1,
 } from "../types/workflowDecisionV1";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
@@ -18,11 +19,18 @@ import {
 import {
   applyOpenPlanItemsFormV1,
   countChecklistEvidenceProgressV1,
+  describeChecklistGateGapV1,
+  getPlanRevisionV1,
   listOpenPlanItemRecordsV1,
   normalizeChecklistItemTextV1,
   OpenPlanItemsFormAnswerV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
+import {
+  classifyOpenPlanItemsV1,
+  formatClassifiedOpenPlanItemsV1,
+  onlyMissingTestEvidenceV1,
+} from "../utils/openPlanItemClassificationV1";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { FastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
@@ -31,9 +39,20 @@ import { resolveConfiguredReviewStages } from "../utils/modelSelection";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { recordPlanItemOwnerDecisionV1 } from "../utils/taskProgressTransforms";
 import { withTaskLock } from "../state/taskStateStore";
+import { clearFormPlanWriteMarkerV1, markFormPlanWriteV1 } from "../utils/formPlanWriteMarkerV1";
+import { POST_OWNER_TEST_RUN_CARD_COMMAND_V1, partitionItemsByNamedCommandV1 } from "./ownerTestRunCardV1";
+import { formatTestsRefusedRemedyV1, type TestsRefusedV1 } from "../utils/testsRefusedV1";
+import type { AllowedTestCommandV1 } from "../utils/allowedTestCommandV1";
+import { clearStageActionRefusalReasonV1, takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
 
 const COMMAND = "vs-code-ai-helper.decideOpenPlanItems";
+const TICK_ALL_COMMAND = "vs-code-ai-helper.tickAllVerifiedOpenPlanItems";
+
+/** The note written beside each item the owner settles with "Tick all N". */
+export const TICK_ALL_VERIFIED_NOTE_V1 = "settled by your decision; no test report recorded";
 
 /** One open plan item as the "nothing more to build" card knows it: its text and the round's own reason (empty = none given). */
 export interface OpenPlanItemReasonForDecisionV1 {
@@ -80,27 +99,7 @@ export async function decideOpenPlanItemsV1(
     NotificationRouter.showWarning(`${taskName}: plan-final.md could not be read, so no form was posted.`);
     return false;
   }
-  // Resolve each item the round named to the plan's own occurrence-aware
-  // record, so two items with identical text get distinct ids.
-  const records = listOpenPlanItemRecordsV1(plan);
-  const used = new Set<string>();
-  const formItems: OpenPlanItemsFormItemV1[] = [];
-  for (const item of arg.items) {
-    const key = normalizeChecklistItemTextV1(item.itemText);
-    const record = records.find(
-      (r) => !r.settled && !used.has(r.itemId) && normalizeChecklistItemTextV1(r.itemText) === key
-    );
-    if (!record) {
-      continue;
-    }
-    used.add(record.itemId);
-    formItems.push({
-      itemId: record.itemId,
-      itemText: record.itemText,
-      occurrence: record.occurrence,
-      reason: item.reason,
-    });
-  }
+  const formItems = resolveOpenFormItemsV1(plan, arg.items);
   if (formItems.length === 0) {
     NotificationRouter.showInformation(`${taskName}: none of these items is still open in the plan.`);
     return { outcome: "done" };
@@ -129,6 +128,91 @@ export async function decideOpenPlanItemsV1(
     return false;
   }
   return { outcome: "done" };
+}
+
+/**
+ * Resolve each item the round named to the plan's own occurrence-aware record, so two items with
+ * identical text get distinct ids. Items no longer open in the plan are dropped.
+ */
+function resolveOpenFormItemsV1(
+  plan: string,
+  items: readonly OpenPlanItemReasonForDecisionV1[]
+): OpenPlanItemsFormItemV1[] {
+  const records = listOpenPlanItemRecordsV1(plan);
+  const used = new Set<string>();
+  const formItems: OpenPlanItemsFormItemV1[] = [];
+  for (const item of items) {
+    const key = normalizeChecklistItemTextV1(item.itemText);
+    const record = records.find(
+      (r) => !r.settled && !used.has(r.itemId) && normalizeChecklistItemTextV1(r.itemText) === key
+    );
+    if (!record) {
+      continue;
+    }
+    used.add(record.itemId);
+    formItems.push({
+      itemId: record.itemId,
+      itemText: record.itemText,
+      occurrence: record.occurrence,
+      reason: item.reason,
+    });
+  }
+  return formItems;
+}
+
+/**
+ * bugs4 item 27 / Step 20: "Tick all N: the review verified them built". Opens the same open-items
+ * form the item-by-item path uses and applies it at once with every row set to tick, so the ticks
+ * go through the one apply path: one plan write, owner provenance in the gate, and one chat
+ * outcome (including the follow-up). It is not a reviewer verification and invents no test
+ * report: the note says the items were settled by the owner's decision.
+ */
+export async function tickAllVerifiedOpenPlanItemsV1(
+  arg?: DecideOpenPlanItemsArgV1
+): Promise<WorkflowDecisionCommandResultV1 | boolean> {
+  if (!arg?.taskFolderPath || arg.items.length === 0) {
+    return false;
+  }
+  const taskName = formatNotificationTaskLabelV1(arg.displayName, arg.taskFolderPath);
+  const plan = await readTextIfExists(getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath)));
+  if (plan === undefined) {
+    return { outcome: "refused", message: `${taskName}: plan-final.md could not be read, so nothing was ticked.` };
+  }
+  const formItems = resolveOpenFormItemsV1(plan, arg.items);
+  if (formItems.length === 0) {
+    return { outcome: "done", message: `${taskName}: none of these items is still open in the plan, so nothing was ticked.` };
+  }
+  const formId = randomBytes(16).toString("hex");
+  const opened = await withTaskLock(arg.taskFolderPath, async () => {
+    const progress = await readTaskProgressStrictV1(vscode.Uri.file(arg.taskFolderPath));
+    if (!progress.ok || progress.decoded.progress.currentStage !== arg.stage) return false;
+    await appendOpenPlanItemsFormV1(arg.taskFolderPath, arg.taskFolderPath, {
+      formId,
+      stage: arg.stage,
+      items: formItems,
+      planFingerprint: fingerprintPlanV1(plan),
+      ...(arg.resumeFastForwardV1
+        ? {
+            resumeFastForwardV1: {
+              attemptNumber: arg.resumeFastForwardV1.attemptNumber,
+              maxAttempts: arg.resumeFastForwardV1.maxAttempts,
+            },
+          }
+        : {}),
+    });
+    return true;
+  });
+  if (!opened) {
+    return { outcome: "refused", message: `${taskName}: the stage changed or could not be verified, so nothing was ticked.` };
+  }
+  const result = await applyOpenPlanItemsFormSubmissionV1({
+    taskFolderPath: arg.taskFolderPath,
+    canonicalId: arg.taskFolderPath,
+    ...(arg.displayName ? { displayName: arg.displayName } : {}),
+    formId,
+    answers: formItems.map((item) => ({ itemId: item.itemId, choice: "tick", note: TICK_ALL_VERIFIED_NOTE_V1 })),
+  });
+  return { outcome: result.kind === "applied" ? "done" : "refused", message: result.message };
 }
 
 function fingerprintPlanV1(plan: string): string {
@@ -183,7 +267,18 @@ export async function applyOpenPlanItemsFormSubmissionV1(input: {
 }): Promise<OpenPlanItemsFormSubmissionResultV1> {
   const result = await withTaskLock(input.taskFolderPath, async () => applyOpenPlanItemsFormLockedV1(input));
   if (result.continuation) {
-    await continueAfterOpenPlanItemDecisionsV1(result.continuation, formatNotificationTaskLabelV1(input.displayName, input.taskFolderPath));
+    // bugs4 item 6: the follow-up's outcome is part of the ONE chat line the
+    // form ends with. It is never a pop-up on its own.
+    let followUp: string;
+    try {
+      followUp = await continueAfterOpenPlanItemDecisionsV1(
+        result.continuation,
+        formatNotificationTaskLabelV1(input.displayName, input.taskFolderPath)
+      );
+    } finally {
+      clearFormPlanWriteMarkerV1(input.taskFolderPath);
+    }
+    return { ...result.result, message: `${result.result.message} ${followUp}` };
   }
   return result.result;
 }
@@ -227,6 +322,19 @@ async function applyOpenPlanItemsFormLockedV1(input: {
   if (changed && !(await writeTextFileIfUnchangedV1(planUri, plan, applied.content))) {
     return { result: { kind: "rejected", message: "plan changed, try Apply again." } };
   }
+  if (changed) {
+    markFormPlanWriteV1(input.taskFolderPath, planUri.fsPath, applied.content);
+  }
+  let provenanceNote = "";
+  if (changed) {
+    // bugs4 item 7: a form tick is an explicit owner decision. Record it with
+    // owner provenance so the gate settles the item, apart from any reviewer
+    // verification. The task lock is already held by the caller.
+    const recorded = await recordOwnerDecisionsV1(input.taskFolderPath, form.formId, plan, applied);
+    provenanceNote = recorded
+      ? ` ${recorded}`
+      : " The completeness gate could not record these as your decisions, so it may still count them as unverified.";
+  }
   await setOpenPlanItemsFormStateV1(input.taskFolderPath, input.canonicalId, form.formId, "applied");
   const textById = new Map(form.items.map((item) => [item.itemId, item.itemText]));
   const parts: string[] = [];
@@ -241,12 +349,71 @@ async function applyOpenPlanItemsFormLockedV1(input: {
   );
   const summary =
     (parts.length > 0 ? `${parts.join(", ")} in plan-final.md.` : "No items were changed. Nothing will run; the items stay open. Fix what blocks them, then use Fast Forward or Apply Review.") +
-    (skippedLines.length > 0 ? ` ${skippedLines.join("; ")}.` : "");
+    (skippedLines.length > 0 ? ` ${skippedLines.join("; ")}.` : "") +
+    provenanceNote;
   NotificationRouter.showInformation(`${taskName}: ${summary}`);
   return { result: { kind: "applied", message: summary }, ...(changed ? { continuation: {
     taskFolderPath: input.taskFolderPath, displayName: input.displayName, items: [], stage: form.stage,
     ...(form.resumeFastForwardV1 ? { resumeFastForwardV1: form.resumeFastForwardV1 } : {}),
   } } : {}) };
+}
+
+/**
+ * Writes owner-provenance evidence for the form's ticks and exclusions and
+ * returns the gate's explanation of the result, or `undefined` when the
+ * evidence could not be written. Runs under the caller's task lock.
+ */
+async function recordOwnerDecisionsV1(
+  taskFolderPath: string,
+  formId: string,
+  priorContent: string,
+  applied: {
+    readonly content: string;
+    readonly tickedWritten: readonly string[];
+    readonly excludedWritten: readonly string[];
+  }
+): Promise<string | undefined> {
+  const planRevision = getPlanRevisionV1(applied.content);
+  const priorRevision = getPlanRevisionV1(priorContent);
+  const at = new Date().toISOString();
+  try {
+    const patched = await patchTaskProgressStrictV1(
+      vscode.Uri.file(taskFolderPath),
+      (progress) => {
+        let next = progress;
+        // The write above can change the plan revision (a note on a tick, an
+        // exclusion), and decisions are only read for the current revision.
+        // Carry the owner's decisions from the revision this write started
+        // from over to the new one so a later form does not undo them. An item
+        // whose own line this write changed no longer matches by key, so it is
+        // simply not counted until it is decided again.
+        if (priorRevision !== planRevision) {
+          for (const record of progress.planItemOwnerDecisions ?? []) {
+            if (record.planRevision !== priorRevision) continue;
+            next = recordPlanItemOwnerDecisionV1(next, {
+              planRevision, itemText: record.itemText, at: record.at, formId: record.formId, decision: record.decision,
+            });
+          }
+        }
+        // Keyed by the text as written: a note appended to a ticked line changes
+        // the key the gate looks the item up by.
+        for (const itemText of applied.tickedWritten) {
+          next = recordPlanItemOwnerDecisionV1(next, { planRevision, itemText, at, formId, decision: "tick" });
+        }
+        for (const itemText of applied.excludedWritten) {
+          next = recordPlanItemOwnerDecisionV1(next, { planRevision, itemText, at, formId, decision: "exclude" });
+        }
+        return next;
+      },
+      { skipLock: true }
+    );
+    if (!patched) return undefined;
+    const gate = countChecklistEvidenceProgressV1(applied.content, patched.planItemEvidence ?? [], patched.planItemOwnerDecisions ?? []);
+    if (!gate) return undefined;
+    return `Gate: ${describeChecklistGateGapV1(gate)}; ${gate.gate.settled} of ${gate.gate.total} settled.`;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Dismissal shares the task lease with submission and stage transitions. */
@@ -263,50 +430,83 @@ export async function dismissOpenPlanItemsFormV1(taskFolderPath: string, canonic
  * reported; a failure to arrange the next step is a `NotificationRouter`
  * warning, not a reason to make this command's own outcome look failed.
  */
-async function continueAfterOpenPlanItemDecisionsV1(
+/** @internal exported for testing */
+export async function continueAfterOpenPlanItemDecisionsV1(
   arg: DecideOpenPlanItemsArgV1,
   taskName: string
-): Promise<void> {
+): Promise<string> {
   try {
-    await continueAfterOpenPlanItemDecisionsInnerV1(arg, taskName);
+    return await continueAfterOpenPlanItemDecisionsInnerV1(arg, taskName);
   } catch (error) {
-    NotificationRouter.showWarning(
-      `${taskName}: your decisions were written to plan-final.md, but arranging what runs next failed: ` +
-        `${error instanceof Error ? error.message : String(error)}`
+    return (
+      "Your decisions were written to plan-final.md, but arranging what runs next failed: " +
+      `${error instanceof Error ? error.message : String(error)}. ${NOTHING_RUNS_NEXT_V1}`
     );
   }
 }
 
+const NOTHING_RUNS_NEXT_V1 = "Nothing else will run now; use Fast Forward or Apply Current Stage Action to continue.";
+
 async function continueAfterOpenPlanItemDecisionsInnerV1(
   arg: DecideOpenPlanItemsArgV1,
   taskName: string
-): Promise<void> {
+): Promise<string> {
   const planUri = getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath));
   const freshPlan = await readTextIfExists(planUri);
   const taskFolder = vscode.Uri.file(arg.taskFolderPath);
   const progressRead = await readTaskProgressStrictV1(taskFolder);
-  const remaining = freshPlan === undefined || !progressRead.ok
-    ? undefined
-    : countChecklistEvidenceProgressV1(freshPlan, progressRead.decoded.progress.planItemEvidence ?? [])?.gate.remaining;
-  if (!progressRead.ok || progressRead.decoded.progress.currentStage !== arg.stage) {
-    return;
+  if (!progressRead.ok) {
+    return `Nothing was started: ${taskName}'s task-progress.json could not be read, so the task's state is unknown. ${NOTHING_RUNS_NEXT_V1}`;
   }
-  if (remaining === undefined) {
-    return;
+  if (progressRead.decoded.progress.currentStage !== arg.stage) {
+    return `Nothing was started: ${taskName} is no longer on ${STAGE_DISPLAY_NAMES[arg.stage]}, so these decisions do not trigger its current stage.`;
+  }
+  const evidenceProgress =
+    freshPlan === undefined
+      ? undefined
+      : countChecklistEvidenceProgressV1(freshPlan, progressRead.decoded.progress.planItemEvidence ?? [], progressRead.decoded.progress.planItemOwnerDecisions ?? []);
+  const remaining = evidenceProgress?.gate.remaining;
+  if (evidenceProgress === undefined || remaining === undefined) {
+    return (
+      "Nothing was started: the completeness gate could not be read " +
+      (freshPlan === undefined
+        ? "(plan-final.md is missing or unreadable)"
+        : "(plan-final.md has no checklist the gate can count)") +
+      `. ${NOTHING_RUNS_NEXT_V1}`
+    );
   }
   if (remaining > 0) {
+    const display = evidenceProgress.display;
+    const unticked = display.total - display.checked - display.closedWithoutDoing;
+    if (unticked <= 0) {
+      // The owner just settled every box, yet the gate still counts items
+      // open: say so rather than dispatch a round to "build" ticked items.
+      return (
+        `Nothing was started. Every item is ticked or excluded in plan-final.md (${display.checked} ticked), but the completeness gate still counts ` +
+        `${remaining} of ${display.total} as not yet verified: ${evidenceProgress.verified} verified by review, ${evidenceProgress.provisional} ticked without review verification. ` +
+        "Building them again would only repeat finished work. Run a review to verify them, or move the task on yourself."
+      );
+    }
+    // The dispatched command holds its own admission for its whole run
+    // (resumeThenDispatchV1), so the form takes none: it would only race the
+    // command it is about to start. A refusal that command records is read
+    // here and reported in the form's one chat line.
+    clearStageActionRefusalReasonV1(arg.taskFolderPath);
     await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
       taskFolderPath: arg.taskFolderPath,
       displayName: arg.displayName,
       ...(arg.resumeFastForwardV1 ? { resumeFastForwardV1: arg.resumeFastForwardV1 } : {}),
     });
-    return;
+    const refusal = takeStageActionRefusalReasonV1(arg.taskFolderPath);
+    if (refusal !== undefined) {
+      return `The next step was not started: ${refusal.replace(/[.\s]+$/, "")}. ${remaining} item(s) are still open. ${NOTHING_RUNS_NEXT_V1}`;
+    }
+    return `${remaining} item(s) are still open, so ${taskName}'s stage action was dispatched to build them; its progress and outcome follow in this chat.`;
   }
   const configuredStages = await resolveConfiguredReviewStages(vscode.Uri.file(arg.taskFolderPath));
   const nextStage = computeNextStage(arg.stage, configuredStages);
   if (!nextStage) {
-    NotificationRouter.showInformation(`${taskName}: every plan item is now settled — there is no further stage to advance to.`);
-    return;
+    return "Every plan item is now settled, and there is no further stage to advance to.";
   }
   const target: ChatTarget = {
     canonicalId: arg.taskFolderPath,
@@ -368,16 +568,15 @@ async function continueAfterOpenPlanItemDecisionsInnerV1(
     },
     target
   );
-  if (!posted) {
-    NotificationRouter.showInformation(
-      `${taskName}: every plan item is now settled. Advance to ${nextStageName} when you are ready.`
-    );
-  }
+  return posted
+    ? `Every plan item is now settled; the Advance to ${nextStageName} card is in this chat.`
+    : `Every plan item is now settled. Advance to ${nextStageName} when you are ready.`;
 }
 
 export function registerDecideOpenPlanItemsCommandV1(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
-    vscode.commands.registerCommand(COMMAND, (arg?: DecideOpenPlanItemsArgV1) => decideOpenPlanItemsV1(arg))
+    vscode.commands.registerCommand(COMMAND, (arg?: DecideOpenPlanItemsArgV1) => decideOpenPlanItemsV1(arg)),
+    vscode.commands.registerCommand(TICK_ALL_COMMAND, (arg?: DecideOpenPlanItemsArgV1) => tickAllVerifiedOpenPlanItemsV1(arg))
   );
 }
 
@@ -409,13 +608,35 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
    * to resume Fast Forward or arrange an ordinary continuing action.
    */
   readonly resumeFastForwardV1?: FastForwardRunStateV1;
+  /**
+   * bugs4 items 5 and 27: normalized keys of the items the latest review
+   * verified complete, so they read "verified built by the review" instead of
+   * "no reason given".
+   */
+  readonly reviewVerifiedKeys?: ReadonlySet<string>;
+  /** Normalized keys of items the round durably claimed built (the classifier's built signal). */
+  readonly builtClaimedKeys?: ReadonlySet<string>;
+  /** bugs4 item 30: the plan's "N open, of which M are owner hand-offs" line. */
+  readonly openSummary?: string;
+  /**
+   * bugs4 Step 20: the test commands the last editing round's summary says the provider refused.
+   * Another round would be refused the same way, so the card points at the permission or tool setup.
+   */
+  readonly testsRefused?: TestsRefusedV1;
+  readonly allowedTestCommand?: AllowedTestCommandV1;
 }): Omit<CreateWorkflowDecisionInputV1, "decisionId"> {
-  const { taskFolderPath, taskCanonicalId, stage, displayName, items, createdAt, resumeFastForwardV1 } = input;
+  const { taskFolderPath, taskCanonicalId, stage, displayName, createdAt, resumeFastForwardV1 } = input;
+  // bugs4 items 5 and 27: say why each item is open, from what the system knows.
+  const classified = classifyOpenPlanItemsV1(input.items, input.reviewVerifiedKeys, input.builtClaimedKeys);
+  const items: readonly OpenPlanItemReasonForDecisionV1[] = classified.map((item) => ({
+    itemText: item.itemText,
+    reason: item.reason,
+  }));
   const count = items.length;
   const plural = count === 1 ? "item" : "items";
-  const evidenceLines = items
-    .map((item) => `- ${item.itemText} — ${item.reason || "no reason given"}`)
-    .join("\n");
+  const evidenceLines = formatClassifiedOpenPlanItemsV1(classified);
+  const testEvidenceOnly = onlyMissingTestEvidenceV1(classified);
+  const refusedCount = classified.filter((item) => item.category === "refused-by-round").length;
   const decideOption: WorkflowDecisionOptionV1 = {
     optionId: "decideItemByItem",
     label: "Decide item by item",
@@ -452,6 +673,33 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
       args: [{ taskFolderPath }],
     },
   };
+  const runTestingRoundOption: WorkflowDecisionOptionV1 = {
+    optionId: "runTestingRound",
+    label: "Run Implementation to run the tests",
+    resumeKind: "continue",
+    consequence:
+      "Starts one ordinary Implementation round for this task. If it runs the tests these items need and reports " +
+      "the passing command, the existing evidence rule can then settle them. Nothing is ticked for you, and the " +
+      "round is not told to run any particular test.",
+    effect: { kind: "command", command: "vs-code-ai-helper.runImplementationWithAI", args: [{ taskFolderPath }] },
+  };
+  // bugs4 Step 19: the owner ran the tests themselves (a Docker drill, a full suite) and records that.
+  const awaitingReportTexts = classified
+    .filter((item) => item.category === "awaiting-test-report" || (item.category === "verified-by-review-no-report" && item.testDependent))
+    .map((item) => item.itemText);
+  const ownerRanTestsOption: WorkflowDecisionOptionV1 = {
+    optionId: "ownerRanTests",
+    label: "I ran the tests myself",
+    resumeKind: "unpause",
+    consequence:
+      "Shows a card in this chat where you pick the command you ran and whether it passed. A passing run is recorded " +
+      `as your test report for the ${awaitingReportTexts.length} item(s) waiting only for one, marked as yours; nothing is ticked for you.`,
+    effect: {
+      kind: "command",
+      command: POST_OWNER_TEST_RUN_CARD_COMMAND_V1,
+      args: [{ taskFolderPath, displayName, stage, itemTexts: awaitingReportTexts }],
+    },
+  };
   const leaveOption: WorkflowDecisionOptionV1 = {
     optionId: "leaveOpen",
     label: "Leave them open",
@@ -459,24 +707,88 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
     consequence: "No change. This card does not pause the task, so it can keep working on anything else it still can.",
     effect: { kind: "doNothing" },
   };
+  // bugs4 item 27: when the latest review verified every listed item built, settling them all is
+  // one click. It is the owner's decision (owner provenance, as the form ticks); the card says so.
+  const allReviewVerified = count > 0 && classified.every((item) => item.category === "verified-by-review-no-report");
+  const tickAllOption: WorkflowDecisionOptionV1 = {
+    optionId: "tickAllVerified",
+    label: `Tick all ${count}: the review verified them built`,
+    resumeKind: "unpause",
+    consequence:
+      `Ticks all ${count} ${plural} in plan-final.md in one pass and records them as your decision, ${TICK_ALL_VERIFIED_NOTE_V1}. ` +
+      (classified.some((item) => item.testDependent)
+        ? "Items that need a test report count as settled by you, not as test-verified; the report is still missing. "
+        : "") +
+      "It then builds whatever is still open, or offers Advance once nothing is.",
+    effect: {
+      kind: "command",
+      command: TICK_ALL_COMMAND,
+      args: [{ taskFolderPath, displayName, items, stage, ...(resumeFastForwardV1 ? { resumeFastForwardV1 } : {}) }],
+    },
+  };
+  // bugs4 Step 20: the last editing round's test commands were refused. Another round is refused
+  // the same way, so the recommendation is the setup or the owner's own run, never "run it again".
+  const testsRefused = input.testsRefused;
+  const refusedRemedy = testsRefused ? formatTestsRefusedRemedyV1(testsRefused, input.allowedTestCommand) : "";
+  // The owner-run card can only record a run of a command a waiting item names; Ensemble never invents one.
+  const ownerRunOffered = partitionItemsByNamedCommandV1(awaitingReportTexts).groups.length > 0;
+  const baseOptions = testEvidenceOnly
+    ? [runTestingRoundOption, ...(ownerRunOffered ? [ownerRanTestsOption] : []), decideOption, openPlanOption, leaveOption]
+    : [decideOption, openPlanOption, leaveOption];
+  const refusedRecommendation: WorkflowDecisionRecommendationV1 | undefined =
+    testEvidenceOnly && testsRefused
+      ? ownerRunOffered
+        ? { kind: "option", optionId: "ownerRanTests", reasoning: `${refusedRemedy} Re-running the same round would be refused the same way.` }
+        : { kind: "option", optionId: "decideItemByItem", reasoning: `${refusedRemedy} Re-running the same round would be refused the same way.` }
+      : undefined;
   return {
     decisionKey: "openPlanItemsNeedDecision",
     taskCanonicalId,
     stage,
     whatHappened:
-      `This round changed no files. The plan checklist still has ${count} open ${plural} the round could not ` +
-      `build:\n\n${evidenceLines}`,
-    whyUserNeeded:
-      "None of the open items look buildable by another round right now — each needs your decision: excluded, " +
-      "already done, or genuinely still open.",
-    options: [decideOption, openPlanOption, leaveOption],
-    recommendation: {
-      kind: "option",
-      optionId: "decideItemByItem",
-      reasoning:
-        "Settling each item by hand is the only way to make real progress here instead of re-running the same " +
-        "empty round.",
-    },
+      `This round changed no files. The plan checklist still has ${count} open ${plural}` +
+      (input.openSummary ? ` (plan-wide: ${input.openSummary})` : "") +
+      `:\n\n${evidenceLines}`,
+    whyUserNeeded: allReviewVerified
+      ? "The latest review verified every open item built. They stay open only because the boxes are unticked or " +
+        "no passing test report is recorded; ticking them is your decision to make." +
+        (refusedRemedy ? ` ${refusedRemedy}` : "")
+      : testEvidenceOnly
+        ? "Every open item is waiting only for a passing test report. " +
+          (testsRefused
+            ? refusedRemedy
+            : "An Implementation round that runs the named tests can produce it; you can still settle the items yourself.")
+        : refusedCount === count
+          ? "None of the open items look buildable by another round right now — each needs your decision: excluded, " +
+            "already done, or genuinely still open."
+          : "Some of these items need your decision; others are waiting on evidence a round can produce. Each item " +
+            "above says which.",
+    options: allReviewVerified ? [tickAllOption, ...baseOptions] : baseOptions,
+    recommendation: allReviewVerified
+      ? {
+          kind: "option",
+          optionId: "tickAllVerified",
+          reasoning:
+            `The latest review verified all ${count} ${plural} built. Ticking them is one click and is recorded as ` +
+            "your decision, not as a test report or a review verification.",
+        }
+      : refusedRecommendation
+        ? refusedRecommendation
+        : testEvidenceOnly
+      ? {
+          kind: "option",
+          optionId: "runTestingRound",
+          reasoning:
+            "The work is in the tree and only the passing test report is missing. A round that runs the tests " +
+            "produces it, and the evidence rule then settles the items without you ticking them by hand.",
+        }
+      : {
+          kind: "option",
+          optionId: "decideItemByItem",
+          reasoning:
+            "Settling the items that need your decision is the way forward here instead of re-running the same " +
+            "empty round.",
+        },
     gating: {
       holdsTaskPaused: false,
       unblocksProgress: false,

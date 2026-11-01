@@ -23,18 +23,20 @@ import {
   decideOpenPlanItemsV1,
   dismissOpenPlanItemsFormV1,
   buildOpenPlanItemsNeedDecisionCardInputV1,
+  tickAllVerifiedOpenPlanItemsV1,
 } from "../commands/decideOpenPlanItemsV1";
 import {
   decodeOpenPlanItemsFormsV1,
   OpenPlanItemsFormV1,
   readOpenPlanItemsFormsV1,
 } from "../utils/chatHistoryStore";
-import { makeOwnedTaskFolder } from "./taskFolderFixture";
+import { makeOwnedTaskFolder, readTaskProgressForTest } from "./taskFolderFixture";
 import { retirePendingQuestionsV1, CARD_RETIRED_BY_TASK_MOVING_ON_REASON_V1 } from "../utils/cardLifecycleV1";
 import {
   applyOpenPlanItemDecisionsV1,
   applyOpenPlanItemsFormV1,
   computeOpenPlanItemIdV1,
+  countChecklistEvidenceProgressV1,
   listOpenPlanItemRecordsV1,
 } from "../utils/implementationChecklist";
 import { parseAcceptedNonGoalsV1 } from "../utils/reviewEvidenceNormalizerV1";
@@ -398,10 +400,11 @@ void describe("buildOpenPlanItemsNeedDecisionCardInputV1", () => {
     assert.equal(input.gating?.holdsTaskPaused, false);
   });
 
-  void it("lists each open item with its reason, or 'no reason given'", () => {
+  void it("lists each open item with its reason; an item the round named nothing for is 'not reached', never 'no reason given'", () => {
     const input = buildOpenPlanItemsNeedDecisionCardInputV1(base);
-    assert.match(input.whatHappened, /A human deployment step — owner hand-off/);
-    assert.match(input.whatHappened, /Runs at Publish — no reason given/);
+    assert.match(input.whatHappened, /A human deployment step — the round said: owner hand-off/);
+    assert.match(input.whatHappened, /Runs at Publish — not reached: the round did not report it built or unbuildable/);
+    assert.doesNotMatch(input.whatHappened, /no reason given/);
   });
 
   void it("the decide-item-by-item option's command carries the items with their reasons", () => {
@@ -412,7 +415,10 @@ void describe("buildOpenPlanItemsNeedDecisionCardInputV1", () => {
       return;
     }
     assert.equal(decide.effect.command, "vs-code-ai-helper.decideOpenPlanItems");
-    assert.deepEqual((decide.effect.args?.[0] as { items?: unknown })?.items, base.items);
+    assert.deepEqual((decide.effect.args?.[0] as { items?: unknown })?.items, [
+      { itemText: "A human deployment step", reason: "the round said: owner hand-off" },
+      { itemText: "Runs at Publish", reason: "not reached: the round did not report it built or unbuildable" },
+    ]);
   });
 
   void it("the open-plan-final option reuses the existing openPlanNonGoals command", () => {
@@ -594,6 +600,76 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
     assert.equal([...content.matchAll(/### Open items settled by the owner/g)].length, 1);
     const stored = (await readOpenPlanItemsFormsV1(folder, folder)).find((f) => f.formId === form.formId);
     assert.equal(stored?.state, "applied");
+  });
+
+  void it("bugs4 item 7: form ticks are recorded with owner provenance and settle the gate, even with notes and across two forms", async () => {
+    const folder = makeTaskFolder("flow-owner", FOUR_PLAN);
+    const first = await postForm(folder, FOUR_ITEMS);
+    const firstResult = await submit(folder, first, [
+      { itemId: idOf(first, "Owner item one"), choice: "tick", note: "did it" },
+      { itemId: idOf(first, "Owner item two"), choice: "tick" },
+    ]);
+    assert.equal(firstResult.kind, "applied");
+    assert.match(firstResult.message, /Gate: 2 ticked, 0 verified by review, 2 settled by you/);
+
+    const second = await postForm(folder, [
+      { itemText: "Owner item three", reason: "needs the owner" },
+      { itemText: "Owner item four", reason: "needs the owner" },
+    ]);
+    const secondResult = await submit(folder, second, [
+      { itemId: idOf(second, "Owner item three"), choice: "tick", note: "also did it" },
+      { itemId: idOf(second, "Owner item four"), choice: "tick", note: "and this" },
+    ]);
+    assert.equal(secondResult.kind, "applied");
+    // The second write changed the plan revision (notes change item text); the
+    // first form's decisions must still count.
+    assert.match(secondResult.message, /Gate: 4 ticked, 0 verified by review, 4 settled by you; 4 of 4 settled/);
+
+    const progress = await readTaskProgressForTest(vscode.Uri.file(folder));
+    const gate = countChecklistEvidenceProgressV1(readPlan(folder), progress?.planItemEvidence ?? [], progress?.planItemOwnerDecisions ?? []);
+    assert.ok(gate);
+    assert.equal(gate.gate.remaining, 0);
+    assert.equal(gate.verified, 0, "owner decisions are never reviewer verification");
+    assert.equal(gate.ownerSettled, 4);
+    const decisions = progress?.planItemOwnerDecisions ?? [];
+    assert.ok(decisions.length >= 4);
+    assert.ok((progress?.planItemEvidence ?? []).every((entry) => !("ownerDecisions" in entry)));
+    assert.ok(decisions.every((d) => d.source === "owner" && d.decision === "tick" && d.formId.length > 0));
+  });
+
+  void it("bugs4 Step 20: 'Tick all N' ticks every listed item in one pass with owner provenance and one outcome message", async () => {
+    const folder = makeTaskFolder("flow-tick-all", FOUR_PLAN);
+    const restore = forbidPopups();
+    let result: unknown;
+    try {
+      result = await tickAllVerifiedOpenPlanItemsV1({ taskFolderPath: folder, stage: "impl", items: FOUR_ITEMS });
+    } finally {
+      restore();
+    }
+    const outcome = result as { outcome: string; message: string };
+    assert.equal(outcome.outcome, "done");
+    assert.match(outcome.message, /ticked 4 in plan-final\.md/);
+    assert.match(outcome.message, /4 settled by you/);
+    const content = readPlan(folder);
+    assert.equal([...content.matchAll(/- \[x\] Owner item/g)].length, 4);
+    assert.match(content, /settled by your decision; no test report recorded/);
+    const progress = await readTaskProgressForTest(vscode.Uri.file(folder));
+    const gate = countChecklistEvidenceProgressV1(content, progress?.planItemEvidence ?? [], progress?.planItemOwnerDecisions ?? []);
+    assert.ok(gate);
+    assert.equal(gate.verified, 0, "Tick all is never reviewer verification");
+    assert.equal(gate.ownerSettled, 4);
+    assert.equal(gate.gate.remaining, 0);
+  });
+
+  void it("bugs4 Step 20: 'Tick all N' on items no longer open ticks nothing and says so", async () => {
+    const folder = makeTaskFolder("flow-tick-all-stale", "<!-- ensemble:implementation-checklist -->\n- [x] Owner item one\n");
+    const result = (await tickAllVerifiedOpenPlanItemsV1({
+      taskFolderPath: folder,
+      stage: "impl",
+      items: [{ itemText: "Owner item one", reason: "" }],
+    })) as { outcome: string; message: string };
+    assert.equal(result.outcome, "done");
+    assert.match(result.message, /none of these items is still open/);
   });
 
   void it("leaving every item open reports that nothing will run and leaves the plan untouched", async () => {
@@ -799,6 +875,7 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
         { itemId: idOf(form, "A human deployment step"), choice: "exclude", note: "owner hand-off" },
       ]);
       assert.equal(result.kind, "applied");
+      assert.match(result.message, /3 item\(s\) are still open, so .* stage action was dispatched to build them/);
       const arranged = exec.calls.find(
         (c) => c.command === "vs-code-ai-helper.resumeAndApplyCurrentStageAction"
       );
@@ -811,7 +888,41 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
     }
   });
 
-  void it("keeps a self-ticked item provisional and continues instead of offering Advance", async () => {
+  void it("bugs4 item 7: when every open item is ticked through the form, the gate counts them settled and the Advance card is posted (no round dispatched)", async () => {
+    const folder = makeTaskFolder("flow-advance", FOUR_PLAN);
+    const workspaceStateValues = new Map<string, unknown>();
+    const memento = {
+      get: <T>(key: string, fallback?: T): T =>
+        workspaceStateValues.has(key) ? (workspaceStateValues.get(key) as T) : (fallback as T),
+      update: (key: string, value: unknown): Promise<void> => {
+        workspaceStateValues.set(key, value);
+        return Promise.resolve();
+      },
+      keys: () => [...workspaceStateValues.keys()],
+    } as unknown as vscode.Memento;
+    setExtensionContextV1({ globalState: memento, workspaceState: memento, subscriptions: [] } as unknown as vscode.ExtensionContext);
+    const exec = installExecuteCommandCapture();
+    try {
+      const form = await postForm(folder, FOUR_ITEMS);
+      const result = await submit(folder, form, FOUR_ITEMS.map((item) => ({
+        itemId: idOf(form, item.itemText), choice: "tick" as const, note: "done by me",
+      })));
+      assert.equal(result.kind, "applied");
+      assert.equal(
+        exec.calls.some((c) => c.command === "vs-code-ai-helper.resumeAndApplyCurrentStageAction"),
+        false,
+        "nothing is open, so no round is dispatched"
+      );
+      const pending = new WorkflowDecisionStoreV1(memento).listPending(folder);
+      const advance = pending.find((d) => d.decisionKey === "openPlanItemsSettledOfferAdvance");
+      assert.ok(advance, `the Advance card must be posted; pending: ${JSON.stringify(pending)}`);
+    } finally {
+      exec.restore();
+      setExtensionContextV1(undefined as unknown as vscode.ExtensionContext);
+    }
+  });
+
+  void it("keeps a model-ticked item provisional (the owner-ticked one is settled) and does not offer Advance", async () => {
     const folder = makeTaskFolder("flow-6", PLAN);
     const workspaceStateValues = new Map<string, unknown>();
     const memento = {
@@ -845,10 +956,19 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
         { itemId: idOf(form, "Something the round actually did"), choice: "tick", note: "verified" },
       ]);
       assert.equal(result.kind, "applied");
-      assert.ok(
+      // bugs4 item 6: every box is now ticked or excluded, yet the gate still
+      // counts the model's earlier self-tick ("Build the thing") as unverified.
+      // The form says so in its one chat line instead of dispatching a round to
+      // "build" a finished item. bugs4 item 7: the owner's own tick, made through
+      // this form, is settled by their decision and is not part of that count.
+      assert.equal(
         exec.calls.some((c) => c.command === "vs-code-ai-helper.resumeAndApplyCurrentStageAction"),
-        "the self-ticked item is provisional, so the ordinary continuing action must be dispatched"
+        false,
+        "no round may be dispatched to build items the owner just ticked"
       );
+      assert.match(result.message, /Nothing was started/);
+      assert.match(result.message, /the completeness gate still counts 1 of 4 as not yet verified/);
+      assert.match(result.message, /0 verified by review, 1 ticked without review verification/);
       const store = new WorkflowDecisionStoreV1(context.workspaceState);
       const pending = store.listPending(folder);
       const advanceCard = pending.find((d) => d.decisionKey === "openPlanItemsSettledOfferAdvance");

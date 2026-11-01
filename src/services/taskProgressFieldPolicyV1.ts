@@ -113,6 +113,12 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve.",
     reopen: "Preserve — same rationale as checklistProgressUnreliable.",
   },
+  checklistProgressUnreliableClaims: {
+    migration: "Validate bounded non-empty string array/current optionality; absent on new tasks and on records predating this field.",
+    nextStage: "Preserve — travels with checklistProgressUnreliable, whose latching claims it records.",
+    markTaskDone: "Preserve.",
+    reopen: "Preserve — same rationale as checklistProgressUnreliable.",
+  },
   zeroChangeImplRounds: {
     migration: "Validate non-negative integer/current optionality; absent on new tasks.",
     nextStage: "Clear — a stage transition means the prior stage's zero-change streak no longer describes the stage now current.",
@@ -304,6 +310,18 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     nextStage: "Preserve claims and reviewer evidence across stage changes.",
     markTaskDone: "Preserve the provenance audit trail.",
     reopen: "Preserve the provenance audit trail.",
+  },
+  planItemOwnerDecisions: {
+    migration: "Validate bounded owner-decision records; absent on new tasks and on any record predating this field. Legacy entry-level ownerDecisions are hoisted here on decode.",
+    nextStage: "Preserve the owner-decision audit trail.",
+    markTaskDone: "Preserve the owner-decision audit trail.",
+    reopen: "Preserve the owner-decision audit trail.",
+  },
+  planItemOwnerTestRuns: {
+    migration: "Validate bounded owner test-run records; absent on new tasks and on any record predating this field.",
+    nextStage: "Preserve the owner test-run audit trail.",
+    markTaskDone: "Preserve the owner test-run audit trail.",
+    reopen: "Preserve the owner test-run audit trail.",
   },
   blockerSupersessions: {
     migration: "Validate bounded exact-shape entry array; preserve.",
@@ -536,6 +554,7 @@ export function applyNextStagePolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): describes who
     // acts next for the CURRENT stage state only — a transition moves that
@@ -587,6 +606,8 @@ export function applyNextStagePolicyV1(
     roundOutcomes: progress.roundOutcomes,
     roundLedger: progress.roundLedger,
     planItemEvidence: progress.planItemEvidence,
+    planItemOwnerDecisions: progress.planItemOwnerDecisions,
+    planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
@@ -631,6 +652,7 @@ export function applyMarkTaskDonePolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
     // stage state only — a transition moves that state, so the field is
@@ -678,6 +700,8 @@ export function applyMarkTaskDonePolicyV1(
     roundOutcomes: progress.roundOutcomes,
     roundLedger: progress.roundLedger,
     planItemEvidence: progress.planItemEvidence,
+    planItemOwnerDecisions: progress.planItemOwnerDecisions,
+    planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
@@ -757,6 +781,7 @@ export function applyReopenPolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
     // stage state only — a transition moves that state, so the field is
@@ -795,6 +820,8 @@ export function applyReopenPolicyV1(
     roundOutcomes: progress.roundOutcomes,
     roundLedger: progress.roundLedger,
     planItemEvidence: progress.planItemEvidence,
+    planItemOwnerDecisions: progress.planItemOwnerDecisions,
+    planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
@@ -880,6 +907,7 @@ export function applyPlanRevisionPolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
     // stage state only — a transition moves that state, so the field is
@@ -931,6 +959,8 @@ export function applyPlanRevisionPolicyV1(
     roundOutcomes: progress.roundOutcomes,
     roundLedger: progress.roundLedger,
     planItemEvidence: progress.planItemEvidence,
+    planItemOwnerDecisions: progress.planItemOwnerDecisions,
+    planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: marked.proposals,
     overriddenEscalations: progress.overriddenEscalations,

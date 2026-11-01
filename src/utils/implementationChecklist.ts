@@ -1198,6 +1198,10 @@ export type ApplyOpenPlanItemsFormResultV1 =
       readonly content: string;
       readonly ticked: readonly string[];
       readonly excluded: readonly string[];
+      /** Each ticked item's text as written (with its `— Checked:` note) — the gate's lookup key after the write. */
+      readonly tickedWritten: readonly string[];
+      /** Each excluded item's text as written (with its `— Excluded by you:` note). */
+      readonly excludedWritten: readonly string[];
       readonly skipped: readonly OpenPlanItemsFormSkippedV1[];
     }
   | {
@@ -1252,6 +1256,8 @@ export function applyOpenPlanItemsFormV1(
   const currentById = new Map(currentRecords.map((record) => [record.itemId, record]));
   let content = planOfRecord;
   const ticked: string[] = [];
+  const tickedWritten: string[] = [];
+  const excludedWritten: string[] = [];
   const excludedItems: AcceptedNonGoalItemV1[] = [];
   const skipped: OpenPlanItemsFormSkippedV1[] = [];
   for (const answer of answers) {
@@ -1276,7 +1282,7 @@ export function applyOpenPlanItemsFormV1(
       continue;
     }
     const mode = answer.choice === "tick" ? "tick" : "exclude";
-    const { content: next, settledItemText } = settleChecklistItemAtOccurrenceV1(
+    const { content: next, settledItemText, writtenItemText } = settleChecklistItemAtOccurrenceV1(
       content,
       current.itemText,
       current.occurrence,
@@ -1298,8 +1304,10 @@ export function applyOpenPlanItemsFormV1(
     content = next;
     if (mode === "tick") {
       ticked.push(settledItemText);
+      tickedWritten.push(writtenItemText ?? settledItemText);
     } else {
       excludedItems.push({ itemText: settledItemText, reason: answer.note ?? "" });
+      excludedWritten.push(writtenItemText ?? settledItemText);
     }
   }
   if (excludedItems.length > 0) {
@@ -1310,6 +1318,8 @@ export function applyOpenPlanItemsFormV1(
     content,
     ticked,
     excluded: excludedItems.map((item) => item.itemText),
+    tickedWritten,
+    excludedWritten,
     skipped,
   };
 }
@@ -1335,6 +1345,7 @@ function settleChecklistItemAtOccurrenceV1(
   const key = exactItemKeyV1(itemText);
   const cleanNote = note.replace(/\s+/g, " ").trim().replace(/\.$/, "");
   let settledItemText: string | undefined;
+  let writtenItemText: string | undefined;
   let seen = 0;
   const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
   const mergedRegion = walkLinesV1(region)
@@ -1356,10 +1367,14 @@ function settleChecklistItemAtOccurrenceV1(
             return whole;
           }
           settledItemText = unescapeChecklistItemTextV1(text);
+          const noteSuffix = mode === "tick"
+            ? (cleanNote ? ` — Checked: ${cleanNote}.` : "")
+            : (cleanNote ? ` — Excluded by you: ${cleanNote}.` : "");
+          writtenItemText = unescapeChecklistItemTextV1(`${text}${noteSuffix}`);
           if (mode === "tick") {
-            return `${open}x${close}${text}${cleanNote ? ` — Checked: ${cleanNote}.` : ""}${trailing}`;
+            return `${open}x${close}${text}${noteSuffix}${trailing}`;
           }
-          return `${open}${state}${close}${text}${cleanNote ? ` — Excluded by you: ${cleanNote}.` : ""} ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}${trailing}`;
+          return `${open}${state}${close}${text}${noteSuffix} ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}${trailing}`;
         }
       );
     })
@@ -1367,6 +1382,7 @@ function settleChecklistItemAtOccurrenceV1(
   return {
     content: settledItemText !== undefined ? `${prefix}${mergedRegion}` : planOfRecord,
     settledItemText,
+    writtenItemText,
   };
 }
 
@@ -1898,8 +1914,51 @@ export interface ChecklistEvidenceProgressV1 {
   readonly display: ChecklistProgressV1;
   /** Reviewer-verified completion plus explicit exclusions; used by gates. */
   readonly gate: ChecklistProgressV1;
+  /** Ticked items the reviewer verified (never includes owner decisions). */
   readonly verified: number;
+  /** Ticked items with only a model claim: neither verified nor decided by the owner. */
   readonly provisional: number;
+  /**
+   * bugs4 item 7: ticked items the owner settled through the form (recorded
+   * with owner provenance). Counted as settled by the gate, kept apart from
+   * `verified` so it is never mistaken for reviewer verification.
+   */
+  readonly ownerSettled: number;
+}
+
+/**
+ * bugs4 Step 13 (item 29): how many nested (sub-)items in the plan of record are still
+ * open (unticked and not excluded). They never change the plan's total, but an unticked
+ * child keeps its parent open, so cards that warn about a changed plan name them.
+ */
+export function countOpenNestedChecklistItemsV1(planOfRecord: string): number {
+  return itemsInLatestRendering(planOfRecord).filter((item) => item.nested && !item.checked && !item.excluded).length;
+}
+
+/**
+ * bugs4 Step 13 (item 39): how many nested (sub-)items the plan of record has in total, whatever
+ * their state. A review records this at dispatch so a later count can say "N sub-items added since
+ * the last review" instead of treating children as a changed checklist set.
+ */
+export function countNestedChecklistItemsV1(planOfRecord: string): number {
+  return itemsInLatestRendering(planOfRecord).filter((item) => item.nested).length;
+}
+
+/** An unticked, non-excluded plan item as Publish lists it: top-level or nested. */
+export interface UnsettledPlanItemV1 {
+  readonly text: string;
+  readonly nested: boolean;
+}
+
+/**
+ * bugs4 Step 13 (item 42): every unticked, non-excluded checklist item in the plan of record,
+ * top-level and nested, in plan order. Publish lists these as blockers; excluded owner
+ * hand-offs are left out because they wait on a person, not on a build.
+ */
+export function listUnsettledPlanItemsV1(planOfRecord: string): readonly UnsettledPlanItemV1[] {
+  return itemsInLatestRendering(planOfRecord)
+    .filter((item) => !item.checked && !item.excluded)
+    .map((item) => ({ text: unescapeChecklistItemTextV1(item.text), nested: item.nested }));
 }
 
 /**
@@ -1941,6 +2000,10 @@ function itemsInLatestRendering(
   const region = filesChangedIsSummaryBoundary(scoped)
     ? splitSummaryAtEchoV1(scoped).echo
     : scoped;
+  // bugs4 item 30: the items of the current top-level item's block (the item
+  // itself, then its nested children), with their indent, so a marker that sits
+  // on an indented line of its own can be attributed to the item it belongs to.
+  let block: { index: number; indent: number }[] = [];
   for (const line of walkLinesV1(region)) {
     if (line.fenced) {
       continue;
@@ -1948,21 +2011,151 @@ function itemsInLatestRendering(
     const heading = /^#{1,6}[ \t]+(.*\S)/.exec(line.text);
     if (heading) {
       section = heading[1] ?? "";
+      block = [];
       continue;
     }
     const match = ANY_ITEM_LINE.exec(line.text);
     if (match) {
       const text = match[3] ?? "";
+      const indent = match[1]?.length ?? 0;
+      if (indent === 0) {
+        block = [];
+      }
+      block.push({ index: items.length, indent });
       items.push({
         text,
         checked: match[2]?.toLowerCase() === "x",
         excluded: isExcludedChecklistItemText(text),
-        nested: (match[1]?.length ?? 0) > 0,
+        nested: indent > 0,
         section,
       });
+      continue;
+    }
+    if (line.text.trim().length === 0) {
+      continue;
+    }
+    const lineIndent = /^[ \t]*/.exec(line.text)?.[0].length ?? 0;
+    if (lineIndent === 0) {
+      block = [];
+      continue;
+    }
+    if (isExcludedContinuationLineV1(line.text)) {
+      for (let b = block.length - 1; b >= 0; b--) {
+        const owner = block[b]!;
+        if (owner.indent < lineIndent) {
+          items[owner.index]!.excluded = true;
+          break;
+        }
+      }
     }
   }
   return items;
+}
+
+/** One finding from {@link checkExclusionMarkerPlacementV1}. */
+export interface ExclusionMarkerPlacementFindingV1 {
+  /** 1-based line number in the plan text. */
+  readonly line: number;
+  /**
+   * `own-line`: the marker sits on an indented line under its item. The gate
+   * counts it, but the writer should put it on the item line.
+   * `orphan`: the marker belongs to no item, so it excludes nothing.
+   */
+  readonly kind: "own-line" | "orphan";
+  readonly text: string;
+}
+
+/**
+ * bugs4 item 30, plan-format check: lists every line that carries a real
+ * exclusion marker (not inside a code fence, not merely mentioned) without
+ * being the item line itself. Orphans exclude nothing and are almost always a
+ * formatting slip; own-line markers are honoured by the gate but flagged so
+ * the writer moves them onto the item line.
+ */
+export function checkExclusionMarkerPlacementV1(planOfRecord: string): readonly ExclusionMarkerPlacementFindingV1[] {
+  const findings: ExclusionMarkerPlacementFindingV1[] = [];
+  const scoped = scopeToLatestChecklistV1(planOfRecord);
+  const prefixLines = scoped.prefix.length === 0 ? 0 : scoped.prefix.split("\n").length - 1;
+  let hasOwner = false;
+  let lineNo = prefixLines;
+  for (const line of walkLinesV1(scoped.region)) {
+    lineNo++;
+    if (line.fenced) continue;
+    if (/^#{1,6}[ \t]+\S/.test(line.text)) {
+      hasOwner = false;
+      continue;
+    }
+    if (ANY_ITEM_LINE.test(line.text)) {
+      hasOwner = true;
+      continue;
+    }
+    if (line.text.trim().length === 0) continue;
+    const indent = /^[ \t]*/.exec(line.text)?.[0].length ?? 0;
+    if (indent === 0) hasOwner = false;
+    const bare = line.text.trim().replace(/^[-*][ \t]+/, "");
+    if (!bare.includes(EXCLUDED_CHECKLIST_ITEM_MARKER_V1)) continue;
+    if (isExcludedContinuationLineV1(line.text)) {
+      findings.push({ line: lineNo, kind: indent > 0 && hasOwner ? "own-line" : "orphan", text: line.text.trim() });
+    } else if (bare === EXCLUDED_CHECKLIST_ITEM_MARKER_V1 || bare === BACKTICK_WRAPPED_EXCLUDED_MARKER_V1) {
+      findings.push({ line: lineNo, kind: "orphan", text: line.text.trim() });
+    }
+  }
+  return findings;
+}
+
+/** Plan-format check wording for the reviewer; empty when the placement is canonical. */
+export function formatExclusionMarkerPlacementForReviewerV1(planOfRecord: string | undefined): string {
+  if (!planOfRecord) return "";
+  const findings = checkExclusionMarkerPlacementV1(planOfRecord);
+  if (findings.length === 0) return "";
+  const orphans = findings.filter((f) => f.kind === "orphan");
+  const ownLine = findings.filter((f) => f.kind === "own-line");
+  const parts: string[] = [];
+  if (orphans.length > 0) {
+    parts.push(`${orphans.length} stray exclusion marker(s) belong to no checklist item and exclude nothing (plan-final.md line ${orphans.map((f) => f.line).join(", ")}); move each onto its item's own line.`);
+  }
+  if (ownLine.length > 0) {
+    parts.push(`${ownLine.length} exclusion marker(s) sit on a line of their own under their item (line ${ownLine.map((f) => f.line).join(", ")}); the gate counts them, but the writer should put the marker on the item line.`);
+  }
+  return `Plan format: ${parts.join(" ")}`;
+}
+
+/**
+ * bugs4 item 30: the plan's unfinished top-level items split into buildable
+ * work and owner hand-offs ("N open, of which M are owner hand-offs"). A
+ * hand-off is an excluded item whose box is still unticked: the gate settles it
+ * against the fixed total, but it is still waiting on a person. `undefined`
+ * when the plan has no countable checklist.
+ */
+export function describeOpenAndHandOffsV1(planOfRecord: string): string | undefined {
+  const counted = countChecklistProgressV1(planOfRecord);
+  if (!counted) return undefined;
+  const handOffs = countOpenOwnerHandOffsV1(planOfRecord);
+  return `${counted.remaining + handOffs} open, of which ${handOffs} are owner hand-offs`;
+}
+
+/** Excluded top-level items whose box is still unticked: waiting on a person, not unbuilt work. */
+export function countOpenOwnerHandOffsV1(planOfRecord: string): number {
+  return itemsInLatestRendering(planOfRecord).filter((item) => !item.nested && item.excluded && !item.checked).length;
+}
+
+/**
+ * bugs4 item 30: true when an indented, non-checkbox line under a checklist
+ * item carries the exclusion marker for that item: the marker alone on its own
+ * line (optionally as a bullet, or wrapped in backticks), or following text on
+ * a continuation line. Stricter than the item-line rule: the marker wrapped in
+ * backticks after other text is a mention of the marker, not an exclusion.
+ */
+export function isExcludedContinuationLineV1(lineText: string): boolean {
+  const text = lineText.trim().replace(/^[-*][ \t]+/, "").trim();
+  if (text === EXCLUDED_CHECKLIST_ITEM_MARKER_V1 || text === BACKTICK_WRAPPED_EXCLUDED_MARKER_V1) {
+    return true;
+  }
+  if (!text.endsWith(EXCLUDED_CHECKLIST_ITEM_MARKER_V1)) {
+    return false;
+  }
+  const before = text.slice(0, text.length - EXCLUDED_CHECKLIST_ITEM_MARKER_V1.length);
+  return /\s$/.test(before) && !before.endsWith("`") && (before.match(/`/g)?.length ?? 0) % 2 === 0;
 }
 
 /** Return newly checked item texts between two plan renderings, preserving plan order. */
@@ -2091,6 +2284,13 @@ export interface SettleChecklistItemResultV1 {
   readonly content: string;
   /** The plan's own text of the item that was settled, or `undefined` when none matched. */
   readonly settledItemText: string | undefined;
+  /**
+   * The item's text as it reads on the written line, including the
+   * `— Checked:` / `— Excluded by you:` note the settle appended. Its
+   * normalized form is the key the gate looks the item up by after the write
+   * (the original `settledItemText` no longer matches once a note is added).
+   */
+  readonly writtenItemText?: string | undefined;
 }
 
 /**
@@ -2216,6 +2416,13 @@ export function countChecklistProgressV1(
   };
 }
 
+/** The slice of a stored owner decision the gate reads (`TaskProgress.planItemOwnerDecisions`). */
+export interface OwnerDecisionRowV1 {
+  readonly planRevision: string;
+  readonly itemKey: string;
+  readonly decision: string;
+}
+
 /** Separate visible checkboxes from completion that has reviewer provenance. */
 export function countChecklistEvidenceProgressV1(
   planOfRecord: string,
@@ -2223,7 +2430,8 @@ export function countChecklistEvidenceProgressV1(
     readonly planRevision: string;
     readonly itemKey: string;
     readonly verifications?: readonly unknown[];
-  }[]
+  }[],
+  ownerDecisions: readonly OwnerDecisionRowV1[] = []
 ): ChecklistEvidenceProgressV1 | undefined {
   const display = countChecklistProgressV1(planOfRecord);
   if (!display) return undefined;
@@ -2231,35 +2439,171 @@ export function countChecklistEvidenceProgressV1(
   const verifiedKeys = new Set(itemEvidence
     .filter((entry) => entry.planRevision === revision && (entry.verifications?.length ?? 0) > 0)
     .map((entry) => entry.itemKey));
+  // bugs4 item 7: a form tick is an explicit owner decision. It settles the
+  // item for the gate, but only while the box is still ticked in the plan
+  // (the loop below), and it is counted apart from reviewer verification.
+  const ownerKeys = new Set(ownerDecisions
+    .filter((row) => row.planRevision === revision && row.decision === "tick")
+    .map((row) => row.itemKey));
   const items = itemsInLatestRendering(planOfRecord);
   let verified = 0;
   let provisional = 0;
+  let ownerSettled = 0;
   for (let i = 0; i < items.length; i++) {
     const item = items[i]!;
     if (item.nested || item.excluded || !item.checked) continue;
-    let childrenVerified = true;
+    let childrenSettled = true;
     for (let j = i + 1; j < items.length && items[j]!.nested; j++) {
       const child = items[j]!;
-      if (!child.excluded && (!child.checked || !verifiedKeys.has(normalizeChecklistItemTextV1(child.text)))) {
-        childrenVerified = false;
+      const childKey = normalizeChecklistItemTextV1(child.text);
+      if (!child.excluded && (!child.checked || !(verifiedKeys.has(childKey) || ownerKeys.has(childKey)))) {
+        childrenSettled = false;
         break;
       }
     }
-    if (verifiedKeys.has(normalizeChecklistItemTextV1(item.text)) && childrenVerified) verified++;
+    const key = normalizeChecklistItemTextV1(item.text);
+    if (verifiedKeys.has(key) && childrenSettled) verified++;
+    else if (ownerKeys.has(key) && childrenSettled) ownerSettled++;
     else provisional++;
   }
-  const settled = verified + display.closedWithoutDoing;
+  const settled = verified + ownerSettled + display.closedWithoutDoing;
   return {
     display,
     gate: {
       ...display,
-      checked: verified,
+      checked: verified + ownerSettled,
       settled,
       remaining: display.total - settled,
     },
     verified,
     provisional,
+    ownerSettled,
   };
+}
+
+/**
+ * What would satisfy the test-evidence rule for an item held back only for a missing
+ * test report (bugs4 items 11 and 21): an editing round whose `## Verification` lists the
+ * passing command that runs the item's test files, with passed/failed counts and the
+ * post-edit source state. The command is a suggestion; the rule itself is unchanged.
+ */
+export const TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1 =
+  "Run an Implementation or Apply Review round that lists, under ## Verification, the passing command for each item's test files " +
+  "(for example `pnpm run test:unit -- <the item's test files>`) with its passed and failed counts and the post-edit source state.";
+
+/** A ticked top-level item that only a model has claimed (no reviewer or owner settlement yet). */
+export interface ProvisionalTickedItemV1 {
+  readonly text: string;
+  readonly testDependent: boolean;
+  /** Earliest recorded claim time for the item at the current plan revision, when one exists. */
+  readonly claimedAt?: string;
+}
+
+/**
+ * The ticked items the gate counts as provisional (the same rule as
+ * {@link countChecklistEvidenceProgressV1}), oldest first: items with no recorded claim
+ * time lead (ticked before evidence tracking), then by earliest claim time, ties in plan
+ * order. A reviewer too short on budget to check them all therefore shrinks the backlog
+ * from the old end every round (bugs4 item 21).
+ */
+export function listProvisionalTickedItemsV1(
+  planOfRecord: string,
+  itemEvidence: readonly {
+    readonly planRevision: string;
+    readonly itemKey: string;
+    readonly verifications?: readonly unknown[];
+    readonly claims?: readonly { readonly at: string }[];
+  }[],
+  ownerDecisions: readonly OwnerDecisionRowV1[] = []
+): ProvisionalTickedItemV1[] {
+  const revision = getPlanRevisionV1(planOfRecord);
+  const current = itemEvidence.filter((entry) => entry.planRevision === revision);
+  const verifiedKeys = new Set(current.filter((e) => (e.verifications?.length ?? 0) > 0).map((e) => e.itemKey));
+  const ownerKeys = new Set(
+    ownerDecisions.filter((row) => row.planRevision === revision && row.decision === "tick").map((row) => row.itemKey)
+  );
+  const earliestClaim = new Map<string, string>();
+  for (const entry of current) {
+    for (const claim of entry.claims ?? []) {
+      const known = earliestClaim.get(entry.itemKey);
+      if (known === undefined || claim.at < known) earliestClaim.set(entry.itemKey, claim.at);
+    }
+  }
+  const items = itemsInLatestRendering(planOfRecord);
+  const found: { item: ProvisionalTickedItemV1; order: number }[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    if (item.nested || item.excluded || !item.checked) continue;
+    let childrenSettled = true;
+    for (let j = i + 1; j < items.length && items[j]!.nested; j++) {
+      const child = items[j]!;
+      const childKey = normalizeChecklistItemTextV1(child.text);
+      if (!child.excluded && (!child.checked || !(verifiedKeys.has(childKey) || ownerKeys.has(childKey)))) {
+        childrenSettled = false;
+        break;
+      }
+    }
+    const key = normalizeChecklistItemTextV1(item.text);
+    if ((verifiedKeys.has(key) || ownerKeys.has(key)) && childrenSettled) continue;
+    const claimedAt = earliestClaim.get(key);
+    found.push({
+      item: { text: item.text, testDependent: isTestDependentChecklistItemV1(item.text), ...(claimedAt ? { claimedAt } : {}) },
+      order: i,
+    });
+  }
+  return found
+    .sort((a, b) => {
+      const ak = a.item.claimedAt;
+      const bk = b.item.claimedAt;
+      if (ak === bk) return a.order - b.order;
+      if (ak === undefined) return -1;
+      if (bk === undefined) return 1;
+      return ak < bk ? -1 : 1;
+    })
+    .map((entry) => entry.item);
+}
+
+/** Reviewer-facing block listing provisional ticked items by text, within a size limit. */
+export function formatProvisionalTickedItemsForReviewerV1(
+  planOfRecord: string | undefined,
+  itemEvidence: Parameters<typeof listProvisionalTickedItemsV1>[1],
+  ownerDecisions: readonly OwnerDecisionRowV1[] = [],
+  limits: { readonly maxItems: number; readonly maxChars: number } = { maxItems: 40, maxChars: 8000 }
+): string {
+  if (!planOfRecord) return "unknown";
+  const provisional = listProvisionalTickedItemsV1(planOfRecord, itemEvidence, ownerDecisions);
+  if (provisional.length === 0) {
+    return "None: every ticked item already has reviewer verification or an owner decision.";
+  }
+  const lines: string[] = [];
+  let chars = 0;
+  for (const item of provisional) {
+    const line = `- ${item.text}${item.testDependent ? " [needs a passing test report]" : ""}`;
+    if (lines.length >= limits.maxItems || chars + line.length > limits.maxChars) break;
+    lines.push(line);
+    chars += line.length + 1;
+  }
+  const hidden = provisional.length - lines.length;
+  return [
+    `${provisional.length} ticked item${provisional.length === 1 ? " is" : "s are"} still provisional (ticked by a round, not yet verified by a reviewer). ` +
+      `Listed oldest first${hidden > 0 ? `; ${lines.length} shown, ${hidden} more come up in later reviews` : ""}.`,
+    "For each one you personally confirmed against the workspace, name it in `## Verified Complete`, copying its text verbatim. Leave out any you did not check.",
+    `Items marked [needs a passing test report] also need an applicable durable passing report from the list above. ${TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1}`,
+    ...lines,
+  ].join("\n");
+}
+
+/**
+ * bugs4 item 7: one sentence that explains any gap between boxes ticked and
+ * items the gate counts as settled, using the gate's own numbers. Shown where
+ * the owner acts (the open-items form result, the cards).
+ */
+export function describeChecklistGateGapV1(progress: ChecklistEvidenceProgressV1): string {
+  const ticked = progress.verified + progress.provisional + progress.ownerSettled;
+  const parts = [`${ticked} ticked`, `${progress.verified} verified by review`];
+  if (progress.ownerSettled > 0) parts.push(`${progress.ownerSettled} settled by you`);
+  if (progress.provisional > 0) parts.push(`${progress.provisional} awaiting review verification`);
+  return parts.join(", ");
 }
 
 /**
@@ -2390,21 +2734,28 @@ export function formatChecklistPercentV1(settled: number, total: number): number
  */
 export function formatChecklistProgressForReviewerV1(
   planOfRecord: string | undefined,
-  itemEvidence?: readonly { readonly planRevision: string; readonly itemKey: string; readonly verifications?: readonly unknown[] }[]
+  itemEvidence?: readonly { readonly planRevision: string; readonly itemKey: string; readonly verifications?: readonly unknown[] }[],
+  ownerDecisions: readonly OwnerDecisionRowV1[] = []
 ): string {
   const counted = planOfRecord ? countChecklistProgressV1(planOfRecord) : undefined;
   if (!counted || itemEvidence === undefined || !planOfRecord) return counted ? `${counted.settled}/${counted.total}` : "unknown";
-  const evidence = countChecklistEvidenceProgressV1(planOfRecord, itemEvidence);
+  const evidence = countChecklistEvidenceProgressV1(planOfRecord, itemEvidence, ownerDecisions);
   return evidence ? `${evidence.gate.settled}/${evidence.gate.total}` : "unknown";
 }
 
 export function formatChecklistEvidenceForReviewerV1(
   planOfRecord: string | undefined,
-  itemEvidence: readonly { readonly planRevision: string; readonly itemKey: string; readonly verifications?: readonly unknown[] }[]
+  itemEvidence: readonly {
+    readonly planRevision: string;
+    readonly itemKey: string;
+    readonly verifications?: readonly unknown[];
+  }[],
+  ownerDecisions: readonly OwnerDecisionRowV1[] = []
 ): string {
   if (!planOfRecord) return "unknown";
-  const evidence = countChecklistEvidenceProgressV1(planOfRecord, itemEvidence);
+  const evidence = countChecklistEvidenceProgressV1(planOfRecord, itemEvidence, ownerDecisions);
   return evidence ? `${evidence.verified} reviewer-verified; ${evidence.provisional} provisional; ` +
+    (evidence.ownerSettled > 0 ? `${evidence.ownerSettled} settled by the owner; ` : "") +
     `${evidence.display.closedWithoutDoing} explicitly excluded` : "unknown";
 }
 
@@ -2756,8 +3107,78 @@ export function listProvisionalTestDependentChecklistItemsV1(
     .map((item) => unescapeChecklistItemTextV1(item.text));
 }
 
-function isTestDependentChecklistItemV1(itemText: string): boolean {
-  return /\b(?:tests?|test cases?|fixtures?|regressions?|coverage)\b/i.test(itemText);
+/**
+ * Text that mentions tests without requiring any (bugs4 item 11):
+ *  - a path or file name (`src/test/x.ts`, `processor.close-account.test.ts`),
+ *    which only says where something lives;
+ *  - tests named as a place to search or a scope to check ("including tests",
+ *    "plus any test found");
+ *  - a statement that no test work is needed ("no test changes needed",
+ *    "without tests").
+ * Removed before the requirement check below.
+ */
+const NON_REQUIREMENT_TEST_MENTIONS_V1: readonly RegExp[] = [
+  /\S*(?:\/|\.(?:test|spec)\.)\S*/gi,
+  /\b(?:including|incl\.?|plus(?:\s+any)?)\s+(?:(?:any|all|the)\s+)?(?:unit\s+|existing\s+)?tests?(?:\s+(?:files?|directories|dirs?|folders?|found))?\b/gi,
+  /\bno\s+(?:new\s+|further\s+)?tests?(?:\s+(?:changes?|updates?|edits?|files?|additions?))?(?:\s+(?:are\s+)?(?:needed|required|necessary|changed))?\b/gi,
+  /\bwithout\s+(?:any\s+)?tests?\b/gi,
+  /\b(?:not|never)\s+(?:need|require)s?\s+(?:any\s+)?tests?\b/gi,
+];
+
+/** A requirement clause starts the item or follows sentence punctuation or a conjunction. */
+const TEST_REQUIREMENT_LEAD_V1 = String.raw`(?:^|[.;:,(]\s*|\b(?:and|then|also|plus)\s+)`;
+/** Up to four filler words (articles, adjectives, "parser table") between a verb and its noun. */
+const TEST_REQUIREMENT_GAP_V1 = String.raw`(?:\s+[^\s,.;:()\`]+){0,4}?\s+`;
+const TEST_NOUN_V1 = String.raw`(?:tests?(?:\s+(?:cases?|suites?|files?))?|regression(?:\s+(?:tests?|cases?|suites?))?|specs?|fixtures?)(?![-\w])`;
+
+/**
+ * What an item has to ask for to be test-dependent: a verb that makes tests,
+ * running them, tests that must pass, or coverage. Descriptive uses of the noun
+ * ("test evidence", "test report", "failed tests", "test-dependent") are not
+ * requirements and match none of these.
+ */
+const TEST_REQUIREMENT_PATTERNS_V1: readonly RegExp[] = [
+  // "Add a parser table test", "Update any test that asserts…", "Add fixtures for…"
+  new RegExp(
+    `${TEST_REQUIREMENT_LEAD_V1}(?:add|write|create|update|extend|author|introduce|include|fix|adjust|rewrite|regenerate|refresh|expand)s?` +
+      `${TEST_REQUIREMENT_GAP_V1}${TEST_NOUN_V1}`,
+    "i"
+  ),
+  // "Run the tests", "Execute the unit test suite"
+  new RegExp(
+    `${TEST_REQUIREMENT_LEAD_V1}(?:re-?run|run|execute)s?${TEST_REQUIREMENT_GAP_V1.replace("{0,4}?", "{0,2}?")}${TEST_NOUN_V1}`,
+    "i"
+  ),
+  // "Commit the captured response as a test fixture": a test fixture is itself test work.
+  /\btest\s+fixtures?\b/i,
+  // "All unit tests pass after the change."
+  new RegExp(
+    String.raw`\b(?:all|every|existing|those|these)\s+(?:[^\s,.;:()]+\s+){0,2}tests?\s+(?:still\s+|must\s+|should\s+)?(?:pass|passes|are\s+green|succeed)\b`,
+    "i"
+  ),
+  // "(coverage must not drop)", "raise coverage", "test coverage target"
+  /\b(?:increase|improve|raise|maintain|keep|preserve)\s+(?:the\s+)?(?:test\s+)?coverage\b|\bcoverage\s+(?:must|should|target|threshold|gate|drop|report)\b|\btest\s+coverage\b/i,
+];
+
+/** "Run `pnpm run test:unit -- …`": the command is a backticked span, so read it before paths are stripped. */
+const RUN_TEST_COMMAND_V1 = new RegExp(
+  `${TEST_REQUIREMENT_LEAD_V1}(?:re-?run|run|execute)s?\\s+\`[^\`]*\\b(?:test|tests|vitest|jest|mocha)\\b[^\`]*\``,
+  "i"
+);
+
+/**
+ * An item is test-dependent only when it requires tests to be added, updated or
+ * run, tests to pass, or coverage. The word "test" anywhere in the text is not
+ * enough, and anything uncertain is left not test-dependent so the reviewer's
+ * evidence or the owner can settle it (bugs4 item 11).
+ */
+export function isTestDependentChecklistItemV1(itemText: string): boolean {
+  if (RUN_TEST_COMMAND_V1.test(itemText)) return true;
+  let remaining = itemText;
+  for (const pattern of NON_REQUIREMENT_TEST_MENTIONS_V1) {
+    remaining = remaining.replace(pattern, " ");
+  }
+  return TEST_REQUIREMENT_PATTERNS_V1.some((pattern) => pattern.test(remaining));
 }
 
 /**
@@ -2777,20 +3198,92 @@ export interface ApplicablePlanItemTestReportV1 {
   readonly sourceState: string;
 }
 
-export function getApplicablePassingTestReportForItemV1(
+/** Why an editing round's report does or does not count as a passing test report for one item (bugs4 item 21). */
+export type TestReportDiagnosisV1 =
+  | { readonly kind: "applicable"; readonly report: ApplicablePlanItemTestReportV1 }
+  | { readonly kind: "not-applicable"; readonly reason: string };
+
+const TEST_FILE_TOKEN_V1 = /[\w@.\-/\\]+?\.(?:test|spec)\.(?:[cm]?[jt]sx?)(?![\w-])/gi;
+/** "post-edit source state", "post-edit run", "final source", "tree fingerprint": the run used the edited tree. */
+export const POST_EDIT_STATEMENT_V1 =
+  /post[- ]edit(?:\s+(?:source(?:\s+state)?|tree|state|run|working\s+tree))?|final\s+(?:post-edit\s+)?(?:source|tree)|tree[- ]fingerprint/i;
+/** A listed file the round says it did not run is not covered by the command above it. */
+const NOT_RUN_LINE_V1 = /\bnot\s+run\b|\bskipp|\bcould\s+not\b|\brefused\b/i;
+
+function normalizeTestPathTokenV1(token: string): string {
+  return token
+    .toLowerCase()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^[([{'"`]+|[)\]}'"`,;]+$/g, "");
+}
+
+/** `src/test/X.test.ts` and the compiled `out/test/X.test.js` are one test: compare by directory-free stem. */
+function testStemV1(token: string): string {
+  const normalized = normalizeTestPathTokenV1(token);
+  return (normalized.split("/").pop() ?? normalized).replace(/\.(?:[cm]?[jt]sx?)$/, "");
+}
+
+function recordCoversTestV1(commandTokens: readonly string[], evidencePath: string): boolean {
+  const wanted = normalizeTestPathTokenV1(evidencePath);
+  const wantedStem = testStemV1(wanted);
+  return commandTokens.some((raw) => {
+    const token = normalizeTestPathTokenV1(raw);
+    if (!token) return false;
+    if (token === wanted) return true;
+    const last = token.split("/").pop() ?? token;
+    if (/\.[a-z]+$/.test(last)) return wantedStem.length > 0 && testStemV1(token) === wantedStem;
+    // A directory the runner was pointed at (`vitest run src/__tests__/`) covers the tests under it.
+    // Only path-shaped tokens count: a bare word such as `test` must not cover every test file.
+    const dir = token.replace(/\/+$/, "");
+    return dir.includes("/") && (wanted.startsWith(`${dir}/`) || wanted.includes(`/${dir}/`));
+  });
+}
+
+/**
+ * Whether a stored test report's command still covers the test identity it was recorded
+ * against (bugs4 item 21). A bare test file is covered the way the report parser covers it: the
+ * same path, the same file as its compiled `.js` counterpart, or a directory the runner was
+ * pointed at. Any other identity is a command or the item's evidence text, which the report
+ * parser tied to this command when it accepted the report, so there is no file to re-check; the
+ * narrower basename-only check this replaces rejected every such report at apply time.
+ */
+export function reportCommandCoversTestIdentityV1(command: string, testIdentity: string): boolean {
+  const identity = testIdentity.trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  const bareTestFile = !/\s/.test(identity) && /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(identity);
+  if (!bareTestFile) return true;
+  return recordCoversTestV1(command.split(/[\s'"`;=,]+/), identity);
+}
+
+function countsInRecordV1(text: string, pattern: RegExp): number[] {
+  return [...text.matchAll(pattern)].map((match) => Number(match[1] ?? match[2]));
+}
+
+/**
+ * Decides whether an editing round's report counts as a passing test report for a
+ * checked test-dependent item, and says why not when it does not (bugs4 item 21).
+ * Accepted: one command run over several listed files, or over directories;
+ * evidence naming several test files with prose around them; a source `.ts` test and
+ * its compiled `.js` counterpart as the same test; evidence that points at a command
+ * listed under Verification; and any clear statement that the run used the edited tree.
+ * Never accepted: a command that names none of the item's tests, a failing run, or
+ * prose that merely mentions a file.
+ */
+export function diagnoseApplicablePassingTestReportForItemV1(
   planOfRecord: string,
   itemText: string,
   editingRoundReport: string
-): ApplicablePlanItemTestReportV1 | undefined {
-  if (!editingRoundReport || !isTestDependentChecklistItemV1(itemText)) return undefined;
+): TestReportDiagnosisV1 {
+  const no = (reason: string): TestReportDiagnosisV1 => ({ kind: "not-applicable", reason });
+  if (!editingRoundReport) return no("the round left no report");
+  if (!isTestDependentChecklistItemV1(itemText)) return no("the item is not test-dependent");
   const wanted = normalizeChecklistItemTextV1(itemText);
   const planItemKeys = collectChecklistItemKeysV1(planOfRecord);
   const { own } = splitSummaryAtEchoV1(editingRoundReport);
   const all = headingsV1(own);
   const checklistAt = findLastHeadingV1(all, "Plan Item Checklist");
-  if (checklistAt < 0) return undefined;
-  const checklistHeading = all[checklistAt];
-  if (!checklistHeading) return undefined;
+  const checklistHeading = checklistAt < 0 ? undefined : all[checklistAt];
+  if (!checklistHeading) return no("the report has no `## Plan Item Checklist` section");
   const lines = walkLinesV1(own);
   let checklistEnd = lines.length;
   for (let i = checklistAt + 1; i < all.length; i++) {
@@ -2801,6 +3294,7 @@ export function getApplicablePassingTestReportForItemV1(
     }
   }
   let itemClaimEvidence = "";
+  let claimedDone = false;
   for (let i = checklistHeading.line + 1; i < checklistEnd; i++) {
     const line = lines[i];
     if (!line || line.fenced) continue;
@@ -2808,15 +3302,28 @@ export function getApplicablePassingTestReportForItemV1(
     if (parsed && parsed.status.toLowerCase().startsWith("done") &&
         normalizeChecklistItemTextV1(parsed.itemText) === wanted) {
       itemClaimEvidence = parsed.evidence;
+      claimedDone = true;
       break;
     }
   }
-  if (!itemClaimEvidence || !/\btest\b/i.test(itemClaimEvidence)) return undefined;
+  if (!claimedDone) return no("the round did not claim this item done in its `## Plan Item Checklist`");
+  // A backticked span with a space is a command; a single token is a file or test name.
+  const evidenceCommands = [...itemClaimEvidence.matchAll(/`([^`]+)`/g)]
+    .map((m) => (m[1] ?? "").trim())
+    .filter((span) => /\s/.test(span));
+  const evidenceNamesTests = /\btests?\b|\.(?:test|spec)\.|\bvitest\b|\bjest\b/i.test(itemClaimEvidence);
+  if (!itemClaimEvidence || (!evidenceNamesTests && evidenceCommands.length === 0)) {
+    return no("the item's evidence names no test file, test name or command");
+  }
+  const evidenceKey = itemClaimEvidence
+    .replace(/^\s*test(?:\s+evidence)?\s*[:=]\s*/i, "")
+    .trim()
+    .toLowerCase();
+  if (!evidenceKey) return no("the item's evidence names no test file, test name or command");
 
   const verificationAt = findLastHeadingV1(all, "Verification");
-  if (verificationAt < 0) return undefined;
-  const verificationHeading = all[verificationAt];
-  if (!verificationHeading) return undefined;
+  const verificationHeading = verificationAt < 0 ? undefined : all[verificationAt];
+  if (!verificationHeading) return no("the report has no `## Verification` section");
   let verificationEnd = lines.length;
   for (let i = verificationAt + 1; i < all.length; i++) {
     const heading = all[i];
@@ -2825,76 +3332,136 @@ export function getApplicablePassingTestReportForItemV1(
       break;
     }
   }
-  const evidenceKey = itemClaimEvidence
-    .replace(/^\s*test(?:\s+evidence)?\s*[:=]\s*/i, "")
-    .trim()
-    .toLowerCase();
-  if (!evidenceKey) return undefined;
-
-  // Treat a Markdown list item and its indented continuation lines as one
-  // report record. The command must itself identify the test named by the
-  // plan-item claim, and the passing result must belong to that same record;
-  // prose elsewhere in the verification section cannot lend its filename or
-  // pass counts to an unrelated command. Source-state evidence is a report
-  // level assertion and may be on a separate line, as the prompt does not
-  // require all evidence fields to share one physical line.
   const verificationLines = lines
     .slice(verificationHeading.line + 1, verificationEnd)
     .filter((line) => line && !line.fenced);
-  const sourceStateReported = verificationLines.some((line) =>
-    /post[- ]edit source state/i.test(line.text)
-  );
-  if (!sourceStateReported) return undefined;
+  const statementLine = verificationLines.find((line) => POST_EDIT_STATEMENT_V1.test(line.text));
+  if (!statementLine) {
+    return no(
+      "the Verification section does not say the run used the post-edit tree (for example “post-edit source state”, “final source” or a tree fingerprint)"
+    );
+  }
 
-  const commandMatchesEvidence = (command: string): boolean => {
-    // A claim may name a repository-relative test path while the command uses
-    // its basename. Accept that precise suffix match, but never a substring
-    // such as `required.test.ts.not-run` or a filename mentioned outside the
-    // executable command.
-    const normalizedEvidence = evidenceKey.replace(/\\/g, "/").replace(/^\.\//, "");
-    const basename = normalizedEvidence.split("/").pop() ?? normalizedEvidence;
-    return basename.length > 0 && command
-      .toLowerCase()
-      .split(/[\s'"`;=,]+/)
-      .some((part) => {
-        const token = part.replace(/^[([{]+|[),\]}]+$/g, "").replace(/\\/g, "/").replace(/^\.\//, "");
-        return token === normalizedEvidence || token.split("/").pop() === basename;
-      });
-  };
+  // A Markdown list item and its more-deeply indented continuation lines are one
+  // record: the command, any files listed under it, and its counts. A sibling
+  // record's prose can never lend its filename or pass counts to another command.
+  const indentOf = (text: string): number => /^\s*/.exec(text)?.[0].length ?? 0;
+  interface VerificationRecordV1 {
+    readonly command: string;
+    readonly commandTokens: string[];
+    readonly text: string;
+  }
+  const records: VerificationRecordV1[] = [];
   for (let i = 0; i < verificationLines.length; i++) {
     const line = verificationLines[i];
     if (!line) continue;
-    const text = line.text;
-    const command = /`([^`]+)`/.exec(text)?.[1];
-    if (!command || !commandMatchesEvidence(command)) continue;
-
-    // Capture continuations until the next peer-level Markdown bullet. This
-    // supports wrapped runner output while keeping results associated with
-    // the command they describe.
-    const record = [text];
+    const command = /`([^`]+)`/.exec(line.text)?.[1];
+    if (!command) continue;
+    const baseIndent = indentOf(line.text);
+    const recordLines = [line.text];
+    const listed: string[] = [];
     for (let j = i + 1; j < verificationLines.length; j++) {
-      const continuation = verificationLines[j];
-      if (!continuation) continue;
-      if (/^\s*[-*+]\s+/.test(continuation.text)) break;
-      record.push(continuation.text);
+      const next = verificationLines[j];
+      if (!next) continue;
+      if (/^\s*[-*+]\s+/.test(next.text) && indentOf(next.text) <= baseIndent) break;
+      recordLines.push(next.text);
+      if (!NOT_RUN_LINE_V1.test(next.text)) listed.push(next.text);
     }
-    const recordText = record.join(" ");
-    const counts = /(\d+)\s+passed\b/i.exec(recordText);
-    const failures = /(\d+)\s+failed\b/i.exec(recordText);
-    if (counts && failures && Number(failures[1]) === 0) {
-      const workingDirectory = /(?:working directory|cwd)\s*[:=]\s*`?([^`\n]+)`?/i.exec(recordText)?.[1]?.trim();
-      const stateLine = verificationLines.find((candidate) => /post[- ]edit source state/i.test(candidate.text));
-      return {
-        testIdentity: evidenceKey,
-        command,
-        ...(workingDirectory ? { workingDirectory } : {}),
-        passed: Number(counts[1]),
-        failed: Number(failures[1]),
-        sourceState: stateLine?.text.slice(0, 1000) ?? "post-edit source state reported",
-      };
-    }
+    records.push({
+      command,
+      commandTokens: [command, ...listed].join(" ").split(/[\s'"`;=,]+/),
+      text: recordLines.join(" "),
+    });
   }
-  return undefined;
+  if (records.length === 0) return no("the Verification section lists no backticked command");
+
+  const build = (record: VerificationRecordV1, identity: string): ApplicablePlanItemTestReportV1 | undefined => {
+    const passes = countsInRecordV1(record.text, /(\d+)\s+(?:tests?\s+)?pass(?:ed|ing)?\b|\bpass(?:ed)?\s*[:=]?\s*(\d+)/gi);
+    const fails = countsInRecordV1(record.text, /(\d+)\s+fail(?:ed|ures?|ing)?\b|\bfail(?:ed|ures?)?\s*[:=]?\s*(\d+)/gi);
+    if (passes.length === 0 || fails.length === 0 || fails.some((n) => n !== 0)) return undefined;
+    const workingDirectory = /(?:working directory|cwd)\s*[:=]\s*`?([^`\n]+)`?/i.exec(record.text)?.[1]?.trim();
+    return {
+      testIdentity: identity,
+      command: record.command,
+      ...(workingDirectory ? { workingDirectory } : {}),
+      passed: passes[0] ?? 0,
+      failed: 0,
+      sourceState: statementLine.text.slice(0, 1000),
+    };
+  };
+
+  // Evidence that points at a command listed under Verification.
+  const collapse = (text: string): string => text.replace(/\s+/g, " ").trim().toLowerCase();
+  for (const evidenceCommand of evidenceCommands) {
+    const wantedCommand = collapse(evidenceCommand);
+    const record = records.find((r) => {
+      const have = collapse(r.command);
+      return have === wantedCommand || have.includes(wantedCommand) || wantedCommand.includes(have);
+    });
+    const report = record ? build(record, wantedCommand) : undefined;
+    if (report) return { kind: "applicable", report };
+  }
+
+  // Evidence naming one or several test files, with prose around them: every
+  // named file must be covered by a passing command.
+  const named = [...new Set((itemClaimEvidence.match(TEST_FILE_TOKEN_V1) ?? []).map(normalizeTestPathTokenV1))];
+  const targets = named.length > 0 ? named : [evidenceKey.replace(/\\/g, "/").replace(/^\.\//, "")];
+  let firstReport: ApplicablePlanItemTestReportV1 | undefined;
+  for (const target of targets) {
+    const covering = records.filter((r) => recordCoversTestV1(r.commandTokens, target));
+    if (covering.length === 0) {
+      return no(`no Verification command names ${named.length > 0 ? `\`${target}\`` : `“${evidenceKey.slice(0, 80)}”`}`);
+    }
+    const report = covering.map((r) => build(r, evidenceKey)).find((r): r is ApplicablePlanItemTestReportV1 => r !== undefined);
+    if (!report) return no(`the command covering \`${target}\` did not report “N passed” with 0 failed`);
+    firstReport ??= report;
+  }
+  return firstReport ? { kind: "applicable", report: firstReport } : no("no Verification command matched the item's evidence");
+}
+
+/**
+ * Test-dependent items the round claimed done whose report did not count as a
+ * passing test report, each with the reason. An item the round never claimed is
+ * not listed: that is a missing claim, not a report that failed to parse.
+ */
+export function listUncountedTestReportClaimsV1(
+  planOfRecord: string,
+  editingRoundReport: string
+): ReadonlyArray<{ readonly itemText: string; readonly reason: string }> {
+  const uncounted: Array<{ itemText: string; reason: string }> = [];
+  const candidates = itemsInLatestRendering(planOfRecord)
+    .filter((item) => !item.excluded && isTestDependentChecklistItemV1(item.text))
+    .map((item) => unescapeChecklistItemTextV1(item.text));
+  for (const itemText of candidates) {
+    const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport);
+    if (diagnosis.kind === "applicable") continue;
+    if (/did not claim this item done|left no report/.test(diagnosis.reason)) continue;
+    uncounted.push({ itemText, reason: diagnosis.reason });
+  }
+  return uncounted;
+}
+
+/** The run-log section that tells the owner why a claimed test-dependent item was not verified (bugs4 item 21). */
+export function formatUncountedTestReportClaimsSectionV1(
+  uncounted: ReadonlyArray<{ readonly itemText: string; readonly reason: string }>
+): string {
+  if (uncounted.length === 0) return "";
+  return (
+    "\n\n## Test reports that did not count\n\n" +
+    "These items were claimed done by the round, but their test evidence did not count as a passing " +
+    "report for the post-edit tree, so they stay provisional:\n\n" +
+    uncounted.map((entry) => `- ${entry.itemText} — ${entry.reason}`).join("\n") +
+    "\n"
+  );
+}
+
+export function getApplicablePassingTestReportForItemV1(
+  planOfRecord: string,
+  itemText: string,
+  editingRoundReport: string
+): ApplicablePlanItemTestReportV1 | undefined {
+  const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport);
+  return diagnosis.kind === "applicable" ? diagnosis.report : undefined;
 }
 
 export function hasApplicablePassingTestReportForItemV1(
@@ -3315,8 +3882,8 @@ export function filterAlreadyCheckedPlanItemsV1(
  *    for audit rather than treating every tick as identical.
  */
 export type MergeChecklistProgressResultV1 =
-  | { readonly kind: "unchanged" }
-  | { readonly kind: "no-report" }
+  | { readonly kind: "unchanged"; readonly alreadyRecorded?: readonly string[] }
+  | { readonly kind: "no-report"; readonly alreadyRecorded?: readonly string[] }
   | {
       readonly kind: "unverified-test-evidence";
       readonly unverifiedSample: readonly string[];
@@ -3331,9 +3898,12 @@ export type MergeChecklistProgressResultV1 =
        * complete set, since a single unresolved claim among many resolved
        * ones must still raise the unreliable-checklist flag. */
       readonly unmatchedAll: readonly string[];
+      /** Claims restating items the plan already records as ticked or excluded (bugs4 item 14). */
+      readonly alreadyRecorded?: readonly string[];
     }
   | {
       readonly kind: "merged";
+      readonly alreadyRecorded?: readonly string[];
       readonly content: string;
       readonly retroactiveTicks?: readonly { readonly itemText: string; readonly evidence: string }[];
       readonly unverifiedTestItems?: readonly string[];
@@ -3404,10 +3974,18 @@ export function mergeChecklistProgressV1(
   const retroactiveKeys = new Set<string>();
   const retroactiveEvidenceByKey = new Map<string, string>();
   const missingEvidenceSamples: string[] = [];
+  // bugs4 item 14: a claim restating an item the plan already records as ticked or
+  // excluded needs no evidence to be harmless. It is "already recorded": never an
+  // unmatched claim, so it can never set the unreliable-checklist latch.
+  const alreadyRecorded: string[] = [];
   for (const claim of collectRetroactiveTickClaimsV1(own, planItemKeys)) {
     const key = normalizeChecklistItemTextV1(claim.itemText);
     if (claim.evidence.length === 0) {
-      missingEvidenceSamples.push(claim.itemText);
+      if (isChecklistClaimTextAlreadyRecordedV1(planOfRecord, claim.itemText)) {
+        alreadyRecorded.push(claim.itemText);
+      } else {
+        missingEvidenceSamples.push(claim.itemText);
+      }
       continue;
     }
     reported.set(key, (reported.get(key) ?? 0) + 1);
@@ -3562,9 +4140,10 @@ export function mergeChecklistProgressV1(
         kind: "no-match",
         unmatchedSample: missingEvidenceSamples.slice(0, 2),
         unmatchedAll: missingEvidenceSamples,
+        ...(alreadyRecorded.length > 0 ? { alreadyRecorded } : {}),
       };
     }
-    return { kind: "no-report" };
+    return alreadyRecorded.length > 0 ? { kind: "no-report", alreadyRecorded } : { kind: "no-report" };
   }
 
   const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
@@ -3618,6 +4197,7 @@ export function mergeChecklistProgressV1(
   if (changed) {
     return {
       kind: "merged",
+      ...(alreadyRecorded.length > 0 ? { alreadyRecorded } : {}),
       content: `${prefix}${mergedRegion}`,
       ...(retroactiveTicks.length > 0 ? { retroactiveTicks } : {}),
       ...(unverifiedTestItems.length > 0 ? { unverifiedTestItems } : {}),
@@ -3637,9 +4217,40 @@ export function mergeChecklistProgressV1(
     }
   }
   if (unmatchedAll.length > 0) {
-    return { kind: "no-match", unmatchedSample: unmatchedAll.slice(0, 2), unmatchedAll };
+    return {
+      kind: "no-match",
+      unmatchedSample: unmatchedAll.slice(0, 2),
+      unmatchedAll,
+      ...(alreadyRecorded.length > 0 ? { alreadyRecorded } : {}),
+    };
   }
-  return { kind: "unchanged" };
+  return alreadyRecorded.length > 0 ? { kind: "unchanged", alreadyRecorded } : { kind: "unchanged" };
+}
+
+/**
+ * bugs4 item 14: true when `claimText`, after {@link normalizeChecklistItemTextV1},
+ * exactly matches at least one plan item and EVERY item with that text is already
+ * ticked or excluded. A claim like that restates recorded progress; it never needs
+ * a tick, so it is neither unmatched nor a reason to doubt the checklist. A claim
+ * that matches no item, or whose text also belongs to a still-open item, is not
+ * "already recorded".
+ */
+export function isChecklistClaimTextAlreadyRecordedV1(planOfRecord: string, claimText: string): boolean {
+  const key = normalizeChecklistItemTextV1(claimText);
+  if (key.length === 0) {
+    return false;
+  }
+  let matches = 0;
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    if (normalizeChecklistItemTextV1(item.text) !== key) {
+      continue;
+    }
+    matches++;
+    if (!item.checked && !item.excluded) {
+      return false;
+    }
+  }
+  return matches > 0;
 }
 
 /** Result of {@link parseNumberedChecklistClaimV1}. */
@@ -3776,6 +4387,9 @@ export function areAllUnmatchedChecklistClaimsAlreadySettledV1(
   unmatchedClaimTexts: readonly string[]
 ): boolean {
   return unmatchedClaimTexts.every((claimText) => {
+    if (isChecklistClaimTextAlreadyRecordedV1(planOfRecord, claimText)) {
+      return true;
+    }
     const parsed = parseNumberedChecklistClaimV1(claimText);
     return (
       parsed.kind === "resolved" &&

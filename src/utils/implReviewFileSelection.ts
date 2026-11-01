@@ -710,16 +710,74 @@ export function shouldClearImplReviewFilesAfterReviewV1(
  */
 export interface ImplReviewLedgerRowV1 {
   roundId: string;
+  /**
+   * The stage the round ran against. Optional only because legacy rows may
+   * lack it — a code-mode row with no (or an unrecognised) stage is uncertain
+   * provenance, never assumed to be code-bearing or plan-writing.
+   */
+  stage?: string;
+  /**
+   * Which impl-review stage an `impl`-stage round was dispatched from. Kept
+   * for diagnostics only: a row under the literal `impl` stage is code-bearing
+   * whatever its `originatingReviewStage`.
+   */
+  originatingReviewStage?: string;
   mode: "implementation" | "apply-review" | "continuation" | "review";
   state: "scheduled" | "open" | "completed" | "rejected" | "cancelled" | "failed" | "quota-blocked" | "dropped" | "interrupted";
   outcome?: {
     filesChanged?: readonly string[];
     filesChangedUnknown?: boolean;
+    /** Snapshot paths the round did not claim; never task-owned review scope. */
+    unattributedFiles?: readonly string[];
   };
 }
 
-const IMPLEMENTATION_LEDGER_MODES = new Set(["implementation", "apply-review", "continuation"]);
+/** Dispatch modes that CAN edit code (a `review` row never does). */
+const CODE_EDITING_LEDGER_MODES = new Set(["implementation", "apply-review", "continuation"]);
+/**
+ * Stages whose rounds write plans and task text, never project code. A
+ * plan-writing or plan-revising round carries a legacy `implementation` /
+ * `apply-review` mode purely because those are the dispatch modes it was
+ * built from — it is not code-editing history.
+ */
+const NON_CODE_LEDGER_STAGES = new Set(["desc", "plan", "plan-high-review", "plan-low-review"]);
+/** Stages whose rounds edit project code (an impl-review stage's Apply Review included). */
+const CODE_LEDGER_STAGES = new Set(["impl", "impl-high-review", "impl-low-review", "publish"]);
 const LIVE_LEDGER_STATES = new Set(["scheduled", "open"]);
+
+/**
+ * True when a ledger row is code-bearing: a code-editing mode at a code stage.
+ * The shared eligibility rule for every review-scope consumer (fresh, manual,
+ * resumed, Fast Forward code review, and Publish scope). A row at a plan stage
+ * is never code-bearing whatever its legacy mode; a row under the literal
+ * `impl` stage stays code-bearing whatever its `originatingReviewStage`.
+ * Rows with a missing or unknown stage are NOT classified here — see
+ * {@link hasUncertainLedgerProvenanceV1}.
+ */
+export function isCodeBearingLedgerRowV1(row: Pick<ImplReviewLedgerRowV1, "mode" | "stage">): boolean {
+  return (
+    CODE_EDITING_LEDGER_MODES.has(row.mode) &&
+    row.stage !== undefined &&
+    CODE_LEDGER_STAGES.has(row.stage)
+  );
+}
+
+/**
+ * True when a code-editing-mode row has a missing or unrecognised stage — a
+ * legacy row whose provenance cannot show whether it wrote code or a plan.
+ * Reconstruction must refuse rather than guess.
+ */
+export function hasUncertainLedgerProvenanceV1(row: Pick<ImplReviewLedgerRowV1, "mode" | "stage">): boolean {
+  return (
+    CODE_EDITING_LEDGER_MODES.has(row.mode) &&
+    (row.stage === undefined ||
+      !(CODE_LEDGER_STAGES.has(row.stage) || NON_CODE_LEDGER_STAGES.has(row.stage)))
+  );
+}
+
+function describeLedgerRowV1(row: ImplReviewLedgerRowV1): string {
+  return `round ${row.roundId} (stage ${row.stage ?? "unrecorded"}, mode ${row.mode})`;
+}
 
 /** RC3 item 10 (Step 6): result of trying to rebuild `implReviewFiles` from
  * `TaskProgress.roundLedger` alone, without reading the working tree. */
@@ -758,26 +816,53 @@ export function resolveLedgerImplReviewFilesV1(
   if (rows.length >= maxEntries) {
     return {
       established: false,
-      reason: `ledger skipped: at retention cap (${rows.length} of ${maxEntries} rows — the ledger cannot prove nothing was evicted)`,
+      reason: `ledger skipped: at retention cap (${rows.length} of ${maxEntries} rows — the ledger cannot prove nothing was evicted). ` +
+        "Run an Implementation round so its change list is recorded again, or restore the task's tracked review files",
     };
   }
 
-  const implRows = rows.filter((row) => IMPLEMENTATION_LEDGER_MODES.has(row.mode));
+  // A code-editing-mode row whose stage is missing or unrecognised may or may
+  // not have written code: refuse rather than guess either way.
+  const uncertain = rows.find(hasUncertainLedgerProvenanceV1);
+  if (uncertain) {
+    return {
+      established: false,
+      reason:
+        `ledger skipped: ${describeLedgerRowV1(uncertain)} is ${uncertain.state} with no recorded stage ` +
+        "(legacy row) — the ledger cannot tell whether it edited code. " +
+        "Run the review again after an Implementation round, which records its stage",
+    };
+  }
+
+  const implRows = rows.filter(isCodeBearingLedgerRowV1);
   if (implRows.length === 0) {
-    return { established: false, reason: "ledger skipped: no implementation-mode rounds recorded" };
+    return {
+      established: false,
+      reason:
+        "ledger skipped: no implementation-mode rounds recorded" +
+        (rows.some((row) => CODE_EDITING_LEDGER_MODES.has(row.mode))
+          ? " at an implementation or review stage (the recorded implementation-mode rows are plan-stage rounds, which edit no code)"
+          : "") +
+        " — run an Implementation round so the ledger records a change list",
+    };
   }
 
   for (const row of implRows) {
     if (LIVE_LEDGER_STATES.has(row.state)) {
       return {
         established: false,
-        reason: `ledger skipped: round ${row.roundId} (${row.mode}) is still ${row.state}`,
+        reason:
+          `ledger skipped: ${describeLedgerRowV1(row)} is still ${row.state} — its edits are not recorded yet; ` +
+          "wait for it to finish, then run the review again",
       };
     }
     if (row.outcome?.filesChangedUnknown === true || !Array.isArray(row.outcome?.filesChanged)) {
       return {
         established: false,
-        reason: `ledger skipped: round ${row.roundId} (${row.mode}, ${row.state}) has no change list`,
+        reason:
+          `ledger skipped: ${describeLedgerRowV1(row)} (${row.state}) has no change list — ` +
+          "the ledger cannot prove which files it edited. Run an Implementation round again so a change " +
+          "list is recorded",
       };
     }
   }
@@ -788,7 +873,12 @@ export function resolveLedgerImplReviewFilesV1(
   // `implRows` is in ledger (chronological, oldest-first) order, so reverse.
   for (const row of [...implRows].reverse()) {
     if (row.state !== "completed") continue;
+    // Concurrent owner edits and other unattributed workspace changes sit in
+    // the observed change list but were never claimed by the round's report:
+    // they must not re-enter review scope through the ledger.
+    const unattributed = new Set(row.outcome!.unattributedFiles ?? []);
     for (const file of row.outcome!.filesChanged!) {
+      if (unattributed.has(file)) continue;
       if (!seen.has(file)) {
         seen.add(file);
         files.push(file);

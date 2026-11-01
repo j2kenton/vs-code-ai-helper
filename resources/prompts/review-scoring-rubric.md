@@ -65,6 +65,12 @@ When the implementation notes below include a plan checklist (`<!-- ensemble:imp
 <!-- verified-complete:end -->
 ```
 
+The block is not only for unchecked items. Some items are already ticked but still provisional: a round ticked them, and no reviewer has verified them yet, so they do not count toward the gate. Those are listed here, oldest first:
+
+{{provisionalTickedItems}}
+
+Name each of those you personally checked against the workspace in the same block, copied verbatim, with its `evidence:` line. That is the only route by which a ticked item becomes verified. A ticked item you checked and found NOT built is a completion blocker, not a Verified Complete entry. If you cannot check them all in this review, check the ones listed first.
+
 The `evidence:` line is strongly encouraged for code-observable items and required in substance for test-dependent items. Put it on its own indented line directly under the item it supports — one line per item, naming the specific file/symbol you opened and what confirmed the item. For a test-dependent item, also name the editing-round ID and test report you accepted from the provenance breakdown; do not claim you ran it. An item with no `evidence:` line shows as unexplained to the person applying it, and host-side processing refuses test-dependent verification without an applicable durable passing report.
 
 This drives a one-click action that ticks exactly these items in plan-final.md on the strength of your code inspection plus any applicable editing-round test reports — so only list an item here when you actually checked it against the tree yourself and its required evidence exists, never because it merely seems likely to be done. Omit an item you did not personally verify. Skip this block entirely when there is no checklist to check items against (e.g. a plan review), or emit it with the two markers and no entries when a checklist exists but you verified nothing beyond what is already ticked.

@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { describeSpoolMismatchDetailV1 } from "../actions/taskActionCoordinatorV1";
 import { ActionCorrelationV1, allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { ResultSpoolRefV1 } from "../types/agentExecutionV1";
 import {
@@ -119,7 +120,13 @@ void describe("boundedResultStoreV1", () => {
         ...correlation,
         operationId: allocateHex128IdV1(),
       });
-      assert.deepEqual(wrongClaim, { ok: false, code: "spoolCorrelationMismatch" });
+      assert.equal(wrongClaim.ok, false);
+      assert.equal(!wrongClaim.ok && wrongClaim.code, "spoolCorrelationMismatch");
+      // bugs4 item 9: the failed comparison is named, with both values.
+      const mismatches = !wrongClaim.ok ? wrongClaim.mismatches : undefined;
+      assert.equal(mismatches?.length, 1);
+      assert.equal(mismatches?.[0]?.field, "operation");
+      assert.equal(mismatches?.[0]?.actual, correlation.operationId);
 
       // The mismatched claim must not have consumed the single claim.
       const rightClaim = await fixture.store.claimSpoolOnce(ref, correlation);
@@ -127,6 +134,39 @@ void describe("boundedResultStoreV1", () => {
     } finally {
       fixture.cleanup();
     }
+  });
+
+  void it("bugs4 item 9: each correlation comparison names its own field; a matching spool is claimed", async () => {
+    const fixture = makeStore();
+    try {
+      const correlation = makeCorrelation();
+      const ref = await fixture.store.writeSpool(correlation, allocateHex128IdV1(), Buffer.from("large review result"));
+      const otherAttempt = allocateHex128IdV1();
+      const attempt = await fixture.store.claimSpoolOnce(ref, { ...correlation, attemptId: otherAttempt });
+      assert.equal(!attempt.ok && attempt.mismatches?.[0]?.field, "attempt");
+      assert.equal(!attempt.ok && attempt.mismatches?.[0]?.expected, otherAttempt);
+      assert.equal(!attempt.ok && attempt.mismatches?.[0]?.actual, correlation.attemptId);
+
+      const otherReservation = allocateHex128IdV1();
+      const reservation = await fixture.store.claimSpoolOnce({ ...ref, reservationId: otherReservation } as typeof ref, correlation);
+      // A different reservation points at a spool directory that does not exist.
+      assert.equal(reservation.ok, false);
+
+      const claimed = await fixture.store.claimSpoolOnce(ref, correlation);
+      assert.ok(claimed.ok, "the attempt that produced the response can claim it");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+
+  void it("bugs4 item 9: describeSpoolMismatchDetail names the first field with both values and the other fields", () => {
+    const detail = describeSpoolMismatchDetailV1([
+      { field: "reservation", expected: "aaa", actual: "bbb" },
+      { field: "store", expected: "s1", actual: "s2" },
+    ]);
+    assert.match(detail ?? "", /^Primary result rejected \(reservation mismatch\): claimed aaa, stored bbb; also differing: store$/);
+    assert.equal(describeSpoolMismatchDetailV1([]), undefined);
+    assert.ok((describeSpoolMismatchDetailV1([{ field: "attempt", expected: "x".repeat(300), actual: "y" }]) ?? "").length <= 200);
   });
 
   void it("is claim-once", async () => {

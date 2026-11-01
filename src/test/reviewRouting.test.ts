@@ -487,6 +487,66 @@ void describe("shouldEscalateChurnCeiling", () => {
     );
   });
 
+  void it("bugs4 item 22: a round that declared a blocker [narrowed:…] resets the run, so the ceiling does not fire", () => {
+    const narrowed = identity({ id: "b2", lineage: { kind: "narrowed", refId: "b1" } });
+    const history = [
+      entry(5, { taskFixableCount: 1, blockers: [identity({ id: "b1" })] }),
+      entry(5, { taskFixableCount: 1, blockers: [identity({ id: "b1", lineage: { kind: "same", refId: "b1" } })] }),
+      entry(5, { taskFixableCount: 1, blockers: [identity({ id: "b1", lineage: { kind: "same", refId: "b1" } })] }),
+      entry(5, { taskFixableCount: 1, blockers: [narrowed] }),
+    ];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 0);
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({ history, stage: "impl-high-review", taskFixableCount: 1, churnCeilingRounds: 2 }),
+      false
+    );
+  });
+
+  void it("bugs4 item 22 control: rounds that keep declaring the same blocker [same:…] with nothing narrowed still escalate", () => {
+    const same = (): ReviewScoreHistoryEntry =>
+      entry(5, { taskFixableCount: 1, blockers: [identity({ id: "b1", lineage: { kind: "same", refId: "b1" } })] });
+    const history = [same(), same(), same(), same(), same()];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 4);
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({ history, stage: "impl-high-review", taskFixableCount: 1, churnCeilingRounds: 4 }),
+      true
+    );
+  });
+
+  void it("bugs4 item 22: newly settled plan items reset the run even though the blocker count is flat", () => {
+    const same = (settledItemCount: number): ReviewScoreHistoryEntry =>
+      entry(5, { taskFixableCount: 1, settledItemCount });
+    const history = [same(10), same(10), same(10), same(14)];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 0);
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({ history, stage: "impl-high-review", taskFixableCount: 1, churnCeilingRounds: 2 }),
+      false
+    );
+  });
+
+  void it("bugs4 item 22: a grouped unbuilt-steps blocker naming fewer steps resets the run", () => {
+    const withSteps = (unbuiltStepCount: number): ReviewScoreHistoryEntry =>
+      entry(5, { taskFixableCount: 1, unbuiltStepCount });
+    const history = [withSteps(20), withSteps(20), withSteps(20), withSteps(15)];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 0);
+  });
+
+  void it("bugs4 item 22 control: flat settled count and unbuilt-step count still count toward the ceiling", () => {
+    const flat = (): ReviewScoreHistoryEntry =>
+      entry(5, { taskFixableCount: 1, settledItemCount: 10, unbuiltStepCount: 20 });
+    const history = [flat(), flat(), flat(), flat(), flat()];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 4);
+    assert.strictEqual(
+      shouldEscalateChurnCeiling({ history, stage: "impl-high-review", taskFixableCount: 1, churnCeilingRounds: 4 }),
+      true
+    );
+  });
+
+  void it("bugs4 item 22: entries without the new fields are judged by blocker count alone", () => {
+    const history = [entry(5), entry(5, { settledItemCount: 30 }), entry(5, { unbuiltStepCount: 1 })];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 2);
+  });
+
   void it("does not escalate when the just-recorded round carries no task-fixable work", () => {
     assert.strictEqual(
       shouldEscalateChurnCeiling({

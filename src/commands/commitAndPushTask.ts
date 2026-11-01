@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { formatNotificationTaskLabelV1, notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { TaskInventory, TaskWithProgress } from "../state/taskInventory";
 import { resolveTaskContext, ResolvedTaskContext, peekTaskFolderPathSynchronouslyV1 } from "../utils/resolveTaskContext";
 import { TASK_FILENAME, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
@@ -96,6 +97,7 @@ import {
 } from "../state/workAdmissionReconciliationV1";
 import { isEffectivelyPausedV1, resolveEffectiveStageTaskStatusV1 } from "../state/effectivePauseStatusV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
+import { buildFullListConfirmMessageV1 } from "../utils/commitPushFullListV1";
 
 /**
  * A pending `commitPushMetadata.v1` Chat interaction being explicitly
@@ -1248,6 +1250,72 @@ const TASK_DESCRIPTION_PLACEHOLDER =
 /** The normalized, display-name-first task label for Commit and Push text. */
 function commitPushTaskLabel(resolvedTask: ResolvedTaskContext): string {
   return formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath);
+}
+
+/**
+ * bugs4 item 34: a Commit & Push that ends before it opens its tracked operation
+ * (stage not eligible, binding unverifiable, rejected before `execute`) has no
+ * "Ended" line, so the notification would be its only trace. Say in the task chat
+ * that nothing was committed, why, and what to do next. `retryHelps` is false when
+ * running the same command again cannot change the outcome (the card then
+ * recommends nothing). Never throws: an unreachable chat must not change the
+ * run's outcome, so the notification stays as the pointer.
+ */
+/**
+ * The admission-busy refusal happens before the task is resolved, so only the
+ * candidate folder path is known (and may be absent, in which case there is no
+ * task chat to post to and the notification stays the only trace).
+ */
+/** @internal exported for testing */
+export async function postCommitPushBusyInChatV1(
+  candidateFolderPath: string | undefined,
+  refusalText: string
+): Promise<void> {
+  if (candidateFolderPath === undefined) {
+    return;
+  }
+  await offerActionInChatV1({
+    taskFolderPath: candidateFolderPath,
+    actionLabel: "Commit & Push again",
+    command: "vs-code-ai-helper.commitAndPushTask",
+    args: [{ taskFolderPath: candidateFolderPath }],
+    noticeText: `Commit & Push did not start, so nothing was committed. ${refusalText}`,
+    actionConsequence: "Starts Commit & Push again. It will be refused again while the other action still holds the task.",
+    recommend: {
+      target: "none",
+      reasoning: "Another action holds this task right now; wait for it to finish, then choose Commit & Push again.",
+    },
+    doNothingOption: {
+      label: "Not now",
+      consequence: "Does nothing. Nothing is committed and the working tree and index stay as they are.",
+    },
+  }).catch(() => undefined);
+}
+
+/** @internal exported for testing */
+export async function postCommitPushNotStartedInChatV1(
+  resolvedTask: ResolvedTaskContext,
+  reason: string,
+  nextStep: string,
+  retryHelps: boolean
+): Promise<void> {
+  const text = `Commit & Push did not start, so nothing was committed. ${reason}`;
+  await offerActionInChatV1({
+    taskFolderPath: resolvedTask.taskFolderPath,
+    taskLabel: commitPushTaskLabel(resolvedTask),
+    actionLabel: "Commit & Push again",
+    command: "vs-code-ai-helper.commitAndPushTask",
+    args: [{ taskFolderPath: resolvedTask.taskFolderPath }],
+    noticeText: text,
+    actionConsequence: `Starts Commit & Push again. ${nextStep}`,
+    ...(retryHelps
+      ? {}
+      : { recommend: { target: "none" as const, reasoning: `Running it again cannot change this until: ${nextStep}` } }),
+    doNothingOption: {
+      label: "Not now",
+      consequence: "Does nothing. Nothing is committed and the working tree and index stay as they are.",
+    },
+  }).catch(() => undefined);
 }
 
 /**
@@ -2642,40 +2710,64 @@ export async function confirmCommitPushScopeV1(
           `See DISCLAIMER.md §4-5 for full risk details.\n\n` +
           `Proceed?`;
 
-        const confirmed = await askCommitPushInChatV1({
-          taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
-          decisionKey: "commitPushFinalScopeConfirmation",
-          token,
-          whatHappened: confirmMessage,
-          whyUserNeeded:
-            "Pushing is outward-facing and largely irreversible; nothing is staged or pushed until you confirm.",
-          options: [
-            {
+        // bugs4 item 34: "View Full List" shows the list and asks the SAME confirmation
+        // again, in this same run — the admission and the check results carry over, so
+        // nothing re-runs and Commit & Push / Cancel stay one click away.
+        let fullListShown = false;
+        let confirmed: string | undefined;
+        for (;;) {
+          confirmed = await askCommitPushInChatV1({
+            taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+            decisionKey: "commitPushFinalScopeConfirmation",
+            token,
+            whatHappened: fullListShown
+              ? buildFullListConfirmMessageV1({
+                  title: `Commit and push ${commitPushTaskLabel(resolvedTask)} — please review carefully`,
+                  scopeLabel,
+                  currentBranch,
+                  pushDestination,
+                  scopedFiles: scopedFiles.map((f) => {
+                    const isRunArtifact = scope.runArtifactPaths.includes(f);
+                    return `${renderPath(f)}${isRunArtifact ? " ⚠ (run artifact — contains AI prompts)" : ""}`;
+                  }),
+                  trailer: `${repoExtra}${sensitiveExtra}${controlExtra}`,
+                })
+              : confirmMessage,
+            whyUserNeeded:
+              "Pushing is outward-facing and largely irreversible; nothing is staged or pushed until you confirm.",
+            options: [
+              {
+                optionId: "commitAndPush",
+                label: "Commit & Push",
+                consequence: "Stages these files, commits them, and pushes the branch.",
+              },
+              ...(fullListShown
+                ? []
+                : [
+                    {
+                      optionId: "viewFullList",
+                      label: "View Full List",
+                      consequence:
+                        "Shows every file in this chat (and in the Commit Preview output channel), then asks this same question again. Nothing is committed and the checks do not run again.",
+                    },
+                  ]),
+              {
+                optionId: "cancel",
+                label: "Cancel",
+                consequence: "Stops here. Nothing is committed; the working tree and index stay exactly as they are.",
+              },
+            ],
+            recommendation: {
               optionId: "commitAndPush",
-              label: "Commit & Push",
-              consequence: "Stages these files, commits them, and pushes the branch.",
+              reasoning: "Proceed once the scope, branch, destination, and files look right.",
             },
-            {
-              optionId: "viewFullList",
-              label: "View Full List",
-              consequence: "Writes the complete file list to the Commit Preview output channel; nothing is committed.",
-            },
-            {
-              optionId: "cancel",
-              label: "Cancel",
-              consequence: "Stops here. The working tree and index stay exactly as they are.",
-            },
-          ],
-          recommendation: {
-            optionId: "commitAndPush",
-            reasoning: "Proceed once the scope, branch, destination, and files look right.",
-          },
-          detail: "Choosing an option continues, shows the full list, or cancels this Commit and Push run.",
-        });
-
-        if (confirmed === "viewFullList") {
-          // Show the full file list in the output channel and return —
-          // the user can re-invoke the command after reviewing.
+            detail: "Choosing an option continues, shows the full list, or cancels this Commit and Push run.",
+          });
+          if (confirmed !== "viewFullList") {
+            break;
+          }
+          fullListShown = true;
+          // Also mirror the list to the output channel, as before.
           const channel = getCommitPreviewChannel();
           channel.clear();
           channel.appendLine("=== Ensemble: Commit Preview — Full File List ===");
@@ -2720,9 +2812,8 @@ export async function confirmCommitPushScopeV1(
             }
           }
           channel.appendLine("");
-          channel.appendLine("Run the command again to proceed after reviewing.");
+          channel.appendLine("The same confirmation is asked again in the task chat; nothing has been committed.");
           channel.show(true);
-          return { kind: "notCompleted", reason: "viewedFullFileList" };
         }
 
         if (confirmed !== "commitAndPush") {
@@ -3208,6 +3299,12 @@ export async function invokeCommitPushRowV1(
       `${commitPushTaskLabel(resolvedTask)} — commit and push failed: this task's ownership binding could not be verified. ` +
         `The task's progress file needs recovery.`
     );
+    await postCommitPushNotStartedInChatV1(
+      resolvedTask,
+      "This task's ownership binding could not be verified, so it cannot be tied to its own files.",
+      "Recover the task's progress file first; the same attempt fails until then.",
+      false
+    );
     return;
   }
   const metadataDispatchProbe: { coordinatorOutcome?: TaskActionOutcomeV1 } = {};
@@ -3269,8 +3366,15 @@ export async function invokeCommitPushRowV1(
     // same user-facing message those steps used to show internally after
     // their own now-redundant (but still present, defense-in-depth) stage
     // check.
+    const stageName = STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage];
     NotificationRouter.showWarning(
-      `${commitPushTaskLabel(resolvedTask)} — task is at stage "${STAGE_DISPLAY_NAMES[resolvedTask.progress.currentStage]}" — must be completed before committing and pushing.`
+      `${commitPushTaskLabel(resolvedTask)} — task is at stage "${stageName}" — must be completed before committing and pushing.`
+    );
+    await postCommitPushNotStartedInChatV1(
+      resolvedTask,
+      `The task is at "${stageName}", and Commit & Push only runs once the task has reached Publish.`,
+      "Finish the current stage (or Complete & Move On) until the task is at Publish, then choose Commit & Push.",
+      false
     );
     return;
   }
@@ -3279,6 +3383,12 @@ export async function invokeCommitPushRowV1(
   // anything yet.
   const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
   NotificationRouter.showError(`${commitPushTaskLabel(resolvedTask)} — commit and push could not start: ${detail}.`);
+  await postCommitPushNotStartedInChatV1(
+    resolvedTask,
+    `The task was not eligible to start (${detail}): its status does not allow it, or another action already holds the task.`,
+    "Wait for the other action to finish or resume the task, then choose Commit & Push again.",
+    true
+  );
 }
 
 /**
@@ -3367,6 +3477,7 @@ export async function commitAndPushTask(
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    await postCommitPushBusyInChatV1(earlyFolderPath, describeWorkAdmissionRefusalForUserV1(early));
     offerBusyRefusalChoicesOnceV1(early);
     releaseCommitPushToken();
     return;
@@ -3482,12 +3593,12 @@ export async function commitAndPushTask(
         commandId: "commitAndPushTask",
       });
       if (late.outcome !== "acquired") {
-        NotificationRouter.showWarning(
-          describeWorkAdmissionRefusalForUserV1(
-            late,
-            notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
-          )
+        const lateBusyWithTaskName = describeWorkAdmissionRefusalForUserV1(
+          late,
+          notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
         );
+        NotificationRouter.showWarning(lateBusyWithTaskName);
+        await postCommitPushBusyInChatV1(resolvedTask.taskFolderPath, lateBusyWithTaskName);
         offerBusyRefusalChoicesOnceV1(
           late,
           notificationTaskDisplayNameV1(resolvedTask.progress.displayName, resolvedTask.taskFolderPath)
@@ -3513,6 +3624,12 @@ export async function commitAndPushTask(
     ) {
       NotificationRouter.showWarning(
         `${commitPushTaskLabel(resolvedTask)} — Commit and Push is only available for tasks that are not paused. Resume the task first.`
+      );
+      await postCommitPushNotStartedInChatV1(
+        resolvedTask,
+        "The task is paused, and Commit & Push only runs on a task that is not paused.",
+        "Resume the task first, then choose Commit & Push.",
+        false
       );
       return;
     }
@@ -3624,6 +3741,7 @@ export async function completeCommitAndPushTask(
   if (early && early.outcome !== "acquired") {
     await endTargetResolutionV1(targetResolutionHandle);
     NotificationRouter.showWarning(describeWorkAdmissionRefusalForUserV1(early));
+    await postCommitPushBusyInChatV1(earlyFolderPath, describeWorkAdmissionRefusalForUserV1(early));
     offerBusyRefusalChoicesOnceV1(early);
     releaseCommitPushToken();
     return;
@@ -3848,6 +3966,12 @@ export async function completeCommitAndPushTask(
       }
       NotificationRouter.showWarning(
         `${commitPushTaskLabel(resolvedTask)} — "Complete, Commit and Push" is only available when the task is at the final review stage (Implementation: Low-Level Review) or completed.`
+      );
+      await postCommitPushNotStartedInChatV1(
+        resolvedTask,
+        'Complete, Commit and Push is only available at the final review stage (Implementation: Low-Level Review) or once the task is completed.',
+        "Move the task to that stage, then choose Complete, Commit and Push.",
+        false
       );
       return;
     }

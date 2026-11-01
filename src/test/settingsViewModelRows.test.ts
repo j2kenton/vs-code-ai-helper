@@ -778,3 +778,59 @@ void describe("AI Models view — provider-disabled note follows the model, not 
     );
   });
 });
+
+void describe("AI Models view — the provider-disabled note fits its row (bugs4 item 24)", () => {
+  void it("a row the owner switched off renders no note, though its provider is disabled", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        models: [],
+        providers: [CLAUDE_PROVIDER],
+        enabledProviders: {},
+        settings: { impl: { primary: "claude-cli:sonnet", primaryEnabled: false } },
+      })
+    );
+    const row = session.tbodyRows()[0]!;
+    assert.ok(
+      row.innerHTML.includes('id="primary-note-impl" class="provider-disabled-note" hidden>'),
+      "a switched-off row shows no note"
+    );
+    assert.ok(row.innerHTML.includes('id="primary-impl" value="claude-cli:sonnet"'), "the stored model id is kept unchanged");
+  });
+
+  void it("a checked row from a disabled provider still starts with its note (control)", async () => {
+    const session = runWebviewSession(extractWebviewScript());
+    await session.deliver(
+      initMessage({
+        models: [],
+        providers: [CLAUDE_PROVIDER],
+        enabledProviders: {},
+        settings: { impl: { primary: "claude-cli:sonnet" } },
+      })
+    );
+    assert.ok(session.tbodyRows()[0]!.innerHTML.includes('id="primary-note-impl" class="provider-disabled-note" >'));
+  });
+
+  void it("the script words each row kind, and the error colour is only for a stage with no model", () => {
+    const script = extractWebviewScript();
+    assert.match(script, /is switched off in Provider Selection, so this stage has no model\. Re-enable /);
+    assert.match(script, /is switched off, so this stage will start with its first enabled backup\./);
+    assert.match(script, /is switched off, so this backup is skipped\./);
+    // Only the no-usable-model wording keeps the error class; the other two are muted.
+    assert.match(script, /error: false/);
+    assert.match(script, /' muted'/);
+  });
+
+  void it("the note is re-derived when a row is switched on or off, and when a backup is removed", () => {
+    const script = extractWebviewScript();
+    assert.match(script, /Switching a row off hides its note; switching it back on restores it at once\./);
+    assert.match(script, /Switching the primary off hides its note; switching it back on restores it at once\./);
+    assert.match(script, /refreshStageNotes\(row\);\s*markDirty\(\);/);
+  });
+
+  void it("the CSS leaves room below the note and mutes the non-error wording", () => {
+    const html = extractWebviewHtml();
+    assert.match(html, /\.provider-disabled-note \{[^}]*margin-bottom: var\(--ensemble-space-1\)/);
+    assert.match(html, /\.provider-disabled-note\.muted \{[^}]*var\(--vscode-descriptionForeground\)/);
+  });
+});

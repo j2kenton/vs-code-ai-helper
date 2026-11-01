@@ -36,7 +36,8 @@ import { safeOpenTextDocument, writeTextFile, writeTextFileIfUnchangedV1 } from 
 import { COMMIT_AND_PUSH_COMMAND_V1, publishNextStepOfferV1 } from "../utils/publishStageActionsV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
-import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
+import { buildStalePublishTextV1, findStalePublishVerdictV1 } from "../utils/publishStaleVerdictV1";
 import {
   runTrackedOperation,
   taskOperations,
@@ -70,7 +71,12 @@ import {
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
-import { listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
+import { listCheckedChecklistItemTextsV1, listUnsettledPlanItemsV1 } from "../utils/implementationChecklist";
+import {
+  buildPublishOpenPlanItemsSectionV1,
+  describePublishOpenPlanItemsSentenceV1,
+  upsertPublishOpenPlanItemsSectionV1,
+} from "../utils/publishOpenPlanItemsV1";
 import { invalidatePlanItemEvidenceContradictedByFailuresV1 } from "../utils/taskProgressTransforms";
 import { associatePublishFailuresWithPlanItemsV1, formatPublishFailurePlanAssociationsV1, ownerHandOffCoverageFromTaskMdV1 } from "../utils/publishFailurePlanAssociationV1";
 import {
@@ -161,6 +167,11 @@ type RunPublishChecksArg =
       parentOperation?: TaskOperationHandle;
       /** Set by `checkAndReviewPublishV1`, which starts the Publish review itself once the checks are fresh. */
       reviewFollowsV1?: boolean;
+      /**
+       * bugs4 Step 13 (item 29): set by the stale-verdict card's "Run Publish Checks anyway" so
+       * an owner who has seen that the last review predates a plan change is not asked twice.
+       */
+      staleVerdictAcknowledgedV1?: boolean;
     };
 
 /**
@@ -256,6 +267,16 @@ export function extractParentOperationV1(node: RunPublishChecksArg | undefined):
     return undefined;
   }
   return node.parentOperation;
+}
+
+/**
+ * True only for the explicit-fields shape carrying `staleVerdictAcknowledgedV1: true`
+ * (bugs4 Step 13); the tree-row `{ task }` shape never does.
+ *
+ * @internal exported for testing
+ */
+export function extractStaleVerdictAcknowledgedV1(node: RunPublishChecksArg | undefined): boolean {
+  return !!node && "staleVerdictAcknowledgedV1" in node && node.staleVerdictAcknowledgedV1 === true;
 }
 
 /**
@@ -593,6 +614,60 @@ export async function runPublishChecks(
           return await refusePreflight("Publish checks are only available for tasks at the Publish stage.", false);
         }
 
+        // bugs4 Step 13 (item 29): Publish Checks started directly (or by Fast Forward) rely on the
+        // last code review's verdict. When `task.md` or the plan of record changed after that
+        // review started, say so in chat, naming the file and time, before any check runs. The
+        // owner's "Run Publish Checks anyway" carries the acknowledgement so they are not asked twice.
+        if (!extractStaleVerdictAcknowledgedV1(explicitArg)) {
+          const stalePublish = await findStalePublishVerdictV1(taskFolderUri.fsPath).catch(() => undefined);
+          if (stalePublish) {
+            const staleText = buildStalePublishTextV1({
+              reviewStageName: STAGE_DISPLAY_NAMES[stalePublish.reviewStage],
+              stale: stalePublish.stale,
+              nestedItemsAdded: stalePublish.nestedItemsAdded,
+              openNestedItems: stalePublish.openNestedItems,
+            });
+            const rerunReview = {
+              label: `Re-run ${STAGE_DISPLAY_NAMES[stalePublish.reviewStage]}`,
+              command: "vs-code-ai-helper.setTaskStage",
+              args: [{ taskFolderPath: taskFolderUri.fsPath, stage: stalePublish.reviewStage }],
+              consequence: `Moves the task back to ${STAGE_DISPLAY_NAMES[stalePublish.reviewStage]} so the review reads the current text.`,
+            };
+            const buildNewItems = {
+              label: "Build the new items",
+              command: "vs-code-ai-helper.setTaskStage",
+              args: [{ taskFolderPath: taskFolderUri.fsPath, stage: "impl" }],
+              consequence: "Moves the task back to Implementation to build the plan items added since the review.",
+            };
+            const runAnyway = {
+              label: "Run Publish Checks anyway",
+              command: "vs-code-ai-helper.runPublishChecks",
+              args: [{ taskFolderPath: taskFolderUri.fsPath, staleVerdictAcknowledgedV1: true }],
+              consequence: "Runs the checks now, relying on the older review.",
+            };
+            await recordPublishChecksOutcomeV1(taskFolderUri, {
+              outcome: "failed",
+              at: new Date().toISOString(),
+              failedCommands: [],
+              reason: `not started — ${staleText.notice}`,
+              operationId: operation.id,
+            });
+            await offerActionInChatV1({
+              taskFolderPath: taskFolderUri.fsPath,
+              taskLabel: resolvedTask.progress.displayName,
+              actionLabel: staleText.offerBuildNewItems ? buildNewItems.label : rerunReview.label,
+              command: staleText.offerBuildNewItems ? buildNewItems.command : rerunReview.command,
+              args: staleText.offerBuildNewItems ? buildNewItems.args : rerunReview.args,
+              actionConsequence: staleText.offerBuildNewItems ? buildNewItems.consequence : rerunReview.consequence,
+              noticeText: staleText.notice,
+              recommend: { target: "action", reasoning: staleText.recommendationReasoning },
+              alternatives: [...(staleText.offerBuildNewItems ? [rerunReview] : []), runAnyway],
+            });
+            operation.settleAs("refused", staleText.notice);
+            return false;
+          }
+        }
+
         // From here on a host that disappears leaves a durable record: the "running" record is
         // written before the slower preflight (pause reconciliation, model check), so activation
         // recovery turns an abandoned preflight into an explicit "interrupted" result rather than
@@ -813,6 +888,36 @@ export async function runPublishChecks(
               // are re-injected after every AI review write, so this can open
               // the one artifact again without either failure mode returning.
               const publishReviewFilename = STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME;
+              // bugs4 item 42: unticked plan items (top-level and nested, excluded hand-offs
+              // aside) are listed in the report as blockers, whether or not the checks passed.
+              let openPlanItemsSentence = "";
+              try {
+                const planForOpenItems = await readPlanOfRecordV1(taskFolderUri);
+                const openPlanItems = planForOpenItems.hasChecklist && planForOpenItems.text
+                  ? listUnsettledPlanItemsV1(planForOpenItems.text)
+                  : [];
+                openPlanItemsSentence = describePublishOpenPlanItemsSentenceV1(openPlanItems);
+                const reportUri = vscode.Uri.joinPath(taskFolderUri, publishReviewFilename);
+                let currentReport: string | undefined;
+                try {
+                  currentReport = new TextDecoder().decode(await vscode.workspace.fs.readFile(reportUri));
+                } catch (error) {
+                  const code = (error as { code?: string }).code;
+                  if (code !== "FileNotFound" && code !== "ENOENT") throw error;
+                }
+                if (currentReport !== undefined) {
+                  const withSection = upsertPublishOpenPlanItemsSectionV1(
+                    currentReport,
+                    buildPublishOpenPlanItemsSectionV1(openPlanItems)
+                  );
+                  if (withSection !== currentReport) {
+                    await writeTextFileIfUnchangedV1(reportUri, currentReport, withSection);
+                  }
+                }
+              } catch (error) {
+                // The checks' own outcome stands; the open-items note is supplementary.
+                console.warn("[runPublishChecks] Could not list open plan items in the Publish report", error);
+              }
               await safeOpenTextDocument(
                 vscode.Uri.joinPath(taskFolderUri, publishReviewFilename),
                 "Publish review"
@@ -827,17 +932,17 @@ export async function runPublishChecks(
                   // Publish review next on its own, so no card asks the owner
                   // to do what is about to happen.
                   NotificationRouter.showInformation(
-                    `Publish checks passed. Report saved to ${publishReviewFilename}. Fast Forward runs the Publish review next.`
+                    `Publish checks passed. Report saved to ${publishReviewFilename}. Fast Forward runs the Publish review next.${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`
                   );
                   // RC11 item 1: the caller starts the review next, so no card asks
                   // for it; a run that left no fresh stamp keeps the card because
                   // the caller will stop.
                 } else if (reviewFollows && freshStampWritten && nextStepOffer.action.command !== COMMIT_AND_PUSH_COMMAND_V1) {
                   NotificationRouter.showInformation(
-                    `Publish checks passed. Report saved to ${publishReviewFilename}. The Publish review runs next.`
+                    `Publish checks passed. Report saved to ${publishReviewFilename}. The Publish review runs next.${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`
                   );
                 } else {
-                  const passedNotice = `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}`;
+                  const passedNotice = `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`;
                   // RC7 item 4: the button only opens the chat. The review step
                   // is offered there as an option; Commit & Push is not moved
                   // to the chat in this task, so that variant has no button.
@@ -970,7 +1075,8 @@ export async function runPublishChecks(
                   (hasContradictedPlanWork
                     ? 'A checked plan item is contradicted by a failing check; return to Implementation to address the missing behavior.'
                     : 'Choose the next action based on the failing check type.') +
-                  (associationReport ? `\n\n${associationReport}` : "");
+                  (associationReport ? `\n\n${associationReport}` : "") +
+                  (openPlanItemsSentence ? `\n\n${openPlanItemsSentence}` : "");
                 recordStageActionTerminalOutcomeV1(taskFolderUri.fsPath, {
                   kind: "failed",
                   actionLabel: "Publish Checks",

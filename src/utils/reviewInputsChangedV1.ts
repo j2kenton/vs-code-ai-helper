@@ -23,6 +23,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { countNestedChecklistItemsV1 } from "./implementationChecklist";
 
 /**
  * `plan-final.md` is the plan of record: its substantive text (items, their
@@ -66,6 +67,8 @@ interface ReviewInputsRecordEntryV1 {
   readonly recordedAtMs: number;
   readonly digests: Readonly<Record<string, string>>;
   readonly workspace?: ReviewWorkspaceIdentityV1;
+  /** Nested plan items at dispatch (bugs4 item 39); absent on records that predate it. */
+  readonly nestedItemCount?: number;
 }
 
 type ReviewInputsRecordV1 = Readonly<Record<string, ReviewInputsRecordEntryV1>>;
@@ -103,12 +106,21 @@ export async function recordReviewInputsV1(
     for (const name of REVIEW_INPUT_FILENAMES_V1) {
       digests[name] = await digestInputV1(taskFolderPath, name);
     }
+    let nestedItemCount: number | undefined;
+    try {
+      nestedItemCount = countNestedChecklistItemsV1(
+        await fs.readFile(path.join(taskFolderPath, PLAN_OF_RECORD_FILENAME_V1), "utf8")
+      );
+    } catch {
+      nestedItemCount = undefined;
+    }
     const record = await readRecordV1(taskFolderPath);
     const next: ReviewInputsRecordV1 = {
       ...record,
       [path.basename(reviewArtifactPath)]: {
         recordedAtMs: Date.now(),
         digests,
+        ...(nestedItemCount !== undefined ? { nestedItemCount } : {}),
         ...(workspace !== undefined ? { workspace } : {}),
       },
     };
@@ -217,4 +229,81 @@ export async function reviewWorkspaceChangedSinceV1(
     was.headSha !== current.headSha ||
     was.treeFingerprint !== current.treeFingerprint
   );
+}
+
+/** One review input that changed after the review was dispatched. */
+export interface StaleReviewInputV1 {
+  readonly name: string;
+  /** ISO time of the file's last modification, when it could be read. */
+  readonly modifiedAt?: string;
+}
+
+/**
+ * bugs4 Step 13 (item 29): has `task.md` or the plan of record changed since the review
+ * was dispatched, so that its verdict (and a "ready to move on" reading of it) no longer
+ * describes the task?
+ *
+ * Unlike {@link reviewInputsChangedSinceV1} this gates the owner's advance, so it answers
+ * only from a usable dispatch-time record: a legacy review with no record (or one newer than
+ * its artifact) is reported as `recorded: false` and not stale. A modification-time guess
+ * must not raise a "your plan changed" warning about an edit nobody can show was made after
+ * the review. Ticks never count (the plan of record is digested with its boxes normalized
+ * and its round summary dropped); a nested child, a reworded item or a new hand-off line does.
+ */
+export async function staleReviewInputsV1(
+  taskFolderPath: string,
+  reviewArtifactPath: string
+): Promise<{
+  readonly recorded: boolean;
+  readonly stale: readonly StaleReviewInputV1[];
+  /** Nested plan items present now beyond the count the review recorded; 0 when unknown or none. */
+  readonly nestedItemsAdded: number;
+}> {
+  let reviewedAtMs: number;
+  try {
+    reviewedAtMs = (await fs.stat(reviewArtifactPath)).mtimeMs;
+  } catch {
+    return { recorded: false, stale: [], nestedItemsAdded: 0 };
+  }
+  const entry = (await readRecordV1(taskFolderPath))[path.basename(reviewArtifactPath)];
+  if (
+    entry === undefined ||
+    typeof entry.recordedAtMs !== "number" ||
+    entry.recordedAtMs > reviewedAtMs ||
+    entry.digests === null ||
+    typeof entry.digests !== "object"
+  ) {
+    return { recorded: false, stale: [], nestedItemsAdded: 0 };
+  }
+  const stale: StaleReviewInputV1[] = [];
+  for (const name of ["task.md", PLAN_OF_RECORD_FILENAME_V1]) {
+    const was = entry.digests[name];
+    if (was === undefined) {
+      continue;
+    }
+    const now = await digestInputV1(taskFolderPath, name);
+    // An unreadable file is not evidence of an edit; a file that appeared or vanished is.
+    if (now === UNREADABLE_DIGEST_V1 || was === now) {
+      continue;
+    }
+    let modifiedAt: string | undefined;
+    try {
+      modifiedAt = new Date((await fs.stat(path.join(taskFolderPath, name))).mtimeMs).toISOString();
+    } catch {
+      modifiedAt = undefined;
+    }
+    stale.push({ name, ...(modifiedAt !== undefined ? { modifiedAt } : {}) });
+  }
+  let nestedItemsAdded = 0;
+  if (typeof entry.nestedItemCount === "number") {
+    try {
+      const now = countNestedChecklistItemsV1(
+        await fs.readFile(path.join(taskFolderPath, PLAN_OF_RECORD_FILENAME_V1), "utf8")
+      );
+      nestedItemsAdded = Math.max(0, now - entry.nestedItemCount);
+    } catch {
+      nestedItemsAdded = 0;
+    }
+  }
+  return { recorded: true, stale, nestedItemsAdded };
 }

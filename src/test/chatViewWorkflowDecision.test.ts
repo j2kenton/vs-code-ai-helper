@@ -1294,6 +1294,81 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
   });
 
   /**
+   * bugs4 Step 9 (item 33): "Advance to Publish" on the no-progress breaker card dispatches
+   * Publish Checks through the same decision handler as "Move on", so the checks it starts
+   * AFTER the command returned still post Started / Progress / Ended lines in the chat.
+   */
+  void it("shows Started / Progress / Ended for Publish Checks started after the breaker card's Advance command returned", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const commandsObj = vscode.commands as unknown as {
+      _executeCommandOverride?: (id: string, ...args: unknown[]) => Promise<unknown>;
+    };
+    const originalCommand = commandsObj._executeCommandOverride;
+    let commandId = "";
+    commandsObj._executeCommandOverride = async (id: string) => {
+      commandId = id;
+      const held = await acquireWorkAdmissionV1({ taskFolderPath: folder, purpose: "admission", commandId: "runPublishChecks" });
+      assert.equal(held.outcome, "acquired");
+      // The command resolves now; the checks register their operation afterwards, under the claim.
+      setTimeout(() => {
+        const operation = taskOperations.begin(folder, { label: "Publish Checks", stage: "publish", taskName: "breaker advance", exclusive: false });
+        assert.ok(operation);
+        operation.reportActivity("test");
+        setTimeout(() => {
+          taskOperations.end(operation, "succeeded");
+          if (held.outcome === "acquired") {
+            void held.handle.release();
+          }
+        }, 60);
+      }, 80);
+      return undefined;
+    };
+    try {
+      await provider.workflowDecisionStore.post(
+        decisionInput(folder, {
+          decisionKey: "reviewPlateauEscalation",
+          options: [
+            {
+              optionId: "advance",
+              label: "Advance to Publish",
+              consequence: "Accepts the current state and moves the task to Publish. Continues fast-forwarding at Publish.",
+              resumeKind: "continue",
+              effect: {
+                kind: "command",
+                command: "vs-code-ai-helper.resumeAndSetTaskStage",
+                args: [{ taskFolderPath: folder, stage: "publish", resumeFastForward: true }],
+              },
+            },
+          ],
+          recommendation: { kind: "option", optionId: "advance", reasoning: "The review is clean." },
+        })
+      );
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
+      await waitForStateMessage(fake);
+      await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "advance" });
+      let texts: string[] = [];
+      for (let retry = 0; retry < 80 && !texts.some((text) => text.includes("Ended Publish Checks")); retry++) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        texts = (await readChatHistory(folder)).map((entry) => entry.text);
+      }
+      assert.equal(commandId, "vs-code-ai-helper.resumeAndSetTaskStage");
+      assert.ok(texts.some((text) => /Started Publish Checks — Publish(?::.*)? at \d{2}:\d{2}/.test(text)), texts.join("\n"));
+      // The activity reported right after the operation registered rides on the Started line itself.
+      assert.ok(texts.some((text) => text.includes("Started Publish Checks — Publish: test")));
+      assert.ok(texts.some((text) => text.includes("Ended Publish Checks — succeeded")));
+    } finally {
+      commandsObj._executeCommandOverride = originalCommand;
+      notify.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  /**
    * Review-flagged (2026-08-23): `goToReviewAndApplyV1` reports a failed
    * multi-step sequence by resolving `false` rather than throwing
    * (`setTaskStage` already reports its own failure by notification and

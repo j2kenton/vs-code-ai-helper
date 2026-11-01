@@ -69,7 +69,7 @@ void describe("Implementation type-check chat hand-off", () => {
     assert.doesNotMatch(excerpt, /package setup output/);
   });
 
-  void it("builds the implementationTypeCheckFailed decision with the resume-and-dispatch option and manual fallback", () => {
+  void it("builds the implementationTypeCheckFailed decision with the fix-and-continue recommendation and Run Implementation kept available", () => {
     const decision = buildImplementationTypeCheckFailedDecisionInputV1({
       taskCanonicalId: "/tmp/task",
       taskFolderPath: "/tmp/task",
@@ -78,9 +78,13 @@ void describe("Implementation type-check chat hand-off", () => {
       logFilePath: "/tmp/task/runs/impl.log",
     });
     assert.equal(decision.decisionKey, "implementationTypeCheckFailed");
-    assert.equal(decision.options[0]?.optionId, "runImplementationFix");
-    assert.equal(decision.options[0]?.resumeKind, "continue");
-    assert.deepEqual(decision.options[0]?.effect, {
+    assert.equal(decision.options[0]?.optionId, "fixBuildManually");
+    assert.equal(decision.options[0]?.resumeKind, "unpause");
+    assert.deepEqual(decision.options[0]?.effect, { kind: "doNothing" });
+    assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "fixBuildManually");
+    assert.equal(decision.options[1]?.optionId, "runImplementationFix");
+    assert.equal(decision.options[1]?.resumeKind, "continue");
+    assert.deepEqual(decision.options[1]?.effect, {
       kind: "command",
       command: "vs-code-ai-helper.resumeAndDispatchImplementation",
       args: [
@@ -91,9 +95,6 @@ void describe("Implementation type-check chat hand-off", () => {
         },
       ],
     });
-    assert.equal(decision.options[1]?.optionId, "fixBuildManually");
-    assert.equal(decision.options[1]?.resumeKind, "unpause");
-    assert.deepEqual(decision.options[1]?.effect, { kind: "doNothing" });
   });
 
   void it("posts one reasoned build-recovery card with the recommended fix first", async () => {
@@ -128,10 +129,10 @@ void describe("Implementation type-check chat hand-off", () => {
       assert.match(decision.whatHappened, /failing its type-check/);
       assert.ok(decision.evidence?.some((item) => item.detail.includes("src/a.ts(12,4): error TS2322")));
       assert.ok(decision.evidence?.some((item) => item.openFilePath === "/tmp/task/runs/impl.log"));
-      assert.deepEqual(decision.options.map((option) => option.optionId), ["runImplementationFix", "fixBuildManually"]);
-      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runImplementationFix");
-      assert.match(decision.options[0]?.consequence ?? "", /errors/);
-      assert.deepEqual(decision.options[1]?.effect, { kind: "doNothing" });
+      assert.deepEqual(decision.options.map((option) => option.optionId), ["fixBuildManually", "runImplementationFix"]);
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "fixBuildManually");
+      assert.match(decision.options[1]?.consequence ?? "", /errors/);
+      assert.deepEqual(decision.options[0]?.effect, { kind: "doNothing" });
     } finally {
       __extensionContextV1TestOnly.reset();
     }

@@ -15,6 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { resolveTaskRootCandidates } from "./taskRoot";
+import { wasExtensionTaskArtifactWriteV1 } from "./extensionTaskWriteRegistryV1";
 
 export const KNOWN_TASK_ARTIFACT_NAMES = Object.freeze([
   "round-progress.md",
@@ -59,6 +60,14 @@ export interface ForeignTaskArtifactContainmentResultV1 {
   readonly detectedChanges: readonly ForeignTaskArtifactChangeV1[];
   readonly actions: readonly ContainmentActionV1[];
   readonly chatNotices: readonly string[];
+  /**
+   * bugs4 item 8: changes that are another task's own update or the extension's
+   * own write. They produce no notice and no action; recorded for diagnostics.
+   */
+  readonly ignoredChanges?: readonly {
+    readonly change: ForeignTaskArtifactChangeV1;
+    readonly why: "extension-write" | "own-task-update";
+  }[];
 }
 
 function normalizePath(p: string): string {
@@ -267,6 +276,49 @@ export interface ContainmentOptionsV1 {
   readonly isTaskOwned?: (artifactName: string, content: string) => boolean;
   /** Whether foreign task is known to be running concurrently */
   readonly isConcurrentForeignUpdate?: boolean;
+  /**
+   * bugs4 item 8: true when `sha256` is bytes the extension itself wrote to
+   * `absolutePath` (pin, unpin, rename, archive, watchdog, Tasks-pane edits).
+   * Defaults to the shared extension-write registry.
+   */
+  readonly isExtensionWrite?: (absolutePath: string, sha256: string) => boolean;
+}
+
+/**
+ * bugs4 item 8: why a changed foreign-folder file is NOT this round's
+ * misplaced artifact, or undefined when it still needs the ownership checks.
+ *
+ * - `extension-write`: its bytes are exactly what the extension last wrote.
+ * - `own-task-update`: a `task-progress.json` whose own `taskFolder` names the
+ *   folder it sits in. Content that positively names a different task belongs
+ *   to that task; it is never "ambiguous".
+ */
+export function classifyForeignChangeAsNotMisplacedV1(
+  change: ForeignTaskArtifactChangeV1,
+  isExtensionWrite: (absolutePath: string, sha256: string) => boolean = wasExtensionTaskArtifactWriteV1
+): "extension-write" | "own-task-update" | undefined {
+  if (isExtensionWrite(change.absolutePath, change.fingerprint.sha256)) {
+    return "extension-write";
+  }
+  if (change.artifactName === "task-progress.json" && change.content !== undefined) {
+    try {
+      const parsed = JSON.parse(change.content) as { taskFolder?: unknown };
+      if (
+        typeof parsed.taskFolder === "string" &&
+        parsed.taskFolder === path.basename(change.foreignFolderPath)
+      ) {
+        return "own-task-update";
+      }
+    } catch {
+      // Unparseable content attributes nothing; fall through to the ownership checks.
+    }
+  }
+  return undefined;
+}
+
+function describeChangeTimeV1(change: ForeignTaskArtifactChangeV1): string {
+  const at = new Date(change.fingerprint.mtimeMs);
+  return Number.isNaN(at.getTime()) ? "during this round" : `at ${at.toISOString()}`;
 }
 
 /**
@@ -280,11 +332,45 @@ export async function containForeignTaskArtifactChangesV1(
 ): Promise<ForeignTaskArtifactContainmentResultV1> {
   const actions: ContainmentActionV1[] = [];
   const chatNotices: string[] = [];
+  const ignoredChanges: { change: ForeignTaskArtifactChangeV1; why: "extension-write" | "own-task-update" }[] = [];
   const normalizedCurrent = normalizePath(currentTaskFolderPath);
 
   for (const change of changes) {
     const destPath = path.join(normalizedCurrent, change.artifactName);
     const foreignPath = change.absolutePath;
+
+    // bugs4 item 8: an extension-originated write (pin, archive, rename,
+    // watchdog, Tasks-pane edit), or a file whose own content names the task
+    // folder it sits in, is that task's own update. No notice, no action.
+    const notMisplaced = classifyForeignChangeAsNotMisplacedV1(
+      change,
+      options?.isExtensionWrite ?? wasExtensionTaskArtifactWriteV1
+    );
+    if (notMisplaced !== undefined) {
+      ignoredChanges.push({ change, why: notMisplaced });
+      continue;
+    }
+
+    // Nothing here is ever copied: a "preserved" file is simply left where it
+    // is, and the note names the one file and when it changed. The round's own
+    // outcome is never altered by a note.
+    const where = `'${change.artifactName}' in another task's folder ('${foreignPath}') changed ${describeChangeTimeV1(change)}`;
+
+    // An existing task.md edited in another task's folder by something other
+    // than this round (the owner, an editor, another session) is a note at most.
+    if (change.artifactName === "task.md" && change.kind === "modified") {
+      actions.push({
+        artifactName: change.artifactName,
+        foreignPath,
+        destPath,
+        outcome: "preserved-ambiguous",
+        reason: "An existing task.md in another task's folder changed; left in place.",
+      });
+      chatNotices.push(
+        `Note: ${where}. If this round did not write it (an owner edit, an editor, another session or another task's round), nothing needs doing; this round's outcome is unaffected.`
+      );
+      continue;
+    }
 
     // Check ambiguous ownership or concurrent foreign-task update
     if (options?.isConcurrentForeignUpdate) {
@@ -293,10 +379,10 @@ export async function containForeignTaskArtifactChangesV1(
         foreignPath,
         destPath,
         outcome: "preserved-ambiguous",
-        reason: "Concurrent foreign-task update detected; preserving both files to avoid data loss.",
+        reason: "Concurrent foreign-task update detected; left in place.",
       });
       chatNotices.push(
-        `Notice: '${change.artifactName}' changed in foreign task folder '${change.foreignFolderPath}' while that task was active. Both copies were preserved; choose whether to copy the foreign version into '${destPath}' after comparing them, or keep the copies separate.`
+        `Note: ${where} while that task was active. It was left in place and no copy was made; if this round's provider wrote it, move it into '${destPath}'.`
       );
       continue;
     }
@@ -307,10 +393,10 @@ export async function containForeignTaskArtifactChangesV1(
         foreignPath,
         destPath,
         outcome: "preserved-ambiguous",
-        reason: "Artifact ownership was not established; preserving both files.",
+        reason: "Artifact ownership was not established; left in place.",
       });
       chatNotices.push(
-        `Notice: '${change.artifactName}' changed in foreign task folder '${change.foreignFolderPath}', but ownership was not established. Both copies were preserved; compare '${foreignPath}' with '${destPath}' and choose which copy belongs to this task before moving or merging either.`
+        `Note: ${where}, but ownership was not established. It was left in place and no copy was made; if this round's provider wrote it, move it into '${destPath}'.`
       );
       continue;
     }
@@ -323,11 +409,11 @@ export async function containForeignTaskArtifactChangesV1(
           foreignPath,
           destPath,
           outcome: "preserved-ambiguous",
-          reason: "Artifact content does not attribute ownership to the current task; preserving both files.",
+          reason: "Artifact content does not attribute ownership to the current task; left in place.",
         });
-      chatNotices.push(
-        `Notice: '${change.artifactName}' was written into foreign task folder '${change.foreignFolderPath}', but ownership is ambiguous. Both copies were preserved; compare '${foreignPath}' with '${destPath}' and choose which copy belongs to this task before moving or merging either.`
-      );
+        chatNotices.push(
+          `Note: ${where}, and its content does not attribute it to this task, so ownership is ambiguous. It was left in place and no copy was made; if this round's provider wrote it, move it into '${destPath}'.`
+        );
         continue;
       }
     }
@@ -395,6 +481,7 @@ export async function containForeignTaskArtifactChangesV1(
     detectedChanges: changes,
     actions,
     chatNotices,
+    ignoredChanges,
   };
 }
 

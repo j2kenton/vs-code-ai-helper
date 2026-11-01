@@ -206,6 +206,7 @@ import type { V1RunnerSelectionV1 } from "../runners/runnerRegistry";
 import { STAGE_ORDER, TaskProgress, TaskStage } from "../types/taskProgress";
 import { isInputSnapshotSizeRejectionReasonV1 } from "../types/chatInteractionTransactionV1";
 import { AttachCoordinatorIdentityErrorV1 } from "../utils/roundLedgerV1";
+import { formatProviderErrorV1 } from "../utils/providerErrorFormatterV1";
 import { reconcileChatSendStateV1 } from "../commands/pausedStageChatSendV1";
 
 export class TaskActionCoordinatorErrorV1 extends Error {
@@ -857,6 +858,43 @@ function isCanonicalTaskStageV0(value: string): value is TaskStage {
  * what the message is explaining; the cap here is what keeps any such
  * fragment bounded.
  */
+/**
+ * bugs4 Step 29 (item 35): the fallback reason recorded for a failed earlier candidate.
+ * It is formatted BEFORE it is bounded: cutting the raw text at 300 characters first
+ * left a provider's structured error (`AGY_ERROR: {…}`) as unparseable, mid-word JSON
+ * that no later formatting step could recognise. The 300-character contract of the
+ * outcome field still holds, because the formatter's own cap is the same.
+ */
+/** @internal exported for testing */
+export function fallbackReasonForAttemptV1(record: {
+  readonly storedModelId?: string | undefined;
+  readonly code: string;
+  readonly detail?: string | undefined;
+}): string {
+  const raw = `${record.storedModelId ?? "the primary"} ${record.code}${record.detail ? `: ${record.detail}` : ""}`;
+  return formatProviderErrorV1(raw, { maxChars: 300, keepInternalCodes: true }) ?? raw.slice(0, 300);
+}
+
+/**
+ * bugs4 item 9: "Primary result rejected (<field> mismatch)…" with both values
+ * of the first differing field and the names of any others. Bounded to the
+ * outcome detail's 200 characters without cutting a value in half.
+ */
+/** @internal exported for testing */
+export function describeSpoolMismatchDetailV1(
+  mismatches: readonly { readonly field: string; readonly expected: string; readonly actual: string }[] | undefined
+): string | undefined {
+  const first = mismatches?.[0];
+  if (!first) {
+    return undefined;
+  }
+  const others = mismatches.slice(1).map((m) => m.field);
+  const text =
+    `Primary result rejected (${first.field} mismatch): claimed ${first.expected}, stored ${first.actual}` +
+    (others.length > 0 ? `; also differing: ${others.join(", ")}` : "");
+  return text.length <= 200 ? text : `${text.slice(0, text.lastIndexOf(" ", 197))}…`;
+}
+
 function boundedDiagnosticDetailV1(text: string, maxChars = 200): string | undefined {
   const flattened = text.replace(/\s+/g, " ").trim();
   if (flattened.length === 0) {
@@ -937,7 +975,21 @@ function eligibilityFailure(
   return undefined;
 }
 
-/** Unseal a broker response payload into UTF-8 text, claiming a spool exactly once when needed. */
+/**
+ * Unseal a broker response payload into UTF-8 text, claiming a spool exactly once when needed.
+ *
+ * bugs4 item 9, trace of the reserve/write/claim path (so the next occurrence can be read against
+ * it): the broker writes the spool with `request.correlation` and `request.reservationId`, and the
+ * broker has already refused any request whose correlation differs from its reservation handle's
+ * (agentExecutionBrokerV1 `correlationMatchesV1(handle.correlation, request.correlation)`). The
+ * coordinator claims with `reserved.handle.correlation` of the SAME loop iteration; a same-model
+ * retry or a fallback candidate allocates a fresh attempt and handle before `invoke`, never between
+ * the write and the claim. The store id is the constant `provider-results-v1`. Nothing in the code
+ * issues a new attempt or reservation between a spool write and its claim, so the code alone does
+ * not show which comparison failed for the 2026-10-29 Codex result; the mismatch now names its
+ * field (operation, attempt, reservation or store) with both values, which is what the next
+ * occurrence needs.
+ */
 async function unsealPayload(
   payload: SealedResultPayloadV1,
   correlation: ActionCorrelationV1,
@@ -960,9 +1012,17 @@ async function unsealPayload(
   const claim = await store.claimSpoolOnce(payload.spoolRef, correlation);
   if (!claim.ok) {
     if (claim.code === "spoolCorrelationMismatch") {
+      // bugs4 item 9: name the comparison that failed, with both values, so the
+      // cause can be found instead of reporting a bare mismatch.
+      const detail = describeSpoolMismatchDetailV1(claim.mismatches);
       return {
         ok: false,
-        outcome: { kind: "malformedResult", correlation, code: "resultCorrelationMismatch" },
+        outcome: {
+          kind: "malformedResult",
+          correlation,
+          code: "resultCorrelationMismatch",
+          ...(detail !== undefined ? { detail } : {}),
+        },
         attemptOutcome: "resultCorrelationMismatch",
       };
     }
@@ -2182,7 +2242,7 @@ export function createTaskActionCoordinatorV1(
           (record) => record.storedModelId === reserved.storedModelId
         );
         if (priorFailure) {
-          firstFallbackReasonV1 ??= `${priorFailure.storedModelId} ${priorFailure.code}${priorFailure.detail ? `: ${priorFailure.detail}` : ""}`.slice(0, 300);
+          firstFallbackReasonV1 ??= fallbackReasonForAttemptV1(priorFailure);
         }
         continue;
       }
@@ -2825,7 +2885,7 @@ export function createTaskActionCoordinatorV1(
       // an intervening candidate subsequently produced a rejected result.
       const fallbackReason = firstFallbackReasonV1
         ?? (primaryFailure
-          ? `${primaryFailure.storedModelId} ${primaryFailure.code}${primaryFailure.detail ? `: ${primaryFailure.detail}` : ""}`.slice(0, 300)
+          ? fallbackReasonForAttemptV1(primaryFailure)
           : undefined);
 
       return settleEnvelope(row, parsed, session, attemptId, context, acquireLeasePhase, promptSha256, {
@@ -2853,7 +2913,7 @@ export function createTaskActionCoordinatorV1(
     // the public completed-outcome field within its decoder's 300-character
     // contract even when a provider returns an unusually long message.
     const boundedFallbackReason = fallbackReason !== undefined
-      ? boundedDiagnosticDetailV1(fallbackReason, 300)
+      ? formatProviderErrorV1(fallbackReason, { maxChars: 300, keepInternalCodes: true })
       : undefined;
     if (!row.permittedResultKinds.includes(envelope.kind)) {
       const preservationResult = await preserveRejectedResultForRecoveryV1(
@@ -3344,7 +3404,7 @@ export function createTaskActionCoordinatorV1(
           (record) => record.storedModelId === next.reserved.storedModelId
         );
         if (priorFailure) {
-          firstFallbackReason ??= `${priorFailure.storedModelId} ${priorFailure.code}${priorFailure.detail ? `: ${priorFailure.detail}` : ""}`.slice(0, 300);
+          firstFallbackReason ??= fallbackReasonForAttemptV1(priorFailure);
         }
         continue;
       }

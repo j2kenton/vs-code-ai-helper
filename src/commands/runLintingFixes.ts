@@ -3,12 +3,16 @@ import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { FAILURE_CLUSTER_PROMPT_MAX_CHARS_V1, selectFailureClustersForPromptV1, type FailingTestSummaryV1 } from "../utils/failingTestsV1";
 import {
   afterRoundChecksV1,
+  cancelledFixHandbackV1,
   decideFixHandbackV1,
   describeFixProgressV1,
   measureFixProgressV1,
   type FixProgressV1,
 } from "../utils/lintFixHandbackPolicyV1";
+import { classifyFixChainBlockV1, readFixChainFailureV1, type FixChainBlockKindV1 } from "../utils/lintFixChainBlockV1";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
+import { ENABLE_PUBLISH_BACKUP_AND_RERUN_FIX_COMMAND_V1, partitionSwitchedOffBackupsByReadinessV1 } from "../utils/enableChainModelV1";
+import { chainModelReadinessProbeV1 } from "../utils/chainModelReadinessV1";
 import { forwardInViewerV1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { TaskInventory } from "../state/taskInventory";
@@ -37,7 +41,7 @@ import {
   runImplementationOrSealedV1,
 } from "./runEditActionV1";
 import { getUnrelatedWorkspaceChanges, isGitWorkspace } from "./reviewActions";
-import { allowsDirtyWorktreeChanges, getPublishVerificationCommands } from "../config/settings";
+import { allowsDirtyWorktreeChanges, getModelSettings, getPublishVerificationCommands } from "../config/settings";
 import {
   completionLintResultFromBaselineV1,
   decideFailingBaselineReuseV1,
@@ -252,18 +256,79 @@ export function offerLintFixRecoveryInChatV1(
    * Implementation after a low-yield round) and offers Run Publish Checks
    * without a recommendation, since nothing has changed since the last run.
    */
-  leftFailing?: { readonly progress?: FixProgressV1 }
+  leftFailing?: {
+    readonly progress?: FixProgressV1;
+    readonly chainBlock?: FixChainBlockKindV1;
+    /** Switched-off Publish backups whose provider is installed and signed in: the card offers to enable one. */
+    readonly disabledBackups?: readonly string[];
+    /** Switched-off backups whose provider cannot run right now; the card names them and why, without offering them. */
+    readonly unavailableBackups?: readonly { readonly label: string; readonly reason: string }[];
+  }
 ): Promise<Awaited<ReturnType<typeof offerActionInChatV1>>> {
   if (leftFailing !== undefined) {
-    const decision = decideFixHandbackV1(leftFailing.progress);
+    const switchedOff = leftFailing.disabledBackups ?? [];
+    const switchedOffClause =
+      switchedOff.length > 0
+        ? ` ${switchedOff.join(" and ")} ${switchedOff.length === 1 ? "is" : "are"} configured as a backup but switched off: turn ${switchedOff.length === 1 ? "it" : "one"} on there.`
+        : "";
+    // A switched-off backup whose provider is not usable is not offered; say why instead of hiding it.
+    const unavailableClause = (leftFailing.unavailableBackups ?? [])
+      .map((entry) => ` ${entry.label} is configured as a backup but switched off, and it would not run yet: ${entry.reason}.`)
+      .join("");
+    const decision = decideFixHandbackV1(leftFailing.progress, leftFailing.chainBlock);
+    const chainBlocked = leftFailing.chainBlock !== undefined;
+    const enableCandidate = chainBlocked ? switchedOff[0] : undefined;
+    if (enableCandidate !== undefined) {
+      // bugs4 item 31: the move that can change the outcome is a configured backup that is only
+      // switched off. Offer it as one click; the owner's other ways forward stay available.
+      return offerActionInChatV1({
+        taskFolderPath,
+        taskLabel,
+        actionLabel: `Enable ${enableCandidate} and rerun the fix`,
+        command: ENABLE_PUBLISH_BACKUP_AND_RERUN_FIX_COMMAND_V1,
+        args: [{ taskFolderPath, modelLabel: enableCandidate, taskLabel }],
+        actionConsequence:
+          `Switches ${enableCandidate} on in the Publish chain (it is already one of your configured backups; nothing new is added), ` +
+          "then runs Fix Linting & Code Errors again. Switch it off in AI Models if you do not want to keep it on.",
+        alternatives: [
+          {
+            label: "Choose a different Publish model",
+            command: "vs-code-ai-helper.openAiModels",
+            args: ["publish"],
+            consequence: "Opens AI Models on the Publish stage. Nothing runs; once you have picked a model, choose Fix Linting & Code Errors again.",
+          },
+          {
+            label: "Back to Implementation",
+            command: "vs-code-ai-helper.setTaskStage",
+            args: [{ taskFolderPath, stage: "implementation" }],
+            consequence: "Returns the task to Implementation, for failures that need real plan work rather than a lint-style fix.",
+          },
+          {
+            label: "Run Publish Checks",
+            command: "vs-code-ai-helper.runPublishChecks",
+            args: [{ taskFolderPath }],
+            consequence:
+              "Re-runs the full checks. Nothing has changed since they last ran, so on its own this repeats the same result; it is useful after you change something yourself.",
+          },
+        ],
+        noticeText,
+        recommend: {
+          target: "action",
+          reasoning:
+            `${decision.reason.replace(/ Choose a different Publish model, then run Fix Linting & Code Errors again\.$/, "")} ` +
+            `${enableCandidate} is configured as a backup but switched off, so switching it on and rerunning the fix is the step that can change the outcome.`,
+        },
+      });
+    }
     return offerActionInChatV1({
       taskFolderPath,
       taskLabel,
       actionLabel: "Fix Linting & Code Errors again",
       command: "vs-code-ai-helper.runLintingFixes",
       args: [{ taskFolderPath }],
-      actionConsequence:
-        "Runs another fix round against the failures that remain. Pick a different Publish model in AI Models first if you want a stronger one.",
+      actionConsequence: chainBlocked
+        ? "Runs another fix round, which will meet the same unavailable Publish model unless you change it first."
+        : "Runs another fix round against the failures that remain. Pick a different Publish model in AI Models first if you want a stronger one.",
       alternatives: [
         {
           label: "Back to Implementation",
@@ -272,11 +337,13 @@ export function offerLintFixRecoveryInChatV1(
           consequence: "Returns the task to Implementation, for failures that need real plan work rather than a lint-style fix.",
         },
         {
-          label: "Choose a stronger Publish model",
+          label: chainBlocked ? "Choose a different Publish model" : "Choose a stronger Publish model",
           command: "vs-code-ai-helper.openAiModels",
           args: ["publish"],
           consequence:
-            "Opens AI Models on the Publish stage. Nothing runs; once you have picked a model, choose Fix Linting & Code Errors again.",
+            "Opens AI Models on the Publish stage. Nothing runs; once you have picked a model, choose Fix Linting & Code Errors again." +
+            switchedOffClause +
+            unavailableClause,
         },
         {
           label: "Run Publish Checks",
@@ -288,10 +355,17 @@ export function offerLintFixRecoveryInChatV1(
       ],
       noticeText,
       recommend: {
-        target: decision.recommended === "fixAgain" ? "action" : { alternativeIndex: 0 },
+        target:
+          decision.recommended === "fixAgain"
+            ? "action"
+            : decision.recommended === "chooseModel"
+              ? { alternativeIndex: 1 }
+              : { alternativeIndex: 0 },
         reasoning: decision.reason,
       },
-      ...(optional ? { optional: true as const } : {}),
+      // A card the owner cannot answer by waiting is not "Optional": the task cannot move on
+      // until the Publish model is changed.
+      ...(optional && !chainBlocked ? { optional: true as const } : {}),
     });
   }
   return offerActionInChatV1({
@@ -697,6 +771,10 @@ export async function runLintingFixes(
   let finalChecksV1: { passed: boolean; failedChecks: readonly { command: string }[] } | undefined;
   let fixSucceededV1 = false;
   const changedFilesV1 = new Set<string>();
+  // bugs4 item 31: true once a check run in this fix has shown failing checks. A fix that is
+  // cancelled after that point leaves the checks failing, so its hand-back is the left-failing
+  // card (a step that can change the outcome), never "Run Publish Checks" on an unchanged tree.
+  let checksKnownFailingV1 = false;
   // Item 2 / Step 57a completion fix (2026-09-29 review): out-param the AI
   // final-fixes dispatch below fills from its own runImplementationOrSealedV1
   // call, read back here so the terminal recordAdmissionReleaseTriggerV1 call
@@ -843,7 +921,12 @@ export async function runLintingFixes(
   const showFixHandbackV1 = async (
     noticeText: string,
     level: "warning" | "error" = "warning",
-    leftFailing?: { readonly progress?: FixProgressV1 }
+    leftFailing?: {
+      readonly progress?: FixProgressV1;
+      readonly chainBlock?: FixChainBlockKindV1;
+      readonly disabledBackups?: readonly string[];
+      readonly unavailableBackups?: readonly { readonly label: string; readonly reason: string }[];
+    }
   ): Promise<void> => {
     const chatPointer = await offerLintFixRecoveryInChatV1(
       resolvedTask.taskFolderPath,
@@ -1115,6 +1198,7 @@ export async function runLintingFixes(
             await runPublishScopeCheck(taskFolderUri, resolvedTask.progress);
             throwIfPublishChecksCancelledV1(cancelToken);
             finalChecksV1 = { passed: postFixLint.passed, failedChecks: postFixLint.failedChecks };
+            checksKnownFailingV1 = !postFixLint.passed;
 
             if (!baselineDecision.reuse && !postFixLint.passed) {
               // A fresh full failing run is the reference the post-fix re-check starts
@@ -1407,9 +1491,8 @@ export async function runLintingFixes(
                     fixSucceededV1 = false;
                     finalChecksV1 = undefined;
                     settleFixOperation("cancelled", `Fix Linting & Code Errors was cancelled.${detail}`);
-                    await showFixHandbackV1(
-                      `Fix Linting & Code Errors was cancelled.${detail} Review any retained edits, then run Publish Checks to verify the current workspace.`
-                    );
+                    const cancelledHandback = cancelledFixHandbackV1(detail, checksKnownFailingV1);
+                    await showFixHandbackV1(cancelledHandback.noticeText, "warning", cancelledHandback.leftFailing);
                     return;
                   }
                   if (result?.status === "completed") {
@@ -1561,15 +1644,66 @@ export async function runLintingFixes(
                     // (Step 9): neither sub-case leaves the fixes actually
                     // applied, so neither may report "completed" at the
                     // operation level.
+                    // bugs4 item 31: whenever the rerun still leaves checks failing, the failed and
+                    // cancelled endings use the same left-failing card as the applied ending, so the
+                    // recommendation is a step that can change the outcome rather than Run Publish
+                    // Checks on an unchanged tree.
+                    const leftFailing = rerunLint.passed
+                      ? undefined
+                      : {
+                          progress: measureFixProgressV1(
+                            postFixLint.failedChecks,
+                            afterRoundChecksV1(rerunLint.failedChecks, rerunLint.passedExecutions),
+                            rerunLint.commandsRun
+                          ),
+                        };
                     if (result?.status === "failed") {
                       settleFixOperation("failed", result.errorMessage ?? "no reason was reported");
+                      const chainBlock = leftFailing ? classifyFixChainBlockV1(result.errorMessage) : undefined;
+                      // bugs4 item 31: reset time once, no contradictory "no reset schedule", the models
+                      // tried named once, and any switched-off backup pointed at on the card.
+                      const chainFailure = readFixChainFailureV1(result.errorMessage, result.chainAttemptsV1);
+                      // Offer "Enable <model> and rerun" only for a switched-off backup whose provider can run now.
+                      const backupReadiness =
+                        chainBlock !== undefined && chainFailure.disabledBackups.length > 0
+                          ? await partitionSwitchedOffBackupsByReadinessV1(
+                              getModelSettings().publish,
+                              chainFailure.disabledBackups,
+                              chainModelReadinessProbeV1()
+                            )
+                          : undefined;
+                      const triedClause =
+                        chainBlock !== undefined && chainFailure.triedOutcomes.length > 0
+                          ? ` Models tried: ${chainFailure.triedOutcomes.map((tried) => `${tried.label} (${tried.outcome})`).join("; ")}.`
+                          : "";
                       await showFixHandbackV1(
-                        `AI final fixes failed: ${result.errorMessage ?? "no reason was reported"} (${classification.summary}). Review the changes, then run Publish Checks.`
+                        leftFailing
+                          ? `AI final fixes failed: ${chainFailure.text}${triedClause} Checks still fail (${classification.summary}).` +
+                              `${leftFailing.progress !== undefined ? ` ${describeFixProgressV1(leftFailing.progress)}` : ""}`
+                          : `AI final fixes failed: ${result.errorMessage ?? "no reason was reported"} (${classification.summary}). Review the changes, then run Publish Checks.`,
+                        "warning",
+                        leftFailing
+                          ? {
+                              ...leftFailing,
+                              ...(chainBlock !== undefined ? { chainBlock } : {}),
+                              ...(backupReadiness !== undefined && backupReadiness.ready.length > 0
+                                ? { disabledBackups: backupReadiness.ready }
+                                : {}),
+                              ...(backupReadiness !== undefined && backupReadiness.notReady.length > 0
+                                ? { unavailableBackups: backupReadiness.notReady }
+                                : {}),
+                            }
+                          : undefined
                       );
                     } else {
                       settleFixOperation("failed", "AI final fixes were cancelled before completing");
                       await showFixHandbackV1(
-                        `AI final fixes were cancelled; completion lint was rerun (${classification.summary}). Run Publish Checks when ready.`
+                        leftFailing
+                          ? `AI final fixes were cancelled; completion lint was rerun and checks still fail (${classification.summary}).` +
+                              `${leftFailing.progress !== undefined ? ` ${describeFixProgressV1(leftFailing.progress)}` : ""}`
+                          : `AI final fixes were cancelled; completion lint was rerun (${classification.summary}). Run Publish Checks when ready.`,
+                        "warning",
+                        leftFailing
                       );
                     }
                   }
@@ -1671,9 +1805,8 @@ export async function runLintingFixes(
               fixSucceededV1 = false;
               finalChecksV1 = undefined;
               settleFixOperation("cancelled", `Fix Linting & Code Errors was cancelled.${detail}`);
-              await showFixHandbackV1(
-                `Fix Linting & Code Errors was cancelled.${detail} Review any retained edits, then run Publish Checks to verify the current workspace.`
-              );
+              const cancelledHandback = cancelledFixHandbackV1(detail, checksKnownFailingV1);
+              await showFixHandbackV1(cancelledHandback.noticeText, "warning", cancelledHandback.leftFailing);
               return;
             }
             if (isExtensionFolderRemovedErrorV1(error)) {

@@ -729,6 +729,35 @@ void describe("improveReviewScore — plan progress", () => {
     );
   });
 
+  void it("leaves a round out of the stall count when the owner-evidence contradiction flag is raised (bugs4 item 19)", async () => {
+    const run = async (excludeFirstRound: boolean) => {
+      let flagged = excludeFirstRound;
+      return improveReviewScore({
+        context: fakeContext(),
+        stage: "impl-high-review",
+        baselineScore: 6.3,
+        maxAttempts: 20,
+        zeroFixableTerminates: true,
+        preLoopEvidence: { zeroFixableEvidence: true, planIncomplete: true, initialComplete: 8 },
+        // The first dispatched round contradicted the review on an owner-evidence gate.
+        roundExcludedFromStallCount: () => {
+          const take = flagged;
+          flagged = false;
+          return take;
+        },
+        apply: () => Promise.resolve(),
+        review: () => Promise.resolve(cleanAt(9, 8, 25)),
+      });
+    };
+    const control = await run(false);
+    const excluded = await run(true);
+    assert.strictEqual(control.stalled, true);
+    assert.strictEqual(control.buildRoundsWithoutProgress, 2);
+    assert.strictEqual(excluded.stalled, true);
+    assert.strictEqual(excluded.buildRoundsWithoutProgress, 2, "the stall still ends the run once two counted rounds pass");
+    assert.ok(excluded.attempts > control.attempts, "the excluded round bought one more attempt before the stall");
+  });
+
   void it("does not count a blocker-fix round before the first build round, even with a seeded baseline", async () => {
     // Complement: preLoopEvidence with planIncomplete=false (i.e. no build
     // mandate carried in) must NOT seed previousWasBuildMandate true, so a

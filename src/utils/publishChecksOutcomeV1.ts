@@ -193,18 +193,37 @@ export async function recordPublishChecksOutcomeV1(
     if (statusLine === undefined) {
       return;
     }
-    await ensurePublishReviewArtifactExistsV1(taskFolderUri);
-    await withPublishChecksReportLockV1(taskFolderUri, async () => {
-      const reportPath = path.join(taskFolderUri.fsPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME);
-      const existing = await readPublishChecksFile(taskFolderUri);
-      const merged = mergePublishStatusLineSection(existing, statusLine);
-      if (merged !== existing) {
-        await writeFileAtomicV1(reportPath, merged);
-      }
-    });
+    await writePublishStatusLineV1(taskFolderUri, statusLine);
   } catch (error) {
     console.warn("[publishChecksOutcome] Could not record the Publish Checks outcome", error);
   }
+}
+
+async function writePublishStatusLineV1(taskFolderUri: vscode.Uri, statusLine: string): Promise<void> {
+  await ensurePublishReviewArtifactExistsV1(taskFolderUri);
+  await withPublishChecksReportLockV1(taskFolderUri, async () => {
+    const reportPath = path.join(taskFolderUri.fsPath, STAGE_ARTIFACT_FILENAMES.publish ?? PUBLISH_CHECKS_FILENAME);
+    const existing = await readPublishChecksFile(taskFolderUri);
+    const merged = mergePublishStatusLineSection(existing, statusLine);
+    if (merged !== existing) {
+      await writeFileAtomicV1(reportPath, merged);
+    }
+  });
+}
+
+/**
+ * bugs4 item 33: while Publish Checks run, `publish-review.md` says so instead of
+ * still showing the previous run's result as if it were current. This is NOT an
+ * outcome (`publishStatusLineForOutcomeV1` stays `undefined` for a running
+ * record, so nothing reads "running" as a result); the finished run's own report
+ * write replaces this line, and a cancel/interrupt/failure replaces it through
+ * `recordPublishChecksOutcomeV1`.
+ */
+export function publishRunningStatusLineV1(startedAtIso: string): string {
+  return (
+    `**Publish Checks are running** (started ${startedAtIso}). Any result shown below is from an earlier run ` +
+    "and is out of date until these checks finish."
+  );
 }
 
 type RunningRecordV1 = Extract<PublishChecksOutcomeV1, { outcome: "running" }>;
@@ -254,6 +273,9 @@ export async function recordPublishChecksRunningV1(
     .catch((error) => console.warn("[publishChecksOutcome] Could not record the running state", error));
   runningRecordQueuesV1.set(taskFolderPath, written);
   await written;
+  await writePublishStatusLineV1(taskFolderUri, publishRunningStatusLineV1(initial.at)).catch((error) =>
+    console.warn("[publishChecksOutcome] Could not mark the Publish report as running", error)
+  );
   return {
     commandStarted: (command) =>
       updateRunningRecordV1(

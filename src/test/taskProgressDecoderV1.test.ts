@@ -38,6 +38,25 @@ function expectRecovery(text: string, code: string): void {
 }
 
 void describe("taskProgressDecoderV1", () => {
+  void it("decodes a round-ledger outcome's unattributedFiles and rejects a malformed list (bugs4 scope leak)", () => {
+    const entry = (outcome: unknown): Record<string, unknown> => ({
+      roundId: "round-1",
+      attemptIds: ["round-1"],
+      stage: "impl",
+      mode: "implementation",
+      startedAt: "2026-07-01T10:00:00.000Z",
+      endedAt: "2026-07-01T10:05:00.000Z",
+      state: "completed",
+      outcome,
+    });
+    const ok = decodeTaskProgressTextV1(
+      doc({ roundLedger: [entry({ filesChanged: ["src/a.ts", "src/b.ts"], unattributedFiles: ["src/b.ts"] })] })
+    );
+    assert.equal(ok.ok, true, ok.ok ? "" : ok.reason);
+    expectRecovery(doc({ roundLedger: [entry({ filesChanged: ["src/a.ts"], unattributedFiles: "src/b.ts" })] }), "invalidFieldValue");
+    expectRecovery(doc({ roundLedger: [entry({ filesChanged: ["src/a.ts"], unattributedFiles: [""] })] }), "invalidFieldValue");
+  });
+
   void it("decodes bounded per-item provenance and rejects malformed claim records", () => {
     const validReport = { at: "2026-10-26T00:02:00.000Z", roundId: "round-2", testIdentity: "case.test.ts",
       command: "pnpm test case.test.ts", workingDirectory: "/workspace", passed: 1, failed: 0,
@@ -298,6 +317,32 @@ void describe("taskProgressDecoderV1", () => {
     );
     expectRecovery(
       doc({ ensembleProgressVersion: 1, reviewScoreHistory: [{ ...valid, reviewer: "not-an-object" }] }),
+      "invalidFieldValue"
+    );
+  });
+
+  void it("decodes the churn progress signals on a reviewScoreHistory entry and fails closed on a bad count (bugs4 item 22)", () => {
+    const entry = {
+      stage: "impl-high-review",
+      score: 7,
+      attemptId: "attempt-1",
+      at: "2026-11-01T11:00:00.000Z",
+      blockerCount: 1,
+      taskFixableCount: 1,
+      settledItemCount: 21,
+      unbuiltStepCount: 14,
+    };
+    const result = decodeTaskProgressTextV1(doc({ ensembleProgressVersion: 1, reviewScoreHistory: [entry] }));
+    assert.equal(result.ok, true);
+    if (result.ok) {
+      assert.deepEqual(result.decoded.progress.reviewScoreHistory, [entry]);
+    }
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, reviewScoreHistory: [{ ...entry, settledItemCount: -1 }] }),
+      "invalidFieldValue"
+    );
+    expectRecovery(
+      doc({ ensembleProgressVersion: 1, reviewScoreHistory: [{ ...entry, unbuiltStepCount: "many" }] }),
       "invalidFieldValue"
     );
   });

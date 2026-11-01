@@ -783,6 +783,13 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             font-size: var(--ensemble-small-font-size);
             color: var(--vscode-errorForeground);
             margin-top: var(--ensemble-space-half);
+            /* At least the gap between rows (.model-row margin-top), so the note
+               reads as part of the row above it, not the one below. */
+            margin-bottom: var(--ensemble-space-1);
+          }
+          /* Not an error: the stage still has a usable model, or this backup is just skipped. */
+          .provider-disabled-note.muted {
+            color: var(--vscode-descriptionForeground);
           }
           .btn-container {
             display: flex;
@@ -1471,14 +1478,74 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // happens to occupy — so a removal, promotion, or replacement
           // that changes selectedId must re-derive the note instead of
           // leaving a stale one behind. Tolerates a missing note element.
-          function syncProviderDisabledNote(note, selectedId) {
+          //
+          // bugs4 item 24: a row the owner has switched off (its checkbox is
+          // unchecked) shows no note at all — it is already visibly off and
+          // keeps its stored id. On a checked row the wording fits the row:
+          // only a stage with no usable model reads as an error.
+          function providerLabelOfModelId(id) {
+            const providerId = providerIdOfModelId(id);
+            const provider = providers.find(p => p.id === providerId);
+            return provider && provider.label ? provider.label : providerId;
+          }
+
+          // True when some other checked row in this stage names a model that
+          // resolves (so its provider is on and the model is in the catalog).
+          function stageHasUsableRow(stageRow, exceptNote) {
+            if (!stageRow || typeof stageRow.querySelectorAll !== 'function') return false;
+            return Array.from(stageRow.querySelectorAll('.model-row')).some(modelRow => {
+              const rowNote = modelRow.querySelector('.provider-disabled-note');
+              if (rowNote && rowNote === exceptNote) return false;
+              const checkbox = modelRow.querySelector('.row-enabled');
+              const hidden = modelRow.querySelector('input[type="hidden"]');
+              return !!checkbox && checkbox.checked && !!hidden && !!hidden.value && !!findModelById(hidden.value);
+            });
+          }
+
+          function providerDisabledNoteFor(note, selectedId) {
+            const name = providerLabelOfModelId(selectedId);
+            const isPrimary = (note.id || '').indexOf('primary-note-') === 0;
+            const stageRow = typeof note.closest === 'function' ? note.closest('.stage-row') : null;
+            if (!isPrimary) {
+              return { text: name + ' is switched off, so this backup is skipped.', error: false };
+            }
+            if (stageHasUsableRow(stageRow, note)) {
+              return { text: name + ' is switched off, so this stage will start with its first enabled backup.', error: false };
+            }
+            return {
+              text: name + ' is switched off in Provider Selection, so this stage has no model. Re-enable ' + name + ' or choose another model.',
+              error: true,
+            };
+          }
+
+          // The primary's wording depends on the stage's backups, so a change
+          // to any row in the stage re-derives the primary's note.
+          function refreshStageNotes(stageRow) {
+            if (!stageRow || typeof stageRow.querySelector !== 'function') return;
+            const primaryNote = stageRow.querySelector('.primary-container .provider-disabled-note');
+            const primaryHidden = stageRow.querySelector('.primary-container input[type="hidden"]');
+            if (primaryNote && primaryHidden) syncProviderDisabledNote(primaryNote, primaryHidden.value, true);
+          }
+
+          function syncProviderDisabledNote(note, selectedId, skipStageRefresh) {
             if (!note) return;
             const unresolved = !!selectedId && !findModelById(selectedId);
-            note.hidden = !unresolved;
-            if (unresolved) {
-              note.textContent = isStoredModelProviderDisabled(selectedId)
-                ? PROVIDER_DISABLED_NOTE_TEXT
-                : unresolvedModelNote(selectedId);
+            const modelRow = typeof note.closest === 'function' ? note.closest('.model-row') : null;
+            const rowCheckbox = modelRow ? modelRow.querySelector('.row-enabled') : null;
+            const rowSwitchedOff = !!rowCheckbox && !rowCheckbox.checked;
+            note.hidden = !unresolved || rowSwitchedOff;
+            if (unresolved && !rowSwitchedOff) {
+              if (isStoredModelProviderDisabled(selectedId)) {
+                const described = providerDisabledNoteFor(note, selectedId);
+                note.textContent = described.text;
+                note.className = 'provider-disabled-note' + (described.error ? '' : ' muted');
+              } else {
+                note.textContent = unresolvedModelNote(selectedId);
+                note.className = 'provider-disabled-note';
+              }
+            }
+            if (!skipStageRefresh && (note.id || '').indexOf('primary-note-') !== 0 && typeof note.closest === 'function') {
+              refreshStageNotes(note.closest('.stage-row'));
             }
           }
 
@@ -1496,7 +1563,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             const hiddenValue = selectedId || '';
             const disabledAttr = disabled ? 'disabled aria-disabled="true"' : '';
             const unresolved = !!selectedId && !selectedModel;
-            const noteHiddenAttr = unresolved ? '' : 'hidden';
+            // A switched-off row (rendered disabled) shows no note; the real text is
+            // derived by syncProviderDisabledNote once the row is in the DOM.
+            const noteHiddenAttr = unresolved && !disabled ? '' : 'hidden';
             const noteText = providerDisabled ? PROVIDER_DISABLED_NOTE_TEXT : unresolved ? unresolvedModelNote(selectedId) : PROVIDER_DISABLED_NOTE_TEXT;
             return \`
               <div class="model-combobox" data-kind="\${kind}" data-stage="\${stage}">
@@ -1742,14 +1811,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             checkbox.addEventListener('change', () => {
               modelRow.classList.toggle('skipped', !checkbox.checked);
               setRowComboDisabled(modelRow, !checkbox.checked);
+              // Switching a row off hides its note; switching it back on restores it at once.
+              const rowHidden = modelRow.querySelector('input[type="hidden"]');
+              syncProviderDisabledNote(modelRow.querySelector('.provider-disabled-note'), rowHidden ? rowHidden.value : '');
             });
             modelRow.querySelector('.remove-backup').addEventListener('click', () => {
               modelRow.remove();
               syncBackupLimitFor(row);
+              refreshStageNotes(row);
               markDirty();
             });
             container.appendChild(modelRow);
             setupModelCombobox(modelRow, kind, stage);
+            const addedHidden = modelRow.querySelector('input[type="hidden"]');
+            syncProviderDisabledNote(modelRow.querySelector('.provider-disabled-note'), addedHidden ? addedHidden.value : '');
             syncBackupLimitFor(row);
           }
 
@@ -1865,6 +1940,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             checkbox.addEventListener('change', () => {
               primaryRow.classList.toggle('skipped', !checkbox.checked);
               setRowComboDisabled(primaryRow, !checkbox.checked);
+              // Switching the primary off hides its note; switching it back on restores it at once.
+              const primaryHidden = primaryRow.querySelector('input[type="hidden"]');
+              syncProviderDisabledNote(primaryRow.querySelector('.provider-disabled-note'), primaryHidden ? primaryHidden.value : '');
             });
             primaryRow.querySelector('.remove-backup').addEventListener('click', () => {
               const hidden = document.getElementById('primary-' + stage);
@@ -1889,6 +1967,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               syncProviderDisabledNote(document.getElementById('primary-note-' + stage), hidden.value);
               setRowComboDisabled(primaryRow, !checkbox.checked);
               syncBackupLimitFor(row);
+              refreshStageNotes(row);
               markDirty();
             });
           }
@@ -1938,6 +2017,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
               backupModels.forEach((model, index) =>
                 addExtraBackupCombobox(row, stage, model, backupFlags[index] !== false)
               );
+              // Every row is in the DOM now: derive the notes from the whole stage, so the
+              // primary's wording knows about its backups and switched-off rows show none.
+              const primaryHiddenInput = row.querySelector('.primary-container input[type="hidden"]');
+              syncProviderDisabledNote(
+                row.querySelector('.primary-container .provider-disabled-note'),
+                primaryHiddenInput ? primaryHiddenInput.value : '',
+                true
+              );
+              refreshStageNotes(row);
 
               row.querySelector('.add-backup').addEventListener('click', () => {
                 addExtraBackupCombobox(row, stage, '', true);

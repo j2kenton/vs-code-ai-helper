@@ -93,6 +93,8 @@ export interface TaskOperationSpec {
   exclusive?: boolean;
   /** Taxonomy classification (operationTaxonomy.ts). */
   kind?: OperationKind;
+  /** bugs4 item 32: the review stage an Apply Review child applies; chat lines name it. */
+  appliesStage?: TaskStage;
   /**
    * Selective mutual exclusion, orthogonal to `exclusive`: `begin` refuses a
    * root operation when any active operation on the same task shares one of
@@ -302,6 +304,8 @@ export interface TaskOperationSnapshot {
   readonly activityStartedAt?: number;
   readonly exclusive: boolean;
   readonly kind?: OperationKind;
+  /** See TaskOperationSpec.appliesStage. */
+  readonly appliesStage?: TaskStage;
   readonly parentId?: string;
   readonly cancellable: boolean;
   readonly state: TaskOperationState;
@@ -360,6 +364,7 @@ interface MutableOperation {
   stageGeneration: number;
   exclusive: boolean;
   kind?: OperationKind;
+  appliesStage?: TaskStage;
   parentId?: string;
   cancellable: boolean;
   state: TaskOperationState;
@@ -676,6 +681,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
       exclusive,
       detail: undefined,
       kind: spec.kind,
+      ...(spec.appliesStage ? { appliesStage: spec.appliesStage } : {}),
       parentId: spec.parent?.id,
       cancellable,
       state: "running",

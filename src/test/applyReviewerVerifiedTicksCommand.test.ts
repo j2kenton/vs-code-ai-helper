@@ -46,6 +46,7 @@ import {
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { WorkflowDecisionCommandResultV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { clearFormPlanWriteMarkerV1, markFormPlanWriteV1 } from "../utils/formPlanWriteMarkerV1";
 import { safeRemoveDir } from "./testFsUtils";
 import {
   markFastForwardRunActiveV1,
@@ -360,6 +361,12 @@ async function run(
         confirmedResult = await applyReviewerVerifiedTicksConfirmedV1(inventory, makeStore(canonicalId), confirmArg);
       }
     }
+    // bugs4 item 32: the withheld-for-test-evidence outcome is a chat card now, not a pop-up.
+    for (const offer of [...store.listPending(folder), ...store.listPending(canonicalId)].filter(
+      (d) => d.decisionKey === "chatActionOffer:resumeAndApplyCurrentStageAction"
+    )) {
+      win.captured.push({ method: "chat", message: offer.whatHappened });
+    }
     return { captured: win.captured, folder, refreshes: refreshCount(), decision, confirmedResult };
   } finally {
     win.restore();
@@ -447,6 +454,25 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
     } finally {
       clearFastForwardRunActiveV1(folder);
       clearFastForwardRunPausedProvenanceV1(folder);
+    }
+  });
+
+  // bugs4 item 6: the open-items form owns the follow-up dispatch for its own plan-final.md
+  // write. This second dispatcher still ticks, but stands down and says so.
+  void it("applies its ticks but stands down from its own dispatch while the open-items form's follow-up is pending", async () => {
+    const folder = nodePath.join(ROOT, ".ensemble", "form-pending");
+    markFormPlanWriteV1(folder, nodePath.join(folder, "plan-final.md"), "form wrote this");
+    const callsBefore = resumeAndApplyCurrentStageActionCalls.length;
+    try {
+      const result = await run("form-pending", { review: REVIEW_WITH_VERIFIED_ITEMS }, { confirm: true });
+      assert.match(readPlan(result.folder), /- \[x\] Wire the completeness gate/, "the ticks are still applied");
+      assert.equal(resumeAndApplyCurrentStageActionCalls.length, callsBefore, "no second dispatch contends for the admission");
+      assert.match(
+        result.captured.filter((m) => m.method === "info").pop()?.message ?? "",
+        /no second dispatch was started/
+      );
+    } finally {
+      clearFormPlanWriteMarkerV1(folder);
     }
   });
 
@@ -926,7 +952,16 @@ void describe("applyReviewerVerifiedTicks — editing-round test evidence", () =
   void it("keeps a test-dependent reviewer claim provisional without a passing editing-round report", async () => {
     const result = await run("test-evidence-missing", { plan, review }, { confirm: true });
     assert.equal(result.decision, undefined);
-    assert.match(result.captured.find((entry) => entry.method === "warning")?.message ?? "", /without an applicable passing/);
+    const chat = result.captured.find((entry) => entry.method === "chat")?.message ?? "";
+    assert.match(chat, /waits? for a passing test report/);
+    assert.match(chat, /\n {2}- Add regression cases in dispatch\.test\.ts/, "the item is listed as a bullet, not joined into one paragraph");
+    assert.match(chat, /pnpm run test:unit -- /, "the card names the command that would satisfy the rule");
+    assert.match(chat, /Add regression cases in dispatch\.test\.ts — no test report is recorded for this item/, "bugs4 Step 20: each withheld item carries its own reason");
+    assert.equal(
+      result.captured.some((entry) => entry.method === "warning" && /without an applicable passing/.test(entry.message)),
+      false,
+      "no pop-up-only warning"
+    );
     assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
   });
 
@@ -1008,10 +1043,9 @@ void describe("applyReviewerVerifiedTicks — editing-round test evidence", () =
       { confirm: true }
     );
     assert.equal(result.decision, undefined);
-    assert.match(
-      result.captured.find((entry) => entry.method === "warning")?.message ?? "",
-      /without an applicable passing/
-    );
+    const staleChat = result.captured.find((entry) => entry.method === "chat")?.message ?? "";
+    assert.match(staleChat, /waits? for a passing test report/);
+    assert.match(staleChat, /its test report predates later edits to the tested files/, "bugs4 Step 20: a stale report is named as stale, not as missing");
     assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
   });
 
@@ -1105,6 +1139,49 @@ void describe("recordReviewerVerificationOfTickedItemsV1 — verifying items an 
         0,
         "an item already verified for this plan revision is not verified again"
       );
+    } finally {
+      realFs.restore();
+    }
+  });
+
+  // bugs4 item 21 / plan item 25: a populated block must not produce zero verifications because an
+  // item merely names a test file or searches "including tests". Those are not test-dependent, so the
+  // reviewer's naming of them is recorded; only the item that really requires a passing test run is held.
+  void it("records ticked items that only mention a test file or search location, and holds only the item that needs a test run", async () => {
+    const filenameItem = "Keep the string style and the first 20 characters of the message in processor.close-account.test.ts";
+    const searchItem = "Search apps/server and apps/web including tests for the old phrases";
+    const needsRunItem = "Add regression tests for the close-account flow and make them pass";
+    const mixedPlan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      `- [x] ${filenameItem}`,
+      `- [x] ${searchItem}`,
+      `- [x] ${needsRunItem}`,
+      "",
+    ].join("\n");
+    const mixedReview = [
+      "Readiness: 9/10",
+      "",
+      "<!-- verified-complete:start -->",
+      `- ${filenameItem}`,
+      "  evidence: opened the file and compared the prefix with HEAD",
+      `- ${searchItem}`,
+      "  evidence: grep found no remaining old phrase",
+      `- ${needsRunItem}`,
+      "  evidence: tests exist in the tree",
+      "<!-- verified-complete:end -->",
+      "",
+    ].join("\n");
+    const { folder } = makeTask("verify-ticked-items-mentions-only", { plan: mixedPlan, review: mixedReview });
+    const realFs = installRealFs();
+    try {
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(vscode.Uri.file(folder), "impl-high-review"), 2);
+      const verified = ((JSON.parse(nodeFs.readFileSync(nodePath.join(folder, "task-progress.json"), "utf8")) as TaskProgress)
+        .planItemEvidence ?? [])
+        .filter((record) => (record.verifications?.length ?? 0) > 0)
+        .map((record) => record.itemText)
+        .sort();
+      assert.deepEqual(verified, [filenameItem, searchItem].sort());
     } finally {
       realFs.restore();
     }
