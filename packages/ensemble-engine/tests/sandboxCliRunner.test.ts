@@ -26,6 +26,9 @@ import {
 } from "../src/sandboxClientV1";
 import {
   buildClaudeCliArgvV1,
+  sandboxCheckCommandsV1,
+  sandboxWorkspacePatternsV1,
+  sandboxMemberCheckCommandsV1,
   buildSandboxCliScriptV1,
   CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT_V1,
   createSandboxCliProviderRunnerV1,
@@ -112,6 +115,98 @@ test("stage → mode: only impl writes; argv mirrors the extension's Claude Code
     "claude", "-p", "--output-format", "text", "--permission-mode", "plan",
     "--append-system-prompt", CLAUDE_CLI_HEADLESS_PLAN_MODE_SYSTEM_PROMPT_V1,
   ]);
+  // Edit mode passes the project's checks as --allowedTools, like the
+  // extension's claudeAllowedToolsValueV1; plan mode never does.
+  assert.deepEqual(buildClaudeCliArgvV1({ mode: "edit", allowedShellCommands: ["pnpm run test"] }), [
+    "claude", "-p", "--output-format", "text", "--permission-mode", "acceptEdits",
+    "--allowedTools", "Bash(pnpm run test),Bash(pnpm run test *)",
+  ]);
+  assert.ok(!buildClaudeCliArgvV1({ mode: "plan", allowedShellCommands: ["pnpm run test"] }).includes("--allowedTools"));
+});
+
+test("sandbox check commands: the scripts Publish Checks would run, never deploys or git", () => {
+  const pkg = (scripts: Record<string, string>): string => JSON.stringify({ name: "p", scripts });
+  assert.deepEqual(sandboxCheckCommandsV1(pkg({ lint: "eslint .", test: "vitest", deploy: "x" }), "pnpm"), [
+    "pnpm run lint",
+    "pnpm run test",
+  ]);
+  assert.deepEqual(sandboxCheckCommandsV1(pkg({ verify: "npm-run-all lint test", test: "vitest" }), "npm"), ["npm run verify"]);
+  assert.deepEqual(sandboxCheckCommandsV1(pkg({ verify: "node scripts/deploy.mjs", test: "vitest" }), "npm"), ["npm run test"]);
+  assert.deepEqual(sandboxCheckCommandsV1(undefined, "npm"), []);
+  assert.deepEqual(sandboxCheckCommandsV1("not json", "npm"), []);
+});
+
+test("an impl round in a monorepo also allows each member's checks", async () => {
+  const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  client.addFile(SANDBOX, `${ROOT}/package.json`, JSON.stringify({ name: "root", workspaces: ["packages/*"] }));
+  client.addFile(SANDBOX, `${ROOT}/packages/app/package.json`, JSON.stringify({ name: "app", scripts: { test: "vitest", deploy: "x" } }));
+  client.addFile(SANDBOX, `${ROOT}/packages/lib/package.json`, JSON.stringify({ name: "lib", scripts: { lint: "eslint ." } }));
+  client.addFile(SANDBOX, `${ROOT}/node_modules/dep/package.json`, JSON.stringify({ name: "dep", scripts: { test: "x" } }));
+  const runner = makeRunner(client, { model: "claude-opus-5" });
+
+  await runner.invoke(invocation("impl"));
+
+  const script = client.executedCommands[0]!.argv[2] as string;
+  assert.match(script, /Bash\(npm run test\)/);
+  assert.match(script, /Bash\(npm run lint\)/);
+  assert.doesNotMatch(script, /deploy/);
+});
+
+test("member discovery also works when the provider lists absolute paths (Daytona)", async () => {
+  const files: Record<string, string> = {
+    "package.json": JSON.stringify({ name: "root", workspaces: ["packages/*"] }),
+    "packages/app/package.json": JSON.stringify({ name: "app", scripts: { test: "vitest" } }),
+  };
+  const dirs: Record<string, string[]> = { "": ["packages"], packages: ["app"], "packages/app": [] };
+  const commands = await sandboxMemberCheckCommandsV1(
+    ["packages/*"],
+    "npm",
+    async (relative) => (dirs[relative] ?? []).map((name) => ({
+      name: `/workspace/project/${relative ? `${relative}/` : ""}${name}`,
+      kind: "directory",
+    })),
+    async (relative) => files[relative]
+  );
+  assert.deepEqual(commands, ["npm run test"]);
+});
+
+test("a large unrelated folder never uses up the walk before the members are reached", async () => {
+  // 400 folders under apps/ (listed first) would exhaust a 300-folder budget
+  // if the walk entered them; the members live under packages/.
+  const appDirs = Array.from({ length: 400 }, (_, i) => `site${i}`);
+  const dirs: Record<string, string[]> = { "": ["apps", "packages"], apps: appDirs, packages: ["app"], "packages/app": [] };
+  const listed: string[] = [];
+  const commands = await sandboxMemberCheckCommandsV1(
+    ["packages/*"],
+    "npm",
+    async (relative) => {
+      listed.push(relative);
+      return (dirs[relative] ?? []).map((name) => ({ name, kind: "directory" }));
+    },
+    async (relative) => (relative === "packages/app/package.json" ? JSON.stringify({ scripts: { test: "vitest" } }) : undefined)
+  );
+  assert.deepEqual(commands, ["npm run test"]);
+  assert.ok(!listed.some((dir) => dir.startsWith("apps")), "the apps tree is never entered");
+});
+
+test("pnpm-workspace.yaml patterns are read when package.json has no workspaces field", () => {
+  assert.deepEqual(
+    sandboxWorkspacePatternsV1(JSON.stringify({ name: "r" }), "packages:\n  - 'packages/*'\n  - \"!packages/fixtures\"\nother: 1\n"),
+    ["packages/*", "!packages/fixtures"]
+  );
+});
+
+test("an impl round in a project with checks allows exactly those checks", async () => {
+  const client = createInMemorySandboxClientV1({ onCommand: scriptedCli({}) });
+  client.addFile(SANDBOX, `${ROOT}/package.json`, JSON.stringify({ name: "p", scripts: { test: "vitest", deploy: "x" } }));
+  client.addFile(SANDBOX, `${ROOT}/pnpm-lock.yaml`, "lockfileVersion: 9");
+  const runner = makeRunner(client, { model: "claude-opus-5" });
+
+  await runner.invoke(invocation("impl"));
+
+  const script = client.executedCommands[0]!.argv[2] as string;
+  assert.match(script, /'--allowedTools' 'Bash\(pnpm run test\),Bash\(pnpm run test \*\)'/);
+  assert.doesNotMatch(script, /deploy/);
 });
 
 test("an impl round runs the CLI in edit mode, attempt-marked, and returns the framed summary", async () => {

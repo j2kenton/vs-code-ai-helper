@@ -108,7 +108,7 @@ Providers differ in how much they restrict plan and review runs. Ensemble passes
 | Provider | Implementation runs | Plan/review runs |
 |---|---|---|
 | GitHub Copilot | VS Code Language Model API with file tools | VS Code Language Model API with file tools |
-| Claude Code | `--permission-mode acceptEdits` | `--permission-mode plan` |
+| Claude Code | `--permission-mode acceptEdits`, plus `--allowedTools` for the project's checks | `--permission-mode plan` |
 | OpenAI Codex | `--sandbox workspace-write` | `--sandbox read-only` |
 | Gemini CLI | `--approval-mode auto_edit` | No write tools |
 | Kiro CLI | `--trust-all-tools` | `--trust-tools fs_read,grep,glob` |
@@ -116,6 +116,8 @@ Providers differ in how much they restrict plan and review runs. Ensemble passes
 | Antigravity CLI | `--dangerously-skip-permissions` | `--dangerously-skip-permissions` |
 | Cline CLI | `--auto-approve true` | `--plan` (shell still auto-approved) |
 | Kimi Code CLI | No permission flag | No permission flag |
+
+> **Note on Claude Code:** a headless run refuses any shell command nobody approved. So that Implementation rounds can still run your project's checks, Ensemble allows exactly the commands Publish Checks would run (from `ensemble.publishVerificationCommands`, or detected from `package.json` scripts). Read-only git (`git status`, `git diff` and so on) needs no rule: Claude Code allows it by itself. Nothing in your Claude Code settings needs changing; any other command still needs an allow rule of your own. Cloud rounds get the same list from the project's `package.json`.
 
 > **Note on Antigravity:** it runs with `--dangerously-skip-permissions` in **every** mode, including plan and review, so it can create, change, or delete any file in your workspace without asking, even on a run you'd expect to be read-only. Its headless CLI offers no scoped read-only mode, and without the flag its runs fail having done nothing. Commit or back up before using it, or pick another provider.
 
@@ -142,8 +144,8 @@ Settings live under `ensemble.*` in VS Code Settings. The most useful ones:
 | `ensemble.modelSettings` | `{}` | Per-stage primary model, ordered backups and fallback strategy. Edited through **Configure AI Models**. |
 | `ensemble.enabledProviders` | `{}` | Which providers are enabled. |
 | `ensemble.autoAdvanceEnabled` | `"off"` | Move a stage on automatically when its review meets the score threshold. |
-| `ensemble.autoAdvanceScoreThreshold` | `10` | Review score (1-10) required for Auto Advance. |
-| `ensemble.fastForwardMaxIterations` | `5` | Maximum rounds for one Fast Forward run (1-99). |
+| `ensemble.autoAdvanceScoreThreshold` | `8` | Review score (1-10) required for Auto Advance. |
+| `ensemble.fastForwardMaxIterations` | `10` | Maximum rounds for one Fast Forward run (1-99). |
 | `ensemble.maxImplementationIterations` | `200` | Maximum implementation tool-call rounds (1-200). |
 | `ensemble.publishVerificationCommands` | `[]` | Explicit commands to run as Publish verification. |
 | `ensemble.allowDirtyWorktreeChanges` | `false` | Allow AI changes alongside unrelated uncommitted changes. |

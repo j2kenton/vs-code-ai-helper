@@ -667,12 +667,13 @@ export function getResilienceSettings(): ResilienceSettings {
  * these checks on every round to produce the {{verifiedChecks}} evidence
  * block — to every review round. Without a cap, a hung command blocks that
  * round indefinitely with no way to recover short of cancelling the whole
- * operation from the UI. Default: 10 minutes, generous enough not to
- * interrupt a legitimately slow real test suite.
+ * operation from the UI. Default: 30 minutes. Ten was too short for real
+ * suites (this repository's takes 10 to 25 minutes), and a long cap costs
+ * nothing when the checks are quick.
  */
 export function getCompletionCheckTimeoutMs(): number {
-  const value = readSetting(COMPLETION_CHECK_TIMEOUT_MS_KEY, 600_000);
-  const numeric = Number.isFinite(value) ? Math.floor(value) : 600_000;
+  const value = readSetting(COMPLETION_CHECK_TIMEOUT_MS_KEY, 1_800_000);
+  const numeric = Number.isFinite(value) ? Math.floor(value) : 1_800_000;
   return Math.max(10_000, numeric);
 }
 
@@ -837,7 +838,7 @@ export async function migrateEnabledProvidersForExistingModels(): Promise<void> 
 }
 
 export function getFastForwardMaxIterations(): number {
-  const value = readSetting(FAST_FORWARD_MAX_ITERATIONS_KEY, 5);
+  const value = readSetting(FAST_FORWARD_MAX_ITERATIONS_KEY, 10);
   return Math.max(1, Math.min(99, Math.floor(value)));
 }
 
@@ -868,6 +869,21 @@ let autoImplementConfirmed = false;
  */
 export function resetAutoImplementConfirmationForTests(): void {
   autoImplementConfirmed = false;
+}
+
+/** Whether this machine has recorded the code-changing acknowledgement. */
+export function isAutoImplementConfirmedV1(context: vscode.ExtensionContext): boolean {
+  return autoImplementConfirmed || context.globalState.get<boolean>(AUTO_IMPLEMENT_CONFIRMED_KEY, false);
+}
+
+/**
+ * Record the acknowledgement after the user accepted an equivalent warning
+ * elsewhere (the Unattended automation level), so the controller below does
+ * not ask a second time for the same consent.
+ */
+export async function recordAutoImplementConfirmedV1(context: vscode.ExtensionContext): Promise<void> {
+  await context.globalState.update(AUTO_IMPLEMENT_CONFIRMED_KEY, true);
+  autoImplementConfirmed = true;
 }
 
 export function getAutoImplementAfterReviewMode(): "off" | "auto" {
@@ -1040,7 +1056,7 @@ export function installAutoImplementConfirmation(context: vscode.ExtensionContex
 }
 
 export function getAutoAdvanceScoreThreshold(): number {
-  const value = readSetting(AUTO_ADVANCE_SCORE_KEY, 10);
+  const value = readSetting(AUTO_ADVANCE_SCORE_KEY, 8);
   return Math.max(1, Math.min(10, Math.floor(value)));
 }
 
@@ -1080,12 +1096,12 @@ const SHOW_PROVIDER_USAGE_BUTTONS_KEY = "showProviderUsageButtons";
 
 /**
  * Whether the Provider Selection section of the AI Models view shows the
- * per-provider Sign in / Switch account button. Hidden by default; toggled
+ * per-provider Sign in / Switch account button. Shown by default; toggled
  * only from the VS Code settings UI — there is deliberately no in-view
  * control, and no `vs-code-ai-helper.*` twin for this key.
  */
 export function isProviderSignInButtonsEnabled(): boolean {
-  return readSetting<unknown>(SHOW_PROVIDER_SIGNIN_BUTTONS_KEY, false) === true;
+  return readSetting<unknown>(SHOW_PROVIDER_SIGNIN_BUTTONS_KEY, true) === true;
 }
 
 /**

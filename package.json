@@ -137,6 +137,11 @@
         "icon": "$(settings)"
       },
       {
+        "command": "vs-code-ai-helper.chooseAutomationLevel",
+        "title": "Choose Automation Level (Supervised / Unattended)",
+        "category": "Ensemble"
+      },
+      {
         "command": "vs-code-ai-helper.recoverLastAiResponse",
         "title": "Recover Last AI Response [Ctrl+Shift+Alt+C]",
         "category": "Ensemble",
@@ -1023,9 +1028,9 @@
         },
         "ensemble.showProviderSignInButtons": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "scope": "window",
-          "description": "Show the Sign in / Switch account button for each provider in the AI Models view's Provider Selection section. Hidden by default. Does not affect Check usage buttons."
+          "description": "Show the Sign in / Switch account button for each provider in the AI Models view's Provider Selection section. Shown by default, since signing in to a provider is the first thing a new user needs. Does not affect Check usage buttons."
         },
         "ensemble.showProviderUsageButtons": {
           "type": "boolean",
@@ -1066,11 +1071,11 @@
         },
         "ensemble.fastForwardMaxIterations": {
           "type": "integer",
-          "default": 5,
+          "default": 10,
           "minimum": 1,
           "maximum": 99,
           "scope": "window",
-          "description": "Maximum rounds for one Fast Forward run (1–99, default 5). Applies only after a fast-forward is explicitly started — this cap never starts one by itself."
+          "description": "Maximum rounds for one Fast Forward run (1–99, default 10). Applies only after a fast-forward is explicitly started — this cap never starts one by itself. The plateau and churn stops (ensemble.reviewPlateauRounds, ensemble.resilience.churnCeilingRounds) end a run that stops improving long before this cap."
         },
         "ensemble.hostRole": {
           "type": "string",
@@ -1122,11 +1127,11 @@
         },
         "ensemble.autoAdvanceScoreThreshold": {
           "type": "integer",
-          "default": 10,
+          "default": 8,
           "minimum": 1,
           "maximum": 10,
           "scope": "window",
-          "description": "Score required for Auto Advance."
+          "description": "Score required for Auto Advance (default 8; 10 would need a perfect review, which almost never happens)."
         },
         "ensemble.fastForwardStopLevel": {
           "type": "integer",
@@ -1264,7 +1269,7 @@
         },
         "ensemble.completionCheckTimeoutMs": {
           "type": "integer",
-          "default": 600000,
+          "default": 1800000,
           "minimum": 10000,
           "scope": "window",
           "description": "Maximum time (milliseconds) a single completion check (lint/type-check/test/explicit verification command) may run before being terminated, both at Publish and during every review round's verified-checks evidence collection."

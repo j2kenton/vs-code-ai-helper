@@ -88,10 +88,11 @@ function assertNoWorkspaceFolderTarget(
 }
 
 void describe("provider sign-in / usage button getters", () => {
-  void it("return false when nothing is set", () => {
+  void it("show Sign in and hide Check usage when nothing is set", () => {
+    // Sign in is shown by default: signing in is a new user's first step.
     const stub = installConfigStub();
     try {
-      assert.equal(isProviderSignInButtonsEnabled(), false);
+      assert.equal(isProviderSignInButtonsEnabled(), true);
       assert.equal(isProviderUsageButtonsEnabled(), false);
     } finally {
       stub.restore();
@@ -111,7 +112,8 @@ void describe("provider sign-in / usage button getters", () => {
   void it("ignore the old combined key when migration has not run", () => {
     const stub = installConfigStub({}, { showProviderAccountActions: true });
     try {
-      assert.equal(isProviderSignInButtonsEnabled(), false);
+      // Both stay at their own defaults; the old key turns nothing on.
+      assert.equal(isProviderSignInButtonsEnabled(), true);
       assert.equal(isProviderUsageButtonsEnabled(), false);
     } finally {
       stub.restore();
@@ -239,12 +241,12 @@ void describe("migrateProviderAccountActionsSetting", () => {
       assert.equal(stub.globalValues.showProviderSignInButtons, true);
       assert.equal(stub.globalValues.showProviderUsageButtons, true);
 
-      // Simulate the user clearing (resetting) just the sign-in key from the
+      // Simulate the user clearing (resetting) just the usage key from the
       // Settings UI after migration.
-      delete stub.globalValues.showProviderSignInButtons;
+      delete stub.globalValues.showProviderUsageButtons;
 
-      assert.equal(isProviderSignInButtonsEnabled(), false);
-      assert.equal(isProviderUsageButtonsEnabled(), true);
+      assert.equal(isProviderUsageButtonsEnabled(), false);
+      assert.equal(isProviderSignInButtonsEnabled(), true);
     } finally {
       stub.restore();
     }
