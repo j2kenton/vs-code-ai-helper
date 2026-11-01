@@ -1352,24 +1352,24 @@ void describe("getAvailableModels", () => {
       for (const effort of ["none", "low", "medium", "high", "xhigh"]) {
         assert.ok(
           clineModels.some(
-            (m) => m.id === `cline-cli:cline-pass/deepseek-v4-flash@${effort}`
+            (m) => m.id === `cline-cli:cline-pass/kimi-k3.1-pro@${effort}`
           ),
-          `expected DeepSeek V4 Flash's @${effort} thinking-effort variant`
+          `expected Kimi K3.1 Pro's @${effort} thinking-effort variant`
         );
       }
       assert.ok(
         clineModels.some(
-          (m) => m.id === "cline-cli:deepseek/deepseek-v4-flash"
+          (m) => m.id === "cline-cli:cline-free/solar-mini4"
         ),
-        "expected the free promotional DeepSeek V4 Flash entry"
+        "expected the free promotional Solar Mini 4 entry"
       );
       assert.ok(
-        clineModels.some((m) => m.id === "cline-cli:cline-free/glm-5.2"),
-        "expected the free promotional GLM-5.2 entry"
+        clineModels.some((m) => m.id === "cline-cli:reflection/beam-free@high"),
+        "expected free Beam 1.0's @high thinking-effort variant"
       );
       assert.ok(
-        clineModels.some((m) => m.id === "cline-cli:cline-free/glm-5.2@high"),
-        "expected free GLM-5.2's @high thinking-effort variant"
+        !clineModels.some((m) => m.id === "cline-cli:cline-pass/glm-5.2"),
+        "GLM-5.2 is no longer in the ClinePass catalog (cline 3.0.74)"
       );
       assert.ok(
         clineModels.every((m) => m.providerLabel === "Cline CLI (subscription CLI)"),

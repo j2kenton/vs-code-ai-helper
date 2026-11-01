@@ -145,6 +145,22 @@ export interface CliBuildArgsContext {
    * that declare `versionedContract`.
    */
   cliMajorVersion?: number;
+  /**
+   * Shell commands an edit-mode run may execute without approval (the
+   * project's checks; see roundShellAllowlistV1.ts). Set
+   * by the runner for edit-mode runs only. Providers whose headless mode
+   * otherwise refuses unapproved commands (Claude Code) pass it on.
+   */
+  allowedShellCommands?: readonly string[];
+}
+
+/**
+ * Claude Code `--allowedTools` rules for `commands`: each command alone and
+ * with arguments (`Bash(pnpm run test)`, `Bash(pnpm run test *)`), joined
+ * into the single comma-separated value the flag accepts.
+ */
+export function claudeAllowedToolsValueV1(commands: readonly string[]): string {
+  return commands.flatMap((command) => [`Bash(${command})`, `Bash(${command} *)`]).join(",");
 }
 
 export interface CliConversationResumeDefinition {
@@ -1145,7 +1161,7 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     // requested `summary-only` report contract even with the mitigation
     // system prompt attached.
     textModeResponseContractV1: "repurposed-interactive-flow",
-    buildArgs(mode, model): string[] {
+    buildArgs(mode, model, context): string[] {
       const parsedModel = parseClaudeCliModelSelection(model);
       // Edit mode keeps the original plain "text" output-format, unchanged —
       // only text (read-only, summary-extraction) mode moves to stream-json
@@ -1158,6 +1174,14 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         // Allow file edits in the workspace without per-edit prompts;
         // anything beyond edits (e.g. arbitrary shell) stays denied.
         args.push("--permission-mode", "acceptEdits");
+        // ...except the project's own checks, which a headless round would
+        // otherwise be refused ("This command requires approval") unless the
+        // user's own Claude Code settings happened to allow them. Read-only
+        // git needs no rule: Claude Code allows it by itself. See
+        // roundShellAllowlistV1.ts.
+        if (context?.allowedShellCommands?.length) {
+          args.push("--allowedTools", claudeAllowedToolsValueV1(context.allowedShellCommands));
+        }
       } else {
         // stream-json, NOT text — same motivation as kimi-cli's identical
         // move (see its own buildArgs comment): `text` mode's only failure

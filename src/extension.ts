@@ -159,6 +159,7 @@ import { registerMarkTaskDoneCommand } from "./commands/markTaskDone";
 import { registerViewStageChangesCommands } from "./commands/viewStageChanges";
 import { registerRenameTaskCommands } from "./commands/renameTask";
 import { registerConfigureStepModelsCommand } from "./commands/configureStepModels";
+import { registerChooseAutomationLevelCommandV1 } from "./commands/chooseAutomationLevelV1";
 import { TaskTreeProvider, TASKS_VIEW_ID, TaskNode, StageNode, EmptyTasksNode } from "./views/taskTreeProvider";
 import { TaskStatusBar } from "./views/taskStatusBar";
 import { SettingsViewProvider } from "./views/settingsView";
@@ -1348,6 +1349,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   );
 
   registerConfigureStepModelsCommand(context, settingsViewProvider);
+  registerChooseAutomationLevelCommandV1(context);
 
   // Register commands — pass the shared inventory, currentTaskStore, and
   // context to every command that needs them.

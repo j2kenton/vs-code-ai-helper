@@ -422,7 +422,9 @@ function wrapDaytonaSandbox(sandbox: DaytonaSandboxV1): DaytonaSandboxHandleV1 {
       async listSessions() {
         const sessions = await sandbox.process.listSessions();
         return sessions.map((session) => ({
-          commands: session.commands?.map((command) => ({ command: command.command })),
+          // Typed explicitly: the SDK's session command type does not flow
+          // into this callback (TS7006 under noImplicitAny).
+          commands: session.commands?.map((command: DaytonaSessionCommandV1) => ({ command: command.command })),
         }));
       },
     },

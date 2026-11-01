@@ -942,6 +942,25 @@ void describe("provider CLI contracts", () => {
       "8192",
     ]);
 
+    // With the runner's shell allow-list, edit mode also passes it on as one
+    // --allowedTools value, so a headless round can run the project's checks.
+    const allowedArgs = claude.buildArgs("edit", "sonnet@high", {
+      allowedShellCommands: ["pnpm run test", "pnpm run lint"],
+    });
+    assert.deepStrictEqual(allowedArgs.slice(0, 7), [
+      "-p",
+      "--output-format",
+      "text",
+      "--permission-mode",
+      "acceptEdits",
+      "--allowedTools",
+      "Bash(pnpm run test),Bash(pnpm run test *),Bash(pnpm run lint),Bash(pnpm run lint *)",
+    ]);
+    // Text (plan) mode never carries it: plan runs stay read-only.
+    assert.ok(
+      !claude.buildArgs("text", "sonnet@high", { allowedShellCommands: ["pnpm run test"] }).includes("--allowedTools")
+    );
+
     // Claude Opus 5.5 must route through the same id/thinking-budget path as
     // every other seeded Claude model, with no silent fallback to Opus 5.
     const opus55Args = claude.buildArgs("text", "claude-opus-5-5@xhigh");
@@ -1069,9 +1088,10 @@ void describe("provider CLI contracts", () => {
   });
 
   void it("round-trips a seeded Cline model id that itself contains a colon", () => {
-    // "poolside/laguna-m.1:free" (one of the seeded ClinePass free models —
-    // see createSeededClineModels in modelSelection.ts) is the only seeded
-    // model id anywhere in this codebase with an embedded colon. Storage
+    // "poolside/laguna-m.1:free" was a seeded ClinePass free model until the
+    // 2026-11-01 catalog refresh dropped it (createSeededClineModels in
+    // modelSelection.ts); a saved selection can still hold it, and it is a
+    // real model id with an embedded colon. Storage
     // uses "<provider>:<model>" with a FIRST-colon split (parseModelSelection)
     // — pin that this specific real id, and its "@high"-suffixed variant,
     // survive that split intact rather than being truncated at the model's

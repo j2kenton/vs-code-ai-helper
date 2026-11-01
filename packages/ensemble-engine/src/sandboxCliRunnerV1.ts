@@ -139,6 +139,203 @@ export interface SandboxCliArgvOptionsV1 {
   readonly maxThinkingTokens?: number;
   /** The CLI executable; default `claude`. */
   readonly command?: string;
+  /**
+   * Edit mode only: the project's check commands the round may run without
+   * approval (see `sandboxCheckCommandsV1`), passed as `--allowedTools`.
+   */
+  readonly allowedShellCommands?: readonly string[];
+}
+
+/**
+ * Mirrors `claudeAllowedToolsValueV1` in `src/runners/providers.ts`: each
+ * command alone and with arguments, joined into one comma-separated value.
+ */
+export function sandboxClaudeAllowedToolsValueV1(commands: readonly string[]): string {
+  return commands.flatMap((command) => [`Bash(${command})`, `Bash(${command} *)`]).join(",");
+}
+
+/** Mirrors `packageManager` in `src/utils/completionLint.ts`. */
+export async function sandboxPackageManagerV1(
+  readFile: (relativePath: string) => Promise<string | undefined>
+): Promise<string> {
+  if ((await readFile("pnpm-lock.yaml")) !== undefined) return "pnpm";
+  if ((await readFile("yarn.lock")) !== undefined) return "yarn";
+  if ((await readFile("bun.lockb")) !== undefined || (await readFile("bun.lock")) !== undefined) return "bun";
+  return "npm";
+}
+
+/**
+ * The project's check commands, as `src/utils/roundShellAllowlistV1.ts` derives
+ * them locally from the scripts Publish Checks would run: a `verify` script
+ * alone when there is one, otherwise whichever of lint, check-types, test and
+ * build exist. Without these, a headless Claude Code round refuses every
+ * command nobody approved, so it can edit but never run a test. Git is never
+ * listed: Claude Code allows read-only git by itself, and a blanket rule would
+ * also approve git invocations that write or run helpers.
+ */
+export function sandboxCheckCommandsV1(packageJsonText: string | undefined, manager: string): string[] {
+  const scripts = packageScriptsV1(packageJsonText);
+  if (scripts === undefined) {
+    return [];
+  }
+  if (typeof scripts.verify === "string" && !/\b(deploy|publish|release|migrat\w*)\b/i.test(scripts.verify)) {
+    return [`${manager} run verify`];
+  }
+  return memberCheckCommandsV1(scripts, manager);
+}
+
+const MEMBER_CHECK_SCRIPTS_V1 = ["lint", "check-types", "test", "build"] as const;
+
+function packageScriptsV1(packageJsonText: string | undefined): Record<string, unknown> | undefined {
+  try {
+    const parsed = JSON.parse(packageJsonText ?? "{}") as { scripts?: unknown };
+    return parsed.scripts && typeof parsed.scripts === "object" ? (parsed.scripts as Record<string, unknown>) : {};
+  } catch {
+    return undefined;
+  }
+}
+
+/** A monorepo member's checks: whichever of lint, check-types, test and build it has. */
+function memberCheckCommandsV1(scripts: Record<string, unknown>, manager: string): string[] {
+  return MEMBER_CHECK_SCRIPTS_V1.filter((name) => typeof scripts[name] === "string").map((name) => `${manager} run ${name}`);
+}
+
+/**
+ * Mirrors `getWorkspacePackagePatterns` in `src/utils/completionLint.ts`: the
+ * root package.json `workspaces` field (array or `{ packages }`), otherwise
+ * pnpm-workspace.yaml's `packages:` list.
+ */
+export function sandboxWorkspacePatternsV1(rootPackageJson: string | undefined, pnpmWorkspaceYaml: string | undefined): string[] {
+  try {
+    const workspaces = (JSON.parse(rootPackageJson ?? "{}") as { workspaces?: unknown }).workspaces;
+    if (Array.isArray(workspaces)) {
+      return workspaces.filter((p): p is string => typeof p === "string");
+    }
+    const packages = (workspaces as { packages?: unknown } | undefined)?.packages;
+    if (Array.isArray(packages)) {
+      return packages.filter((p): p is string => typeof p === "string");
+    }
+  } catch {
+    // An unreadable root package.json falls through to pnpm-workspace.yaml.
+  }
+  const patterns: string[] = [];
+  let inPackages = false;
+  for (const line of (pnpmWorkspaceYaml ?? "").split(/\r?\n/)) {
+    if (/^packages\s*:\s*$/.test(line)) {
+      inPackages = true;
+      continue;
+    }
+    if (inPackages) {
+      const item = /^\s*-\s*['"]?([^'"#]+?)['"]?\s*(#.*)?$/.exec(line);
+      if (item?.[1] !== undefined) {
+        patterns.push(item[1].trim());
+        continue;
+      }
+      if (/^\S/.test(line)) {
+        inPackages = false;
+      }
+    }
+  }
+  return patterns;
+}
+
+/** Mirrors `globPatternToRegExp` in `src/utils/completionLint.ts` (`*` and `**`). */
+function workspaceGlobToRegExpV1(pattern: string): RegExp {
+  const parts = pattern.replace(/\\/g, "/").split("**").map((part) =>
+    part.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*")
+  );
+  return new RegExp(`^${parts.join(".*")}$`);
+}
+
+/** One path segment of a workspace pattern as a RegExp; `undefined` for `**`. */
+function segmentRegExpV1(segment: string): RegExp | undefined {
+  if (segment === "**") {
+    return undefined;
+  }
+  return new RegExp(`^${segment.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*")}$`);
+}
+
+/**
+ * Whether some include pattern can still match `relativeDir` or a folder
+ * below it: every segment so far fits the pattern's segment at that depth, or
+ * the pattern reached a `**`. This keeps the walk inside the pattern's own
+ * subtree, so an unrelated large folder (an `apps` tree when members live
+ * under `packages/*`) never uses up the folder budget.
+ */
+function couldLeadToMatchV1(relativeDir: string, includeSegments: ReadonlyArray<ReadonlyArray<RegExp | undefined>>): boolean {
+  const parts = relativeDir.split("/");
+  return includeSegments.some((segments) => {
+    for (let i = 0; i < parts.length; i++) {
+      if (i >= segments.length) {
+        return false;
+      }
+      const segment = segments[i];
+      if (segment === undefined) {
+        return true; // `**`: anything below can match
+      }
+      if (!segment.test(parts[i] ?? "")) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+/**
+ * The check commands of every monorepo member the patterns select, found by a
+ * depth-bounded walk of the sandbox (skipping node_modules and dot folders),
+ * as the local Publish Checks discovery does. The walk only enters folders an
+ * include pattern can still match (see `couldLeadToMatchV1`), and is bounded
+ * in depth and in folders visited so a large tree cannot stall the round; the
+ * folder budget can only be reached inside a pattern's own subtree (a `**`
+ * pattern over a very large tree).
+ */
+export async function sandboxMemberCheckCommandsV1(
+  patterns: readonly string[],
+  manager: string,
+  listDirectory: (relativePath: string) => Promise<readonly { name: string; kind: string }[] | undefined>,
+  readFile: (relativePath: string) => Promise<string | undefined>,
+  limits: { maxDepth: number; maxFolders: number } = { maxDepth: 4, maxFolders: 300 }
+): Promise<string[]> {
+  const includePatterns = patterns.filter((p) => !p.startsWith("!"));
+  const include = includePatterns.map(workspaceGlobToRegExpV1);
+  const includeSegments = includePatterns.map((p) =>
+    p.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "").split("/").map(segmentRegExpV1)
+  );
+  const exclude = patterns.filter((p) => p.startsWith("!")).map((p) => workspaceGlobToRegExpV1(p.slice(1)));
+  if (include.length === 0) {
+    return [];
+  }
+  const commands: string[] = [];
+  let visited = 0;
+  const walk = async (relativeDir: string, depth: number): Promise<void> => {
+    if (depth > limits.maxDepth || visited >= limits.maxFolders) {
+      return;
+    }
+    visited++;
+    const entries = await listDirectory(relativeDir);
+    for (const entry of entries ?? []) {
+      // Providers differ: some list basenames, Daytona lists absolute paths.
+      // Only the last segment names the child.
+      const name = entry.name.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "";
+      if (entry.kind !== "directory" || name === "" || name === "node_modules" || name.startsWith(".")) {
+        continue;
+      }
+      const child = relativeDir ? `${relativeDir}/${name}` : name;
+      if (!couldLeadToMatchV1(child, includeSegments)) {
+        continue;
+      }
+      if (include.some((re) => re.test(child)) && !exclude.some((re) => re.test(child))) {
+        const scripts = packageScriptsV1(await readFile(`${child}/package.json`));
+        if (scripts !== undefined) {
+          commands.push(...memberCheckCommandsV1(scripts, manager));
+        }
+      }
+      await walk(child, depth + 1);
+    }
+  };
+  await walk("", 0);
+  return [...new Set(commands)];
 }
 
 /** Mirrors `providers.ts`'s Claude Code `buildArgs` for the sandbox path. */
@@ -146,6 +343,9 @@ export function buildClaudeCliArgvV1(options: SandboxCliArgvOptionsV1): readonly
   const argv: string[] = [options.command ?? "claude", "-p", "--output-format", "text"];
   if (options.mode === "edit") {
     argv.push("--permission-mode", "acceptEdits");
+    if (options.allowedShellCommands !== undefined && options.allowedShellCommands.length > 0) {
+      argv.push("--allowedTools", sandboxClaudeAllowedToolsValueV1(options.allowedShellCommands));
+    }
   } else {
     argv.push(
       "--permission-mode",
@@ -328,8 +528,33 @@ export function createSandboxCliProviderRunnerV1(
           await client.writeFile(sandboxId, envPath, renderEnvFileV1(options.env));
         }
 
+        const mode = sandboxCliModeForStageV1(input.stage);
+        const readProjectFile = (relativePath: string): Promise<string | undefined> =>
+          client
+            .readFileUtf8(sandboxId, `${workingDirectoryRoot.replace(/\/$/, "")}/${relativePath}`)
+            .catch(() => undefined);
+        const allowedShellCommands: string[] = [];
+        if (mode === "edit") {
+          // The checks Publish Checks would run: the root's, plus each
+          // monorepo member's (listed without a folder prefix, because the
+          // round runs them from inside that folder).
+          const manager = await sandboxPackageManagerV1(readProjectFile);
+          const rootPackageJson = await readProjectFile("package.json");
+          const listProjectDir = (relativePath: string) =>
+            client
+              .listDirectory(sandboxId, `${workingDirectoryRoot.replace(/\/$/, "")}${relativePath ? `/${relativePath}` : ""}`)
+              .catch(() => undefined);
+          const members = await sandboxMemberCheckCommandsV1(
+            sandboxWorkspacePatternsV1(rootPackageJson, await readProjectFile("pnpm-workspace.yaml")),
+            manager,
+            listProjectDir,
+            readProjectFile
+          );
+          allowedShellCommands.push(...new Set([...sandboxCheckCommandsV1(rootPackageJson, manager), ...members]));
+        }
         const argv = buildClaudeCliArgvV1({
-          mode: sandboxCliModeForStageV1(input.stage),
+          mode,
+          ...(allowedShellCommands.length > 0 ? { allowedShellCommands } : {}),
           ...(selection.model !== undefined ? { model: selection.model } : {}),
           ...(selection.maxThinkingTokens !== undefined
             ? { maxThinkingTokens: selection.maxThinkingTokens }

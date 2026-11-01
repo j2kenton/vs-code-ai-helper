@@ -84,6 +84,7 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   refreshTasksView: { kind: "notWatchdogSusceptible", reason: "UI refresh only" },
   openSettings: { kind: "notWatchdogSusceptible", reason: "opens a settings UI panel; no provider dispatch" },
   openAiModels: { kind: "notWatchdogSusceptible", reason: "opens a settings UI panel; no provider dispatch" },
+  chooseAutomationLevel: { kind: "notWatchdogSusceptible", reason: "writes five automation settings; no provider dispatch" },
   runOnRunner: {
     kind: "notWatchdogSusceptible",
     reason:

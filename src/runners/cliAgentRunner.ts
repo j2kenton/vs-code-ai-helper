@@ -59,6 +59,7 @@ import {
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
 import { killProcessTree, sanitizedCliEnv } from "../utils/cliProcessUtils";
 import { readPackageScripts, runExplicitCheck } from "../utils/completionLint";
+import { resolveRoundShellCommandsV1 } from "../utils/roundShellAllowlistV1";
 import { prioritizeImplementationTypeCheckDiagnosticsV1 } from "../utils/implementationTypeCheckHandOffV1";
 import {
   abandonProcessSpawnAttemptV1,
@@ -3838,6 +3839,7 @@ async function execCliAgentProcessV1(options: {
       ...(versionedContract.cliMajorVersion !== undefined
         ? { cliMajorVersion: versionedContract.cliMajorVersion }
         : {}),
+      ...(mode === "edit" && cwd ? { allowedShellCommands: resolveRoundShellCommandsV1(cwd) } : {}),
     });
   } catch (error) {
     cleanupPromptFile();
