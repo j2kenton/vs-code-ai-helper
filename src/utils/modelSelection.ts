@@ -824,34 +824,32 @@ function createClineReasoningVariant(
 }
 
 /**
- * Curated ClinePass catalog snapshot (cline 3.0.46, captured 2026-07-23 from
- * the CLI's own bundled model catalog and cross-checked against
- * https://docs.cline.bot/getting-started/clinepass, which confirms the
- * `cline-pass/<model>` id prefix). No `cline models`-style listing
- * subcommand exists to discover this live the way opencode's does — see
- * cline-cli's absent discoverModels in providers.ts — so, like Claude's and
- * Codex's catalogs, this is a hand-curated static list rather than a parsed
- * live-CLI snapshot, and is expected to go stale as ClinePass's own catalog
- * changes.
+ * ClinePass catalog snapshot: the "cline-pass" group of the Cline CLI's own
+ * bundled model catalog (`@cline/llms/dist/index.js` inside the installed
+ * `cline` package), cline 3.0.74, captured 2026-11-01. The previous snapshot
+ * was cline 3.0.46 (2026-07-23); the `cline-pass/<model>` id prefix is
+ * confirmed by https://docs.cline.bot/getting-started/clinepass. No
+ * `cline models`-style listing subcommand exists to discover this live the
+ * way opencode's does (see cline-cli's absent discoverModels in
+ * providers.ts), so this is a static list and goes stale as ClinePass's
+ * catalog changes: regenerate it from that bundled catalog. Models the
+ * catalog no longer lists were dropped (GLM-5.2 and its free promo, Kimi
+ * K2.7 Code, Kimi K2.6, MiMo-V2.5-Pro, MiMo-V2.5, DeepSeek V4 Flash and its
+ * free promo, Step 3.7 Flash, Laguna M.1).
  *
- * Cline's `--thinking` flag (none|low|medium|high|xhigh, verified live via
- * `cline --help` and a rejected `--thinking bogus` call) is ONE fixed ladder
- * applied uniformly to every model rather than opencode's per-model variant
- * sets, so — like Codex/Claude — each model gets a bare entry (provider
- * default reasoning) plus one variant per ladder rung, via
- * parseClineModelSelection's "model@effort" convention (providers.ts).
+ * Cline's `--thinking` flag (none|low|medium|high|xhigh, per `cline --help`)
+ * is ONE fixed ladder applied uniformly to every model. The catalog records a
+ * narrower per-model effort list (Kimi K3.1 Pro: none|low|high|max), but the
+ * CLI accepts any ladder rung for any model: `--thinking medium` on
+ * `cline-pass/kimi-k3.1-pro` answered normally (verified 2026-11-01). So, like
+ * Codex/Claude, each model gets a bare entry (provider default reasoning)
+ * plus one variant per ladder rung, via parseClineModelSelection's
+ * "model@effort" convention (providers.ts).
  *
- * "GLM-5.2 (Free)", "DeepSeek V4 Flash (Free)", "Step 3.7 Flash (Free)",
- * and "Laguna M.1 (Free)" are separate, differently-namespaced $0
- * promotional entries inside the SAME `cline-pass` catalog grouping (ids
- * "cline-free/glm-5.2", "deepseek/deepseek-v4-flash",
- * "stepfun/step-3.7-flash", "poolside/laguna-m.1:free"). Only
- * "deepseek/deepseek-v4-flash" was confirmed live (`-P cline-pass -m
- * deepseek/deepseek-v4-flash` answered correctly); the others follow the
- * identical id/invocation shape but were not individually exercised —
- * re-verify if any is reported broken. Kept separate from the price-listed
- * "DeepSeek V4 Flash" entry above rather than merged, since they are
- * distinct model ids that could disappear independently of the paid ones.
+ * The "(Free)" entries are separately namespaced $0 promotional models inside
+ * the SAME catalog group ("reflection/beam-free", "cline-free/...",
+ * "nvidia/...", "poolside/..."). They are kept separate from the ClinePass
+ * models because they are distinct ids that can disappear independently.
  */
 function createSeededClineModels(): readonly DiscoveredCliModel[] {
   const CLINE_THINKING_LEVELS: readonly (readonly [string, string])[] = [
@@ -876,36 +874,47 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
   };
 
   return [
+    ...createModelWithVariants("cline-pass/kimi-k3.1-pro", "Kimi K3.1 Pro"),
+    ...createModelWithVariants("cline-pass/kimi-k3", "Kimi K3"),
+    ...createModelWithVariants("cline-pass/glm-5.3", "GLM-5.3"),
+    ...createModelWithVariants("cline-pass/glm-5.3-flash", "GLM-5.3-Flash"),
     ...createModelWithVariants("cline-pass/deepseek-v4-pro", "DeepSeek V4 Pro"),
     ...createModelWithVariants(
-      "cline-pass/deepseek-v4-flash",
-      "DeepSeek V4 Flash"
+      "cline-pass/deepseek-v4.1-flash",
+      "DeepSeek V4.1 Flash"
     ),
-    ...createModelWithVariants("cline-pass/glm-5.2", "GLM-5.2"),
-    ...createModelWithVariants("cline-free/glm-5.2", "GLM-5.2 (Free)"),
-    ...createModelWithVariants("cline-pass/kimi-k3", "Kimi K3"),
     ...createModelWithVariants(
-      "cline-pass/kimi-k2.7-code",
-      "Kimi K2.7 Code"
+      "cline-pass/deepseek-v4.1-flash-1017",
+      "DeepSeek V4.1 Flash 1017"
     ),
-    ...createModelWithVariants("cline-pass/kimi-k2.6", "Kimi K2.6"),
-    ...createModelWithVariants("cline-pass/mimo-v2.5-pro", "MiMo-V2.5-Pro"),
-    ...createModelWithVariants("cline-pass/mimo-v2.5", "MiMo-V2.5"),
-    ...createModelWithVariants("cline-pass/minimax-m3", "MiniMax-M3"),
+    ...createModelWithVariants("cline-pass/qwen3.8-max", "Qwen 3.8 Max"),
     ...createModelWithVariants("cline-pass/qwen3.7-max", "Qwen3.7 Max"),
     ...createModelWithVariants("cline-pass/qwen3.7-plus", "Qwen3.7 Plus"),
+    ...createModelWithVariants("cline-pass/mimo-v2.6-pro", "MiMo-V2.6-Pro"),
+    ...createModelWithVariants("cline-pass/mimo-v2.6-flash", "MiMo-V2.6-Flash"),
     ...createModelWithVariants(
-      "deepseek/deepseek-v4-flash",
-      "DeepSeek V4 Flash (Free)"
+      "cline-pass/minimax-m3.1-flash",
+      "MiniMax-M3.1-Flash"
+    ),
+    ...createModelWithVariants("cline-pass/minimax-m3", "MiniMax-M3"),
+    ...createModelWithVariants(
+      "cline-pass/muse-spark-1.3-contributor",
+      "Muse Spark 1.3 Contributor"
+    ),
+    ...createModelWithVariants("reflection/beam-free", "Beam 1.0 (Free)"),
+    ...createModelWithVariants(
+      "cline-free/nemotron-3.5-super-vl",
+      "Nemotron 3.5 Super VL (Free)"
     ),
     ...createModelWithVariants(
-      "stepfun/step-3.7-flash",
-      "Step 3.7 Flash (Free)"
+      "nvidia/nemotron-3.5-lightning-free",
+      "Nemotron 3.5 Lightning (Free)"
     ),
     ...createModelWithVariants(
-      "poolside/laguna-m.1:free",
-      "Laguna M.1 (Free)"
+      "poolside/laguna-s-2.1-free",
+      "Laguna S 2.1 (Free)"
     ),
+    ...createModelWithVariants("cline-free/solar-mini4", "Solar Mini 4 (Free)"),
   ];
 }
 

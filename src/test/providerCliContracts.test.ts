@@ -1069,9 +1069,10 @@ void describe("provider CLI contracts", () => {
   });
 
   void it("round-trips a seeded Cline model id that itself contains a colon", () => {
-    // "poolside/laguna-m.1:free" (one of the seeded ClinePass free models —
-    // see createSeededClineModels in modelSelection.ts) is the only seeded
-    // model id anywhere in this codebase with an embedded colon. Storage
+    // "poolside/laguna-m.1:free" was a seeded ClinePass free model until the
+    // 2026-11-01 catalog refresh dropped it (createSeededClineModels in
+    // modelSelection.ts); a saved selection can still hold it, and it is a
+    // real model id with an embedded colon. Storage
     // uses "<provider>:<model>" with a FIRST-colon split (parseModelSelection)
     // — pin that this specific real id, and its "@high"-suffixed variant,
     // survive that split intact rather than being truncated at the model's
