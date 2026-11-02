@@ -28,7 +28,8 @@ import {
   LEGACY_UNCORRELATED_RUNNER_INVOCATION_REJECTED_V0,
   LegacyAiActionSafetyGateErrorV0,
 } from "../services/legacyAiActionSafetyGateV0";
-import { resolveQuotaAccountKeyV1 } from "../config/settings";
+import { isModelProviderEnabled, resolveQuotaAccountKeyV1 } from "../config/settings";
+import { fingerprintStageChainV1 } from "../utils/rememberedFallbackV1";
 import { parseModelSelection, providerAccountIdForModelId } from "../runners/providers";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
@@ -5295,6 +5296,13 @@ void describe("runImplementationForModel", () => {
           updatedAt: now,
           fallbackActive: { impl: true },
           fallbackModelId: { impl: "impl-backup" },
+          // A pin is honoured only while it matches the current chain (bugs5 Step 25).
+          fallbackChainFingerprint: {
+            impl: fingerprintStageChainV1(
+              { strategy: "switch-to-backup", primary: "impl-primary", backups: ["impl-backup"] },
+              isModelProviderEnabled
+            ),
+          },
         },
         null,
         2

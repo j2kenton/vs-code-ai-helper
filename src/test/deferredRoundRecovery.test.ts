@@ -27,6 +27,8 @@
  *     an implementation stage where `reviewAttemptId` is legitimately absent.
  */
 import { recordReviewerVerificationOfTickedItemsV1 } from "../commands/applyReviewerVerifiedTicks";
+import { isModelProviderEnabled } from "../config/settings";
+import { fingerprintStageChainV1 } from "../utils/rememberedFallbackV1";
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
@@ -56,6 +58,12 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
+
+// The chain the sticky-pin tests install; a pin is only honoured while it matches the current chain (bugs5 Step 25).
+const STICKY_PIN_CHAIN_FINGERPRINT = fingerprintStageChainV1(
+  { strategy: "switch-to-backup", primary: "codex-cli:gpt-5.6", backups: ["claude-cli:sonnet"] },
+  isModelProviderEnabled
+);
 import { DISCLAIMER_VERSION } from "../legal/disclaimerVersion";
 import { effectiveReviewProgressV1 } from "../utils/effectiveReviewProgress";
 import { readyToAdvanceStage, isStaleReviewArtifactV1 } from "../utils/reviewReadiness";
@@ -1056,6 +1064,7 @@ void describe("Part 15 / Step 40: a claimed dirty-tree hand-off continuation res
         },
         fallbackActive: { impl: true },
         fallbackModelId: { impl: "claude-cli:sonnet" },
+        fallbackChainFingerprint: { impl: STICKY_PIN_CHAIN_FINGERPRINT },
       }
     );
 
@@ -1191,6 +1200,7 @@ void describe("Part 15 / Step 40: a claimed dirty-tree hand-off continuation res
         },
         fallbackActive: { impl: true },
         fallbackModelId: { impl: "claude-cli:sonnet" },
+        fallbackChainFingerprint: { impl: STICKY_PIN_CHAIN_FINGERPRINT },
       }
     );
 

@@ -8,7 +8,7 @@ import { IncompleteTask } from "../types/incompleteTask";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
-import { runTrackedOperation } from "../utils/taskOperations";
+import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
 /**
@@ -143,20 +143,49 @@ export async function pauseTask(
   // the moment the button is pressed; the terminal entry is recorded centrally
   // by the operation-notification bridge, not by an ad-hoc message here.
   const taskUri = vscode.Uri.file(resolvedTask.taskFolderPath);
+  // bugs5 Step 14: Pause is never refused because a round or an owed continuation holds the task. It
+  // is a non-exclusive status write, so it is admitted beside the running round, and it places the
+  // owner hold that keeps the recovery sweep from re-arming the continuation.
+  const roundRunning = taskOperations.hasRootOperationForTask(resolvedTask.taskFolderPath);
   try {
-    await runTrackedOperation(
+    const paused = await runTrackedOperation(
       resolvedTask.taskFolderPath,
-      { label: "Pause Task", taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName, kind: "pause-task" },
+      {
+        label: "Pause Task",
+        taskName: resolvedTask.progress.displayName ?? resolvedTask.folderName,
+        kind: "pause-task",
+        exclusive: false,
+      },
       async () => {
-        const patched = await patchTaskProgressStrictV1(taskUri, (current) =>
-          updateTaskStatus(current, "paused")
-        );
+        const patched = await patchTaskProgressStrictV1(taskUri, (current) => {
+          const next = updateTaskStatus(current, "paused");
+          return next.implRecovery
+            ? {
+                ...next,
+                implRecovery: {
+                  ...next.implRecovery,
+                  ownerHold: next.implRecovery.ownerHold ?? { at: new Date().toISOString(), cause: "paused" as const },
+                },
+              }
+            : next;
+        });
         if (!patched) {
           throw new Error("Could not read task progress.");
         }
         await inventory.refresh();
+        return patched;
       }
     );
+    if (paused?.implRecovery?.ownerHold !== undefined) {
+      NotificationRouter.showInformation(
+        `${taskLabel} is paused. Its owed implementation report is held: nothing restarts it until you choose Run Implementation.` +
+          (roundRunning ? " The round already running is not interrupted; cancel it to stop it now." : "")
+      );
+    } else if (roundRunning) {
+      NotificationRouter.showInformation(
+        `${taskLabel} is paused. The round already running is not interrupted and nothing new will start; cancel it to stop it now.`
+      );
+    }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     NotificationRouter.showError(`${taskLabel}: ${message}`);

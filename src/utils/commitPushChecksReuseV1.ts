@@ -19,6 +19,11 @@ import {
   computeCommandIdentityV1,
   type PublishChecksReuseEligibilityResultV1,
 } from "./publishChecksFreshness";
+import {
+  describeOutcomeBlockingReuseV1,
+  readPublishChecksOutcomeV1,
+  type PublishChecksOutcomeV1,
+} from "./publishChecksOutcomeV1";
 
 export type CommitPushChecksReuseV1 =
   | { readonly reuse: true; readonly result: CompletionLintResult; readonly message: string }
@@ -32,6 +37,8 @@ export interface CommitPushChecksReuseInputV1 {
   readonly currentCommands: readonly string[] | null;
   /** Replaceable in tests; the real freshness and fingerprint check by default. */
   readonly checkEligibility?: typeof checkPublishChecksReuseEligibilityV1;
+  /** Replaceable in tests; the task's recorded Publish Checks outcome by default. */
+  readonly readOutcome?: (taskFolderPath: string) => PublishChecksOutcomeV1 | undefined;
 }
 
 /** The recorded Completion Checks must exist and show a pass. */
@@ -43,6 +50,10 @@ function passingRecordOrUndefined(content: string): CompletionLintResult | undef
 /** Plain words for why the recorded result cannot be used. */
 export function describeReuseRefusalV1(eligibility: PublishChecksReuseEligibilityResultV1): string {
   const reason = eligibility.reason ?? "";
+  const fromOutcome = /^Latest run record: (.+)$/s.exec(reason)?.[1];
+  if (fromOutcome !== undefined) {
+    return fromOutcome;
+  }
   const freshness = /^Freshness check failed: (\w+)/.exec(reason)?.[1];
   if (freshness === "missing") {
     return "no passing Publish Checks result is recorded for this task";
@@ -77,10 +88,31 @@ export function describeReuseRefusalV1(eligibility: PublishChecksReuseEligibilit
   return reason.length > 0 ? reason : "the recorded Publish Checks result could not be confirmed";
 }
 
+/** `HH:MM` in the viewer's local time, or `undefined` when the stamp's time is unreadable. */
+export function formatPassTimeV1(completedAt: string | undefined): string | undefined {
+  if (completedAt === undefined) {
+    return undefined;
+  }
+  const time = new Date(completedAt);
+  if (Number.isNaN(time.getTime())) {
+    return undefined;
+  }
+  return `${String(time.getHours()).padStart(2, "0")}:${String(time.getMinutes()).padStart(2, "0")}`;
+}
+
 export async function decideCommitPushChecksReuseV1(input: CommitPushChecksReuseInputV1): Promise<CommitPushChecksReuseV1> {
   const expectedIdentity = input.currentCommands ? computeCommandIdentityV1(input.currentCommands) : undefined;
   if (expectedIdentity === undefined) {
     return { reuse: false, reason: "the commands the checks would run could not be determined, so a recorded result cannot be matched to them" };
+  }
+  // bugs5 Step 10: the latest run record. A run that merely stopped (cancelled, or interrupted with no
+  // failure of its own) leaves an earlier pass on the same tree standing; a later failure, or a run
+  // still going, does not.
+  const blockedByOutcome = describeOutcomeBlockingReuseV1(
+    (input.readOutcome ?? readPublishChecksOutcomeV1)(input.taskFolderUri.fsPath)
+  );
+  if (blockedByOutcome !== undefined) {
+    return { reuse: false, reason: blockedByOutcome };
   }
   const check = input.checkEligibility ?? checkPublishChecksReuseEligibilityV1;
   let eligibility: PublishChecksReuseEligibilityResultV1;
@@ -105,12 +137,10 @@ export async function decideCommitPushChecksReuseV1(input: CommitPushChecksReuse
   if (recorded === undefined) {
     return { reuse: false, reason: "the recorded Completion Checks do not show a pass" };
   }
-  const completedAt = eligibility.stamp?.completedAt;
+  const passedAt = formatPassTimeV1(eligibility.stamp?.completedAt);
   return {
     reuse: true,
     result: recorded,
-    message:
-      `Using the Publish Checks result that passed${completedAt ? ` at ${completedAt}` : ""}: the commit, files, scope ` +
-      "and commands are unchanged since, so the checks were not run again.",
+    message: `Using the Publish Checks that passed${passedAt ? ` at ${passedAt}` : ""} on this code.`,
   };
 }

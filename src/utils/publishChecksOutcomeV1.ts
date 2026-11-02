@@ -17,6 +17,7 @@ import type * as vscode from "vscode";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import {
   ensurePublishReviewArtifactExistsV1,
+  invalidatePublishChecksFreshnessStampOnDiskV1,
   mergePublishStatusLineSection,
   readPublishChecksFile,
   withPublishChecksReportLockV1,
@@ -35,6 +36,22 @@ export interface PublishCheckCommandRecordV1 {
   readonly exitCode?: number;
 }
 
+/**
+ * bugs5 Step 10: the last run that really finished (passed or failed), kept on every record that
+ * is not itself a result (`running`, `interrupted`, `cancelled`), so a later run that never
+ * finished does not erase what the earlier one proved.
+ */
+export interface LastCompletedPublishChecksV1 {
+  readonly outcome: "passed" | "failed";
+  /** When that run ended. */
+  readonly at: string;
+  /** The commands that failed (failed runs). */
+  readonly failedCommands?: readonly string[];
+  /** How long that run took, when known: the estimate offered before the next one. */
+  readonly durationMs?: number;
+  readonly operationId?: string;
+}
+
 export type PublishChecksOutcomeV1 =
   /**
    * Written before the first command starts and kept current as each command settles, so a
@@ -51,6 +68,7 @@ export type PublishChecksOutcomeV1 =
       readonly finishedCommands: readonly PublishCheckCommandRecordV1[];
       /** Commands started and not yet settled. */
       readonly runningCommands: readonly string[];
+      readonly lastCompleted?: LastCompletedPublishChecksV1;
     }
   /** A run found abandoned: it stopped without a recorded result, so the rest is unknown. */
   | {
@@ -60,8 +78,19 @@ export type PublishChecksOutcomeV1 =
       readonly finishedCommands: readonly PublishCheckCommandRecordV1[];
       /** Commands that were running when it stopped; their outcome is unknown. */
       readonly unknownCommands: readonly string[];
+      readonly lastCompleted?: LastCompletedPublishChecksV1;
     }
-  | { readonly outcome: "passed"; readonly at: string; readonly operationId?: string }
+  | {
+      readonly outcome: "passed";
+      readonly at: string;
+      readonly operationId?: string;
+      readonly durationMs?: number;
+      /**
+       * bugs5 Step 17: the commands passed, but these files changed while the run was going, so the
+       * pass does not cover the tree as it is now. No freshness stamp is written for such a run.
+       */
+      readonly changedDuringRun?: readonly string[];
+    }
   | {
       readonly outcome: "failed";
       readonly at: string;
@@ -70,6 +99,7 @@ export type PublishChecksOutcomeV1 =
       /** Set when the run died on an error instead of finishing with red checks. */
       readonly reason?: string;
       readonly operationId?: string;
+      readonly durationMs?: number;
     }
   | {
       readonly outcome: "cancelled";
@@ -77,7 +107,84 @@ export type PublishChecksOutcomeV1 =
       /** Plain words for who or what stopped the run. */
       readonly cause: string;
       readonly operationId?: string;
+      readonly lastCompleted?: LastCompletedPublishChecksV1;
     };
+
+/**
+ * The last run that finished, as seen from the record on disk now: the record itself when it is a
+ * result, or the one it carried forward when it is not.
+ */
+export function lastCompletedPublishChecksV1(
+  record: PublishChecksOutcomeV1 | undefined
+): LastCompletedPublishChecksV1 | undefined {
+  if (record === undefined) {
+    return undefined;
+  }
+  if (record.outcome === "passed") {
+    return {
+      outcome: "passed",
+      at: record.at,
+      ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+      ...(record.operationId !== undefined ? { operationId: record.operationId } : {}),
+    };
+  }
+  if (record.outcome === "failed") {
+    // A run that died on an error before any check reported is not a completed result.
+    if (record.reason !== undefined && record.failedCommands.length === 0) {
+      return undefined;
+    }
+    return {
+      outcome: "failed",
+      at: record.at,
+      failedCommands: record.failedCommands,
+      ...(record.durationMs !== undefined ? { durationMs: record.durationMs } : {}),
+      ...(record.operationId !== undefined ? { operationId: record.operationId } : {}),
+    };
+  }
+  return record.lastCompleted;
+}
+
+/** The commands of a run's own settled results that failed (non-zero exit). */
+export function failedCommandsAmongFinishedV1(finished: readonly PublishCheckCommandRecordV1[]): readonly string[] {
+  return finished.filter((entry) => entry.exitCode !== undefined && entry.exitCode !== 0).map((entry) => entry.command);
+}
+
+/**
+ * bugs5 Step 10: why the latest record stops a recorded pass being reused, or `undefined` when it
+ * does not. A cancelled or interrupted run leaves an earlier pass alone unless that run's own settled
+ * results include a failure; a later failed run replaces the pass; a run in progress is not yet a result.
+ */
+export function describeOutcomeBlockingReuseV1(record: PublishChecksOutcomeV1 | undefined): string | undefined {
+  if (record === undefined) {
+    return undefined;
+  }
+  switch (record.outcome) {
+    case "passed":
+      return undefined;
+    case "failed":
+      return record.failedCommands.length > 0
+        ? `the latest Publish Checks run failed (${record.failedCommands.map((c) => `\`${c}\``).join(", ")})`
+        : "the latest Publish Checks run did not finish cleanly";
+    case "running":
+      return "Publish Checks are running right now, so their result is not known yet";
+    case "interrupted":
+    case "cancelled": {
+      const ownFailures = record.outcome === "interrupted" ? failedCommandsAmongFinishedV1(record.finishedCommands) : [];
+      if (ownFailures.length > 0) {
+        return `the Publish Checks run that was interrupted had already failed ${ownFailures.map((c) => `\`${c}\``).join(", ")}`;
+      }
+      return record.lastCompleted?.outcome === "failed"
+        ? "the last Publish Checks run that finished had failed"
+        : undefined;
+    }
+  }
+}
+
+/** Minutes the last completed run took, rounded up, or `undefined` when it was never timed. */
+export function estimateChecksMinutesV1(record: PublishChecksOutcomeV1 | undefined): number | undefined {
+  const last = lastCompletedPublishChecksV1(record);
+  return last?.durationMs !== undefined && last.durationMs > 0 ? Math.max(1, Math.ceil(last.durationMs / 60_000)) : undefined;
+}
 
 /** "from Notifications", "from the chat", … — who asked the run to stop. */
 export function describePublishCancelSourceV1(source: CancelSourceV1 | undefined): string {
@@ -126,6 +233,18 @@ export function publishStatusLineForOutcomeV1(outcome: PublishChecksOutcomeV1): 
       return outcome.reason !== undefined
         ? `**Publish Checks did not finish** (${outcome.reason}). Run Publish Checks again.`
         : undefined;
+    case "passed": {
+      const changed = outcome.changedDuringRun ?? [];
+      if (changed.length === 0) {
+        return undefined;
+      }
+      const shown = changed.slice(0, 5).map((file) => `\`${file}\``).join(", ");
+      const more = changed.length > 5 ? ` and ${changed.length - 5} more` : "";
+      return (
+        `**Publish Checks passed, but these files changed while they ran:** ${shown}${more}. ` +
+        "Run Publish Checks again to cover the change."
+      );
+    }
     default:
       return undefined;
   }
@@ -188,8 +307,29 @@ export async function recordPublishChecksOutcomeV1(
   try {
     // Let any pending running-record update land first so it cannot overwrite this result.
     await (runningRecordQueuesV1.get(taskFolderUri.fsPath) ?? Promise.resolve()).catch(() => undefined);
-    await writeFileAtomicV1(outcomeFilePathV1(taskFolderUri.fsPath), `${JSON.stringify({ version: 1, ...outcome }, null, 2)}\n`);
-    const statusLine = publishStatusLineForOutcomeV1(outcome);
+    const previous = readPublishChecksOutcomeV1(taskFolderUri.fsPath);
+    // bugs5 Step 10: what the earlier run proved is carried on records that are not results, and a
+    // result remembers how long its run took (the estimate offered before the next one).
+    let toWrite: PublishChecksOutcomeV1 = outcome;
+    if (outcome.outcome === "interrupted" || outcome.outcome === "cancelled") {
+      const carried = outcome.lastCompleted ?? lastCompletedPublishChecksV1(previous);
+      toWrite = carried !== undefined ? { ...outcome, lastCompleted: carried } : outcome;
+    } else if ((outcome.outcome === "passed" || outcome.outcome === "failed") && outcome.durationMs === undefined) {
+      const startedAt = previous?.outcome === "running" ? Date.parse(previous.at) : Number.NaN;
+      const durationMs = Date.parse(outcome.at) - startedAt;
+      toWrite = Number.isFinite(durationMs) && durationMs > 0 ? { ...outcome, durationMs } : outcome;
+    }
+    await writeFileAtomicV1(outcomeFilePathV1(taskFolderUri.fsPath), `${JSON.stringify({ version: 1, ...toWrite }, null, 2)}\n`);
+    // A failure replaces an earlier pass: a run that failed, or one that was interrupted after one of
+    // its own commands had already failed, leaves no passing stamp behind. A run that merely stopped
+    // (cancelled, interrupted with no failure) leaves the earlier pass alone.
+    if (
+      (toWrite.outcome === "failed" && toWrite.failedCommands.length > 0) ||
+      (toWrite.outcome === "interrupted" && failedCommandsAmongFinishedV1(toWrite.finishedCommands).length > 0)
+    ) {
+      await invalidatePublishChecksFreshnessStampOnDiskV1(taskFolderUri).catch(() => undefined);
+    }
+    const statusLine = publishStatusLineForOutcomeV1(toWrite);
     if (statusLine === undefined) {
       return;
     }
@@ -258,6 +398,8 @@ export async function recordPublishChecksRunningV1(
   now: () => Date = () => new Date()
 ): Promise<{ commandStarted(command: string): void; commandSettled(command: string, exitCode?: number): void }> {
   const taskFolderPath = taskFolderUri.fsPath;
+  // bugs5 Step 10: the run that is starting does not erase what the last finished one proved.
+  const carried = lastCompletedPublishChecksV1(readPublishChecksOutcomeV1(taskFolderPath));
   const initial: RunningRecordV1 = {
     outcome: "running",
     at: now().toISOString(),
@@ -266,6 +408,7 @@ export async function recordPublishChecksRunningV1(
     hostname: os.hostname(),
     finishedCommands: [],
     runningCommands: [],
+    ...(carried !== undefined ? { lastCompleted: carried } : {}),
   };
   const written = (runningRecordQueuesV1.get(taskFolderPath) ?? Promise.resolve())
     .catch(() => undefined)
@@ -325,7 +468,7 @@ export async function settleUnrecordedPublishChecksRunV1(
 }
 
 /** Whether a process id is alive on this machine (signal 0 probes without sending anything). */
-function processAliveV1(pid: number): boolean {
+export function processAliveV1(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;

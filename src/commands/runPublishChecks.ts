@@ -22,8 +22,11 @@ import {
 } from "../utils/completionLint";
 import { runChecksFailedFirstV1 } from "../utils/failedFirstChecksV1";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
+import { maybeWarnAboutAutoUpdateV1 } from "../utils/autoUpdateWarningV1";
 import {
   describePublishCancelSourceV1,
+  estimateChecksMinutesV1,
+  readPublishChecksOutcomeV1,
   recordPublishChecksOutcomeV1,
   recordPublishChecksRunningV1,
   settleUnrecordedPublishChecksRunV1,
@@ -33,7 +36,12 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { handBackToHumanAfterPublishChecksV1 } from "../utils/taskProgressTransforms";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { safeOpenTextDocument, writeTextFile, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
-import { COMMIT_AND_PUSH_COMMAND_V1, publishNextStepOfferV1 } from "../utils/publishStageActionsV1";
+import {
+  COMMIT_AND_PUSH_COMMAND_V1,
+  publishChecksPassedHeadingV1,
+  publishNextStepOfferV1,
+  publishPartOneRunningLineV1,
+} from "../utils/publishStageActionsV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
@@ -53,7 +61,8 @@ import {
 } from "../utils/stageActionRefusalV1";
 import {
   computePublishScopeId,
-  computeTreeFingerprintV1,
+  computeTreeFingerprintSnapshotV1,
+  diffTreeFingerprintSnapshotsV1,
   invalidatePublishChecksFreshnessStampOnDiskV1,
   withCommandIdentityV1,
   writePublishChecksFreshnessStampV1,
@@ -563,7 +572,15 @@ export async function runPublishChecks(
         // scope/HEAD/tree-fingerprint work after it all run inside this tracked operation,
         // so Cancel has a target and a refusal settles as an operation outcome rather than
         // vanishing as a claim-only startup.
-        operation.reportActivity("preparing the checks", { resetElapsedOrigin: true });
+        // bugs5 Step 18: one plain status line that says which part of Publish this is and that the
+        // owner can leave; each check then updates the same row as it starts and ends.
+        operation.reportActivity(
+          publishPartOneRunningLineV1(
+            getPublishVerificationCommands(),
+            estimateChecksMinutesV1(readPublishChecksOutcomeV1(taskFolderUri.fsPath))
+          ),
+          { resetElapsedOrigin: true }
+        );
         const displayName = notificationTaskDisplayNameV1(
           resolvedTask.progress.displayName,
           resolvedTask.taskFolderPath
@@ -673,7 +690,13 @@ export async function runPublishChecks(
         // recovery turns an abandoned preflight into an explicit "interrupted" result rather than
         // leaving the previous run's result standing as this one's. Every exit below replaces it
         // with a refused, cancelled or finished result.
+        const previousChecksRecordV1 = readPublishChecksOutcomeV1(taskFolderUri.fsPath);
         const runningRecord = await recordPublishChecksRunningV1(taskFolderUri, operation.id);
+        // bugs5 Step 11: a run this long can be killed by VS Code's extension auto-update.
+        void maybeWarnAboutAutoUpdateV1({
+          taskFolderPath: taskFolderUri.fsPath,
+          expectedMinutes: estimateChecksMinutesV1(previousChecksRecordV1) ?? 20,
+        });
 
         // Admission is guaranteed live for this exact target — reverse a watchdog-provenance
         // pause (never a user pause) before any further setup, exactly like
@@ -748,13 +771,20 @@ export async function runPublishChecks(
                 resolvedTask.progress
               ).folder;
               const beforeSha = await resolveHeadCommitSha(scopeGuess);
-              const beforeFingerprint = await computeTreeFingerprintV1(scopeGuess);
-              await invalidatePublishChecksFreshnessStampOnDiskV1(taskFolderUri);
+              // bugs5 Step 17: the per-path records are kept so the end of the run can name the files
+              // that changed while it ran, not just notice that something did.
+              const beforeSnapshot = await computeTreeFingerprintSnapshotV1(scopeGuess);
+              const beforeFingerprint = beforeSnapshot?.fingerprint;
+              // bugs5 Step 10: the previous stamp is NOT wiped here. A run that is cancelled,
+              // interrupted or killed leaves an earlier pass on the same tree standing (wiping it
+              // made Commit & Push re-run 20-35 minutes of checks that had already passed). A new
+              // pass replaces the stamp below, and a failure removes it
+              // (`recordPublishChecksOutcomeV1`), so a stamp never outlives the result it described.
 
               throwIfPublishChecksCancelledV1(cancelToken);
               // Cancellation kills the check process trees and rejects with
               // PublishChecksCancelledError BEFORE any result is persisted;
-              // the invalidation above stands, so no stale stamp survives.
+              // the earlier stamp, if any, is untouched.
               // bugs3 Step 15: the failed-first run is shared with Fix Linting &
               // Code Errors' post-fix re-check (bugs2 Steps 29-30), so both consume
               // exactly one result.
@@ -810,7 +840,15 @@ export async function runPublishChecks(
                 });
               }
               const afterSha = await resolveHeadCommitSha(verifiedFolder);
-              const afterFingerprint = await computeTreeFingerprintV1(verifiedFolder);
+              const afterSnapshot = await computeTreeFingerprintSnapshotV1(verifiedFolder);
+              const afterFingerprint = afterSnapshot?.fingerprint;
+              const changedDuringRun =
+                beforeSnapshot !== undefined &&
+                afterSnapshot !== undefined &&
+                beforeFingerprint !== afterFingerprint &&
+                computePublishScopeId(scopeGuess) === computePublishScopeId(verifiedFolder)
+                  ? diffTreeFingerprintSnapshotsV1(beforeSnapshot, afterSnapshot)
+                  : [];
               if (!failedFirstResult) {
                 // bugs3 Step 15: keep the complete failing result, bound to the commit,
                 // tree fingerprint, scope and commands it ran against, so a fix round
@@ -838,7 +876,12 @@ export async function runPublishChecks(
               await recordPublishChecksOutcomeV1(
                 taskFolderUri,
                 checksPassed
-                  ? { outcome: "passed", at: new Date().toISOString(), operationId: operation.id }
+                  ? {
+                      outcome: "passed",
+                      at: new Date().toISOString(),
+                      operationId: operation.id,
+                      ...(changedDuringRun.length > 0 ? { changedDuringRun } : {}),
+                    }
                   : {
                       outcome: "failed",
                       at: new Date().toISOString(),
@@ -867,11 +910,16 @@ export async function runPublishChecks(
                   ...withCommandIdentityV1(result.commandsRun),
                 });
               }
-              // A mismatch (working tree advanced mid-run, or HEAD could not be
-              // resolved) leaves no stamp — the previous one was already
-              // invalidated above, so the report correctly reads as stale
-              // rather than carrying a commit that no longer matches its own
-              // check output.
+              // A finished run that cannot be tied to one unchanged commit and tree (the working
+              // tree advanced mid-run, or HEAD could not be resolved) writes no stamp, and the
+              // previous one is removed: it described an earlier run, and this run's output has
+              // replaced the report, so the report must read as stale rather than carry a commit
+              // that no longer matches its own check output.
+              if (!freshStampWritten) {
+                await invalidatePublishChecksFreshnessStampOnDiskV1(taskFolderUri).catch((error) => {
+                  console.warn("[runPublishChecks] Could not remove the superseded freshness stamp", error);
+                });
+              }
 
               // Keep the tree aligned with the persisted lint payload.
               await inventory.refresh();
@@ -925,24 +973,47 @@ export async function runPublishChecks(
 
               // Same verdict the artifact's status line and the freshness stamp
               // use: a check that failed only on a quarantined known flake is a pass.
-              if (result.passedModuloKnownFlakes ?? result.passed) {
+              if (checksPassed && changedDuringRun.length > 0) {
+                // bugs5 Step 17: the commands passed, but not on the tree as it is now. No stamp was
+                // written, so no review is offered: the only honest next step is to run them again.
+                const shown = changedDuringRun.slice(0, 5).join(", ");
+                const more = changedDuringRun.length > 5 ? ` and ${changedDuringRun.length - 5} more` : "";
+                const changedNotice =
+                  `Publish Checks passed, but these files changed while they ran: ${shown}${more}. ` +
+                  "Run them again to cover the change.";
+                NotificationRouter.showWarning(
+                  changedNotice,
+                  undefined,
+                  undefined,
+                  undefined,
+                  await offerActionInChatV1({
+                    taskFolderPath: taskFolderUri.fsPath,
+                    actionLabel: "Run Publish Checks",
+                    command: "vs-code-ai-helper.runPublishChecks",
+                    args: [{ taskFolderPath: taskFolderUri.fsPath }],
+                    noticeText: changedNotice,
+                  })
+                );
+              } else if (result.passedModuloKnownFlakes ?? result.passed) {
                 const nextStepOffer = publishNextStepOfferV1();
                 if (parentOperation !== undefined && nextStepOffer.action.command !== COMMIT_AND_PUSH_COMMAND_V1) {
                   // RC9 item 2: a parent operation (Fast Forward) runs the
                   // Publish review next on its own, so no card asks the owner
                   // to do what is about to happen.
                   NotificationRouter.showInformation(
-                    `Publish checks passed. Report saved to ${publishReviewFilename}. Fast Forward runs the Publish review next.${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`
+                    `${publishChecksPassedHeadingV1("review")} Report saved to ${publishReviewFilename}. Fast Forward runs the Publish review next.${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`
                   );
                   // RC11 item 1: the caller starts the review next, so no card asks
                   // for it; a run that left no fresh stamp keeps the card because
                   // the caller will stop.
                 } else if (reviewFollows && freshStampWritten && nextStepOffer.action.command !== COMMIT_AND_PUSH_COMMAND_V1) {
                   NotificationRouter.showInformation(
-                    `Publish checks passed. Report saved to ${publishReviewFilename}. The Publish review runs next.${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`
+                    `${publishChecksPassedHeadingV1("review")} Report saved to ${publishReviewFilename}. The Publish review runs next.${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`
                   );
                 } else {
-                  const passedNotice = `Publish checks passed. Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`;
+                  const passedNotice = `${publishChecksPassedHeadingV1(
+                    nextStepOffer.action.command === COMMIT_AND_PUSH_COMMAND_V1 ? "commit-and-push" : "review"
+                  )} Report saved to ${publishReviewFilename}. ${nextStepOffer.sentence}${openPlanItemsSentence ? ` ${openPlanItemsSentence}` : ""}`;
                   // RC7 item 4: the button only opens the chat. The review step
                   // is offered there as an option; Commit & Push is not moved
                   // to the chat in this task, so that variant has no button.

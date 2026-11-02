@@ -4,6 +4,17 @@ import * as path from "path";
 
 export interface SessionLease { sessionId: string; pid: number; host: string; root: string; acquiredAt: string; expiresAt: number; }
 
+/**
+ * Another live session holds the lease. A typed error (bugs5 Step 11) so a caller that can wait
+ * for the lease to expire recognises it by type instead of matching the message text.
+ */
+export class PrimarySessionLockHeldError extends Error {
+  constructor() {
+    super("Another Ensemble session is currently updating task state.");
+    this.name = "PrimarySessionLockHeldError";
+  }
+}
+
 /** A workspace-scoped lease preventing two extension hosts from mutating state concurrently. */
 export class PrimarySessionLock {
   private readonly sessionId = `${process.pid}-${Math.random().toString(36).slice(2)}`;
@@ -14,14 +25,14 @@ export class PrimarySessionLock {
     try { await fs.promises.writeFile(this.lockPath, JSON.stringify(lease), { flag: "wx" }); }
     catch {
       try { const current = JSON.parse(await fs.promises.readFile(this.lockPath, "utf8")) as SessionLease;
-        if (current.expiresAt > Date.now() || current.host !== lease.host || current.root !== lease.root) throw new Error("Another Ensemble session is currently updating task state.");
+        if (current.expiresAt > Date.now() || current.host !== lease.host || current.root !== lease.root) throw new PrimarySessionLockHeldError();
         // Atomically move the expired lease out of the way. Two contenders
         // cannot both rename the same lock, so takeover is race-safe.
         const stalePath = `${this.lockPath}.stale-${process.pid}-${Math.random().toString(36).slice(2)}`;
         await fs.promises.rename(this.lockPath, stalePath);
         try { await fs.promises.writeFile(this.lockPath, JSON.stringify(lease), { flag: "wx" }); }
         finally { try { await fs.promises.unlink(stalePath); } catch { /* best-effort stale lock cleanup */ } }
-      } catch (error) { if (error instanceof Error && error.message.includes("Another Ensemble")) throw error; throw new Error("Unable to acquire Ensemble state lock."); }
+      } catch (error) { if (error instanceof PrimarySessionLockHeldError) throw error; throw new Error("Unable to acquire Ensemble state lock."); }
     }
     let stopped = false;
     const heartbeat = setInterval(() => {

@@ -638,38 +638,56 @@ export function roundsWithoutTaskFixableDecrease(
   const scored = history.filter(
     (entry) => entry.stage === stage && entry.score !== null && entry.taskFixableCount !== undefined
   );
+  // bugs5 Step 21 (item 10): each round is compared with the BEST value so far in the stage's trailing
+  // run, not with the previous round, so a count that swings 2 → 1 → 2 does not keep resetting the
+  // ceiling. Only a measurable gain restarts the count: fewer task-fixable blockers than ever, more settled
+  // plan items than ever, fewer unbuilt steps than ever, or a higher score than ever. A `[narrowed:…]` tag on
+  // a grouped blocker is not itself a gain (bugs4 item 22 treated it as one, and a grouped blocker narrowed
+  // every round never reached the ceiling): it counts only through one of those four measures moving.
+  // Settled and unbuilt counts are absent on older entries; a missing value is never a gain.
   let rounds = 0;
-  for (let i = scored.length - 1; i >= 1; i--) {
+  let bestFixable = Number.POSITIVE_INFINITY;
+  let bestSettled = Number.NEGATIVE_INFINITY;
+  let bestUnbuilt = Number.POSITIVE_INFINITY;
+  let bestScore = Number.NEGATIVE_INFINITY;
+  const seed = (entry: ReviewScoreHistoryEntry): void => {
+    bestFixable = entry.taskFixableCount;
+    bestSettled = entry.settledItemCount ?? Number.NEGATIVE_INFINITY;
+    bestUnbuilt = entry.unbuiltStepCount ?? Number.POSITIVE_INFINITY;
+    bestScore = entry.score ?? Number.NEGATIVE_INFINITY;
+  };
+  for (let i = 0; i < scored.length; i++) {
     const current = scored[i];
     const previous = scored[i - 1];
-    if (!current || !previous || previous.taskFixableCount <= 0 || current.taskFixableCount < previous.taskFixableCount) {
-      break;
+    if (!current) {
+      continue;
     }
-    // bugs4 item 22: a round in which the reviewer declared a task-fixable blocker
-    // `[narrowed:<id>]` is real progress the flat count cannot see. It resets the
-    // trailing run here, so only rounds AFTER the narrowing count toward the ceiling.
-    if (current.blockers?.some((b) => b.resolver === "task-fixable" && b.lineage?.kind === "narrowed")) {
-      break;
+    if (!previous || previous.taskFixableCount <= 0) {
+      // The first round, or a transition out of a zero-fixable round (nothing to churn on): start over.
+      seed(current);
+      rounds = 0;
+      continue;
     }
-    // Newly settled plan items and a shorter list of unbuilt steps are progress the
-    // flat blocker count cannot show (the grouped unbuilt-steps blocker stays one
-    // blocker until the last step is built). Both fields are absent on older
-    // entries, in which case the transition is judged by blocker count alone.
-    if (
-      current.settledItemCount !== undefined &&
-      previous.settledItemCount !== undefined &&
-      current.settledItemCount > previous.settledItemCount
-    ) {
-      break;
+    const gained =
+      current.taskFixableCount < bestFixable ||
+      (current.settledItemCount !== undefined &&
+        Number.isFinite(bestSettled) &&
+        current.settledItemCount > bestSettled) ||
+      (current.unbuiltStepCount !== undefined &&
+        Number.isFinite(bestUnbuilt) &&
+        current.unbuiltStepCount < bestUnbuilt) ||
+      (current.score !== null && current.score > bestScore);
+    bestFixable = Math.min(bestFixable, current.taskFixableCount);
+    if (current.settledItemCount !== undefined) {
+      bestSettled = Math.max(bestSettled, current.settledItemCount);
     }
-    if (
-      current.unbuiltStepCount !== undefined &&
-      previous.unbuiltStepCount !== undefined &&
-      current.unbuiltStepCount < previous.unbuiltStepCount
-    ) {
-      break;
+    if (current.unbuiltStepCount !== undefined) {
+      bestUnbuilt = Math.min(bestUnbuilt, current.unbuiltStepCount);
     }
-    rounds++;
+    if (current.score !== null) {
+      bestScore = Math.max(bestScore, current.score);
+    }
+    rounds = gained ? 0 : rounds + 1;
   }
   return rounds;
 }
@@ -1130,11 +1148,21 @@ export function decideReviewRoute(input: {
    * a plateau; the route is decided on the remaining blockers.
    */
   carriedGateBlockers?: readonly ReviewBlocker[];
+  /**
+   * bugs5 Step 22: every blocker holding the score needs the owner.
+   */
+  allBlockersNeedOwnerDecision?: boolean;
 }): RouteDecision {
-  const { score, threshold, plateaued, secondOpinionTriedThisPlateau } = input;
+  const { score, threshold, plateaued, secondOpinionTriedThisPlateau, allBlockersNeedOwnerDecision } = input;
   const carriedSet = new Set<ReviewBlocker>(input.carriedGateBlockers ?? []);
   const blockers = input.blockers.filter((b) => !carriedSet.has(b));
   const meetsThreshold = score !== null && score >= threshold;
+  if (!meetsThreshold && allBlockersNeedOwnerDecision && blockers.length > 0) {
+    return {
+      route: "escalate",
+      reason: "Every blocker holding the score requires an owner decision; automated iteration cannot resolve it.",
+    };
+  }
   if (blockers.length === 0 && carriedSet.size > 0) {
     // Only carried gates remain. At threshold nothing holds the stage; below
     // it the reviewer's own blocker cap is what keeps the score down, so ask

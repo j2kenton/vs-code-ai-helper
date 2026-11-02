@@ -23,9 +23,12 @@ import {
   upsertCompletionChecksReportV1,
 } from "../utils/completionLint";
 import { decideCommitPushChecksReuseV1 } from "../utils/commitPushChecksReuseV1";
+import { estimateChecksMinutesV1, readPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
+import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishReadiness, resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import { buildCommitPushUnstagedListV1, describeCommitPushUnstagedListV1 } from "../utils/commitPushUnstagedListV1";
 import { refreshStaleReviewBannersForTaskV1 } from "../utils/reviewFreshness";
 import { runLintingFixes } from "./runLintingFixes";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
@@ -260,15 +263,36 @@ function isFileInFolder(filePath: string, folderPath: string): boolean {
  * outcome the old dismissed modal produced, so nothing is ever staged,
  * committed, or pushed on a missing answer.
  */
+const COMMIT_PUSH_COMMAND_NAME_V1 = "Commit & Push";
+/** bugs5 Step 9: what answering any Commit & Push card unblocks. */
+const COMMIT_PUSH_UNBLOCKS_V1 = "the commit and push";
+/** bugs5 Step 9: the non-committing choice, worded like other cards' "Not now". */
+const COMMIT_PUSH_NOT_NOW_V1 = {
+  label: "Not now",
+  consequence: "Nothing is staged, committed or pushed. Choose Commit & Push again when you're ready.",
+  recordedNext: "stopped; nothing was staged, committed or pushed",
+} as const;
+
 async function askCommitPushInChatV1(args: {
   taskFolderUri: vscode.Uri;
   decisionKey: string;
   whatHappened: string;
   whyUserNeeded: string;
-  options: readonly { optionId: string; label: string; consequence: string }[];
+  /**
+   * `recordedNext` is what the chat's "Recorded" line says the choice does next (bugs5 Step 7):
+   * the command itself acts on the answer, so the decision's own effect is `doNothing` and could
+   * not say it.
+   */
+  options: readonly { optionId: string; label: string; consequence: string; recordedNext: string }[];
   recommendation?: { optionId: string; reasoning: string };
-  detail: string;
+  /** What the answer unblocks, in the owner's words ("the commit and push"). */
+  detail?: string;
   token?: vscode.CancellationToken;
+  /**
+   * The answer to assume when no chat is available to ask (no activated extension), so a headless
+   * run proceeds as it did before the card existed instead of treating "nobody to ask" as a refusal.
+   */
+  answerWhenUnavailable?: string;
 }): Promise<string | undefined> {
   const stage: TaskStage = "publish";
   let ended: AwaitedDecisionOutcomeV1 | undefined;
@@ -286,15 +310,20 @@ async function askCommitPushInChatV1(args: {
         label: option.label,
         resumeKind: "continue" as const,
         consequence: option.consequence,
+        recordedNext: option.recordedNext,
         effect: { kind: "doNothing" as const },
       })),
       recommendation: args.recommendation
         ? { kind: "option", optionId: args.recommendation.optionId, reasoning: args.recommendation.reasoning }
         : { kind: "none", reasoning: "The choice is yours." },
+      // bugs5 Step 9: Commit & Push is waiting on this answer, so the card is blocking and never
+      // "Optional"; it says what the answer unblocks and what Dismiss does.
       gating: {
         holdsTaskPaused: false,
-        unblocksProgress: false,
-        detail: args.detail,
+        unblocksProgress: true,
+        detail: args.detail ?? COMMIT_PUSH_UNBLOCKS_V1,
+        waitingCommand: COMMIT_PUSH_COMMAND_NAME_V1,
+        waitingNothingDone: "committed",
       },
     },
     { canonicalId: args.taskFolderUri.fsPath, taskFolderPath: args.taskFolderUri.fsPath, stage },
@@ -309,6 +338,9 @@ async function askCommitPushInChatV1(args: {
   // bugs3 Step 17: say what stopped the run. An explicit Cancel is an answer and
   // never reaches here; a timeout, a reload or a dismissal is not the owner
   // cancelling, and the final notice must not claim it was.
+  if (answer === undefined && ended?.kind === "unavailable" && args.answerWhenUnavailable !== undefined) {
+    return args.answerWhenUnavailable;
+  }
   if (answer === undefined && ended !== undefined && (ended.kind === "timedOut" || ended.kind === "interrupted" || ended.kind === "dismissed")) {
     recordCommitPushStopV1(args.taskFolderUri.fsPath, ended.kind, args.decisionKey);
   }
@@ -440,23 +472,23 @@ async function reviewCommitMessage(
           optionId: "commitAndPush",
           label: "Commit & Push",
           consequence: "Commits these files with this message and pushes the branch.",
+          recordedNext: "committing with this message and pushing now",
         },
         {
           optionId: "regenerate",
           label: "Regenerate",
           consequence: "Asks the configured model for a different commit message; nothing is committed.",
+          recordedNext: "asking for a different commit message; the confirmation is offered again",
         },
         {
           optionId: "cancel",
-          label: "Cancel",
-          consequence: "Stops here. The working tree and index stay exactly as they are.",
+          ...COMMIT_PUSH_NOT_NOW_V1,
         },
       ],
       recommendation: {
         optionId: "commitAndPush",
         reasoning: "Use this message if it describes the change accurately.",
       },
-      detail: "Choosing an option continues or cancels this Commit and Push run.",
       token: cancellationToken,
     });
     if (choice === "regenerate") {
@@ -1940,6 +1972,33 @@ export type CommitPushCompletionChecksResultV1 =
       readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "checksDeclined" | "fixWithAiUnavailable">;
     };
 
+/**
+ * bugs5 Step 10: the chat line that says why the checks run again before Commit & Push, with how
+ * long the last run took when that is known. Exported for direct unit testing.
+ */
+export function describeCommitPushFreshRunV1(reason: string, minutes: number | undefined): string {
+  const duration = minutes !== undefined ? ` The last run took about ${minutes} min.` : "";
+  return `Running the Publish Checks again before committing: ${reason}.${duration}`;
+}
+
+/** bugs5 Step 10: the label of the run-the-checks choice, with the last run's length when known. */
+export function describeRunChecksNowLabelV1(minutes: number | undefined): string {
+  return minutes !== undefined ? `Run the checks now (about ${minutes} min, based on the last run)` : "Run the checks now";
+}
+
+/** A durable chat line (kept in chat-v1.json) about the checks Commit & Push relies on. */
+async function postCommitPushChecksLineV1(resolvedTask: ResolvedTaskContext, text: string): Promise<void> {
+  try {
+    await appendChatMessageV1(
+      resolvedTask.taskFolderPath,
+      { role: "assistant", text, stage: "publish", at: new Date().toISOString() },
+      resolvedTask.taskFolderPath
+    );
+  } catch {
+    // The progress line already carries it; the chat copy is best-effort.
+  }
+}
+
 /** The recorded-pass decision for the tree as it is right now. */
 async function decideCurrentCommitPushChecksReuseV1(
   resolvedTask: ResolvedTaskContext,
@@ -2149,6 +2208,8 @@ export async function runCommitPushCompletionChecksV1(
   // instead of going through the failing-checks modal below, which is
   // reserved for lint/test failures.
   let freshChecksRequired = false;
+  // Set when the owner answers "Not now" to the run-the-checks card; nothing has run or changed.
+  let checksRunDeclined = false;
   // The commit, files and command set each check run starts from. The last run's
   // identity is the one the pass is tied to, so files the checks themselves
   // changed (or anything edited while they ran) cannot become the "checked" tree.
@@ -2167,9 +2228,51 @@ export async function runCommitPushCompletionChecksV1(
       if (reuse.reuse) {
         noteCommitPushChecksReusedV1(resolvedTask.taskFolderPath, true);
         op.report(reuse.message);
+        await postCommitPushChecksLineV1(resolvedTask, reuse.message);
+        // The chat line is a write into the task folder; the pass is tied to the tree as it is now.
+        checkedIdentity = await captureCommitPushCheckedTreeV1(resolvedTask);
         return reuse.result;
       }
       op.report(`Running the checks fresh: ${reuse.reason}.`);
+      // bugs5 Step 10: said in the chat history, before any check starts, so the owner (and a
+      // later session reading chat-v1.json) can see why the 20-35 minutes are being spent.
+      const lastRun = readPublishChecksOutcomeV1(resolvedTask.taskFolderPath);
+      const minutes = estimateChecksMinutesV1(lastRun);
+      await postCommitPushChecksLineV1(resolvedTask, describeCommitPushFreshRunV1(reuse.reason, minutes));
+      // bugs5 Step 10: the owner chooses whether to spend that time now, or stops with nothing touched.
+      const runNow = await askCommitPushInChatV1({
+        taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+        decisionKey: "commitPushRunChecksNow",
+        whatHappened:
+          `${commitPushTaskLabel(resolvedTask)}: the recorded Publish Checks can't be used because ${reuse.reason}.`,
+        whyUserNeeded:
+          "Commit & Push needs passing checks on the files it will commit. Running them takes a while, so it asks first.",
+        options: [
+          {
+            optionId: "runChecksNow",
+            label: describeRunChecksNowLabelV1(minutes),
+            consequence: "Runs the Publish Checks now, then asks you to confirm the commit.",
+            recordedNext: "running the Publish Checks now; the commit confirmation follows if they pass",
+          },
+          { optionId: "cancel", ...COMMIT_PUSH_NOT_NOW_V1 },
+        ],
+        recommendation: { optionId: "runChecksNow", reasoning: "Nothing is committed unless the checks pass on these files." },
+        token: op.token,
+        answerWhenUnavailable: "runChecksNow",
+      });
+      if (runNow !== "runChecksNow") {
+        checksRunDeclined = true;
+        return {
+          runAt: new Date().toISOString(),
+          passed: false,
+          summary: "The checks were not run.",
+          issueCount: 0,
+          failedChecks: [],
+          missingScripts: [],
+        };
+      }
+      // Still before any check starts: the identity must not include the chat line just written.
+      checkedIdentity = await captureCommitPushCheckedTreeV1(resolvedTask);
     }
     freshChecksRequired = true;
     const preflight = (await runTrackedOperation(
@@ -2213,6 +2316,9 @@ export async function runCommitPushCompletionChecksV1(
     };
   };
   let lintPayload = await runChecks();
+  if (checksRunDeclined) {
+    return { ok: false, reason: "checksDeclined" };
+  }
   // Failing checks surface a three-way decision (C3): Publish Anyway,
   // Fix with AI, or Cancel (the modal's dismiss affordance). Fix with AI
   // runs the linting-fixes flow — editor autofixes plus the configured
@@ -2235,23 +2341,23 @@ export async function runCommitPushCompletionChecksV1(
           optionId: "publishAnyway",
           label: "Publish Anyway",
           consequence: "Records the failing checks in the Publish review and continues publishing.",
+          recordedNext: "recording the failing checks in the Publish review and continuing to publish",
         },
         {
           optionId: "fixWithAi",
           label: "Fix with AI",
           consequence: "Runs automatic and AI fixes from the failing output, then re-runs the checks.",
+          recordedNext: "running the fixes, then the checks again; this card is offered again if they still fail",
         },
         {
           optionId: "cancel",
-          label: "Cancel",
-          consequence: "Stops here. Nothing is committed or pushed.",
+          ...COMMIT_PUSH_NOT_NOW_V1,
         },
       ],
       recommendation: {
         optionId: "fixWithAi",
         reasoning: "Fixing the checks first keeps the published result verified.",
       },
-      detail: "Choosing an option continues or cancels this Commit and Push run.",
       token: op.token,
     });
     if (choice === "publishAnyway") {
@@ -2430,6 +2536,12 @@ export async function resolveCommitPushStagingScopeV1(
           const hasUnstagedChanges =
             unstagedOutput.trim().length > 0 || untrackedOutput.trim().length > 0;
           if (hasUnstagedChanges) {
+            // bugs5 Step 8: name what "Commit Everything Together" would add, so the owner can see it.
+            const unstagedList = buildCommitPushUnstagedListV1({
+              unstagedOutput,
+              untrackedOutput,
+              taskFolderRelative: path.relative(repoRoot, resolvedTask.taskFolderPath).replace(/\\/g, "/"),
+            });
             const choice = await askCommitPushInChatV1({
               taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
               decisionKey: "commitPushExistingStagedChanges",
@@ -2437,7 +2549,8 @@ export async function resolveCommitPushStagingScopeV1(
               whatHappened:
                 `${commitPushTaskLabel(resolvedTask)} — this repository already has ${preStagedFiles.length} staged change(s) alongside unstaged changes.\n\n` +
                 "Commit everything together (staged and unstaged changes in one commit), " +
-                "or cancel to handle the existing staged changes manually first.",
+                "or choose Not now to handle the existing staged changes manually first." +
+                describeCommitPushUnstagedListV1(unstagedList),
               whyUserNeeded:
                 "Committing pre-staged changes together with this task's changes is a choice only you can make.",
               options: [
@@ -2445,18 +2558,17 @@ export async function resolveCommitPushStagingScopeV1(
                   optionId: "commitEverything",
                   label: "Commit Everything Together",
                   consequence: "Stages and commits both the pre-staged and unstaged changes in one commit.",
+                  recordedNext: "continuing to the final confirmation",
                 },
                 {
                   optionId: "cancel",
-                  label: "Cancel",
-                  consequence: "Stops here so you can handle the staged changes manually.",
+                  ...COMMIT_PUSH_NOT_NOW_V1,
                 },
               ],
               recommendation: {
                 optionId: "commitEverything",
                 reasoning: "Continue when the pre-staged changes belong with this commit.",
               },
-              detail: "Choosing an option continues or cancels this Commit and Push run.",
             });
             if (choice !== "commitEverything") {
               return {
@@ -2500,18 +2612,17 @@ export async function resolveCommitPushStagingScopeV1(
                 optionId: "includeTaskFolder",
                 label: "Include Task Folder Changes",
                 consequence: "Stages the task folder's planning files in this commit.",
+                recordedNext: "including the task folder's planning files and continuing",
               },
               {
                 optionId: "cancel",
-                label: "Cancel",
-                consequence: "Stops here with nothing staged.",
+                ...COMMIT_PUSH_NOT_NOW_V1,
               },
             ],
             recommendation: {
               optionId: "includeTaskFolder",
               reasoning: "Include them when the planning records belong with this commit.",
             },
-            detail: "Choosing an option continues or cancels this Commit and Push run.",
           });
           if (choice !== "includeTaskFolder") {
             return { kind: "notCompleted", reason: "taskFolderChangesDeclined" };
@@ -2539,18 +2650,17 @@ export async function resolveCommitPushStagingScopeV1(
                   optionId: "includeRunArtifacts",
                   label: "Include Run Artifacts",
                   consequence: "Stages the task's run artifacts in this commit.",
+                  recordedNext: "including the run artifacts and continuing",
                 },
                 {
                   optionId: "cancel",
-                  label: "Cancel",
-                  consequence: "Stops here with nothing staged.",
+                  ...COMMIT_PUSH_NOT_NOW_V1,
                 },
               ],
               recommendation: {
                 optionId: "cancel",
                 reasoning: "Leave run artifacts out unless they are needed in the repository.",
               },
-              detail: "Choosing an option continues or cancels this Commit and Push run.",
             });
             if (artifactChoice === "includeRunArtifacts") {
               const taskRelative = path
@@ -2740,6 +2850,7 @@ export async function confirmCommitPushScopeV1(
                 optionId: "commitAndPush",
                 label: "Commit & Push",
                 consequence: "Stages these files, commits them, and pushes the branch.",
+                recordedNext: "staging, committing and pushing now",
               },
               ...(fullListShown
                 ? []
@@ -2749,19 +2860,18 @@ export async function confirmCommitPushScopeV1(
                       label: "View Full List",
                       consequence:
                         "Shows every file in this chat (and in the Commit Preview output channel), then asks this same question again. Nothing is committed and the checks do not run again.",
+                      recordedNext: "showing the list; the confirmation is offered again",
                     },
                   ]),
               {
                 optionId: "cancel",
-                label: "Cancel",
-                consequence: "Stops here. Nothing is committed; the working tree and index stay exactly as they are.",
+                ...COMMIT_PUSH_NOT_NOW_V1,
               },
             ],
             recommendation: {
               optionId: "commitAndPush",
               reasoning: "Proceed once the scope, branch, destination, and files look right.",
             },
-            detail: "Choosing an option continues, shows the full list, or cancels this Commit and Push run.",
           });
           if (confirmed !== "viewFullList") {
             break;

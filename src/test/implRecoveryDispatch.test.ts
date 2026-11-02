@@ -24,7 +24,7 @@ import * as path from "node:path";
 import { after, afterEach, describe, it } from "node:test";
 import * as vscode from "vscode";
 
-import { TaskActionScheduler } from "../commands/scheduleTaskResume";
+import { TaskActionScheduler, buildOwedContinuationRearmLimitDecisionV1 } from "../commands/scheduleTaskResume";
 import {
   ImplRecoveryV1,
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
@@ -47,7 +47,9 @@ import {
   describeOwedImplRecoveryRefusalV1,
   discardOwedImplRecoveryV1,
   formatRecoveryClaimOwnerV1,
+  isAutomaticRearmLimitReachedV1,
   isImplRecoveryDiscardOfferableV1,
+  MAX_AUTOMATIC_CONTINUATION_REARMS_V1,
   parseRecoveryClaimOwnerV1,
   retireSatisfiedSummaryRejectedRecoveryV1,
   shouldLogNoOpContinuationRoundV1,
@@ -356,6 +358,78 @@ void describe("implRecovery dispatch sweep (restart semantics)", () => {
 
     await harness.armAll();
     assert.equal(harness.dispatches.length, 0);
+  });
+
+  void it("bugs5 Step 14: does not re-arm a continuation the owner cancelled or paused, however many sweeps run", async () => {
+    for (const cause of ["cancelled", "paused"] as const) {
+      const harness = makeHarness(
+        makeProgress(pendingRecord({ ownerHold: { at: new Date(BASE_NOW - 1000).toISOString(), cause } }))
+      );
+      active = harness;
+      await harness.armAll();
+      harness.advance(10 * 60 * 1000);
+      await harness.armAll();
+      assert.equal(harness.dispatches.length, 0, `held (${cause}) record must not be re-armed by the sweep`);
+      harness.dispose();
+      active = undefined;
+    }
+  });
+
+  void it("bugs5 Step 14: claimAndDispatchOwedContinuationLockedV1 re-checks ownerHold inside the CAS", async () => {
+    const harness = makeHarness(
+      makeProgress(pendingRecord({ ownerHold: { at: new Date(BASE_NOW - 1000).toISOString(), cause: "cancelled" } }))
+    );
+    active = harness;
+    const scheduler = harness.scheduler as unknown as {
+      claimAndDispatchOwedContinuationLockedV1: (taskFolderPath: string) => Promise<{ kind: string }>;
+    };
+    const result = await scheduler.claimAndDispatchOwedContinuationLockedV1("C:/tasks/2026-08-14_task_1");
+    assert.equal(result.kind, "notClaimed");
+    assert.equal(harness.dispatches.length, 0);
+    harness.dispose();
+    active = undefined;
+  });
+
+  void it("bugs5 Step 13: re-arms a continuation that finished once without clearing, but not a second time", async () => {
+    const underLimit = makeHarness(makeProgress(pendingRecord({ automaticRearms: 1 })));
+    active = underLimit;
+    await underLimit.armAll();
+    assert.equal(underLimit.dispatches.length, 1, "one finished attempt allows the single automatic re-arm");
+    underLimit.dispose();
+    active = undefined;
+
+    const atLimit = makeHarness(makeProgress(pendingRecord({ automaticRearms: 2 })));
+    active = atLimit;
+    await atLimit.armAll();
+    atLimit.advance(10 * 60 * 1000);
+    await atLimit.armAll();
+    assert.equal(atLimit.dispatches.length, 0, "after the limit only the owner can start another attempt");
+  });
+
+  void it("bugs5 Step 13: the re-arm limit is a plain function of the record", () => {
+    assert.equal(isAutomaticRearmLimitReachedV1({}), false);
+    assert.equal(isAutomaticRearmLimitReachedV1({ automaticRearms: MAX_AUTOMATIC_CONTINUATION_REARMS_V1 }), false);
+    assert.equal(isAutomaticRearmLimitReachedV1({ automaticRearms: MAX_AUTOMATIC_CONTINUATION_REARMS_V1 + 1 }), true);
+  });
+
+  void it("bugs5 Step 13: the limit card offers Retry, Leave it owed and Discard, and none of them is automatic", () => {
+    const card = buildOwedContinuationRearmLimitDecisionV1(
+      { canonicalId: "c", taskFolderPath: "/t", stage: "impl", taskName: "T" },
+      { failedProvider: "Claude Code" }
+    );
+    assert.deepEqual(
+      card.options.map((option) => option.optionId),
+      ["retry", "leaveOwed", "discard"]
+    );
+    assert.equal(card.options.find((option) => option.optionId === "leaveOwed")?.effect.kind, "doNothing");
+    const retryEffect = card.options.find((option) => option.optionId === "retry")?.effect;
+    assert.equal(retryEffect?.kind === "command" ? retryEffect.command : undefined, "vs-code-ai-helper.runOwedContinuationNow");
+    const discardEffect = card.options.find((option) => option.optionId === "discard")?.effect;
+    assert.equal(
+      discardEffect?.kind === "command" ? discardEffect.command : undefined,
+      "vs-code-ai-helper.discardOwedImplRecoveryV1"
+    );
+    assert.equal(card.recommendation?.kind, "option");
   });
 
   void it("does not re-arm on a paused task", async () => {

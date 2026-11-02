@@ -28,6 +28,7 @@ const reusedChecks = new Set<string>();
 /** The confirmation the owner was asked, in plain words. */
 const STEP_WORDS_V1: Readonly<Record<string, string>> = {
   commitPushCompletionChecksFailed: "the failing-checks question",
+  commitPushRunChecksNow: "the question about running the checks now",
   commitPushExistingStagedChanges: "the question about changes already staged",
   commitPushIncludeTaskFolder: "the question about the task folder's files",
   commitPushIncludeRunArtifacts: "the question about run artifacts",

@@ -323,6 +323,16 @@ export interface TaskProgress {
   fallbackActive?: Partial<Record<TaskStage, boolean>>;
   /** Stored model ID for the backup that is currently carrying a stage. */
   fallbackModelId?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: chain fingerprint at the time fallback was remembered */
+  fallbackChainFingerprint?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: model that failed when fallback was triggered */
+  fallbackFailedModelId?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: failure reason formatted by provider-error formatter */
+  fallbackFailureReason?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: timestamp when the failure occurred */
+  fallbackFailedAt?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: provider reset time if given */
+  fallbackResetTime?: Partial<Record<TaskStage, string>>;
   /** Monotonic token identifying the review run allowed to finalize this stage. */
   reviewAttemptId?: string;
   /**
@@ -539,6 +549,15 @@ export interface TaskProgress {
    * record)" statement rather than silently omitting the citation.
    */
   checklistProgressUnreliableReason?: string;
+
+  /**
+   * bugs5 Step 6 (item 21): when `checklistProgressUnreliable` was last set (ISO timestamp). It
+   * identifies the flag's generation: the owner's dismissal of the "checklist is flagged unreliable"
+   * card holds for one generation, and a round that sets the flag again starts a new one, so the
+   * card comes back. Absent on records written before this field existed (the reason text stands
+   * in as the generation there).
+   */
+  checklistProgressUnreliableSetAt?: string;
 
   /**
    * bugs4 Step 15 (item 22): the claim texts the latching round reported that matched no
@@ -871,6 +890,17 @@ export interface ImplRecoveryV1 {
   failedProvider?: string;
   /** Model that failed, triggering or holding the recovery. */
   failedModel?: string;
+  /**
+   * bugs5 Step 14: set when the owner cancels the continuation or pauses the task. The recovery
+   * sweep leaves a held record alone (the automatic retry is for crashes and reloads, not for the
+   * owner's own cancel); a manual Run Implementation or Run now claims it and clears the hold.
+   */
+  ownerHold?: { at: string; cause: "cancelled" | "paused" };
+  /**
+   * bugs5 Step 13: how many times the sweep re-armed this continuation after it finished without
+   * clearing the owed state. Re-arming after a crash or reload does not count.
+   */
+  automaticRearms?: number;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
@@ -1305,13 +1335,18 @@ export const MAX_BLOCKER_SUPERSESSIONS = 50;
  *  - `rejected-degenerate`: a review round with no parseable `Readiness:
  *    N/10` line — a failed attempt wearing a review's clothes, not a
  *    review (see `TaskProgress.reviewRejections`).
+ *  - `continuation-report-produced` (bugs5 Step 13): a recovery continuation
+ *    wrote the report it was dispatched to produce. Changing no files is its
+ *    mandate, so it is a success that clears the owed state, never a
+ *    provider failure.
  */
 export type RoundOutcomeClassificationV1 =
   | "edits-produced"
   | "genuine-no-op"
   | "provider-failure-empty"
   | "cancelled"
-  | "rejected-degenerate";
+  | "rejected-degenerate"
+  | "continuation-report-produced";
 
 /** One row of `TaskProgress.roundOutcomes`. */
 export interface RoundOutcomeEntryV1 {

@@ -5,6 +5,7 @@ import {
   createWorkflowDecisionV1,
   normalizeWorkflowDecisionV1,
   WorkflowDecisionCompletionReasonV1,
+  WorkflowDecisionDeferredAnswerV1,
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
 } from "../types/workflowDecisionV1";
@@ -14,6 +15,13 @@ import {
   liveOperationBlockingOptionV1,
   refreshFastForwardResumeOptionLabelsV1,
 } from "../commands/fastForwardResumeSuffixV1";
+import {
+  buildHeldTicksAnswerOptionsV1,
+  carryDeferredAnswerOverV1,
+  computeDeferredAnswerCarryOverV1,
+  offeredTickItemsOfV1,
+  type DeferredAnswerCarryOverV1,
+} from "../commands/verifiedTicksHeldOptionsV1";
 import { describeLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
 import {
   endedLiveReferenceRefusalV1,
@@ -168,6 +176,12 @@ export type PostWorkflowDecisionResultV1 =
        * chat anchor and notification it only needs the first time.
        */
       readonly updatedInPlace?: true;
+      /**
+       * bugs5 Step 3: set when the card that was replaced held a kept answer ("Apply when Fast
+       * Forward next pauses"): which of its items carried over to the replacement, which dropped out
+       * and which are new. The caller says so in the chat.
+       */
+      readonly deferredCarryOver?: DeferredAnswerCarryOverV1;
     }
   | { readonly ok: false; readonly reason: string };
 
@@ -322,9 +336,21 @@ export class WorkflowDecisionStoreV1 {
     });
     if (matchIndices.length > 0) {
       const keepIndex = matchIndices[0]!;
+      // bugs5 Step 3: a kept answer on the card being replaced carries over to the items the
+      // replacement shares with it (same item text); the rest wait for the owner.
+      const keptAnswer = existing[keepIndex]!.deferredAnswer;
+      const carryOver =
+        keptAnswer !== undefined && keptAnswer.kind === "applyAndDispatch"
+          ? computeDeferredAnswerCarryOverV1(keptAnswer.itemKeys, offeredTickItemsOfV1(created.decision))
+          : undefined;
+      const carriedAnswer =
+        keptAnswer !== undefined && carryOver !== undefined
+          ? carryDeferredAnswerOverV1(keptAnswer, carryOver)
+          : undefined;
       const updated: WorkflowDecisionV1 = {
         ...created.decision,
         decisionId: existing[keepIndex]!.decisionId,
+        ...(carriedAnswer !== undefined ? { deferredAnswer: carriedAnswer } : {}),
       };
       const next = [...existing];
       next[keepIndex] = updated;
@@ -337,7 +363,12 @@ export class WorkflowDecisionStoreV1 {
         };
       }
       await this.saveAll(next);
-      return { ok: true, decision: updated, updatedInPlace: true };
+      return {
+        ok: true,
+        decision: updated,
+        updatedInPlace: true,
+        ...(carryOver !== undefined ? { deferredCarryOver: carryOver } : {}),
+      };
     }
     if (input.suppressWhileAnswered !== undefined && created.decision.identity !== undefined) {
       const lastSettled = [...existing]
@@ -377,6 +408,24 @@ export class WorkflowDecisionStoreV1 {
         !isWorkflowDecisionOrphanedV1(decision.decisionId) &&
         (needle === undefined || normalizePath(decision.taskCanonicalId) === needle)
     );
+  }
+
+  /** The most recently answered decision of this key for the task whose answer was `optionId`, if any. */
+  findLatestResolvedForOption(
+    taskCanonicalId: string,
+    decisionKey: string,
+    optionId: string
+  ): WorkflowDecisionV1 | undefined {
+    const needle = normalizePath(taskCanonicalId);
+    return this.all()
+      .filter(
+        (decision) =>
+          decision.decisionKey === decisionKey &&
+          decision.state === "resolved" &&
+          decision.resolvedOptionId === optionId &&
+          normalizePath(decision.taskCanonicalId) === needle
+      )
+      .sort((a, b) => (b.resolvedAt ?? "").localeCompare(a.resolvedAt ?? ""))[0];
   }
 
   get(decisionId: string): WorkflowDecisionV1 | undefined {
@@ -432,7 +481,11 @@ export class WorkflowDecisionStoreV1 {
     // The explicit Run Implementation option exists only in the ended-run view
     // (bugs3 Step 19), so look the option up there.
     const answerable = optionId === RUN_IMPLEMENTATION_OPTION_ID_V1 ? viewEndedLiveReferenceV1(decision) : decision;
-    const option = answerable.options.find((candidate) => candidate.optionId === optionId);
+    // bugs5 Steps 2-3: the held-answer options of a reviewer-verified-ticks card are built, not
+    // stored, so a click that lands just after the operation ended still finds its option.
+    const option =
+      answerable.options.find((candidate) => candidate.optionId === optionId) ??
+      buildHeldTicksAnswerOptionsV1(answerable).find((candidate) => candidate.optionId === optionId);
     if (!option) {
       return { kind: "rejected", reason: `decision "${decisionId}" has no option "${optionId}"` };
     }
@@ -483,11 +536,59 @@ export class WorkflowDecisionStoreV1 {
     if (!decision || decision.state !== "resolved" || decision.resolvedOptionId !== optionId) {
       return false;
     }
-    const { resolvedOptionId: _optionId, resolvedAt: _resolvedAt, ...rest } = decision;
+    // A kept answer that could not be carried out is not kept: the card is back for a fresh choice.
+    const { resolvedOptionId: _optionId, resolvedAt: _resolvedAt, deferredAnswer: _kept, ...rest } = decision;
     const next = [...existing];
     next[index] = { ...rest, state: "pending" };
     await this.saveAll(next);
     return true;
+  }
+
+  /**
+   * bugs5 Steps 2-3: keep an answer given while an operation runs, on the decision record, so it
+   * survives a reload and a replacement card. Returns false when the decision is gone.
+   */
+  async recordDeferredAnswer(decisionId: string, answer: WorkflowDecisionDeferredAnswerV1): Promise<boolean> {
+    return serializeDecisionWriteV1(this.state, async () => {
+      const existing = this.all();
+      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
+      if (index === -1) {
+        return false;
+      }
+      const next = [...existing];
+      next[index] = { ...existing[index]!, deferredAnswer: answer };
+      await this.saveAll(next);
+      return true;
+    });
+  }
+
+  /** Drops a kept answer (carried out, replaced away, or the owner chose again). */
+  async clearDeferredAnswer(decisionId: string, markCarriedOut = false): Promise<void> {
+    await serializeDecisionWriteV1(this.state, async () => {
+      const existing = this.all();
+      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
+      const current = index === -1 ? undefined : existing[index]!;
+      if (!current?.deferredAnswer) {
+        return;
+      }
+      const next = [...existing];
+      const { deferredAnswer: kept, ...rest } = current;
+      next[index] = markCarriedOut
+        ? { ...rest, deferredAnswer: { ...kept, carriedOutAt: new Date().toISOString() } }
+        : rest;
+      await this.saveAll(next);
+    });
+  }
+
+  /** Decisions holding a kept answer that has not been carried out yet, optionally for one task. */
+  listWithPendingDeferredAnswer(taskCanonicalId?: string): readonly WorkflowDecisionV1[] {
+    const needle = taskCanonicalId !== undefined ? normalizePath(taskCanonicalId) : undefined;
+    return this.all().filter(
+      (decision) =>
+        decision.deferredAnswer !== undefined &&
+        decision.deferredAnswer.carriedOutAt === undefined &&
+        (needle === undefined || normalizePath(decision.taskCanonicalId) === needle)
+    );
   }
 
   /** Dismiss a pending decision without selecting an option. */

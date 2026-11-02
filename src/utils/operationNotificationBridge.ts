@@ -6,6 +6,9 @@ import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { notificationTaskDisplayNameV1 } from "./notificationTaskContextV1";
 import { describeModelWithProviderV1 } from "../runners/providers";
 import { offerActionInChatV1 } from "./chatActionOfferV1";
+import { appendChatMessageV1 } from "./chatHistoryStore";
+import { planInterruptedRecoveryV1 } from "./interruptedRecoveryPlanV1";
+import { readInterruptedRecoveryStateV1 } from "./interruptedRecoveryStateV1";
 
 /**
  * The centralized operation → Notifications-section terminal-entry policy
@@ -107,28 +110,53 @@ export async function offerInterruptedOperationRecoveryV1(
     return;
   }
   const reason = `${snapshot.label} was interrupted when the runner stopped reporting; its outcome is unknown.`;
-  const isPublishChecks = snapshot.label === "Run Publish Checks";
+  // bugs5 Step 12: restart what was interrupted, by name; at Publish list the stage's real actions and
+  // recommend one from what the checks have proved about the tree as it is now.
+  const state = await readInterruptedRecoveryStateV1(snapshot.key).catch(() => undefined);
+  const plan = planInterruptedRecoveryV1({
+    label: snapshot.label,
+    ...(snapshot.kind !== undefined ? { kind: snapshot.kind } : {}),
+    atPublish: (snapshot.stage ?? state?.stage) === "publish",
+    ...(state !== undefined ? { checksState: state.checksState } : {}),
+    ...(state?.lastRunCommands !== undefined ? { lastRunCommands: state.lastRunCommands } : {}),
+    ...(state?.lastRunMinutes !== undefined ? { lastRunMinutes: state.lastRunMinutes } : {}),
+  });
+  const args = [{ taskFolderPath: snapshot.key }];
+  if (plan.primary === undefined) {
+    // The interrupted operation cannot be named, so no action is guessed: say what happened in the chat.
+    await appendChatMessageV1(
+      snapshot.key,
+      { role: "assistant", text: `${reason} ${plan.reasoning}`, stage: snapshot.stage ?? state?.stage ?? "desc", at: new Date().toISOString() },
+      snapshot.key
+    ).catch((error) => console.warn("[operationNotificationBridge] Could not post the interruption notice", error));
+    return;
+  }
   await offerActionInChatV1({
     taskFolderPath: snapshot.key,
     taskLabel: snapshot.taskName,
-    actionLabel: isPublishChecks ? "Run Publish Checks" : "Run Current Stage Action",
-    command: isPublishChecks
-      ? "vs-code-ai-helper.runPublishChecks"
-      : "vs-code-ai-helper.applyCurrentStageAction",
-    args: [{ taskFolderPath: snapshot.key }],
-    ...(snapshot.resultTargetUri
-      ? {
-          alternatives: [{
+    actionLabel: plan.primary.label,
+    command: plan.primary.command,
+    args,
+    actionConsequence: plan.primary.consequence,
+    alternatives: [
+      ...plan.alternatives.map((action) => ({
+        label: action.label,
+        command: action.command,
+        args,
+        consequence: action.consequence,
+      })),
+      ...(snapshot.resultTargetUri
+        ? [{
             label: "View Run Log",
             command: "vscode.open",
             args: [vscode.Uri.parse(snapshot.resultTargetUri)],
-            consequence: "Opens the run evidence before deciding whether to rerun the stage action.",
-            resumeKind: "unpause",
-          }],
-        }
-      : {}),
-    noticeText: `${reason} The recommended action rechecks the task's current state and runs its current stage action.`,
-    optional: true,
+            consequence: "Opens the run evidence before deciding what to run next.",
+            resumeKind: "unpause" as const,
+          }]
+        : []),
+    ],
+    noticeText: reason,
+    recommend: { target: "action", reasoning: plan.reasoning },
   });
 }
 

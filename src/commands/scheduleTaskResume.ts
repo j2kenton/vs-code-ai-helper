@@ -31,6 +31,7 @@ import {
 } from "../utils/automationChain";
 import {
   IMPL_CONTINUATION_CHAIN_ID_V1,
+  isAutomaticRearmLimitReachedV1,
   owedContinuationSourceV1,
   parseRecoveryClaimOwnerV1,
   releaseImplRecoveryClaimV1,
@@ -590,6 +591,73 @@ export function buildOwedContinuationDecisionV1(
       holdsTaskPaused: false,
       unblocksProgress: false,
       detail: `The task is not waiting on this answer: ${nextAttempt} whichever option you pick. "Run now" only brings it forward.`,
+    },
+  };
+}
+
+export const OWED_CONTINUATION_REARM_LIMIT_DECISION_KEY_V1 = "owedContinuationRearmLimit";
+
+/**
+ * bugs5 Step 13: the card raised when an owed continuation has been retried automatically as often
+ * as the sweep allows. Nothing here is automatic any more; each button is the owner's choice.
+ */
+export function buildOwedContinuationRearmLimitDecisionV1(
+  target: ChatTarget,
+  options?: { failedProvider?: string; failedModel?: string }
+): PostWorkflowDecisionInputV1 {
+  const displayName = notificationTaskDisplayNameV1(target.taskName, target.taskFolderPath);
+  const attempt = options?.failedProvider
+    ? ` The last attempt ran on ${options.failedProvider}${options.failedModel ? ` (${options.failedModel})` : ""}.`
+    : "";
+  return {
+    decisionKey: OWED_CONTINUATION_REARM_LIMIT_DECISION_KEY_V1,
+    taskCanonicalId: target.canonicalId,
+    stage: target.stage,
+    whatHappened:
+      `The report that Implementation owes for "${displayName}" is still missing after two automatic attempts.${attempt} ` +
+      "Ensemble has stopped retrying on its own so it doesn't loop.",
+    whyUserNeeded: "Only you can decide whether another attempt is worth the cost, or whether to give up on the missing report.",
+    options: [
+      {
+        optionId: "retry",
+        resumeKind: "continue",
+        label: "Retry",
+        consequence: "Starts the owed continuation again now. The automatic retry limit starts over.",
+        effect: {
+          kind: "command",
+          command: "vs-code-ai-helper.runOwedContinuationNow",
+          args: [{ taskFolderPath: target.taskFolderPath, canonicalId: target.canonicalId }],
+        },
+      },
+      {
+        optionId: "leaveOwed",
+        resumeKind: "unpause",
+        label: "Leave it owed",
+        consequence: "Does nothing. The report stays owed and nothing runs until you choose Run Implementation.",
+        effect: { kind: "doNothing" },
+      },
+      {
+        optionId: "discard",
+        resumeKind: "continue",
+        label: "Discard the owed report",
+        consequence:
+          "Stops waiting for the missing report and moves its files into normal review scope. You are asked to confirm first.",
+        effect: {
+          kind: "command",
+          command: "vs-code-ai-helper.discardOwedImplRecoveryV1",
+          args: [target.taskFolderPath],
+        },
+      },
+    ],
+    recommendation: {
+      kind: "option",
+      optionId: "leaveOwed",
+      reasoning: "Two attempts produced no usable report; look at the last run before spending a third.",
+    },
+    gating: {
+      holdsTaskPaused: false,
+      unblocksProgress: true,
+      detail: "the owed implementation report",
     },
   };
 }
@@ -1778,6 +1846,15 @@ export class TaskActionScheduler implements vscode.Disposable {
         task.progress.status === "active" ||
         (task.progress.status === "paused" && !(await isEffectivelyPausedV1(task.taskFolderPath, task.progress)));
       if (!effectivelyActive) continue;
+      // bugs5 Step 14: the owner's own cancel or pause overrides the automatic retry. A hold is cleared
+      // only by a deliberate start (Run Implementation, Run now); crashes and reloads never set it.
+      if (recovery.ownerHold !== undefined) continue;
+      // bugs5 Step 13: a continuation that already ran and finished without clearing the owed state
+      // is re-armed once on its own. After that the owner decides, so the sweep cannot loop.
+      if (recovery.dispatch === "pending" && isAutomaticRearmLimitReachedV1(recovery)) {
+        await this.announceOwedContinuationRearmLimitV1(task);
+        continue;
+      }
       if (recovery.dispatch === "dispatched") {
         // The wait a Run-now card announced is over: the round started.
         if (this.owedRetryAnnounced.has(task.taskFolderPath)) {
@@ -2025,6 +2102,10 @@ export class TaskActionScheduler implements vscode.Disposable {
       wroteClaim = false;
       const record = progress.implRecovery;
       if (!record || record.dispatch !== "pending") return progress;
+      // bugs5 Step 14: re-checked inside the CAS; a cancel or pause in between lands an owner hold.
+      if (record.ownerHold !== undefined) return progress;
+      // bugs5 Step 13: re-checked inside the CAS; a deliberate Run now resets the count first.
+      if (isAutomaticRearmLimitReachedV1(record)) return progress;
       const live =
         record.leaseUntil !== undefined &&
         new Date(record.leaseUntil).getTime() > this.clock.now();
@@ -2106,6 +2187,40 @@ export class TaskActionScheduler implements vscode.Disposable {
 
   /** Owed-continuation re-arms already announced (task + the wait they announced). */
   private readonly owedRetryAnnounced = new Map<string, string>();
+
+  /** Tasks whose re-arm-limit card this window has posted (task -> the record `at` it was posted for). */
+  private readonly rearmLimitAnnounced = new Map<string, string>();
+
+  /**
+   * bugs5 Step 13: the continuation ran twice and still has not produced a usable report. Ask the
+   * owner once per owed record instead of letting the sweep loop: Retry, Leave it owed, or Discard.
+   */
+  private async announceOwedContinuationRearmLimitV1(task: {
+    taskFolderPath: string;
+    canonicalId?: string;
+    progress: TaskProgress;
+  }): Promise<void> {
+    const recordAt = task.progress.implRecovery?.at ?? "";
+    if (this.rearmLimitAnnounced.get(task.taskFolderPath) === recordAt) return;
+    this.rearmLimitAnnounced.set(task.taskFolderPath, recordAt);
+    const target: ChatTarget = {
+      canonicalId: task.canonicalId ?? task.taskFolderPath,
+      taskFolderPath: task.taskFolderPath,
+      stage: task.progress.currentStage,
+      taskName: task.progress.displayName,
+    };
+    try {
+      await postWorkflowDecisionV1(
+        buildOwedContinuationRearmLimitDecisionV1(target, {
+          failedProvider: task.progress.implRecovery?.failedProvider,
+          failedModel: task.progress.implRecovery?.failedModel,
+        }),
+        target
+      );
+    } catch (error) {
+      console.error("announceOwedContinuationRearmLimitV1: could not post the card", error);
+    }
+  }
 
   /**
    * v1 fixes 2, item 22: post the Run-now card for an owed continuation the
@@ -2254,9 +2369,28 @@ export class TaskActionScheduler implements vscode.Disposable {
         return { ...progress, implRecovery: { ...record, leaseOwner: undefined, leaseUntil: undefined } };
       });
     }
-    await this.store.patch(vscode.Uri.file(taskFolderPath), (progress) =>
-      clearStageFallbackReservation(progress, "impl")
-    );
+    // bugs5 Step 13: choosing Run now is the owner's deliberate retry, so the automatic-re-arm count
+    // starts again and the limit card (if any) is withdrawn.
+    this.rearmLimitAnnounced.delete(taskFolderPath);
+    await withdrawWorkflowDecisionsByKeyV1(
+      { taskFolderPath, canonicalId: taskFolderPath },
+      OWED_CONTINUATION_REARM_LIMIT_DECISION_KEY_V1,
+      "the owner chose to retry the owed continuation"
+    ).catch(() => undefined);
+    await this.store.patch(vscode.Uri.file(taskFolderPath), (progress) => {
+      const reserved = clearStageFallbackReservation(progress, "impl");
+      const record = reserved.implRecovery;
+      if (!record) return reserved;
+      if (record.automaticRearms === undefined && record.ownerHold === undefined) return reserved;
+      return {
+        ...reserved,
+        implRecovery: {
+          ...record,
+          automaticRearms: undefined,
+          ownerHold: undefined,
+        },
+      };
+    });
     const result = await this.claimAndDispatchOwedContinuationLockedV1(taskFolderPath);
     if (result.kind === "dispatched") {
       return { kind: "started" };

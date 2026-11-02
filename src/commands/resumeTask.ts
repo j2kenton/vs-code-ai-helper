@@ -32,12 +32,22 @@ import { readChatInteractions } from "../utils/chatHistoryStore";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
-import { CancelRunningOperationsResultV1, runTrackedOperation } from "../utils/taskOperations";
+import { CancelRunningOperationsResultV1, runTrackedOperation, taskKey } from "../utils/taskOperations";
+import { clearApplyReviewFocusV1, setApplyReviewFocusV1 } from "../utils/applyReviewFocusV1";
+import { clearPendingEndedLineNoteV1, setPendingEndedLineNoteV1 } from "../utils/operationEndedLineV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { loadResumeActionPlanV1, preflightFixedDispatchV1 } from "../utils/resumeActionPlanV1";
-import { FastForwardResumeStateV1, isFastForwardResumeStateTrustedV1 } from "./fastForwardResumeSuffixV1";
+import {
+  FastForwardResumeStateV1,
+  buildFastForwardResumeDispatchV1,
+  decideDurableFastForwardResumeV1,
+  describeKeepIteratingStandInEndedNoteV1,
+  isFastForwardResumeStateTrustedV1,
+} from "./fastForwardResumeSuffixV1";
+import { getFastForwardSessionIdV1 } from "../utils/activeFastForwardRunsV1";
+import { getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -1185,6 +1195,11 @@ export async function resumeAndApplyCurrentStageActionV1(
      * dispatch, not the single-cycle plan below.
      */
     resumeFastForwardV1?: FastForwardResumeStateV1;
+    /**
+     * bugs5 Step 24: set ONLY by the escalation card's "Let the AI gather it" option. The Apply Review this
+     * dispatches works on this one blocker (its text) instead of on every task-fixable blocker.
+     */
+    focusBlocker?: string;
   }
 ): Promise<void> {
   const resolverArg = normalizeResumeTaskArg(explicitArg);
@@ -1205,9 +1220,31 @@ export async function resumeAndApplyCurrentStageActionV1(
   // fall through to the single-cycle dispatch below instead of starting an
   // unrequested Fast Forward run.
   const resumeFastForwardCandidate = explicitArg?.resumeFastForwardV1;
-  const resumeFastForwardTrusted =
+  let resumeFastForwardTrusted =
     resumeFastForwardCandidate !== undefined &&
     isFastForwardResumeStateTrustedV1(resumeFastForwardCandidate, target.taskFolderPath);
+  // bugs5 Step 19: the in-memory record is gone after a window or extension-host restart. Trust the card's
+  // captured run details when the task's own records show the run ended by pausing for this card and nothing
+  // has started since, instead of quietly running one cycle.
+  let untrustedReason = "the run has since ended, a different run started, or the window restarted";
+  if (resumeFastForwardCandidate !== undefined && !resumeFastForwardTrusted) {
+    const freshForFf = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath));
+    const ffProgress = freshForFf.ok ? freshForFf.decoded.progress : target.progress;
+    // A read of the stage, bound to a local so the one-door stage-write scan does not take it for a write.
+    const { currentStage } = ffProgress;
+    const decision = decideDurableFastForwardResumeV1(resumeFastForwardCandidate, {
+      currentSessionId: getFastForwardSessionIdV1(),
+      status: ffProgress.status,
+      currentStage,
+      hasLiveOperation: getLiveTaskOperationV1(target.taskFolderPath) !== undefined,
+      latestRoundStartedAtMs: latestRoundStartedAtMsV1(ffProgress.roundLedger),
+    });
+    if (decision.trusted) {
+      resumeFastForwardTrusted = true;
+    } else {
+      untrustedReason = decision.reason;
+    }
+  }
   const resumeFastForward = resumeFastForwardTrusted ? resumeFastForwardCandidate : undefined;
   if (resumeFastForwardCandidate !== undefined && !resumeFastForwardTrusted) {
     // Review-flagged completion fix, round 2 (2026-09-30): the option's own
@@ -1217,9 +1254,8 @@ export async function resumeAndApplyCurrentStageActionV1(
     // Forward resumed when it silently fell back to one cycle. This is the
     // only point where the truth is available, so it is said here instead.
     NotificationRouter.showInformation(
-      `"${target.progress.displayName ?? target.folderName}": this card's captured Fast Forward run is no longer valid ` +
-        "(the run has since ended, a different run started, or the window restarted) — ran one cycle instead of " +
-        "resuming Fast Forward."
+      `"${target.progress.displayName ?? target.folderName}": Fast Forward was not resumed (${untrustedReason}) — ` +
+        "running one cycle instead."
     );
   }
   if (resumeFastForward) {
@@ -1230,11 +1266,8 @@ export async function resumeAndApplyCurrentStageActionV1(
       explicitArg,
       target.taskFolderPath,
       async (admissionHandoffToken) => {
-        await vscode.commands.executeCommand("vs-code-ai-helper.fastForwardReviewWithAI", {
-          taskFolderPath: target.taskFolderPath,
-          admissionHandoffTokenV1: admissionHandoffToken,
-          resumeFromAttemptV1: resumeFastForward,
-        });
+        const dispatch = buildFastForwardResumeDispatchV1(target.taskFolderPath, resumeFastForward, admissionHandoffToken);
+        await vscode.commands.executeCommand(dispatch.command, dispatch.arg);
         return true;
       }
     );
@@ -1289,35 +1322,76 @@ export async function resumeAndApplyCurrentStageActionV1(
     }
     return;
   }
-  const dispatched = await resumeThenDispatchV1(
-    inventory,
-    currentTaskStore,
-    explicitArg,
-    target.taskFolderPath,
-    async (admissionHandoffToken) => {
-      const result = await vscode.commands.executeCommand(
-        plan.kind === "run-review"
-          ? "vs-code-ai-helper.runReviewWithAI"
-          : "vs-code-ai-helper.applyCurrentStageAction",
-        {
-          taskFolderPath: target.taskFolderPath,
-          admissionHandoffTokenV1: admissionHandoffToken,
-        }
-      );
-      // `runReviewWithAI` resolves `true` only when a review round started
-      // (a refusal on any guard clause, including "no model configured",
-      // resolves `false` or nothing); normalise so resumeThenDispatchV1 clears
-      // its `nextActor: automation` stamp on a refusal.
-      return plan.kind === "run-review" ? result === true : result;
-    }
-  );
+  // bugs5 Step 19: the one-cycle stand-in's own Ended line says why Fast Forward did not continue.
+  const standInTaskKey = taskKey(target.taskFolderPath);
+  if (resumeFastForwardCandidate !== undefined) {
+    setPendingEndedLineNoteV1(standInTaskKey, describeKeepIteratingStandInEndedNoteV1(untrustedReason));
+  }
+  let dispatched: unknown;
+  if (explicitArg?.focusBlocker && plan.kind !== "run-review") {
+    setApplyReviewFocusV1(target.taskFolderPath, explicitArg.focusBlocker);
+  }
+  try {
+    dispatched = await resumeThenDispatchV1(
+      inventory,
+      currentTaskStore,
+      explicitArg,
+      target.taskFolderPath,
+      async (admissionHandoffToken) => {
+        const result = await vscode.commands.executeCommand(
+          plan.kind === "run-review"
+            ? "vs-code-ai-helper.runReviewWithAI"
+            : "vs-code-ai-helper.applyCurrentStageAction",
+          {
+            taskFolderPath: target.taskFolderPath,
+            admissionHandoffTokenV1: admissionHandoffToken,
+          }
+        );
+        // `runReviewWithAI` resolves `true` only when a review round started
+        // (a refusal on any guard clause, including "no model configured",
+        // resolves `false` or nothing); normalise so resumeThenDispatchV1 clears
+        // its `nextActor: automation` stamp on a refusal.
+        return plan.kind === "run-review" ? result === true : result;
+      }
+    );
+  } finally {
+    clearPendingEndedLineNoteV1(standInTaskKey);
+    clearApplyReviewFocusV1(target.taskFolderPath);
+  }
   // A composed action that did not start its second step must not read as
   // success: both commands report refusal as `false`.
   if (dispatched === false) {
     NotificationRouter.showWarning(
       `"${plan.label}" resumed "${taskName}" but the action was refused, so nothing is running — see the message above for the cause.`
     );
+    return;
   }
+  // bugs5 Step 19: a one-cycle run that stands in for a Keep iterating answer never ends as a bare "succeeded".
+  // Say why Fast Forward did not continue and what to choose next.
+  if (resumeFastForwardCandidate !== undefined) {
+    await offerActionInChatV1({
+      taskFolderPath: target.taskFolderPath,
+      taskLabel: taskName,
+      actionLabel: "Fast Forward Review",
+      command: "vs-code-ai-helper.fastForwardReviewWithAI",
+      args: [{ taskFolderPath: target.taskFolderPath }],
+      noticeText:
+        `"${taskName}": one cycle finished (Apply Review, then a review) and Fast Forward did not continue — ` +
+        `${untrustedReason}. Choose Fast Forward Review to keep iterating.`,
+      optional: true,
+    });
+  }
+}
+
+function latestRoundStartedAtMsV1(ledger: readonly { readonly startedAt: string }[] | undefined): number | undefined {
+  let latest: number | undefined;
+  for (const row of ledger ?? []) {
+    const ms = Date.parse(row.startedAt);
+    if (Number.isFinite(ms) && (latest === undefined || ms > latest)) {
+      latest = ms;
+    }
+  }
+  return latest;
 }
 
 /**

@@ -42,6 +42,10 @@ import { ImplRecoveryV1, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 } from "../types/
  * function's busiest caller (`taskOperations.ts`'s `showTaskBusyWarning`)
  * lives in, and a value import back from either would form a module cycle.
  */
+/** bugs5 Step 14: posted when the owner cancels a continuation, so they know the cancel holds. */
+export const OWNER_CANCEL_HOLD_CHAT_TEXT_V1 =
+  "Cancelled. The missing report is still owed — choose Run Implementation to retry.";
+
 export function describeOwedContinuationRefusalV1(
   record: ImplRecoveryV1,
   pendingFiles: readonly string[],
@@ -54,10 +58,14 @@ export function describeOwedContinuationRefusalV1(
     record.leaseUntil !== undefined
       ? ` Its lease is held until ${formatWallClockV1(record.leaseUntil)}.`
       : "";
-  const retryClause = dispatched
+  const retryClause = record.ownerHold !== undefined
+    ? ` You ${record.ownerHold.cause === "paused" ? "paused the task" : "cancelled it"}, so it is held and ` +
+      "will not restart by itself. Choose Run Implementation when you want it to run."
+    : dispatched
     ? " A round already claimed this continuation and has not finished — retrying this action will not " +
-      "help; it refuses before any provider is invoked. A dispatched continuation is never re-fired " +
-      "automatically, even once its lease expires."
+      "help; it refuses before any provider is invoked. If the window running it has died or its claim " +
+      "goes stale, the recovery sweep reclaims and re-arms it automatically; a continuation you cancel is " +
+      "held until you run it yourself."
     : budgetExhausted
       ? " The continuation budget is exhausted, so automated recovery has stopped — retrying this action " +
         "will not help either; the task needs a human decision."
@@ -70,13 +78,16 @@ export function describeOwedContinuationRefusalV1(
         ? " The changed files behind it could not be enumerated (recorded as unknown), so whether anything " +
           "is quarantined cannot be confirmed from this message alone."
         : "";
-  const remedyClause = dispatched
+  const remedyClause = record.ownerHold !== undefined
+    ? ""
+    : dispatched
     ? record.leaseUntil !== undefined
-      ? " Its lease expiring does not restart it — that only marks the round as stale. If it is stale " +
-        "(the window that started it likely died), reload the window to release the dead owner and rerun " +
-        "the implementation manually; otherwise wait for the round already running to finish on its own."
+      ? " Its lease expiring does not restart it by itself — that only marks the round as stale, and the " +
+        "recovery sweep then reclaims it. If it is stale (the window that started it likely died), reload " +
+        "the window to release the dead owner and rerun the implementation manually; otherwise wait for " +
+        "the round already running to finish on its own."
       : " Reload the window to release a dead owner and rerun the implementation manually if this " +
-        "persists — it will not restart by itself."
+        "persists."
     : budgetExhausted
       ? // v1 fixes 2, item 15: "rerun the implementation manually" is refused
         // by this very record — a pending, cap-reached continuation blocks

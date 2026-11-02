@@ -400,6 +400,10 @@ function installHarness(
     if (input.decisionKey === "commitPushFinalScopeConfirmation") {
       return Promise.resolve("commitAndPush");
     }
+    // bugs5 Step 10: the run-the-checks-now card is answered "run" so the checks proceed as before.
+    if (input.decisionKey === "commitPushRunChecksNow") {
+      return Promise.resolve("runChecksNow");
+    }
     return Promise.resolve(undefined);
   };
   vscode.window.showWarningMessage =
@@ -479,7 +483,8 @@ void describe("commit-message review (in-UI modal, no editor session)", () => {
       assert.match(call.message, /Files \(\d+ total\):/);
       assert.match(call.message, /foo\.ts/, "the file preview lists changed files");
       assert.match(call.message, /Destination: /);
-      assert.deepEqual(call.items, ["Commit & Push", "Regenerate", "Cancel"]);
+      // bugs5 Step 9: the non-committing choice is "Not now", never "Cancel".
+      assert.deepEqual(call.items, ["Commit & Push", "Regenerate", "Not now"]);
 
       assert.equal(
         git(harness.repoRoot, ["rev-list", "--count", "HEAD"]).trim(),

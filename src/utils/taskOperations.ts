@@ -52,6 +52,14 @@ function describeRoundGitDeltaV1(record: import("./roundGitStateV1").RoundGitObs
 }
 
 /**
+ * bugs5 Step 20: whether a Git-state line is worth posting again. A line identical to the last one posted for the
+ * same operation is a repeat (the same changed paths re-observed every few seconds); anything else is new.
+ */
+export function shouldPostGitStateDetailV1(last: string | undefined, next: string): boolean {
+  return last !== next;
+}
+
+/**
  * Lifecycle states of a tracked operation (contract C1):
  * `running → succeeded | failed | cancelled`. Live operations only ever exist
  * in `running`; the terminal state is recorded at `end()` and delivered via
@@ -1477,13 +1485,20 @@ export async function runTrackedOperation<T>(
   return runWithNotificationTaskContextV1(spec.taskName, taskPath, () => runWithRoundProcessTaskFolderV1(taskPath, async () => {
     try {
       const invoke = (): Promise<T> => fn(handle);
+      // bugs5 Step 20: the Git-state line is posted once per distinct text. A repeat of the last line is
+      // not posted or toasted again; a changed line replaces the previous detail.
+      let lastGitStateDetailV1: string | undefined;
       const result = spec.kind && ROUND_GIT_OBSERVED_KINDS_V1.has(spec.kind)
         ? (await withRoundGitStateObservationV1(
             { taskFolderPath: taskPath, roundId: handle.id, operationId: handle.id },
             invoke,
             (record) => {
               const detail = describeRoundGitDeltaV1(record);
+              if (detail && !shouldPostGitStateDetailV1(lastGitStateDetailV1, detail)) {
+                return;
+              }
               if (detail) {
+                lastGitStateDetailV1 = detail;
                 handle.reportRootDetail?.(detail);
                 NotificationRouter.showWarning(
                   `${formatTaskNameForDisplay(notificationTaskDisplayNameV1(spec.taskName, taskPath))} — ${detail} Changes are observed, but another actor may have made them. Review and resolve Git state before starting another round.`

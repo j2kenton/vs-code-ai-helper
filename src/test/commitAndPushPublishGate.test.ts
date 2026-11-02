@@ -224,6 +224,10 @@ function installGateHarness(
             : undefined
       );
     }
+    // bugs5 Step 10: the run-the-checks-now card is answered "run" so the checks proceed as before.
+    if (input.decisionKey === "commitPushRunChecksNow") {
+      return Promise.resolve("runChecksNow");
+    }
     // Every other confirmation (the staging scope gate) is dismissed,
     // cancelling cleanly before any git mutation — same as the old modal
     // stub.
@@ -260,8 +264,9 @@ void describe("commitAndPushTask failing-checks gate (Publish Anyway / Fix with 
       assert.ok(checksModal, "the failing-checks decision modal must be shown");
       assert.deepEqual(
         checksModal.items,
-        ["Publish Anyway", "Fix with AI", "Cancel"],
-        "the chat decision must offer Publish Anyway, Fix with AI, and an explicit Cancel"
+        // bugs5 Step 9: the non-committing choice is "Not now", never "Cancel".
+        ["Publish Anyway", "Fix with AI", "Not now"],
+        "the chat decision must offer Publish Anyway, Fix with AI, and an explicit Not now"
       );
 
       const reviewPath = path.join(harness.taskFolderPath, "publish-review.md");

@@ -44,6 +44,8 @@ import {
   resolveQuotaAccountKeyV1,
 } from "../config/settings";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { formatProviderErrorV1 } from "../utils/providerErrorFormatterV1";
+import { fingerprintStageChainV1 } from "../utils/rememberedFallbackV1";
 import { candidateHasRecentZeroFileFailuresV1 } from "../utils/fallbackProviderBreakerV1";
 import {
   describeStageSubstitutesV1,
@@ -103,6 +105,8 @@ export interface CandidateInvocationInfoV1 {
   readonly operationId?: string;
   readonly attemptId: string;
   readonly backup: boolean;
+  /** bugs5 Step 26: when `backup`, why the candidate before it did not serve the round (best effort). */
+  readonly previousFailure?: string;
 }
 
 type EffectiveProvider =
@@ -380,9 +384,20 @@ export async function recordActiveFallbackModel(
      * has been identified. A different named model continues to win.
      */
     replaceActiveModelId?: string;
+    /**
+     * bugs5 Step 25: the model that failed and why, so the pin can be explained ("remembered after DevPass
+     * failed at 04:54 (HTTP 402)") and expire at the provider's reset time when one was given.
+     */
+    failure?: { modelId: string; reason?: string };
   } = {}
 ): Promise<boolean> {
   let recorded = false;
+  const chainFingerprint = fingerprintStageChainV1(resolveEffectiveStageChainV1(stage), isModelProviderEnabled);
+  const failedAt = new Date();
+  const failureReason = options.failure?.reason
+    ? formatProviderErrorV1(options.failure.reason, { maxChars: 160 })
+    : undefined;
+  const resetTime = options.failure?.reason ? parseQuotaResetV1(options.failure.reason, failedAt) : undefined;
   await patchTaskProgressStrictV1(taskFolderUri, (current) => {
     if (
       options.expectedReviewAttemptId !== undefined &&
@@ -402,6 +417,17 @@ export async function recordActiveFallbackModel(
       }
     }
     recorded = true;
+    // A write that names no failure keeps the cause already recorded for the SAME model (a later round that
+    // starts from the pin re-records it), and drops a cause that belonged to a different model.
+    const sameModelRepeat = options.failure === undefined && current.fallbackModelId?.[stage] === modelId;
+    const withoutStage = <T>(map: Partial<Record<TaskStage, T>> | undefined): Partial<Record<TaskStage, T>> => {
+      if (sameModelRepeat) {
+        return { ...map };
+      }
+      const { [stage]: _dropped, ...rest } = map ?? {};
+      return rest;
+    };
+    const failure = options.failure;
     return {
       ...current,
       fallbackActive: {
@@ -412,6 +438,19 @@ export async function recordActiveFallbackModel(
         ...current.fallbackModelId,
         [stage]: modelId,
       },
+      fallbackChainFingerprint: { ...current.fallbackChainFingerprint, [stage]: chainFingerprint },
+      fallbackFailedModelId: failure
+        ? { ...current.fallbackFailedModelId, [stage]: failure.modelId }
+        : withoutStage(current.fallbackFailedModelId),
+      fallbackFailureReason:
+        failure && failureReason
+          ? { ...current.fallbackFailureReason, [stage]: failureReason }
+          : withoutStage(current.fallbackFailureReason),
+      fallbackFailedAt: failure
+        ? { ...current.fallbackFailedAt, [stage]: failedAt.toISOString() }
+        : withoutStage(current.fallbackFailedAt),
+      fallbackResetTime:
+        failure && resetTime ? { ...current.fallbackResetTime, [stage]: resetTime } : withoutStage(current.fallbackResetTime),
     };
   });
   return recorded;
@@ -667,6 +706,8 @@ export function resolveRunnerForModel(
         (await checkRunnerAvailabilityForModel(modelId, stage)).availability,
       async run(request, token): Promise<AgentRunResult> {
         assertNoUnauthorizedV1CorrelationV0(request);
+        // Why the primary did not serve this run; the pin recorded on a backup's success names it.
+        let primaryFailureReason: string | undefined;
         const runBackups = async (): Promise<AgentRunResult> => {
           const releaseReservation = (): Promise<void> =>
             releaseUnresolvedFallbackReservation(
@@ -719,7 +760,12 @@ export function resolveRunnerForModel(
                 taskFolderUri ?? request.taskFolderUri,
                 stage,
                 backupModel,
-                { expectedReviewAttemptId }
+                {
+                  expectedReviewAttemptId,
+                  ...(modelId
+                    ? { failure: { modelId, ...(primaryFailureReason ? { reason: primaryFailureReason } : {}) } }
+                    : {}),
+                }
               );
               return fallbackResult;
             }
@@ -744,6 +790,7 @@ export function resolveRunnerForModel(
         if (!availability.available && !authenticationFailure) {
           const folder = taskFolderUri ?? request.taskFolderUri;
           if (folder && await reserveFallback(folder, stage, expectedReviewAttemptId)) {
+            primaryFailureReason = availability.reason;
             return runBackups();
           }
           return { runnerId: primary.id, status: "failed", failureKind: "temporarily-unavailable", errorMessage: availability.reason ?? "Model is temporarily unavailable." };
@@ -773,6 +820,7 @@ export function resolveRunnerForModel(
           return result;
         }
 
+        primaryFailureReason = result.errorMessage;
         return runBackups();
       },
     },
@@ -1461,7 +1509,10 @@ export async function runImplementationForModel(options: {
         await recordActiveFallbackModel(
           options.taskFolderUri,
           options.stage,
-          backupModel
+          backupModel,
+          options.modelId
+            ? { failure: { modelId: options.modelId, ...(result.errorMessage ? { reason: result.errorMessage } : {}) } }
+            : {}
         );
         const rescueNote = authFailure
           ? authFailureRescueNoteV1(primaryProviderLabel, result.errorMessage, labelForBackup(backupModel))

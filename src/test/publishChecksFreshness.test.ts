@@ -35,6 +35,7 @@ import {
   writePublishChecksFreshnessStampV1,
 } from "../utils/publishChecksFreshness";
 import { STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
+import { recordPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
 import { safeRemoveDir } from "./testFsUtils";
 
 const PUBLISH_REVIEW_FILENAME = STAGE_ARTIFACT_FILENAMES.publish!;
@@ -452,6 +453,34 @@ void describe("publishChecksFreshness — command identity (bugs3 Step 15)", () 
       assert.equal(required.eligible, false);
       assert.match(required.reason ?? "", /legacy record/);
       assert.equal((await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head)).eligible, true);
+    });
+
+    void it("bugs5 Step 10: reads the latest run record itself — a stopped run keeps the earlier pass, a failure or a live run does not", async () => {
+      const identity = computeCommandIdentityV1(commands)!;
+      const taskFolder = await stampWith("reuse-outcome-record", identity);
+      const lastCompleted = { outcome: "passed" as const, at: "2026-10-30T00:00:00.000Z" };
+      await recordPublishChecksOutcomeV1(taskFolder, {
+        outcome: "interrupted",
+        at: "2026-10-30T01:00:00.000Z",
+        finishedCommands: [{ command: "pnpm run lint", exitCode: 0 }],
+        unknownCommands: ["pnpm run test"],
+        lastCompleted,
+      });
+      assert.equal((await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head, undefined, identity)).eligible, true);
+
+      await recordPublishChecksOutcomeV1(taskFolder, { outcome: "cancelled", at: "2026-10-30T02:00:00.000Z", cause: "cancelled", lastCompleted });
+      assert.equal((await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head, undefined, identity)).eligible, true);
+
+      await recordPublishChecksOutcomeV1(taskFolder, {
+        outcome: "interrupted",
+        at: "2026-10-30T03:00:00.000Z",
+        finishedCommands: [{ command: "pnpm run lint", exitCode: 1 }],
+        unknownCommands: [],
+        lastCompleted,
+      });
+      const afterOwnFailure = await checkPublishChecksReuseEligibilityV1(taskFolder, repo, head, undefined, identity);
+      assert.equal(afterOwnFailure.eligible, false);
+      assert.match(afterOwnFailure.reason ?? "", /^Latest run record: .*already failed/);
     });
 
     void it("still refuses a changed tree even when the identity matches", async () => {

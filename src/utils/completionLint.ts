@@ -3,6 +3,7 @@ import { spawn, execSync, execFileSync } from "child_process";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "./taskProgressTransforms";
+import { planRawCheckReportV1 } from "./rawCheckReportPathsV1";
 import * as fs from "fs";
 import * as path from "path";
 import {
@@ -1601,7 +1602,13 @@ export async function collectCompletionLint(
     .filter((entry) => entry.match !== undefined)
     .map(({ failure, match }) => ({ command: failure.command, exitCode: failure.code, reason: match!.reason }));
   const unquarantinedFailureCount = commandFailures.length - knownFlakeFailures.length;
-  const rawReportRelPath = options?.rawReportLocation ?? "runs/raw-check-output.log";
+  // bugs5 Step 16: one raw log per run; the canonical file is replaced only by a completed run.
+  const rawReportPlan = planRawCheckReportV1({
+    requestedLocation: options?.rawReportLocation,
+    cancelled: guard.token?.isCancellationRequested === true,
+    runId: new Date().toISOString().replace(/[^0-9TZ]/g, "-"),
+  });
+  const rawReportRelPath = rawReportPlan.resultLocation;
   if (commandFailures.length > 0 && options?.taskFolderUri) {
     try {
       const runsDir = path.join(options.taskFolderUri.fsPath, "runs");
@@ -1609,11 +1616,9 @@ export async function collectCompletionLint(
       const fullRawOutput = commandFailures
         .map((f) => `=== ${f.command} (exit code ${f.code}) ===\n${f.output}`)
         .join("\n\n");
-      await fs.promises.writeFile(
-        path.join(options.taskFolderUri.fsPath, rawReportRelPath),
-        fullRawOutput,
-        "utf8"
-      );
+      for (const relPath of rawReportPlan.writes) {
+        await fs.promises.writeFile(path.join(options.taskFolderUri.fsPath, relPath), fullRawOutput, "utf8");
+      }
     } catch {
       // Best-effort write of raw report
     }

@@ -114,10 +114,28 @@ export function terminalOutcomeFromTaskActionOutcomeV1(
   }
 }
 
+const pendingEndedLineNotesV1 = new Map<string, string>();
+
+/**
+ * bugs5 Step 19: a note for the next outermost operation of `taskKey` that ends as "succeeded", so its Ended
+ * line says what did NOT happen and what to do next (a one-cycle stand-in for Fast Forward never ends as a
+ * bare "succeeded"). `taskKey` is the same normalized key `taskOperations` uses.
+ */
+export function setPendingEndedLineNoteV1(taskKey: string, note: string): void {
+  pendingEndedLineNotesV1.set(taskKey, note);
+}
+
+/** Drop a pending note that was not consumed (the dispatch was refused, or a test finished). */
+export function clearPendingEndedLineNoteV1(taskKey: string): void {
+  pendingEndedLineNotesV1.delete(taskKey);
+}
+
 export class OperationEndedLineTrackerV1 {
   private readonly registered = new Map<string, TrackedOperationV1>();
   private readonly emitted = new Set<string>();
   private readonly inherited = new Map<string, SettledOutcomeV1>();
+
+  constructor(private readonly taskKey?: string) {}
 
   /** Remember an operation seen starting, so a child can find its parent. */
   register(operation: TrackedOperationV1): void {
@@ -170,6 +188,17 @@ export class OperationEndedLineTrackerV1 {
     // registry, so a second delivery or a late ledger line cannot double it.
     if (!claimTerminalLineV1(operation.id, "operation")) {
       return undefined;
+    }
+    const pendingNote =
+      this.taskKey !== undefined &&
+      operation.parentId === undefined &&
+      effective.state === "succeeded" &&
+      operation.label !== "Resume Task"
+        ? pendingEndedLineNotesV1.get(this.taskKey)
+        : undefined;
+    if (pendingNote !== undefined && this.taskKey !== undefined) {
+      pendingEndedLineNotesV1.delete(this.taskKey);
+      return describeSettledOutcomeV1(operation.label, { state: effective.state, reason: pendingNote });
     }
     return describeSettledOutcomeV1(operation.label, effective);
   }

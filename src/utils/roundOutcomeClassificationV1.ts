@@ -22,6 +22,11 @@ export interface ClassifyZeroFileImplRoundInputV1 {
    * (`reviewActions.ts`'s zero-file gate).
    */
   readonly warnedAsZeroFileFailure: boolean;
+  /**
+   * bugs5 Step 13: true when this round was a recovery continuation whose report was accepted
+   * (it parsed with a Plan Item Checklist). Changing no files is the continuation's mandate.
+   */
+  readonly continuationReportProduced?: boolean;
 }
 
 /**
@@ -34,6 +39,9 @@ export interface ClassifyZeroFileImplRoundInputV1 {
 export function classifyZeroFileImplRoundV1(
   input: ClassifyZeroFileImplRoundInputV1
 ): RoundOutcomeClassificationV1 {
+  if (input.continuationReportProduced === true) {
+    return "continuation-report-produced";
+  }
   if (input.checklistAdvanced) {
     return "edits-produced";
   }

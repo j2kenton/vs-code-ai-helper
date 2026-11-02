@@ -1217,7 +1217,7 @@ void describe("runPublishChecks pass notice (RC9 item 2, b)", () => {
   void it("with a parent operation the pass notice says the review runs next", async () => {
     const { surface, decisions } = await runPassing("rc9-pass-parent", true);
     assert.equal(decisions.length, 0, "Fast Forward runs the review itself, so no Run Publish Review card is posted");
-    const passed = surface.entries.filter((e) => /Publish checks passed/.test(e.message));
+    const passed = surface.entries.filter((e) => /Publish (?:checks|part 1 of 2 \(checks\)) passed/.test(e.message));
     assert.equal(passed.length, 1, JSON.stringify(surface.entries));
     assert.match(passed[0]?.message ?? "", /Fast Forward runs the Publish review next\./);
     assert.doesNotMatch(passed[0]?.message ?? "", /Request a Publish review/);
@@ -1228,12 +1228,12 @@ void describe("runPublishChecks pass notice (RC9 item 2, b)", () => {
     assert.equal(decisions.length, 1, "repeated manual passes update one Run Publish Review card");
     const decision = decisions[0];
     assert.ok(decision);
-    assert.match(decision.whatHappened, /Publish checks passed/);
+    assert.match(decision.whatHappened, /Publish (?:checks|part 1 of 2 \(checks\)) passed/);
     assert.deepEqual(decision.options.map((option) => option.label), ["Run Publish Review", "Not now"]);
     assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : undefined, "runAction");
     assert.equal(decision.options[0]?.effect.kind, "command");
     assert.deepEqual(decision.options[1]?.effect, { kind: "doNothing" });
-    const passed = surface.entries.filter((e) => e.level === "info" && /Publish checks passed/.test(e.message));
+    const passed = surface.entries.filter((e) => e.level === "info" && /Publish (?:checks|part 1 of 2 \(checks\)) passed/.test(e.message));
     assert.equal(passed.length, 2, JSON.stringify(surface.entries));
     assert.doesNotMatch(passed[0]?.message ?? "", /Fast Forward runs the Publish review next/);
   });
@@ -1367,7 +1367,7 @@ void describe("runPublishChecks failed-first execution sequences", () => {
     assert.deepEqual(retries[0]?.options.map((option) => option.label), ["Run Publish Checks", "Not now"]);
     assert.equal(retries[0]?.recommendation.kind === "option" ? retries[0]?.recommendation.optionId : undefined, "runAction");
     assert.match(surface.entries.map((entry) => entry.message).join("\n"), /cancelled/i);
-    assert.doesNotMatch(surface.entries.map((entry) => entry.message).join("\n"), /Publish checks passed/);
+    assert.doesNotMatch(surface.entries.map((entry) => entry.message).join("\n"), /Publish (?:checks|part 1 of 2 \(checks\)) passed/);
   });
 
   void it("uses the full set directly when compatibility changes", async () => {
@@ -1486,7 +1486,7 @@ void describe("runPublishChecks durable result across the composed lifecycle (bu
       );
       const outcome = readPublishChecksOutcomeV1(taskFolderPath);
       assert.equal(outcome?.outcome, "cancelled");
-      assert.doesNotMatch(surface.entries.map((entry) => entry.message).join("\n"), /Publish checks passed/);
+      assert.doesNotMatch(surface.entries.map((entry) => entry.message).join("\n"), /Publish (?:checks|part 1 of 2 \(checks\)) passed/);
     } finally {
       completionLintModule.runCompletionLint = originalLint;
       run.restore();
@@ -1658,7 +1658,7 @@ void describe("Move on dispatches Publish Checks through the real resume path (b
     try {
       await move.outcome;
       assert.equal(readPublishChecksOutcomeV1(move.taskFolderPath)?.outcome, "cancelled");
-      assert.doesNotMatch(move.surface.entries.map((entry) => entry.message).join("\n"), /Publish checks passed/);
+      assert.doesNotMatch(move.surface.entries.map((entry) => entry.message).join("\n"), /Publish (?:checks|part 1 of 2 \(checks\)) passed/);
       assert.equal(hasLiveWorkAdmissionBestEffortV1(move.taskFolderPath), false);
     } finally {
       move.restore();

@@ -149,6 +149,11 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "scheduledResumeTime",
   "fallbackActive",
   "fallbackModelId",
+  "fallbackChainFingerprint",
+  "fallbackFailedModelId",
+  "fallbackFailureReason",
+  "fallbackFailedAt",
+  "fallbackResetTime",
   "reviewAttemptId",
   "reviewScoreHistory",
   "reviewRejections",
@@ -165,6 +170,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "implementationTypeCheckFailure",
   "checklistProgressUnreliable",
   "checklistProgressUnreliableReason",
+  "checklistProgressUnreliableSetAt",
   "checklistProgressUnreliableClaims",
   "zeroChangeImplRounds",
   "pendingImplReviewFiles",
@@ -235,6 +241,7 @@ const ROUND_OUTCOME_CLASSIFICATIONS: ReadonlySet<string> = new Set([
   "provider-failure-empty",
   "cancelled",
   "rejected-degenerate",
+  "continuation-report-produced",
 ]);
 const IMPLEMENTATION_DISPATCH_MODES: ReadonlySet<string> = new Set([
   "implementation",
@@ -1889,6 +1896,8 @@ function validateImplRecovery(
     "operationId",
     "failedProvider",
     "failedModel",
+    "ownerHold",
+    "automaticRearms",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
@@ -1995,6 +2004,25 @@ function validateImplRecovery(
   ) {
     return "implRecovery.failedModel must be a bounded non-empty string when present";
   }
+  const ownerHold = value["ownerHold"];
+  if (
+    ownerHold !== undefined &&
+    (!isPlainObject(ownerHold) ||
+      !isIsoTimestamp(ownerHold["at"]) ||
+      (ownerHold["cause"] !== "cancelled" && ownerHold["cause"] !== "paused") ||
+      Object.keys(ownerHold).some((key) => key !== "at" && key !== "cause"))
+  ) {
+    return 'implRecovery.ownerHold must be { at: ISO timestamp, cause: "cancelled" | "paused" } when present';
+  }
+  if (
+    value["automaticRearms"] !== undefined &&
+    (typeof value["automaticRearms"] !== "number" ||
+      !Number.isInteger(value["automaticRearms"]) ||
+      value["automaticRearms"] < 0 ||
+      value["automaticRearms"] > 1000)
+  ) {
+    return "implRecovery.automaticRearms must be a small non-negative integer when present";
+  }
   return undefined;
 }
 
@@ -2086,15 +2114,19 @@ function validateImplementationTypeCheckFailure(value: unknown): string | undefi
 }
 
 function validateFallbackModelId(value: unknown): string | undefined {
+  return validateFallbackStageStringMap("fallbackModelId", value, MAX_NAME_LENGTH);
+}
+
+function validateFallbackStageStringMap(name: string, value: unknown, maxLen = MAX_ESCALATION_REASON_LENGTH): string | undefined {
   if (!isPlainObject(value)) {
-    return "fallbackModelId must be a per-stage object map";
+    return `${name} must be a per-stage object map`;
   }
   for (const [key, entry] of Object.entries(value)) {
     if (!CANONICAL_STAGES.has(key)) {
-      return `fallbackModelId has an unrecognized stage key ${JSON.stringify(key)}`;
+      return `${name} has an unrecognized stage key ${JSON.stringify(key)}`;
     }
-    if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_NAME_LENGTH) {
-      return `fallbackModelId[${JSON.stringify(key)}] must be a bounded non-empty string`;
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > maxLen) {
+      return `${name}[${JSON.stringify(key)}] must be a bounded non-empty string`;
     }
   }
   return undefined;
@@ -2350,6 +2382,16 @@ export function decodeTaskProgressTextV1(
           );
         }
         draft.checklistProgressUnreliableReason = value;
+        break;
+      }
+      case "checklistProgressUnreliableSetAt": {
+        if (!isIsoTimestamp(value)) {
+          return recovery(
+            "invalidFieldValue",
+            "checklistProgressUnreliableSetAt must be an ISO timestamp"
+          );
+        }
+        draft.checklistProgressUnreliableSetAt = value;
         break;
       }
       case "checklistProgressUnreliableClaims": {
@@ -2688,6 +2730,46 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.fallbackModelId = value as TaskProgress["fallbackModelId"];
+        break;
+      }
+      case "fallbackChainFingerprint": {
+        const error = validateFallbackStageStringMap("fallbackChainFingerprint", value, MAX_NAME_LENGTH);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.fallbackChainFingerprint = value as TaskProgress["fallbackChainFingerprint"];
+        break;
+      }
+      case "fallbackFailedModelId": {
+        const error = validateFallbackStageStringMap("fallbackFailedModelId", value, MAX_NAME_LENGTH);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.fallbackFailedModelId = value as TaskProgress["fallbackFailedModelId"];
+        break;
+      }
+      case "fallbackFailureReason": {
+        const error = validateFallbackStageStringMap("fallbackFailureReason", value, MAX_ESCALATION_REASON_LENGTH);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.fallbackFailureReason = value as TaskProgress["fallbackFailureReason"];
+        break;
+      }
+      case "fallbackFailedAt": {
+        const error = validateFallbackStageStringMap("fallbackFailedAt", value, MAX_NAME_LENGTH);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.fallbackFailedAt = value as TaskProgress["fallbackFailedAt"];
+        break;
+      }
+      case "fallbackResetTime": {
+        const error = validateFallbackStageStringMap("fallbackResetTime", value, MAX_NAME_LENGTH);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.fallbackResetTime = value as TaskProgress["fallbackResetTime"];
         break;
       }
       case "reviewAttemptId": {

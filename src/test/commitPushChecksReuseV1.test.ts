@@ -12,6 +12,13 @@ import {
   describeReuseRefusalV1,
 } from "../utils/commitPushChecksReuseV1";
 import {
+  estimateChecksMinutesV1,
+  lastCompletedPublishChecksV1,
+  type LastCompletedPublishChecksV1,
+  type PublishChecksOutcomeV1,
+} from "../utils/publishChecksOutcomeV1";
+import { describeCommitPushFreshRunV1, describeRunChecksNowLabelV1 } from "../commands/commitAndPushTask";
+import {
   clearCommitPushStopStateV1,
   describeCommitPushStopV1,
   noteCommitPushChecksReusedV1,
@@ -58,8 +65,8 @@ void describe("Commit & Push reuse of a recorded passing result (bugs3 Step 17)"
     assert.equal(outcome.reuse, true);
     if (outcome.reuse) {
       assert.equal(outcome.result.passed, true);
-      assert.match(outcome.message, /2026-10-27T18:29:30/);
-      assert.match(outcome.message, /not run again/);
+      // bugs5 Step 10: "Using the Publish Checks that passed at HH:MM on this code."
+      assert.match(outcome.message, /^Using the Publish Checks that passed at \d\d:\d\d on this code\.$/);
     }
     assert.equal(expectedIdentity, computeCommandIdentityV1(COMMANDS), "the check is asked for the commands a fresh run would execute");
   });
@@ -112,6 +119,123 @@ void describe("Commit & Push reuse of a recorded passing result (bugs3 Step 17)"
   void it("describes a refusal with no recognised cause without losing the reason", () => {
     assert.equal(describeReuseRefusalV1({ eligible: false, reason: "something new" }), "something new");
     assert.match(describeReuseRefusalV1({ eligible: false }), /could not be confirmed/);
+  });
+
+  void it("offers to run the checks now with the last run's length when it is known", () => {
+    assert.equal(describeRunChecksNowLabelV1(20), "Run the checks now (about 20 min, based on the last run)");
+    assert.equal(describeRunChecksNowLabelV1(undefined), "Run the checks now");
+  });
+
+  void it("names the latest run record's own reason, without the internal prefix", () => {
+    assert.equal(
+      describeReuseRefusalV1({ eligible: false, reason: "Latest run record: the latest Publish Checks run failed (`pnpm run verify`)" }),
+      "the latest Publish Checks run failed (`pnpm run verify`)"
+    );
+  });
+});
+
+void describe("the latest run record and a recorded pass (bugs5 Step 10)", () => {
+  const PASS: LastCompletedPublishChecksV1 = { outcome: "passed", at: "2026-11-01T05:40:14.000Z", durationMs: 20 * 60_000 };
+  const FAIL: LastCompletedPublishChecksV1 = { outcome: "failed", at: "2026-11-01T05:40:14.000Z", failedCommands: ["pnpm run verify"] };
+  const eligible = eligibility({ eligible: true, stamp: { completedAt: "2026-11-01T05:40:14.000Z" } as never });
+
+  function decideWith(outcome: PublishChecksOutcomeV1 | undefined) {
+    return decideCommitPushChecksReuseV1({
+      taskFolderUri: vscode.Uri.file("/tmp/task"),
+      scopeFolder: "/repo",
+      headCommitSha: "abc123",
+      currentCommands: COMMANDS,
+      checkEligibility: eligible,
+      readOutcome: () => outcome,
+    });
+  }
+
+  void it("jester's sequence: a pass, then a run interrupted 23 s in on the same tree, still reuses the pass", async () => {
+    const interrupted: PublishChecksOutcomeV1 = {
+      outcome: "interrupted",
+      at: "2026-11-01T07:52:28.000Z",
+      finishedCommands: [{ command: "pnpm run check-types", exitCode: 0 }],
+      unknownCommands: ["npm run test"],
+      lastCompleted: PASS,
+    };
+    const outcome = await decideWith(interrupted);
+    assert.equal(outcome.reuse, true);
+  });
+
+  void it("a cancelled run with an earlier pass on the same tree still reuses the pass", async () => {
+    const cancelled: PublishChecksOutcomeV1 = { outcome: "cancelled", at: "2026-11-01T17:18:46.000Z", cause: "cancelled from Notifications", lastCompleted: PASS };
+    assert.equal((await decideWith(cancelled)).reuse, true);
+  });
+
+  void it("an interrupted run whose own settled results include a failure does not reuse the pass, and names it", async () => {
+    const interrupted: PublishChecksOutcomeV1 = {
+      outcome: "interrupted",
+      at: "2026-11-01T07:52:28.000Z",
+      finishedCommands: [{ command: "pnpm run lint", exitCode: 1 }],
+      unknownCommands: [],
+      lastCompleted: PASS,
+    };
+    const outcome = await decideWith(interrupted);
+    assert.equal(outcome.reuse, false);
+    if (!outcome.reuse) {
+      assert.match(outcome.reason, /had already failed `pnpm run lint`/);
+    }
+  });
+
+  void it("a later failed run replaces the pass, and names the failing command", async () => {
+    const outcome = await decideWith({ outcome: "failed", at: "2026-11-01T09:00:00.000Z", failedCommands: ["pnpm run test"] });
+    assert.equal(outcome.reuse, false);
+    if (!outcome.reuse) {
+      assert.match(outcome.reason, /the latest Publish Checks run failed \(`pnpm run test`\)/);
+    }
+  });
+
+  void it("an interrupted run after an earlier failure does not reuse anything", async () => {
+    const outcome = await decideWith({ outcome: "interrupted", at: "x", finishedCommands: [], unknownCommands: [], lastCompleted: FAIL });
+    assert.equal(outcome.reuse, false);
+    if (!outcome.reuse) {
+      assert.match(outcome.reason, /last Publish Checks run that finished had failed/);
+    }
+  });
+
+  void it("a run in progress is not a result", async () => {
+    const outcome = await decideWith({
+      outcome: "running",
+      at: "2026-11-01T09:00:00.000Z",
+      pid: 1,
+      hostname: "h",
+      finishedCommands: [],
+      runningCommands: [],
+      lastCompleted: PASS,
+    });
+    assert.equal(outcome.reuse, false);
+    if (!outcome.reuse) {
+      assert.match(outcome.reason, /running right now/);
+    }
+  });
+
+  void it("with no run record at all the recorded pass is judged on its own", async () => {
+    assert.equal((await decideWith(undefined)).reuse, true);
+  });
+
+  void it("an earlier pass is what the record carries when the latest one is not a result", () => {
+    const record: PublishChecksOutcomeV1 = { outcome: "cancelled", at: "x", cause: "c", lastCompleted: PASS };
+    assert.deepEqual(lastCompletedPublishChecksV1(record), PASS);
+    assert.deepEqual(lastCompletedPublishChecksV1({ outcome: "passed", at: "y", durationMs: 60_000 }), { outcome: "passed", at: "y", durationMs: 60_000 });
+    assert.equal(lastCompletedPublishChecksV1({ outcome: "failed", at: "y", failedCommands: [], reason: "died" }), undefined);
+    assert.equal(estimateChecksMinutesV1(record), 20);
+    assert.equal(estimateChecksMinutesV1(undefined), undefined);
+  });
+
+  void it("says why the checks run again, with the last run's duration when known", () => {
+    assert.equal(
+      describeCommitPushFreshRunV1("files changed since the Publish Checks passed", 35),
+      "Running the Publish Checks again before committing: files changed since the Publish Checks passed. The last run took about 35 min."
+    );
+    assert.equal(
+      describeCommitPushFreshRunV1("no passing Publish Checks result is recorded for this task", undefined),
+      "Running the Publish Checks again before committing: no passing Publish Checks result is recorded for this task."
+    );
   });
 });
 

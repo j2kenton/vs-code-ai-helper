@@ -52,6 +52,15 @@ export type PublishPreflightResult =
  * managed Completion Checks section, so the artifact reflects what the
  * publish attempt actually saw.
  */
+/**
+ * bugs5 Step 16: a preflight reason already ends in a full stop when it carries a summary
+ * ("...: 2 completion check(s) failed."), so a caller that adds its own punctuation printed
+ * "failed..". This returns the reason with exactly one closing full stop.
+ */
+export function endPreflightReasonSentenceV1(reason: string): string {
+  return `${reason.trim().replace(/[.\s]+$/, "")}.`;
+}
+
 export async function checkPublishPreflight(
   taskFolderUri: vscode.Uri,
   relevantFiles?: readonly string[],

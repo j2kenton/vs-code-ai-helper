@@ -3,6 +3,7 @@ import { getModelSettings } from "../config/settings";
 import { RUNS_DIRNAME, TaskStage } from "../types/taskProgress";
 import { ModelSettings, StageModelSetting } from "./modelFallback";
 import { resolveEffectiveStageChainV1 } from "./modelSelection";
+import { getModelResolutionNoteV1 } from "./rememberedFallbackV1";
 
 export interface DispatchModelChainSnapshotV1 {
   readonly schemaVersion: 1;
@@ -16,6 +17,12 @@ export interface DispatchModelChainSnapshotV1 {
   readonly invoked?: { readonly storedModelId: string; readonly providerLabel: string };
   /** Monotonic ordering within this process/operation; ties never choose evidence. */
   readonly candidateOrdinal?: number;
+  /**
+   * bugs5 Step 25: why the chain's first model was or was not the one tried first, for example a
+   * remembered fallback ("using Claude Code, remembered after DevPass failed at 04:54 (HTTP 402); Kimi K3.1
+   * not tried") or a pin cleared by a settings change.
+   */
+  readonly modelSelectionNote?: string;
 }
 
 export interface DispatchCorrelationV1 {
@@ -76,8 +83,10 @@ export async function persistCandidateDispatchModelChainV1(input: {
   readonly providerLabel: string;
 }): Promise<DispatchModelChainSnapshotV1> {
   const captured = dispatchModelChainForOperationV1(input.stage, input.operationId);
+  const modelSelectionNote = getModelResolutionNoteV1(input.taskFolderUri.fsPath, input.stage);
   const snapshot: DispatchModelChainSnapshotV1 = {
     ...captured,
+    ...(modelSelectionNote ? { modelSelectionNote } : {}),
     operationId: input.operationId,
     attemptId: input.attemptId,
     runnerId: input.runnerId,
@@ -98,10 +107,21 @@ function nextCandidateOrdinal(operationId: string | undefined): number {
   return next;
 }
 
-export function candidateInvocationMessageV1(activity: string, storedModelId: string, providerLabel: string, backup: boolean): string {
+export function candidateInvocationMessageV1(
+  activity: string,
+  storedModelId: string,
+  providerLabel: string,
+  backup: boolean,
+  /** bugs5 Step 26: why the candidate before this backup did not serve the round. */
+  previousFailure?: string,
+  /** bugs5 Step 25: why this model rather than the chain's first (a remembered fallback, or a cleared one). */
+  modelSelectionNote?: string
+): string {
+  const why = backup && previousFailure?.trim() ? ` The previous model did not serve it: ${previousFailure.trim().replace(/[.\s]+$/, "")}.` : "";
+  const choice = !backup && modelSelectionNote?.trim() ? ` Model choice: ${modelSelectionNote.trim().replace(/[.\s]+$/, "")}.` : "";
   return backup
-    ? `Backup started for ${activity}: ${providerLabel} — ${storedModelId}.`
-    : `Running ${activity} with ${providerLabel} — ${storedModelId}.`;
+    ? `Backup started for ${activity}: ${providerLabel} — ${storedModelId}.${why}`
+    : `Running ${activity} with ${providerLabel} — ${storedModelId}.${choice}`;
 }
 
 export function formatDispatchModelChainForRunLogV1(snapshot: DispatchModelChainSnapshotV1): string {
@@ -114,6 +134,7 @@ export function formatDispatchModelChainForRunLogV1(snapshot: DispatchModelChain
     `Effective primary: ${snapshot.effective.primary ?? "none"}`,
     `Effective enabled backups: ${snapshot.effective.backups.length > 0 ? snapshot.effective.backups.join(" → ") : "none"}`,
     `Chain source: ${snapshot.effective.source} (${snapshot.effective.originStage})`,
+    ...(snapshot.modelSelectionNote ? [`Model selection: ${snapshot.modelSelectionNote}`] : []),
     "",
   ].join("\n");
 }

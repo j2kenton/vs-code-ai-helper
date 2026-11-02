@@ -802,7 +802,8 @@ void test("a declined (false-resolving) automation dispatch closes its round-led
     assert.equal(row?.state, "dropped", "a declined resolve must never be recorded as completed");
     assert.equal(
       row?.outcome?.rejectionReason,
-      "the dispatched command declined to run and no round was started"
+      "the dispatched command declined to run and no round was started; vs-code-ai-helper.runImplementationWithAI " +
+        "recorded no cause (see this task's chat and the Ensemble output panel)"
     );
 
     // The round-ledger row above is already confirmed terminal, but the run

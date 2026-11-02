@@ -33,3 +33,19 @@ void test(
     );
   }
 );
+
+// bugs5 Step 13 (item 16): a continuation that wrote its report is a success, not a provider failure.
+void test("a continuation that produced its report classifies as continuation-report-produced, whatever else holds", () => {
+  for (const checklistAdvanced of [true, false]) {
+    for (const warnedAsZeroFileFailure of [true, false]) {
+      assert.equal(
+        classifyZeroFileImplRoundV1({ checklistAdvanced, warnedAsZeroFileFailure, continuationReportProduced: true }),
+        "continuation-report-produced"
+      );
+    }
+  }
+  assert.equal(
+    classifyZeroFileImplRoundV1({ checklistAdvanced: false, warnedAsZeroFileFailure: true, continuationReportProduced: false }),
+    "provider-failure-empty"
+  );
+});

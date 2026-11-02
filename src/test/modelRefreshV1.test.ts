@@ -227,6 +227,24 @@ void describe("viewer windows discover on demand (bugs3 Step 10)", () => {
     assert.equal(hasUndiscoveredCliProvidersV1(), false);
   });
 
+  void it("bugs5 Step 28: Refresh models sits on its own line under the provider buttons, with a one-line note", () => {
+    const source = fs.readFileSync(path.resolve(__dirname, "..", "..", "src", "views", "settingsView.ts"), "utf8");
+    const saveButton = source.indexOf('id="save-providers-btn"');
+    const discardButton = source.indexOf('id="discard-providers-btn"');
+    const refreshButton = source.indexOf('id="refresh-models-btn"');
+    const fieldsetEnd = source.indexOf("</fieldset>';", saveButton);
+    assert.ok(discardButton > 0 && saveButton > discardButton, "Discard then Save keep their own row");
+    assert.ok(refreshButton > saveButton && refreshButton < fieldsetEnd, "Refresh models is after Save, inside the section");
+    // The provider row closes before Refresh models starts, so the row keeps only its own buttons.
+    const providerRowEnd = source.indexOf("Save Provider Selection</button></div>");
+    assert.ok(providerRowEnd > 0 && providerRowEnd < refreshButton);
+    assert.match(
+      source,
+      /Re-reads the model lists from the AI tools installed on this machine\. Doesn\\\\'t change your saved choices or other machines\./
+    );
+    assert.match(source, /title="Ask every installed CLI for its current model list and update the pickers below, without reloading the window"/);
+  });
+
   void it("wiring: opening AI Models discovers for a viewer, and the view offers Refresh models", () => {
     const source = fs.readFileSync(path.resolve(__dirname, "..", "..", "src", "views", "settingsView.ts"), "utf8");
     assert.match(source, /shouldDiscoverModelsOnDemandV1\(resolveEnsembleHostRoleV1\(\), hasUndiscoveredCliProvidersV1\(\)\)/);

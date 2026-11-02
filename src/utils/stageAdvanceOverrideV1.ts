@@ -16,6 +16,7 @@
 import * as crypto from "node:crypto";
 import * as fsp from "node:fs/promises";
 import * as path from "node:path";
+import { AGENT_CAN_GATHER_RE } from "./reviewReadiness";
 
 /** The task-folder file the overrides are appended to (one JSON object per line). */
 export const STAGE_ADVANCE_OVERRIDE_FILE_V1 = "advance-overrides-v1.jsonl";
@@ -48,6 +49,9 @@ export function advanceAnywayLabelV1(nextStageName: string): string {
 }
 
 export function isOwnerEvidenceBlockerV1(blocker: Pick<AdvanceSkippedBlockerV1, "description">): boolean {
+  if (AGENT_CAN_GATHER_RE.test(blocker.description)) {
+    return false;
+  }
   return OWNER_EVIDENCE_RE.test(blocker.description);
 }
 

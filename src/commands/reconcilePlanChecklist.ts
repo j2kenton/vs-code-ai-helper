@@ -2389,6 +2389,7 @@ async function reconcileChecklistHeldV1(
       ...current,
       checklistProgressUnreliable: undefined,
       checklistProgressUnreliableReason: undefined,
+      checklistProgressUnreliableSetAt: undefined,
       checklistProgressUnreliableClaims: undefined,
       updatedAt: new Date().toISOString(),
     };
@@ -2471,6 +2472,7 @@ export async function autoClearUnreliableChecklistLatchAfterReviewV1(
         ...current,
         checklistProgressUnreliable: undefined,
         checklistProgressUnreliableReason: undefined,
+        checklistProgressUnreliableSetAt: undefined,
         checklistProgressUnreliableClaims: undefined,
         updatedAt: new Date().toISOString(),
       };

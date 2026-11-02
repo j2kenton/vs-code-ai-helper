@@ -28,12 +28,19 @@ void describe("formatDisplayTimestampPairV1", () => {
 
 void describe("buildDecisionCopyTextV1", () => {
   const base = {
-    // Effects are irrelevant to the copy text, so the fixture omits them.
+    // The copy text does not show effects, but the heading (bugs5 Step 1) asks whether any available
+    // option does something, so the available option carries a command effect.
     whatHappened: "A round failed.",
     whyUserNeeded: "Cannot decide alone.",
     recommendation: { kind: "option" as const, optionId: "retry", reasoning: "Cheapest." },
     options: [
-      { optionId: "retry", label: "Retry", consequence: "Runs again.", destructive: false },
+      {
+        optionId: "retry",
+        label: "Retry",
+        consequence: "Runs again.",
+        destructive: false,
+        effect: { kind: "command", command: "ensemble.retry" },
+      },
       {
         optionId: "restore",
         label: "Restore",

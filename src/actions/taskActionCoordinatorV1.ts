@@ -491,6 +491,8 @@ export interface TaskActionRequestV1 {
     readonly operationId?: string;
     readonly attemptId: string;
     readonly backup: boolean;
+    /** bugs5 Step 26: when `backup`, why the candidate before it did not serve the round. */
+    readonly previousFailure?: string;
   }) => void | Promise<void>;
 }
 
@@ -2405,6 +2407,7 @@ export function createTaskActionCoordinatorV1(
             operationId,
             attemptId,
             backup,
+            ...(backup && firstFallbackReasonV1 ? { previousFailure: firstFallbackReasonV1 } : {}),
           });
         } catch {
           // an observer failure must never affect the round

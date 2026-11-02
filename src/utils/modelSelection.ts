@@ -15,6 +15,18 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { clearStageFallbackReservation } from "./taskProgressTransforms";
 import {
+  ConfiguredCandidateV1,
+  RememberedFallbackInfoV1,
+  SkippedCandidateV1,
+  collectSkippedCandidatesV1,
+  describeRememberedFallbackV1,
+  describeSkippedCandidatesV1,
+  fingerprintStageChainV1,
+  getModelResolutionNoteV1,
+  judgeRememberedFallbackV1,
+  setModelResolutionNoteV1,
+} from "./rememberedFallbackV1";
+import {
   CLI_PROVIDERS,
   CODEX_MODEL_CAPABILITIES,
   type CliProviderId,
@@ -23,7 +35,7 @@ import {
   providerAccountIdForModelId,
   toQualifiedModelId,
 } from "../runners/providers";
-import { AI_MODEL_STAGES, REVIEW_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { AI_MODEL_STAGES, REVIEW_STAGES, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
 import {
   describeCliDiscoveryFailureReasonV1,
   latestCliDiscoveryFailureV1,
@@ -45,6 +57,10 @@ export interface ResolvedStageModel {
   /** "general" = resolved through the general model's chain because the
    * stage itself has no (enabled) model of its own. */
   source: "task" | "workspace" | "general" | "none";
+  /** bugs5 Step 25: set when the model is a remembered fallback rather than the chain's primary. */
+  rememberedFallback?: RememberedFallbackInfoV1;
+  /** bugs5 Step 25: chain candidates ahead of `modelId` that were not tried, each with the reason. */
+  skippedCandidates?: SkippedCandidateV1[];
 }
 
 /**
@@ -467,6 +483,28 @@ export async function resolveModelForStage(
     return { source: "none" };
   }
   const source = chain.source === "general" ? "general" : "workspace";
+  let progressRead = false;
+  let progressForSkips: TaskProgress | undefined;
+  // bugs5 Step 25: configured candidates the chain passes over, each with the reason, for the run log and
+  // the round's starting line. Not computed for the availability probes that ignore the pin.
+  const reasonedSkipsFor = (chosenModelId: string | undefined): SkippedCandidateV1[] =>
+    options.ignoreActiveFallback
+      ? []
+      : collectSkippedCandidatesV1({
+          configured: configuredCandidatesOfStageV1(getModelSettings()[chain.originStage]),
+          chosenModelId,
+          isProviderEnabled: isModelProviderEnabled,
+          quotaBlockedUntil: quotaBlockLookupV1(progressForSkips),
+          // The Implementation chain also serves Apply Review, Fix Linting and Fast Forward, which edit code
+          // unattended. A Copilot backup is never picked for that (its sealed pipeline reported available while
+          // producing zero-file rounds), though Copilot configured as the primary is still used.
+          modeUnsupportedReason: (modelId) =>
+            chain.originStage === "impl" &&
+            modelId !== chain.primary &&
+            providerAccountIdForModelId(modelId) === "copilot"
+              ? "Copilot is not used as a backup for unattended code edits"
+              : undefined,
+        });
   if (
     !options.ignoreActiveFallback &&
     chain.strategy === "switch-to-backup" &&
@@ -477,21 +515,117 @@ export async function resolveModelForStage(
     try {
       const readResult = await readTaskProgressStrictV1(taskFolderUri);
       const progress = readResult.ok ? readResult.decoded.progress : undefined;
+      progressRead = true;
+      progressForSkips = progress;
       if (progress && progress.fallbackActive && progress.fallbackActive[stage]) {
-        const activeFallbackModel = progress.fallbackModelId?.[stage];
-        return {
-          modelId:
-            activeFallbackModel && chain.backups.includes(activeFallbackModel)
+        const verdict = judgeRememberedFallbackV1({
+          progress,
+          stage,
+          currentFingerprint: fingerprintStageChainV1(chain, isModelProviderEnabled),
+          now: new Date(),
+        });
+        if (verdict.kind === "clear") {
+          // bugs5 Step 25: the pin was made for a chain that no longer exists (or its provider's reset has
+          // passed). Drop it for this task and start at the chain's primary.
+          await patchTaskProgressStrictV1(taskFolderUri, (current) => clearStageFallbackReservation(current, stage)).catch(
+            () => undefined
+          );
+          setModelResolutionNoteV1(taskFolderUri.fsPath, stage, `remembered fallback cleared: ${verdict.reason}`);
+        } else if (verdict.kind === "keep") {
+          const activeFallbackModel = progress.fallbackModelId?.[stage];
+          const modelId =
+            (activeFallbackModel && chain.backups.includes(activeFallbackModel)
               ? activeFallbackModel
-              : chain.backups[0],
-          source,
-        };
+              : chain.backups[0]) ?? chain.primary;
+          const candidates = [chain.primary, ...chain.backups];
+          const ahead = candidates.slice(0, candidates.indexOf(modelId));
+          const notTried: SkippedCandidateV1[] = ahead.map((id) => ({
+            modelId: id,
+            reason: "not tried: a remembered fallback is in use",
+          }));
+          const otherSkips = reasonedSkipsFor(modelId).filter((s) => !ahead.includes(s.modelId));
+          const skippedCandidates: SkippedCandidateV1[] = [...notTried, ...otherSkips];
+          const rememberedFallback: RememberedFallbackInfoV1 = {
+            modelId,
+            ...(progress.fallbackFailedModelId?.[stage] ? { failedModelId: progress.fallbackFailedModelId[stage] } : {}),
+            ...(progress.fallbackFailureReason?.[stage] ? { failureReason: progress.fallbackFailureReason[stage] } : {}),
+            ...(progress.fallbackFailedAt?.[stage] ? { failedAt: progress.fallbackFailedAt[stage] } : {}),
+          };
+          const otherNote = describeSkippedCandidatesV1(otherSkips, describeModelWithProviderV1);
+          setModelResolutionNoteV1(
+            taskFolderUri.fsPath,
+            stage,
+            describeRememberedFallbackV1(rememberedFallback, notTried, describeModelWithProviderV1) +
+              (otherNote ? `; ${otherNote}` : "")
+          );
+          return { modelId, source, rememberedFallback, skippedCandidates };
+        }
+      } else {
+        setModelResolutionNoteV1(taskFolderUri.fsPath, stage, undefined);
       }
     } catch {
       // No persisted progress (or unreadable) — fall through to the primary model.
     }
   }
+  if (options.ignoreActiveFallback) {
+    return { modelId: chain.primary, source };
+  }
+  if (!progressRead) {
+    try {
+      const readResult = await readTaskProgressStrictV1(taskFolderUri);
+      progressForSkips = readResult.ok ? readResult.decoded.progress : undefined;
+    } catch {
+      progressForSkips = undefined;
+    }
+  }
+  const skippedCandidates = reasonedSkipsFor(chain.primary);
+  const skipNote = describeSkippedCandidatesV1(skippedCandidates, describeModelWithProviderV1);
+  if (skipNote) {
+    // Keep a "remembered fallback cleared" note set just above; add what else was passed over.
+    const existing = getModelResolutionNoteV1(taskFolderUri.fsPath, stage);
+    setModelResolutionNoteV1(taskFolderUri.fsPath, stage, existing ? `${existing}; ${skipNote}` : skipNote);
+    return { modelId: chain.primary, source, skippedCandidates };
+  }
   return { modelId: chain.primary, source };
+}
+
+/** The configured entries of a stage in order (primary first), with the owner's enabled flag for each. */
+function configuredCandidatesOfStageV1(setting: StageModelSetting | undefined): ConfiguredCandidateV1[] {
+  if (!setting) {
+    return [];
+  }
+  const entries: ConfiguredCandidateV1[] = [];
+  const seen = new Set<string>();
+  const add = (modelId: unknown, enabled: boolean): void => {
+    if (typeof modelId !== "string" || modelId.trim().length === 0 || seen.has(modelId.trim())) {
+      return;
+    }
+    seen.add(modelId.trim());
+    entries.push({ modelId: modelId.trim(), enabled });
+  };
+  add(setting.primary, setting.primaryEnabled !== false);
+  const backups = Array.isArray(setting.backups) && setting.backups.length > 0 ? setting.backups : setting.backup ? [setting.backup] : [];
+  backups.forEach((model, index) => add(model, setting.backupsEnabled?.[index] !== false));
+  return entries;
+}
+
+/** Answers, for a model id, the reset time of a quota block on its account that has not reset yet. */
+function quotaBlockLookupV1(progress: TaskProgress | undefined): ((modelId: string) => string | undefined) | undefined {
+  const record = progress?.quotaParkRecord;
+  if (!record) {
+    return undefined;
+  }
+  const resetMs = record.resetAt ? Date.parse(record.resetAt) : undefined;
+  if (resetMs !== undefined && Number.isFinite(resetMs) && resetMs <= Date.now()) {
+    return undefined;
+  }
+  const blockedAccount = providerAccountIdForModelId(record.modelId);
+  return (modelId) =>
+    providerAccountIdForModelId(modelId) === blockedAccount
+      ? record.resetAt && resetMs !== undefined && Number.isFinite(resetMs)
+        ? `${new Date(resetMs).toISOString().slice(0, 16).replace("T", " ")} UTC`
+        : "unknown"
+      : undefined;
 }
 
 /**
@@ -552,12 +686,18 @@ export async function resolveFreshModelForStage(
   stage: TaskStage
 ): Promise<ResolvedStageModel> {
   if (isConfigurableStage(stage)) {
+    setModelResolutionNoteV1(taskFolderUri.fsPath, stage, undefined);
     try {
       const readResult = await readTaskProgressStrictV1(taskFolderUri);
       if (readResult.ok && readResult.decoded.progress.fallbackActive?.[stage]) {
         await patchTaskProgressStrictV1(
           taskFolderUri,
           (current) => clearStageFallbackReservation(current, stage)
+        );
+        setModelResolutionNoteV1(
+          taskFolderUri.fsPath,
+          stage,
+          "remembered fallback cleared: this run was started fresh, so the chain's first model is tried first"
         );
       }
     } catch {

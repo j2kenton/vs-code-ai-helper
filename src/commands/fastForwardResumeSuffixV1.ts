@@ -5,6 +5,15 @@ import {
 } from "../utils/activeFastForwardRunsV1";
 import { WorkflowDecisionOptionV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import {
+  APPLY_OPTION_ID_V1,
+  APPLY_TICKS_NOW_OPTION_ID_V1,
+  APPLY_WHEN_PAUSED_OPTION_ID_V1,
+  HELD_CARD_STAYS_OPEN_NOTE_V1,
+  buildHeldTicksAnswerOptionsV1,
+  describeKeptDeferredAnswerV1,
+  isVerifiedTicksDecisionV1,
+} from "./verifiedTicksHeldOptionsV1";
+import {
   describeLiveTaskOperationV1,
   getLiveTaskOperationV1,
   LiveTaskOperationV1,
@@ -62,6 +71,61 @@ import {
 export interface FastForwardResumeStateV1 extends FastForwardRunStateV1 {
   readonly fastForwardSessionIdV1?: string;
   readonly fastForwardRunEpochV1?: number;
+  /** bugs5 Step 19: when the card captured this state (ms since epoch). */
+  readonly fastForwardCapturedAtMsV1?: number;
+  /** bugs5 Step 19: the stage the run was paused at when the card captured this state. */
+  readonly fastForwardStageV1?: string;
+}
+
+/** What `decideDurableFastForwardResumeV1` reads from the task's own records at the moment of choosing. */
+export interface DurableFastForwardResumeFactsV1 {
+  readonly currentSessionId: string;
+  readonly status: string | undefined;
+  readonly currentStage: string | undefined;
+  /** An operation is running for the task right now. */
+  readonly hasLiveOperation: boolean;
+  /** Start time (ms) of the newest round-ledger row, if any. */
+  readonly latestRoundStartedAtMs: number | undefined;
+}
+
+export type DurableFastForwardResumeDecisionV1 =
+  | { readonly trusted: true }
+  | { readonly trusted: false; readonly reason: string };
+
+/**
+ * bugs5 Step 19 (item 8): the in-memory pause provenance is lost when the window or extension host
+ * restarts, so an owner who answers a plateau card an hour later, after an update, got one
+ * Apply Review and one review, then silence. After a restart the card's captured run details
+ * (attempt N of M, stage, capture time) are trusted instead when the task's own records show that the
+ * run ended by pausing and nothing has started since: the task is still paused at the captured
+ * stage, no operation is running, and no round started after the card was captured.
+ *
+ * Only used when the session id differs. In the SAME session the in-memory record is authoritative:
+ * if it no longer names this run's pause, the run ended another way or a new one started.
+ */
+export function decideDurableFastForwardResumeV1(
+  state: FastForwardResumeStateV1,
+  facts: DurableFastForwardResumeFactsV1
+): DurableFastForwardResumeDecisionV1 {
+  if (state.fastForwardSessionIdV1 === undefined || state.fastForwardCapturedAtMsV1 === undefined) {
+    return { trusted: false, reason: "the card did not record when its Fast Forward run paused" };
+  }
+  if (state.fastForwardSessionIdV1 === facts.currentSessionId) {
+    return { trusted: false, reason: "that Fast Forward run has since ended another way, or a different run started" };
+  }
+  if (facts.hasLiveOperation) {
+    return { trusted: false, reason: "something else is running for this task now" };
+  }
+  if (facts.status !== "paused") {
+    return { trusted: false, reason: "the task is no longer paused for this card" };
+  }
+  if (state.fastForwardStageV1 !== undefined && facts.currentStage !== state.fastForwardStageV1) {
+    return { trusted: false, reason: "the task has moved to another stage since the card was raised" };
+  }
+  if (facts.latestRoundStartedAtMs !== undefined && facts.latestRoundStartedAtMs > state.fastForwardCapturedAtMsV1) {
+    return { trusted: false, reason: "a round started after the card was raised" };
+  }
+  return { trusted: true };
 }
 
 /**
@@ -298,6 +362,8 @@ export function liveOperationBlockingOptionV1(
 ): LiveTaskOperationV1 | undefined {
   if (
     record.state !== "pending" ||
+    // bugs5 Step 3: an answer accepted now and carried out when the task is free never collides.
+    option.runsWhenTaskFree === true ||
     !OPERATION_HELD_DECISION_KEYS_V1.has(record.decisionKey) ||
     option.effect.kind !== "command" ||
     !(option.resumeKind === "continue" || option.effect.command === RECONCILE_CONFIRMED_COMMAND_V1)
@@ -319,6 +385,57 @@ export function liveOperationBlockingOptionV1(
  * live state in `WorkflowDecisionStoreV1.resolve`.
  */
 export function holdDispatchingOptionsWhileOperationLiveV1(record: WorkflowDecisionV1): WorkflowDecisionV1 {
+  const held = holdDispatchingOptionsV1(record);
+  // bugs5 Steps 2-3: a reviewer-verified-ticks card whose Apply is held offers the two answers that
+  // do not race the running operation, and says plainly that it stays open.
+  const heldApply = held.options.find((option) => option.optionId === APPLY_OPTION_ID_V1);
+  if (
+    held.state !== "pending" ||
+    !isVerifiedTicksDecisionV1(held) ||
+    heldApply?.disabled !== true ||
+    held.options.some((option) => option.optionId === APPLY_TICKS_NOW_OPTION_ID_V1)
+  ) {
+    return held;
+  }
+  const extra = buildHeldTicksAnswerOptionsV1(held).map((option) =>
+    option.optionId === APPLY_WHEN_PAUSED_OPTION_ID_V1 && held.deferredAnswer !== undefined
+      ? {
+          ...option,
+          disabled: true,
+          disabledReason: "your answer is already kept; it runs when nothing is running for this task",
+        }
+      : option
+  );
+  if (extra.length === 0) {
+    return held;
+  }
+  const tickNow = extra.find((option) => option.optionId === APPLY_TICKS_NOW_OPTION_ID_V1);
+  const note = held.deferredAnswer
+    ? `${describeKeptDeferredAnswerV1(held.deferredAnswer)} ${HELD_CARD_STAYS_OPEN_NOTE_V1}`
+    : HELD_CARD_STAYS_OPEN_NOTE_V1;
+  return {
+    ...held,
+    // Not-yet stays last, after the answers that can be given now.
+    options: [
+      ...held.options.filter((option) => option.effect.kind !== "doNothing"),
+      ...extra,
+      ...held.options.filter((option) => option.effect.kind === "doNothing"),
+    ],
+    whyUserNeeded: `${held.whyUserNeeded} ${note}`,
+    recommendation:
+      tickNow !== undefined
+        ? {
+            kind: "option",
+            optionId: tickNow.optionId,
+            reasoning:
+              "The reviewer already verified these items; ticking them now lets Fast Forward's next round count " +
+              "them, and dispatching stays Fast Forward's job.",
+          }
+        : held.recommendation,
+  };
+}
+
+function holdDispatchingOptionsV1(record: WorkflowDecisionV1): WorkflowDecisionV1 {
   let changed = false;
   const options = record.options.map((option) => {
     const live = liveOperationBlockingOptionV1(record, option);
@@ -341,4 +458,37 @@ export function holdDispatchingOptionsWhileOperationLiveV1(record: WorkflowDecis
     };
   });
   return changed ? { ...record, options } : record;
+}
+
+/**
+ * bugs5 Step 19: the Ended-line note for the one cycle that stands in for a "Keep iterating" answer whose
+ * Fast Forward run could not be resumed. It says what ran, why Fast Forward did not continue, and what to
+ * choose next, so the line never reads as a bare "succeeded" with nothing scheduled.
+ */
+export function describeKeepIteratingStandInEndedNoteV1(untrustedReason: string): string {
+  return (
+    `one cycle finished (Apply Review, then a review) but Fast Forward did not continue — ${untrustedReason}. ` +
+    "Next: choose Fast Forward Review to keep iterating"
+  );
+}
+
+/**
+ * bugs5 Step 19: the command and argument a trusted "Keep iterating" answer dispatches. It is Fast Forward
+ * itself (not a single Apply Review), carrying the card's captured attempt so the loop continues with the
+ * remaining budget, and `fastForwardReviewWithAI` starts a resumed run with Apply Review whenever its review is
+ * provably of the current tree.
+ */
+export function buildFastForwardResumeDispatchV1(
+  taskFolderPath: string,
+  state: FastForwardResumeStateV1,
+  admissionHandoffToken: string | undefined
+): { readonly command: "vs-code-ai-helper.fastForwardReviewWithAI"; readonly arg: Record<string, unknown> } {
+  return {
+    command: "vs-code-ai-helper.fastForwardReviewWithAI",
+    arg: {
+      taskFolderPath,
+      admissionHandoffTokenV1: admissionHandoffToken,
+      resumeFromAttemptV1: state,
+    },
+  };
 }

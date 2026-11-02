@@ -4,7 +4,10 @@ Read the current plan and the review below, then produce a revised plan in Markd
 - Addresses every unresolved or partially resolved previous blocker and every new blocking issue raised in the review.
 - Incorporates non-blocking suggestions where they clearly improve the plan, and skips ones that don't fit the task's scope.
 - Keeps the same overall structure as the current plan (restated goal, numbered steps, affected files/areas, risks/assumptions, acceptance criteria) unless the review calls for a different structure.
+- Notes, in a "Plan deviations" section (under `## Plan deviations`), any intentional deviation from the user request or prior plan with what was changed, why, and trade-offs.
 - Notes, in a short "Changes from previous plan" section at the end, what was changed and why.
+
+Owner evidence: before recording that a step needs owner evidence, consider what can be safely done by an agent directly: run a CLI in a throwaway folder outside the workspace, read accessible files, or run a read-only command. "Owner evidence needed" must state which of these it requires (the owner's machine, an account, a payment, or the owner's judgement) and why an agent cannot obtain it.
 
 Output ONLY the complete revised plan — it replaces the current plan file at {{planFinalPath}} in place.
 

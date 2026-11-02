@@ -129,6 +129,7 @@ import {
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
 import { classifyZeroFileImplRoundV1 } from "../utils/roundOutcomeClassificationV1";
+import { hasOwedImplContinuationV1 } from "../utils/owedContinuationCardGuardV1";
 import {
   markFastForwardRunActiveV1,
   clearFastForwardRunActiveV1,
@@ -205,6 +206,19 @@ import {
   formatImplementationTypeCheckErrorsV1,
 } from "../utils/implementationTypeCheckHandOffV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
+import { formatApplyReviewFocusBlockV1, peekApplyReviewFocusV1 } from "../utils/applyReviewFocusV1";
+import {
+  REVIEW_SCOPE_PARTIAL_COUNT_VARIABLE,
+  REVIEW_SCOPE_PARTIAL_FILES_VARIABLE,
+  REVIEW_SCOPE_PARTIAL_HASH_VARIABLE,
+  REVIEW_SCOPE_PARTIAL_SUMMARY_VARIABLE,
+  isPartialScopeAcceptedV1,
+  partialScopeFromVariablesV1,
+  partialScopeVariablesV1,
+  qualifyReviewForPartialScopeV1,
+} from "../utils/reviewPartialScopeV1";
+import { postPartialScopeDecisionV1, readPartialScopeAcceptanceV1 } from "./partialScopeDecisionV1";
 import { loadRetryFailedReviewOptionFieldsV1 } from "../utils/resumeActionPlanV1";
 import { applyReviewActivityV1, stepNameV1, stepProgressLabelV1 } from "../utils/stepLabelsV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -271,6 +285,7 @@ import { generateContextPack, writeContextPack, writeContextPackContent, writeIm
 import { renderPromptTemplate } from "../utils/promptTemplates";
 import { writeRunLog } from "../utils/runLog";
 import { candidateInvocationMessageV1, dispatchCorrelationFromOutcomeV1, persistCandidateDispatchModelChainV1 } from "../utils/dispatchModelChainV1";
+import { getModelResolutionNoteV1 } from "../utils/rememberedFallbackV1";
 import {
   collectAttemptIdsFromOutcomeV1,
   describeTaskActionFailureV1,
@@ -410,8 +425,9 @@ import {
   missingCompletionArtifactsV1,
   stageActionRequirementMessageV1,
 } from "../utils/stageArtifactRequirementsV1";
-import { describeOwedContinuationRefusalV1 } from "../utils/owedContinuationRefusalV1";
+import { describeOwedContinuationRefusalV1, OWNER_CANCEL_HOLD_CHAT_TEXT_V1 } from "../utils/owedContinuationRefusalV1";
 import {
+  applyAcceptedTicksNowV1,
   deriveApplicableVerifiedTicksV1,
   postApplyReviewerVerifiedTicksDecisionV1,
   writeVerifiedTicksToPlanV1,
@@ -476,7 +492,20 @@ import {
   partitionStageUnsatisfiableBlockersV1,
   reclassifyDeclinedBlockersV1,
   parseReviewVerifiedCompleteV1,
+  parseOwnerDecisionsNeededV1,
+  parsePlanDeviationsV1,
 } from "../utils/reviewReadiness";
+import {
+  postOwnerOnlyBlockersCardV1,
+  raiseOwnerDecisionCardsFromReviewV1,
+  raisePlanDeviationCardsV1,
+} from "./ownerPlanDecisionCommandV1";
+import {
+  computeReviewScopeGapV1,
+  describeReviewedCountV1,
+  describeTrackedScopeFallbackLineV1,
+  formatMissingFilesSectionV1,
+} from "../utils/reviewScopeGapV1";
 import {
   refreshStaleReviewBannerForArtifactV1,
 } from "../utils/reviewFreshness";
@@ -497,7 +526,8 @@ import {
   resolvePublishScopeFolder,
   synthesizeMechanicalBlockers,
 } from "../utils/completionLint";
-import { checkPublishPreflight } from "../utils/publishPreflight";
+import { checkPublishPreflight, endPreflightReasonSentenceV1 } from "../utils/publishPreflight";
+import { describePublishChecksFailureV1, PUBLISH_CHECKS_FIX_ACTION_LABEL_V1 } from "../utils/publishChecksFailureNoticeV1";
 import {
   derivePlanNonGoalSupersessionsV1,
   filterSupersededBlockersV1,
@@ -518,6 +548,8 @@ import {
   PublishChecksFreshnessCheckV1,
   readPublishChecksFile,
 } from "../utils/publishChecksFreshness";
+import { readPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
+import { reviewOperationLabelV1 } from "../utils/publishStageActionsV1";
 import { improveReviewScore } from "../utils/reviewScoreLoop";
 import { classifyFastForwardStageV1 } from "../utils/fastForwardStageDriftV1";
 import {
@@ -581,6 +613,7 @@ import { detectPlanArtifactDisagreementV1 } from "../utils/planArtifactMismatchV
 import { buildStandingBlockersNoticeV1 } from "../prompts/standingBlockersNoticeV1";
 import {
   escalateReviewToHuman,
+  isOwnerDecisionBlockerV1,
   postEnvironmentalAdvanceNoticeV1,
   postLatchedOpenItemsDecisionV1,
   postUnbuiltStepsHoldDecisionV1,
@@ -776,11 +809,13 @@ export async function warnHandOverNotStartedV1(
     ? "vs-code-ai-helper.runImplementationWithAI"
     : "vs-code-ai-helper.runReviewWithAI";
   const taskLabel = formatNotificationTaskLabelV1(displayName, folderUri.fsPath);
-  const finding = findHandOverRoundFindingV1(
-    await readTaskProgressAdvisoryV1(folderUri).catch(() => undefined),
-    stage,
-    { now: options.now, since: options.since }
-  );
+  const handOverProgress = await readTaskProgressAdvisoryV1(folderUri).catch(() => undefined);
+  // bugs5 Step 14: an owed continuation owns the next step; a "Run Implementation" or "Run Review"
+  // card now would be superseded when it starts.
+  if (hasOwedImplContinuationV1(handOverProgress)) {
+    return;
+  }
+  const finding = findHandOverRoundFindingV1(handOverProgress, stage, { now: options.now, since: options.since });
   if (finding?.kind === "gated"&& finding.gate.kind === "type-check") {
     // The gate's own decision names the type-check as the blocker and
     // recommends the fix. Posting it here is idempotent by decision key, so a
@@ -895,6 +930,10 @@ export async function offerCompletedImplementationReviewInChatV1(
   folderUri: vscode.Uri,
   displayName?: string
 ): Promise<Awaited<ReturnType<typeof offerActionInChatV1>>> {
+  // bugs5 Step 14: no review card while a continuation is owed; it is raised once the owed state clears.
+  if (hasOwedImplContinuationV1(await readTaskProgressAdvisoryV1(folderUri).catch(() => undefined))) {
+    return undefined;
+  }
   return offerActionInChatV1({
     taskFolderPath: folderUri.fsPath,
     actionLabel: "Run Review",
@@ -2374,6 +2413,49 @@ export async function isGitWorkspace(cwd: string): Promise<boolean> {
 }
 
 /**
+ * The working tree's changes against HEAD (modified, added, deleted-from-index excluded) and untracked
+ * files, workspace-relative. Best effort: an empty list when the folder is not a Git workspace.
+ */
+async function readWorkingTreeChangesV1(cwd: string): Promise<string[]> {
+  const run = (args: string[]): Promise<string[]> =>
+    new Promise((resolve) => {
+      cp.execFile("git", args, { cwd, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
+        resolve(err ? [] : stdout.split("\0").filter((entry) => entry.length > 0));
+      });
+    });
+  const [tracked, untracked] = await Promise.all([
+    run(["diff", "--name-only", "--diff-filter=d", "-z", "HEAD"]),
+    run(["ls-files", "--others", "--exclude-standard", "-z"]),
+  ]);
+  return [...tracked, ...untracked].map((file) => file.replace(/\\/g, "/"));
+}
+
+/**
+ * bugs5 Step 27: the paths other open tasks in the same task root claim (tracked scope, quarantine, ledger), so a
+ * review's change set does not count their working-tree edits as this task's. Best effort: empty when the
+ * sibling tasks cannot be listed.
+ */
+async function readOtherTaskClaimedFilesV1(taskFolderPath: string): Promise<string[]> {
+  try {
+    const found = await findAllTasksStrictV1(vscode.Uri.file(path.dirname(taskFolderPath)));
+    const claimed: string[] = [];
+    for (const task of found.tasks) {
+      if (isSameWorkspacePath(task.folderUri.fsPath, taskFolderPath) || task.progress.status === "completed") {
+        continue;
+      }
+      claimed.push(
+        ...(task.progress.implReviewFiles ?? []),
+        ...(task.progress.pendingImplReviewFiles ?? []),
+        ...(task.progress.roundLedger ?? []).flatMap((row) => row.outcome?.filesChanged ?? [])
+      );
+    }
+    return claimed;
+  } catch {
+    return [];
+  }
+}
+
+/**
  * Return changed paths that do not belong to the task currently being run.
  * Task metadata and files recorded by earlier implementation runs are related
  * work, so they must not trigger the pre-run warning.
@@ -3018,7 +3100,7 @@ async function requirePublishChecksFreshnessOrWarnV1(
       },
     };
   }
-  const freshnessNotice = `${formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath)} — ${describePublishChecksFreshnessFailureV1(check)}`;
+  const freshnessNotice = `${formatNotificationTaskLabelV1(progress?.displayName, folderUri.fsPath)} — ${describePublishChecksFreshnessFailureV1(check, readPublishChecksOutcomeV1(folderUri.fsPath))}`;
   NotificationRouter.showWarning(
     freshnessNotice,
     undefined,
@@ -4534,6 +4616,13 @@ export async function handleReviewRoutingOutcome(options: {
       progressBefore.escalation.secondOpinionAttempted === true;
 
     const carriedGateBlockers = await readCarriedGateBlockersV1(folderUri, targetStage, blockers);
+    const ownerDecisionBlocks = parseOwnerDecisionsNeededV1(content);
+    if (ownerDecisionBlocks.length > 0) {
+      await raiseOwnerDecisionCardsFromReviewV1(folderUri.fsPath, targetStage, content).catch(() => []);
+    }
+    const allBlockersNeedOwnerDecision =
+      blockers.length > 0 &&
+      blockers.every((b) => isOwnerDecisionBlockerV1(b, ownerDecisionBlocks));
     const decision = decideReviewRoute({
       score,
       threshold,
@@ -4541,6 +4630,7 @@ export async function handleReviewRoutingOutcome(options: {
       plateaued,
       secondOpinionTriedThisPlateau,
       carriedGateBlockers,
+      allBlockersNeedOwnerDecision,
     });
 
     if (carriedGateBlockers.length > 0 && (decision.route === "advance" || decision.route === "advance-with-note")) {
@@ -5619,10 +5709,49 @@ async function routeReviewOutcomeV1(
                 deferredScope ? deferredOrGatedStepNumbersV1(deferredScope) : undefined
               )
             : undefined;
-        const meetsThreshold =
+        // bugs5 Step 27: a scope known to miss changed files is named in the verdict, and its score does not clear
+        // the stage unless the owner accepted exactly this gap.
+        const partialScope = noTrackedFileSet ? undefined : partialScopeFromVariablesV1(variables, targetStage);
+        let partialScopeHolds = false;
+        if (partialScope) {
+          const accepted = isPartialScopeAcceptedV1(
+            await readPartialScopeAcceptanceV1(folderUri.fsPath),
+            targetStage,
+            partialScope.hash
+          );
+          partialScopeHolds = !accepted;
+          const qualified = qualifyReviewForPartialScopeV1(content, partialScope, accepted);
+          if (qualified !== content) {
+            try {
+              await vscode.workspace.fs.writeFile(reviewUri, new TextEncoder().encode(qualified));
+              content = qualified;
+            } catch {
+              // Best effort: the hold below does not depend on the note being written.
+            }
+          }
+        }
+        const clearsWithoutScopeHold =
           readyToAdvanceStage(score, autoAdvanceThreshold, gateProgress) &&
           !noTrackedFileSet &&
           unbuiltStepsContradiction === undefined;
+        const meetsThreshold = clearsWithoutScopeHold && !partialScopeHolds;
+        if (partialScope && partialScopeHolds && clearsWithoutScopeHold) {
+          await appendChatMessageV1(folderUri.fsPath, {
+            role: "assistant",
+            text:
+              `${STAGE_DISPLAY_NAMES[targetStage]} scored ${score}/10, but ${partialScope.summary}. ` +
+              "The stage was not advanced; choose how to continue in the card below.",
+            stage: targetStage,
+            at: new Date().toISOString(),
+          }).catch(() => undefined);
+          await postPartialScopeDecisionV1({
+            taskFolderPath: folderUri.fsPath,
+            stage: targetStage,
+            scope: partialScope,
+            score,
+            threshold: autoAdvanceThreshold,
+          }).catch(() => undefined);
+        }
         if (noTrackedFileSet) {
           NotificationRouter.showWarning(
             `${STAGE_DISPLAY_NAMES[targetStage]} scored ${score ?? "unscored"}/10, but this task has no tracked ` +
@@ -7131,6 +7260,9 @@ export async function runReviewForFolder(
   // (reportStageRunningV1) so a late resolution here can never overwrite a
   // stage this same root has since moved on to.
   const stageToken = options.operation?.reportActivity("starting", { resetElapsedOrigin: true });
+  // bugs5 Step 26: this round has not invoked a model yet. Drop the one the previous round (an Apply Review on
+  // another chain) left on the root row; `setModel` below names the model that actually starts.
+  options.operation?.setModel?.(undefined);
   // Captured alongside stageToken (not read back from the operation, which
   // exposes no getter for it) so the completion-check accumulator below can
   // restore this exact origin between check batches instead of the last
@@ -7730,6 +7862,8 @@ export async function runReviewForFolder(
     );
   } else {
     let taskProgress = await readTaskProgressAdvisoryV1(folderUri);
+    // bugs5 Step 27: set below for an implementation review whose scope is missing changed files.
+    let scopeGapSection = "";
     // Implementation reviews must use task-owned round evidence when their
     // tracked scope is missing or incomplete. This runs before the context
     // pack can consider open editors, and it is shared by fresh, Resume and
@@ -7813,6 +7947,49 @@ export async function runReviewForFolder(
           targetStage,
           `Source: existing tracked scope (${ledgerScope.files.length} path(s)); ledger could not prove a complete replacement. ${ledgerScope.reason ?? ""}`
         ).catch(() => undefined);
+      }
+      // bugs5 Step 27: compare the scope with everything the task changed, and say so when files are missing.
+      const scopeGap = computeReviewScopeGapV1({
+        ledgerFiles: (taskProgress.roundLedger ?? []).flatMap((row) => row.outcome?.filesChanged ?? []),
+        workingTreeFiles: await readWorkingTreeChangesV1(workspaceRoot.uri.fsPath),
+        scopeFiles: taskProgress.implReviewFiles ?? [],
+        quarantinedFiles: taskProgress.pendingImplReviewFiles,
+        otherTaskFiles: await readOtherTaskClaimedFilesV1(folderUri.fsPath),
+        taskRecordFolders: [path.relative(workspaceRoot.uri.fsPath, path.dirname(folderUri.fsPath))],
+      });
+      scopeGapSection = formatMissingFilesSectionV1(scopeGap);
+      // Carry the gap to routing (the way the open-editors fallback travels): the verdict names it and the
+      // score does not clear the stage while it stands.
+      for (const key of [
+        REVIEW_SCOPE_PARTIAL_COUNT_VARIABLE,
+        REVIEW_SCOPE_PARTIAL_SUMMARY_VARIABLE,
+        REVIEW_SCOPE_PARTIAL_HASH_VARIABLE,
+        REVIEW_SCOPE_PARTIAL_FILES_VARIABLE,
+      ]) {
+        delete variables[key];
+      }
+      if (scopeGap.missing.length > 0) {
+        Object.assign(variables, partialScopeVariablesV1(scopeGap.missing, describeReviewedCountV1(scopeGap)));
+      }
+      if (scopeGap.missing.length > 0) {
+        await writeRunLog(
+          folderUri,
+          "impl-review-scope-rebuild",
+          targetStage,
+          `${describeReviewedCountV1(scopeGap)}; ${scopeGap.missing.length} changed file(s) are not in this review's scope.`
+        ).catch(() => undefined);
+        const fallbackLine =
+          ledgerScope.kind === "established" && ledgerScope.source === "ledger"
+            ? undefined
+            : describeTrackedScopeFallbackLineV1((taskProgress.implReviewFiles ?? []).length, scopeGap);
+        if (fallbackLine) {
+          await appendChatMessageV1(folderUri.fsPath, {
+            role: "assistant",
+            text: fallbackLine,
+            stage: targetStage,
+            at: new Date().toISOString(),
+          }).catch(() => undefined);
+        }
       }
     }
     // RC3 item 10 (Step 6): Publish runs after both implementation reviews,
@@ -7945,9 +8122,9 @@ export async function runReviewForFolder(
       }
       lastEmbeddedContentBytes = written.embeddedContentBytes;
       lastOmittedRelPaths = written.omittedRelPaths;
-      contextPackContent = new TextDecoder().decode(
-        await vscode.workspace.fs.readFile(written.contextPackUri)
-      );
+      contextPackContent =
+        scopeGapSection +
+        new TextDecoder().decode(await vscode.workspace.fs.readFile(written.contextPackUri));
       variables.contextPack = contextPackContent;
       const probePrompt = await renderPromptTemplate(extensionUri, templateFile, variables);
       const probeActionInput: ReviewActionInputV1 = {
@@ -9629,7 +9806,7 @@ export async function runReviewWithAI(
     const dispatchedReview = await runTrackedOperation(
       lockKey,
       {
-        label: stepNameV1("review"),
+        label: reviewOperationLabelV1(resolved.progress.currentStage, stepNameV1("review")),
         stage: resolved.progress.currentStage,
         taskName: resolveWorkflowRootTaskName(resolved.progress.displayName, resolved.folderUri.fsPath),
         kind: "review",
@@ -10913,9 +11090,33 @@ export async function fastForwardReviewWithAI(
       (savedChecksPayload.passedModuloKnownFlakes ?? savedChecksPayload.passed);
     if (!savedChecksPassed) {
       if (freshnessBeforeChecks.status === "valid") {
-        // The checks were not run here, so nothing has said why yet.
+        // bugs5 Step 15: the last completed run failed on this same commit and tree, so running the
+        // checks again can only fail the same way. Nothing was run here, so say why and offer the
+        // fix round (a card, not an automatic model run); Run Publish Checks stays an alternative.
+        const failedNotice =
+          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: ` +
+          `${describePublishChecksFailureV1(savedChecksPayload)} ` +
+          "They were not run again because nothing has changed since. Fix what they found, then review.";
         NotificationRouter.showWarning(
-          `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderUri.fsPath)}: Publish Checks have not passed. Use Fix Linting & Code Errors, then Review.`
+          failedNotice,
+          undefined,
+          undefined,
+          undefined,
+          await offerActionInChatV1({
+            taskFolderPath: resolved.folderUri.fsPath,
+            actionLabel: "Fix Linting & Code Errors",
+            command: "vs-code-ai-helper.runLintingFixes",
+            args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+            noticeText: failedNotice,
+            alternatives: [
+              {
+                label: "Run Publish Checks",
+                command: "vs-code-ai-helper.runPublishChecks",
+                args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+                consequence: "Runs the checks again on the same code. Only worth it if something outside the code changed.",
+              },
+            ],
+          })
         );
       }
       return false;
@@ -11278,6 +11479,38 @@ export async function fastForwardReviewWithAI(
     return;
   }
 
+  // bugs5 Step 22: when every blocker holding the score needs the owner, stop Fast Forward and raise cards.
+  const initialDetailed = parseReviewBlockersDetailed(initialContent);
+  const initialOwnerBlocks = parseOwnerDecisionsNeededV1(initialContent);
+  const initialAllNeedOwner =
+    initialDetailed.blockers.length > 0 &&
+    initialDetailed.blockers.every((b) => isOwnerDecisionBlockerV1(b, initialOwnerBlocks));
+  if (initialAllNeedOwner) {
+    if (initialOwnerBlocks.length > 0) {
+      await raiseOwnerDecisionCardsFromReviewV1(resolved.folderUri.fsPath, targetStage, initialContent).catch(() => []);
+    } else {
+      // No plain-language decision block to raise a card from: raise one card naming the blockers, and say
+      // the same in chat so the stop is explained.
+      await postOwnerOnlyBlockersCardV1({
+        taskFolderPath: resolved.folderUri.fsPath,
+        stage: targetStage,
+        blockerDescriptions: initialDetailed.blockers.map((b) => b.description),
+      }).catch(() => undefined);
+      await appendChatMessageV1(resolved.folderUri.fsPath, {
+        role: "assistant",
+        text:
+          "Fast Forward stopped: every blocker holding the score needs you, not another Apply Review. Blockers: " +
+          initialDetailed.blockers.map((b) => b.description).join("; "),
+        stage: targetStage,
+        at: new Date().toISOString(),
+      }).catch(() => undefined);
+    }
+    NotificationRouter.showWarning(
+      `Fast Forward Review stopped: every blocker holding the score requires an owner decision. Review the decision card(s) in Chat.`
+    );
+    return;
+  }
+
   // Concrete, already-resolved task node so every attempt targets this same
   // task without resolveTask re-prompting (it already resolved the task once
   // above). Deliberately `{ task }` rather than `{ taskFolderPath }` (plan
@@ -11434,6 +11667,9 @@ export async function fastForwardReviewWithAI(
               ...buildFastForwardApplyReviewOptions(attemptNumber, op, chatViewProvider),
               dispatchProbe: ffAttemptProbe,
             });
+            // bugs5 Step 2: ticks the owner accepted while this round was open are merged now,
+            // before Fast Forward reads the checklist for its next decision.
+            await applyAcceptedTicksNowV1(resolved.folderUri.fsPath).catch(() => 0);
             if (ffAttemptProbe.preflightRefusal !== undefined) {
               ffPreflightRefusedV1 = true;
             }
@@ -12254,7 +12490,9 @@ async function buildApplyReviewPromptPartsV1(
   const reviewContentCapped =
     (maxReviewChars !== undefined
       ? truncateTextToBudgetV1(reviewContent, maxReviewChars, "the review")
-      : reviewContent) + ownerEvidenceVerdictBlock;
+      : reviewContent) +
+    ownerEvidenceVerdictBlock +
+    formatApplyReviewFocusBlockV1(peekApplyReviewFocusV1(folderUri.fsPath));
 
   let approvedPlan: string | undefined;
   let planName = "plan.md";
@@ -13550,9 +13788,27 @@ export async function nextStage(
   // user's own button click, so this only nudges — never schedules it.
   // Gated on the checkPublishPreflight result captured in Step 3 above.
   if (next === "publish") {
-    if (publishPreflight?.ok === false) {
+    if (publishPreflight?.ok === false && publishPreflight.lintPayload !== undefined) {
+      // bugs5 Step 16: name what failed and recommend the fix round. The card does not suggest
+      // Publish Anyway while checks fail; it stays reachable from Commit & Push, not recommended.
       const failedChecksNotice =
-        `${resolved.progress.taskFolder} checks failed: ${publishPreflight.reason}. Publish manually once checks pass, or use Publish Anyway from Commit and Push.`;
+        `${resolved.progress.taskFolder}: ${describePublishChecksFailureV1(publishPreflight.lintPayload)}`;
+      NotificationRouter.showWarning(
+        failedChecksNotice,
+        undefined,
+        undefined,
+        undefined,
+        await offerActionInChatV1({
+          taskFolderPath: resolved.folderUri.fsPath,
+          actionLabel: PUBLISH_CHECKS_FIX_ACTION_LABEL_V1,
+          command: "vs-code-ai-helper.runLintingFixes",
+          args: [{ taskFolderPath: resolved.folderUri.fsPath }],
+          noticeText: failedChecksNotice,
+        })
+      );
+    } else if (publishPreflight?.ok === false) {
+      const failedChecksNotice =
+        `${resolved.progress.taskFolder} checks failed: ${endPreflightReasonSentenceV1(publishPreflight.reason)} Publish manually once checks pass, or use Publish Anyway from Commit and Push.`;
       NotificationRouter.showWarning(
         failedChecksNotice,
         undefined,
@@ -13959,6 +14215,8 @@ export async function generateImplementationWithAI(
       // exists to remove. The model attaches separately via setModel once
       // resolved (see below), which never resets the origin this call sets.
       const stageToken = op?.reportActivity("starting", { resetElapsedOrigin: true });
+      // bugs5 Step 26: no model has been invoked for this round yet; never show the previous round's.
+      op?.setModel?.(undefined);
 
       const implementationUri = getCanonicalImplementationUri(resolved.folderUri);
       let planFinalContent = await readNonEmptyText(implementationUri);
@@ -14321,10 +14579,18 @@ async function observeCandidateModelInvocationV1(
     readonly operationId?: string;
     readonly attemptId: string;
     readonly backup: boolean;
+    readonly previousFailure?: string;
   }
 ): Promise<void> {
   operation?.setModel?.(info.storedModelId);
-  const message = candidateInvocationMessageV1(activity, info.storedModelId, info.providerLabel, info.backup);
+  const message = candidateInvocationMessageV1(
+    activity,
+    info.storedModelId,
+    info.providerLabel,
+    info.backup,
+    info.previousFailure,
+    getModelResolutionNoteV1(taskFolderUri.fsPath, stage)
+  );
   operation?.report?.(message);
   // Normally already inside the round's own task context (kept as is); the
   // wrapper names the task when this is reached without one.
@@ -15200,6 +15466,17 @@ async function executeImplementationRun(
       sourceDispatchMode: nextRecoverySourceDispatchMode,
       ...(nextRecoverySourceReviewStage ? { sourceReviewStage: nextRecoverySourceReviewStage } : {}),
       sourceRoundIdHint: implRoundId,
+      // bugs5 Step 13: a continuation that ends without a usable report counts toward the breakers.
+      ...(claimedRecovery.record !== undefined
+        ? {
+            continuationRoundOutcome: {
+              attemptId: implRoundId,
+              ...((result.storedModelId ?? modelId) ? { modelId: result.storedModelId ?? modelId } : {}),
+              ...(result.runnerId ? { providerId: result.runnerId } : {}),
+              dispatchMode: currentDispatchMode,
+            },
+          }
+        : {}),
     });
   }
   const quarantinedPaths = recovery?.quarantinedPaths ?? [];
@@ -15863,8 +16140,11 @@ async function executeImplementationRun(
     // it as a zero-change round would advance the no-progress breaker on a
     // round that did exactly its job, and the early return here would skip
     // the promotion that clears the recovery record.
+    // bugs5 Step 13: any claimed continuation (summary-only or inspect-and-complete) whose report was
+    // accepted and parsed with a Plan Item Checklist did its job; observed 2026-11-01 (jester), an
+    // inspect-and-complete continuation with quarantined files was gated as a zero-file failure every time.
     const acceptedSummaryOnlyReport =
-      !summaryIssue && claimedRecovery.record?.mode === "summary-only";
+      !summaryIssue && claimedRecovery.record !== undefined && planChecklist !== undefined;
     // Implementation review round 2 (review commit c66cbc9, "more than one
     // surface"): set inside the zero-file branch below when RC2 item 13's
     // "nothing more to build" card already told this round's story, so the
@@ -16145,7 +16425,11 @@ async function executeImplementationRun(
             undefined,
             undefined,
             undefined,
-            notReachedRetry
+            // bugs5 Step 14: a round that is (or leaves) an owed continuation raises no Run
+            // Implementation / Run Review card; the continuation is the next step.
+            claimedRecovery.record !== undefined || hasOwedImplContinuationV1(priorProgress)
+              ? undefined
+              : notReachedRetry
               ? await offerActionInChatV1({
                   taskFolderPath: folderUri.fsPath,
                   actionLabel: notReachedRetry.actionLabel,
@@ -16247,6 +16531,7 @@ async function executeImplementationRun(
               ? {
                   ...withStreak,
                   checklistProgressUnreliable: true,
+                  checklistProgressUnreliableSetAt: new Date().toISOString(),
                   checklistProgressUnreliableReason:
                     "a zero-change implementation round reported plan-item completions that did not match the plan checklist",
                   updatedAt: new Date().toISOString(),
@@ -16653,6 +16938,7 @@ async function executeImplementationRun(
               ? {
                   ...cleared,
                   checklistProgressUnreliable: true,
+                  checklistProgressUnreliableSetAt: new Date().toISOString(),
                   checklistProgressUnreliableReason:
                     "an implementation round claimed checklist items that could not be merged, leaving unticked work",
                   ...latchingClaimsRecordPatchV1(checklistMergeResult),
@@ -16692,6 +16978,7 @@ async function executeImplementationRun(
             : {
                 ...current,
                 checklistProgressUnreliable: true,
+                checklistProgressUnreliableSetAt: new Date().toISOString(),
                 checklistProgressUnreliableReason:
                   "an implementation round claimed checklist items that did not match any plan item, and no review has cleared the stage",
                 ...latchingClaimsRecordPatchV1(checklistMergeResult),
@@ -16800,6 +17087,7 @@ async function executeImplementationRun(
       const noEditsClassification = classifyZeroFileImplRoundV1({
         checklistAdvanced,
         warnedAsZeroFileFailure: false,
+        continuationReportProduced: acceptedSummaryOnlyReport,
       });
       await terminalizeRoundV1(
         implRoundId,
@@ -17138,6 +17426,7 @@ async function executeImplementationRun(
         ? {
             ...stageUpdated,
             checklistProgressUnreliable: true,
+            checklistProgressUnreliableSetAt: new Date().toISOString(),
             checklistProgressUnreliableReason:
               "the round may have changed files but produced a synthetic or unusable summary, so checklist progress cannot be trusted",
             updatedAt: new Date().toISOString(),
@@ -17498,6 +17787,22 @@ async function executeImplementationRun(
 
     await safeOpenTextDocument(summaryUri, IMPLEMENTATION_SUMMARY_FILENAME);
 
+    // bugs5 Step 23 item 6: parse plan deviations, raise cards, and name deviations in summary
+    const deviations = parsePlanDeviationsV1(summary);
+    if (deviations.length > 0) {
+      // `postRunReviewStage` is "impl" for an Implementation round and the review stage for an Apply Review
+      // round, so the cards and the chat line land on the stage the round ran for.
+      await raisePlanDeviationCardsV1(folderUri.fsPath, postRunReviewStage, summary).catch(() => []);
+      const devProblems = deviations.map((d) => d.problem).join("; ");
+      const roundName = postRunReviewStage === "impl" ? "Implementation" : "Apply Review";
+      await appendChatMessageV1(folderUri.fsPath, {
+        role: "assistant",
+        text: `${roundName} completed with plan deviation(s): ${devProblems}. Decision card(s) raised for owner approval.`,
+        stage: postRunReviewStage,
+        at: new Date().toISOString(),
+      }).catch(() => undefined);
+    }
+
     // Auto-advance: a completed implementation proceeds to High-Level Code
     // Review when auto-advance is enabled, and (via AUTO_REVIEW_TRANSITIONS)
     // starts that review. Runs before the legacy auto-review-in-place setting
@@ -17652,13 +17957,30 @@ async function executeImplementationRun(
       changedFiles: result.filesChanged,
     });
     options.parentOperation?.settleAs("cancelled", "Implementation cancelled");
-    await releaseImplRecoveryClaimV1(folderUri, {
+    // bugs5 Step 14: the owner's own cancel holds an owed continuation; the automatic retry is for
+    // crashes and reloads, not for a cancel the owner pressed.
+    const cancelSourceV1 = options.parentOperation?.cancelSource?.();
+    const cancelledByOwnerV1 = cancelSourceV1 !== undefined && cancelSourceV1 !== "unknown";
+    const releasedAfterCancelV1 = await releaseImplRecoveryClaimV1(folderUri, {
       failedProvider: result.providerLabel ?? result.runnerId,
       failedModel: result.storedModelId,
       reason: "Implementation cancelled",
       operationId: options.parentOperation?.id,
       attemptId: implRoundId,
+      ...(cancelledByOwnerV1 ? { ownerHold: "cancelled" as const } : {}),
     });
+    if (cancelledByOwnerV1 && releasedAfterCancelV1?.implRecovery?.ownerHold !== undefined) {
+      await appendChatMessageV1(
+        folderUri.fsPath,
+        {
+          role: "assistant",
+          text: OWNER_CANCEL_HOLD_CHAT_TEXT_V1,
+          stage: "impl",
+          at: new Date().toISOString(),
+        },
+        folderUri.fsPath
+      ).catch((error) => console.warn("Could not post the cancelled-continuation line:", error));
+    }
     // wf10 item 4 / Part 4: a cancelled round reaches completion accounting
     // (it is not a runner-level failure) and must be recorded as such rather
     // than left indistinguishable from an unreported round. `logUri` was
@@ -20229,7 +20551,7 @@ export async function buildReviewResumeVariablesV1(
       const currentCommitSha = await resolveHeadCommitSha(scopeFolder);
       const freshnessCheck = await checkPublishChecksFreshnessV1(folderUri, scopeFolder, currentCommitSha);
       if (freshnessCheck.status !== "valid") {
-        return { ok: false, warning: describePublishChecksFreshnessFailureV1(freshnessCheck) };
+        return { ok: false, warning: describePublishChecksFreshnessFailureV1(freshnessCheck, readPublishChecksOutcomeV1(folderUri.fsPath)) };
       }
     }
     // Same resolver and same order as runReviewForFolder — a resumed review
@@ -20499,7 +20821,7 @@ export async function resumeReviewInteractionV1(
     const outcome = await runResumedRoundOperationV1(
       ownedTask.taskFolderPath,
       {
-        label: stepNameV1("review"),
+        label: reviewOperationLabelV1(currentStage, stepNameV1("review")),
         stage: currentStage,
         kind: "review",
         displayName: ownedTask.progress.displayName,

@@ -28,11 +28,25 @@ import {
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
 import { writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import { PlanItemEvidenceV1, PlanItemOwnerTestRunV1, PlanItemTestReportV1, STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
-import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
+import {
+  openWorkflowDecisionStoreV1,
+  postWorkflowDecisionV1,
+  withdrawWorkflowDecisionsByKeyV1,
+} from "../utils/workflowDecisionDispatchV1";
+import {
+  APPLY_TICKS_DECISION_KEY_V1,
+  APPLY_TICKS_NOW_OPTION_ID_V1,
+  buildHeldTicksAnswerOptionsV1,
+} from "./verifiedTicksHeldOptionsV1";
+import { appendChatMessageV1 } from "../utils/chatHistoryStore";
+import type { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { armDeferredOptionRunV1 } from "../utils/deferredOptionRunV1";
+import { taskOperations } from "../utils/taskOperations";
+import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 import { withdrawStaleOpenItemsCardV1 } from "../utils/withdrawStaleOpenItemsCardV1";
 import { ChatTarget } from "../views/chatView";
 import { normalizePath } from "../utils/taskRoot";
-import { WorkflowDecisionCommandResultV1 } from "../types/workflowDecisionV1";
+import { WorkflowDecisionCommandResultV1, WorkflowDecisionOptionV1 } from "../types/workflowDecisionV1";
 import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
 import { fastForwardResumeSuffixV1, FastForwardResumeStateV1 } from "./fastForwardResumeSuffixV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -41,6 +55,17 @@ import { recordPlanItemReviewerVerificationV1 } from "../utils/taskProgressTrans
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { isFormContinuationPendingV1 } from "../utils/formPlanWriteMarkerV1";
+
+/**
+ * bugs5 Step 4: the name of the command that settles one checklist item by hand, as the Command
+ * Palette shows it (the `package.json` title without its trailing ellipsis; a unit test keeps the two
+ * in step).
+ */
+export const SETTLE_CHECKLIST_ITEM_COMMAND_TITLE_V1 = "Tick or Exclude a Checklist Item";
+
+/** Said under the withheld items, so the owner knows they are not stuck with them. */
+export const SETTLE_WITHHELD_ITEMS_HINT_V1 =
+  `You can settle them yourself with ${SETTLE_CHECKLIST_ITEM_COMMAND_TITLE_V1}.`;
 
 type ApplyArg =
   | { task?: IncompleteTask }
@@ -587,6 +612,29 @@ export async function deriveApplicableVerifiedTicksV1(
   };
 }
 
+/**
+ * bugs5 Step 2: while a Fast Forward run is live, the card also offers the answer that only ticks.
+ * Inserted before the trailing "Not yet", so that stays last.
+ */
+export function addTickOnlyOptionWhenFastForwardLiveV1(
+  fastForwardLive: boolean,
+  options: readonly WorkflowDecisionOptionV1[]
+): readonly WorkflowDecisionOptionV1[] {
+  if (!fastForwardLive) {
+    return options;
+  }
+  const tickOnly = buildHeldTicksAnswerOptionsV1({ decisionKey: APPLY_TICKS_DECISION_KEY_V1, options }).find(
+    (option) => option.optionId === APPLY_TICKS_NOW_OPTION_ID_V1
+  );
+  if (!tickOnly) {
+    return options;
+  }
+  const notYetIndex = options.findIndex((option) => option.effect.kind === "doNothing");
+  return notYetIndex === -1
+    ? [...options, tickOnly]
+    : [...options.slice(0, notYetIndex), tickOnly, ...options.slice(notYetIndex)];
+}
+
 export type ApplyTicksDecisionPostResultV1 =
   | { readonly kind: "posted" }
   | {
@@ -628,7 +676,8 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
   }
   const { reviewFilename, applicable, applicableEvidence, withheldTestItems, withheldReasons } = derived.derivation;
   const withheldNote = withheldTestItems.length > 0
-    ? `\nWithheld and still provisional because no applicable passing Implementation or Apply Review test report was found. ${describeWithheldTestItemsV1(withheldTestItems, 12, withheldReasons)}`
+    ? `\nWithheld and still provisional because no applicable passing Implementation or Apply Review test report was found. ${describeWithheldTestItemsV1(withheldTestItems, 12, withheldReasons)}` +
+      ` ${SETTLE_WITHHELD_ITEMS_HINT_V1}`
     : "";
 
   const target: ChatTarget = {
@@ -656,7 +705,7 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
         "Applying re-arms the completeness gate on the reviewer's own word — a consequential enough change " +
         "to confirm once, even though the merge itself is monotonic (it can only tick items, never untick or " +
         "misfile one) and text-matched against the plan of record.",
-      options: [
+      options: addTickOnlyOptionWhenFastForwardLiveV1(ffResume.extraArgs.resumeFastForwardV1 !== undefined, [
         {
           optionId: "apply",
           label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"}${ffResume.labelSuffix}`,
@@ -692,14 +741,23 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
           consequence: "Does nothing. The items stay unticked until you apply this or tick them yourself.",
           effect: { kind: "doNothing" },
         },
-      ],
-      recommendation: {
-        kind: "option",
-        optionId: "apply",
-        reasoning:
-          "The reviewer already verified these items against the tree; applying only records that " +
-          "verification as ticks, which cannot untick or misapply anything.",
-      },
+      ]),
+      recommendation:
+        ffResume.extraArgs.resumeFastForwardV1 !== undefined
+          ? {
+              kind: "option",
+              optionId: APPLY_TICKS_NOW_OPTION_ID_V1,
+              reasoning:
+                "Fast Forward is running and dispatching is its job; ticking only records the reviewer's " +
+                "verification, which cannot untick or misapply anything.",
+            }
+          : {
+              kind: "option",
+              optionId: "apply",
+              reasoning:
+                "The reviewer already verified these items against the tree; applying only records that " +
+                "verification as ticks, which cannot untick or misapply anything.",
+            },
       gating: {
         holdsTaskPaused: false,
         unblocksProgress: true,
@@ -973,6 +1031,199 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   });
 }
 
+async function postTicksChatLineV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  text: string
+): Promise<void> {
+  try {
+    await appendChatMessageV1(taskFolderPath, { role: "assistant", text, stage, at: new Date().toISOString() });
+  } catch {
+    // The ticks themselves are already written (or kept); the chat line is best-effort.
+  }
+}
+
+function describeTicksNowResultV1(appliedCount: number, offeredCount: number): string {
+  const already = offeredCount - appliedCount;
+  const alreadyNote =
+    already > 0 ? ` ${already} other item${already === 1 ? " was" : "s were"} already ticked and left as they are.` : "";
+  return `Ticked ${appliedCount} item${appliedCount === 1 ? "" : "s"} in plan-final.md; Fast Forward's next round counts them.${alreadyNote}`;
+}
+
+/**
+ * bugs5 Step 2: "Apply the N ticks now". Only the monotonic tick merge: nothing is dispatched, so
+ * Fast Forward keeps its own next step. With no round open the ticks are merged at once; with one
+ * open (a write to plan-final.md could trip the round's foreign-write containment) the accepted
+ * ticks are kept on the decision record and merged as soon as the round ends, before Fast
+ * Forward's next decision ({@link applyAcceptedTicksNowV1}).
+ */
+export async function applyReviewerVerifiedTicksNowV1(
+  inventory: TaskInventory,
+  currentTaskStore: CurrentTaskStore,
+  explicitArg?: ApplyArg
+): Promise<WorkflowDecisionCommandResultV1 | void> {
+  await TaskCreationStartupReconcilerV1.waitUntilReady();
+  const normalized = normalizeArg(explicitArg);
+  const resolved = await resolveTaskContext(inventory, normalized, { allowPaused: true }, currentTaskStore);
+  if (!resolved) {
+    NotificationRouter.showError("The task could not be found. Refresh the Tasks panel and try again.");
+    return;
+  }
+  const folderUri = vscode.Uri.file(resolved.taskFolderPath);
+  const reviewStage = normalized?.reviewStage ?? resolved.progress.currentStage;
+  const offered = normalized?.offeredItems ?? [];
+  const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage, normalized?.offeredItems);
+  if (derived.kind === "blocked") {
+    const count = derived.alreadyAppliedCount ?? 0;
+    return {
+      outcome: "alreadyDone",
+      message:
+        count > 0
+          ? `Already done: the ${count} reviewer-verified tick${count === 1 ? "" : "s"} ${count === 1 ? "is" : "are"} applied.`
+          : derived.message,
+    };
+  }
+  const { applicable } = derived.derivation;
+
+  if (hasLiveWorkAdmissionBestEffortV1(resolved.taskFolderPath)) {
+    const store = openWorkflowDecisionStoreV1();
+    const answered = store?.findLatestResolvedForOption(
+      resolved.taskFolderPath,
+      APPLY_TICKS_DECISION_KEY_V1,
+      APPLY_TICKS_NOW_OPTION_ID_V1
+    );
+    if (store && answered && answered.deferredAnswer === undefined) {
+      await store.recordDeferredAnswer(answered.decisionId, {
+        kind: "ticksOnly",
+        optionId: APPLY_TICKS_NOW_OPTION_ID_V1,
+        acceptedAt: new Date().toISOString(),
+        itemKeys: applicable,
+      });
+      armDeferredOptionRunV1({
+        key: `ticks-now:${normalizePath(resolved.taskFolderPath)}`,
+        isTaskBusy: () => hasLiveWorkAdmissionBestEffortV1(resolved.taskFolderPath),
+        subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
+        carryOut: async () => {
+          await applyAcceptedTicksNowV1(resolved.taskFolderPath);
+          return { kind: "done" };
+        },
+        report: () => Promise.resolve(),
+      });
+      // The chat shows a "done" result's message nowhere, so the line is posted here.
+      await postTicksChatLineV1(
+        resolved.taskFolderPath,
+        reviewStage,
+        `These ${applicable.length} ticks are applied as soon as the current ${describeRoundNounV1(reviewStage)} ends, before Fast ` +
+          "Forward's next decision."
+      );
+      return { outcome: "done" };
+    }
+  }
+
+  const applied = await writeVerifiedTicksToPlanV1(folderUri, derived.derivation);
+  if (applied.kind !== "applied") {
+    return {
+      outcome: "refused",
+      message:
+        "plan-final.md changed while these ticks were being applied, so nothing was written. " +
+        "The card is back; choose it again.",
+      reopenCard: true,
+    };
+  }
+  await inventory.refresh();
+  await postTicksChatLineV1(
+    resolved.taskFolderPath,
+    reviewStage,
+    describeTicksNowResultV1(applied.count, offered.length || applicable.length)
+  );
+  return { outcome: "done" };
+}
+
+/** "Apply Review" for a review stage (the round whose end the ticks wait for), "round" otherwise. */
+function describeRoundNounV1(stage: TaskStage): string {
+  return isReviewStage(stage) ? "Apply Review" : "round";
+}
+
+/**
+ * bugs5 Step 2: merges the ticks the owner accepted while a round was open, now that it has ended.
+ * Called at Fast Forward's iteration boundary (after an Apply Review ends, before its next
+ * decision reads the checklist), when the task becomes free, and on activation. Re-derives against
+ * the plan on disk, so an item ticked in the meantime is reported as already ticked and never
+ * ticked twice. Returns the number of items ticked.
+ */
+export async function applyAcceptedTicksNowV1(taskFolderPath: string): Promise<number> {
+  const store = openWorkflowDecisionStoreV1();
+  if (!store) {
+    return 0;
+  }
+  const accepted = store
+    .listWithPendingDeferredAnswer(taskFolderPath)
+    .filter((decision) => decision.deferredAnswer?.kind === "ticksOnly");
+  let total = 0;
+  for (const decision of accepted) {
+    const answer = decision.deferredAnswer!;
+    const folderUri = vscode.Uri.file(taskFolderPath);
+    const derived = await deriveApplicableVerifiedTicksV1(folderUri, decision.stage, answer.itemKeys);
+    if (derived.kind === "blocked") {
+      await store.clearDeferredAnswer(decision.decisionId, true);
+      await postTicksChatLineV1(
+        taskFolderPath,
+        decision.stage,
+        `The ${answer.itemKeys.length} ticks you accepted were already in plan-final.md when the round ended; nothing more to tick.`
+      );
+      continue;
+    }
+    const written = await writeVerifiedTicksToPlanV1(folderUri, derived.derivation);
+    if (written.kind === "applied") {
+      total += written.count;
+      await store.clearDeferredAnswer(decision.decisionId, true);
+      await postTicksChatLineV1(
+        taskFolderPath,
+        decision.stage,
+        `The round has ended: ticked ${written.count} of the ${answer.itemKeys.length} items you accepted in plan-final.md. ` +
+          "Fast Forward's next decision counts them."
+      );
+    } else {
+      await postTicksChatLineV1(
+        taskFolderPath,
+        decision.stage,
+        "The ticks you accepted could not be written because plan-final.md changed; choose the card again if it is still shown."
+      );
+      await store.clearDeferredAnswer(decision.decisionId, true);
+    }
+  }
+  return total;
+}
+
+/**
+ * bugs5 Step 2 / item 10: after a reload, ticks accepted while a round was open are merged once the
+ * task has no round (the waiter that did it is memory only).
+ */
+export async function rearmAcceptedTicksV1(store: WorkflowDecisionStoreV1): Promise<void> {
+  const tasks = new Set(
+    store
+      .listWithPendingDeferredAnswer()
+      .filter((decision) => decision.deferredAnswer?.kind === "ticksOnly")
+      .map((decision) => decision.taskCanonicalId)
+  );
+  for (const taskPath of tasks) {
+    if (hasLiveWorkAdmissionBestEffortV1(taskPath)) {
+      armDeferredOptionRunV1({
+        key: `ticks-now:${normalizePath(taskPath)}`,
+        isTaskBusy: () => hasLiveWorkAdmissionBestEffortV1(taskPath),
+        subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
+        carryOut: async () => {
+          await applyAcceptedTicksNowV1(taskPath);
+          return { kind: "done" };
+        },
+        report: () => Promise.resolve(),
+      });
+    } else {
+      await applyAcceptedTicksNowV1(taskPath).catch(() => 0);
+    }
+  }
+}
+
 export function registerApplyReviewerVerifiedTicksCommands(
   context: vscode.ExtensionContext,
   inventory: TaskInventory,
@@ -986,6 +1237,10 @@ export function registerApplyReviewerVerifiedTicksCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
       (arg?: ApplyArg) => applyReviewerVerifiedTicksConfirmedV1(inventory, currentTaskStore, arg)
+    ),
+    vscode.commands.registerCommand(
+      "vs-code-ai-helper.applyReviewerVerifiedTicksNow",
+      (arg?: ApplyArg) => applyReviewerVerifiedTicksNowV1(inventory, currentTaskStore, arg)
     )
   );
 }

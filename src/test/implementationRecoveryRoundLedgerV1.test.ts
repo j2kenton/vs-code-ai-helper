@@ -16,6 +16,7 @@ import { MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1, TaskProgress } from "../types/ta
 import {
   beginImplementationRecoveryV1,
   claimImplRecoveryDispatchV1,
+  releaseImplRecoveryClaimV1,
 } from "../commands/implementationRecoveryV1";
 import { closeRoundRowIfDispatchThrowsV1 } from "../commands/reviewActions";
 import { configureWorkflowPrivateStorageRootV1 } from "../services/workflowRuntimeServicesV1";
@@ -131,6 +132,95 @@ void describe("beginImplementationRecoveryV1 — source round terminalization (P
       const outcomeMessages = messages.filter((m) => m.kind === "outcome" && m.roundId === begun.sourceAttemptId);
       assert.equal(outcomeMessages.length, 1);
       assert.match(outcomeMessages[0]?.text ?? "", /rejected/);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("bugs5 Step 13: a continuation that ends without a usable report is recorded as provider-failure-empty", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("continuation_no_report", undefined);
+      await beginImplementationRecoveryV1(folderUri, {
+        trigger: "summaryRejected",
+        reason: "the continuation's report had no Plan Item Checklist",
+        terminatedExternally: false,
+        filesChanged: [],
+        filesChangedUnknown: false,
+        postRunReviewStage: "impl",
+        continuationRoundOutcome: {
+          attemptId: "impl-continuation-1",
+          modelId: "claude-cli:claude-sonnet-5-5@high",
+          providerId: "claude-cli",
+          dispatchMode: "implementation",
+        },
+      });
+      const entries = readProgress(folderPath).roundOutcomes ?? [];
+      assert.equal(entries.length, 1);
+      assert.equal(entries[0]?.classification, "provider-failure-empty");
+      assert.equal(entries[0]?.stage, "impl");
+      assert.equal(entries[0]?.attemptId, "impl-continuation-1");
+      assert.equal(entries[0]?.modelId, "claude-cli:claude-sonnet-5-5@high");
+      assert.equal(readProgress(folderPath).zeroChangeImplRounds, 1, "the no-progress streak counts the continuation");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("bugs5 Step 13: a first round that is not a continuation adds no round outcome entry", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const { folderUri, folderPath } = makeTaskFolder("first_round_no_outcome", undefined);
+      await beginImplementationRecoveryV1(folderUri, {
+        trigger: "summaryRejected",
+        reason: "unusable summary",
+        terminatedExternally: false,
+        filesChanged: ["src/a.ts"],
+        filesChangedUnknown: false,
+        postRunReviewStage: "impl",
+      });
+      assert.equal((readProgress(folderPath).roundOutcomes ?? []).length, 0);
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("bugs5 Step 13: releasing a claimed continuation counts one automatic re-arm; an owner hold does not", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      const record = {
+        sourceAttemptId: "src",
+        reason: "r",
+        trigger: "summaryRejected" as const,
+        mode: "unconstrained" as const,
+        dispatch: "dispatched" as const,
+        at: "2026-01-01T00:00:00.000Z",
+        attemptId: "att-1",
+        operationId: "op-1",
+      };
+      const { folderUri, folderPath } = makeTaskFolder("release_counts", undefined, { implRecovery: record });
+      await releaseImplRecoveryClaimV1(folderUri, { operationId: "op-1", attemptId: "att-1", reason: "ended" });
+      assert.equal(readProgress(folderPath).implRecovery?.automaticRearms, 1);
+      assert.equal(readProgress(folderPath).implRecovery?.dispatch, "pending");
+
+      const held = makeTaskFolder("release_hold", undefined, { implRecovery: record });
+      await releaseImplRecoveryClaimV1(held.folderUri, {
+        operationId: "op-1",
+        attemptId: "att-1",
+        ownerHold: "cancelled",
+      });
+      assert.equal(readProgress(held.folderPath).implRecovery?.automaticRearms, undefined);
+      assert.equal(readProgress(held.folderPath).implRecovery?.ownerHold?.cause, "cancelled");
+
+      // A release with nothing claimed (already pending) has no round to count.
+      await releaseImplRecoveryClaimV1(folderUri, { operationId: "op-1", reason: "again" });
+      assert.equal(readProgress(folderPath).implRecovery?.automaticRearms, 1);
     } finally {
       wsStub.restore();
       fsBridge.restore();

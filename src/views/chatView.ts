@@ -10,7 +10,14 @@ import type { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeReviewStageScoreV1 } from "./taskTreeProvider";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { notifyDesktop } from "../utils/desktopNotifier";
-import { formatTaskNameForDisplay, taskOperations } from "../utils/taskOperations";
+import { formatTaskNameForDisplay, taskKey, taskOperations } from "../utils/taskOperations";
+import { readPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
+import {
+  endedBeforeStartLineV1,
+  isLivePublishChecksRunV1,
+  startingLineV1,
+  stillStartingLineV1,
+} from "../utils/startupAnnouncerLinesV1";
 import { operationChatLabelV1 } from "../utils/stepLabelsV1";
 import { NotificationRouter, getNotificationRouterStatus } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
@@ -71,7 +78,30 @@ import {
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { OperationEndedLineTrackerV1 } from "../utils/operationEndedLineV1";
 import { releaseOperationTerminalLineV1 } from "../utils/terminalLineEmitterV1";
-import { liveOperationBlockingOptionV1 } from "../commands/fastForwardResumeSuffixV1";
+import {
+  holdDispatchingOptionsWhileOperationLiveV1,
+  liveOperationBlockingOptionV1,
+} from "../commands/fastForwardResumeSuffixV1";
+import { ENSEMBLE_DISMISS_BUTTON_CSS_V1 } from "./sharedButtonStylesV1";
+import {
+  IDLE_RECONCILE_DISMISSALS_STATE_KEY_V1,
+  idleReconcileGenerationV1,
+  recordIdleReconcileDismissalV1,
+  shouldBuildIdleReconcileCardV1,
+  type IdleReconcileDismissalsV1,
+} from "../utils/idleReconcileCardV1";
+import { trackedFilesHaveUncommittedChangesV1 } from "../utils/idleReconcileGitV1";
+import {
+  APPLY_OPTION_ID_V1,
+  HELD_CARD_STAYS_OPEN_NOTE_V1,
+  buildHeldTicksAnswerOptionsV1,
+  offeredTickItemsOfV1,
+} from "../commands/verifiedTicksHeldOptionsV1";
+import {
+  clearDecisionAnnouncedAsInformationOnlyV1,
+  markDecisionAnnouncedAsInformationOnlyV1,
+  renotifyHeldDecisionsV1,
+} from "../utils/heldDecisionRenotifyV1";
 import { describeLiveTaskOperationV1, getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
 import {
   acquireOrAdoptWorkAdmissionV1,
@@ -94,6 +124,7 @@ import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import {
   currentActorNameV1,
   describeCardDismissalV1,
+  describeWaitingCommandDismissWarningV1,
   describeQuestionSettlementV1,
   describeSettledDecisionRefusalV1,
   dismissPendingQuestionV1,
@@ -568,6 +599,53 @@ function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): Readon
 }
 
 /**
+ * bugs5 Step 7: the chat's "Recorded" line for a choice that says what happens next:
+ * `Recorded: "Commit Everything Together" — continuing to the final confirmation.` Exported for
+ * direct unit testing.
+ */
+export function describeRecordedChoiceV1(label: string, recordedNext: string): string {
+  const next = recordedNext.trim().replace(/[.\s]+$/, "");
+  return `Recorded: "${label}" — ${next}.`;
+}
+
+/**
+ * bugs5 Step 1: whether the owner can do anything with this card: at least one enabled option
+ * whose effect is not `doNothing`. Judge it on the viewed record (after
+ * `holdDispatchingOptionsWhileOperationLiveV1`), so an option held back by a running operation
+ * does not count.
+ */
+export function hasActionableOptionV1(
+  decision: Pick<WorkflowDecisionV1, "options"> & Partial<Pick<WorkflowDecisionV1, "gating" | "awaited">>
+): boolean {
+  // A command that is awaiting the answer in-process acts on it itself, so every option on its card
+  // has a `doNothing` effect and is still the owner's real choice (Commit & Push, a round-limit gate).
+  const answeredByWaitingCommand =
+    decision.awaited !== undefined || (decision.gating?.waitingCommand?.trim().length ?? 0) > 0;
+  return decision.options.some(
+    (option) => option.disabled !== true && (answeredByWaitingCommand || option.effect.kind !== "doNothing")
+  );
+}
+
+/**
+ * bugs5 Step 1: the heading a decision card shows. "For information" when nothing on it can be
+ * chosen right now; "<Command> is waiting for your answer" when a running command awaits it;
+ * otherwise "Decision needed" or "Optional". Shared by the webview title, the copy text and the
+ * notification so they cannot drift apart. Exported for direct unit testing.
+ */
+export function decisionHeadingV1(
+  decision: Pick<WorkflowDecisionV1, "gating" | "options"> & Partial<Pick<WorkflowDecisionV1, "awaited">>
+): string {
+  if (!hasActionableOptionV1(decision)) {
+    return "For information";
+  }
+  const waiting = decision.gating?.waitingCommand?.trim();
+  if (waiting) {
+    return `${waiting} is waiting for your answer`;
+  }
+  return isBlockingDecisionV1(decision) ? "Decision needed" : "Optional";
+}
+
+/**
  * bugs4 item 17 / Step 15: whether a decision is headlined "Decision needed". It must be
  * awaited (gating says so, or is unknown) AND offer a real choice: at least two options,
  * one of which is a harmless "Not now" (a `doNothing` effect) whose consequence says what
@@ -575,8 +653,17 @@ function computeAwaitingQuestionIndices(entries: readonly ChatMessage[]): Readon
  * a "Decision needed". Exported for direct unit testing.
  */
 export function isBlockingDecisionV1(
-  decision: Pick<WorkflowDecisionV1, "gating" | "options">
+  decision: Pick<WorkflowDecisionV1, "gating" | "options"> & Partial<Pick<WorkflowDecisionV1, "awaited">>
 ): boolean {
+  // bugs5 Step 1: judged on the viewed record. A card with nothing the owner can actually do
+  // (every non-"Not now" option is unavailable) asks for no decision.
+  if (!hasActionableOptionV1(decision)) {
+    return false;
+  }
+  // bugs5 Step 1: a running command is waiting on this answer, so it is blocking by definition.
+  if (decision.gating?.waitingCommand !== undefined && decision.gating.waitingCommand.trim().length > 0) {
+    return true;
+  }
   if (decision.options.length < 2) {
     return false;
   }
@@ -638,12 +725,18 @@ export function buildIdleReconcileDecisionV1(target: ChatTarget): WorkflowDecisi
  * webview cannot import host code, so this is built here and posted as
  * `copyText`. Exported for direct unit testing. */
 export function buildDecisionCopyTextV1(
-  decision: Pick<WorkflowDecisionV1, "whatHappened" | "whyUserNeeded" | "options" | "recommendation" | "evidence">,
+  decision: Pick<WorkflowDecisionV1, "whatHappened" | "whyUserNeeded" | "options" | "recommendation" | "evidence"> &
+    Partial<Pick<WorkflowDecisionV1, "gating" | "awaited">>,
   gatingLine: string,
   isBlockingDecision: boolean
 ): string {
   const lines = [
-    isBlockingDecision ? "Decision needed" : "Optional",
+    // bugs5 Step 1: "For information" / "<Command> is waiting…" come from the shared heading.
+    hasActionableOptionV1(decision) && decision.gating?.waitingCommand === undefined
+      ? isBlockingDecision
+        ? "Decision needed"
+        : "Optional"
+      : decisionHeadingV1({ gating: decision.gating, options: decision.options, awaited: decision.awaited }),
     decision.whatHappened,
     decision.whyUserNeeded,
     gatingLine,
@@ -771,10 +864,37 @@ function buildChatTimelineV1<
  * `taskFolderPath` or a display name), so it is passed in rather than
  * re-derived here.
  */
-export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, target: ChatTarget): void {
+export function notifyPendingWorkflowDecision(postedDecision: WorkflowDecisionV1, target: ChatTarget): void {
   if (!getNotificationRouterStatus()) return;
   const taskLabel = target.taskName ?? target.taskFolderPath;
   const stageName = STAGE_DISPLAY_NAMES[target.stage];
+  // bugs5 Step 1: judged on the record as the owner sees it, so an option held back by a running
+  // operation does not make the announcement a "Decision needed" with nothing to choose.
+  const decision = holdDispatchingOptionsWhileOperationLiveV1(postedDecision);
+  if (!hasActionableOptionV1(decision)) {
+    // Held back only by a running operation: the answer comes back when it ends. A card with no
+    // actionable option to begin with has nothing to come back.
+    const heldByOperation = hasActionableOptionV1(postedDecision);
+    NotificationRouter.showInformation(
+      `For information — ${taskLabel} (${stageName}): ${decision.whatHappened}` +
+        (heldByOperation
+          ? " Nothing can be chosen on this card right now; it is raised again as a decision if it still applies when the running work ends."
+          : ""),
+      undefined,
+      undefined,
+      undefined,
+      {
+        command: "vs-code-ai-helper.openWorkflowDecision",
+        title: "Review decision in Chat",
+        args: [target],
+      }
+    );
+    if (heldByOperation) {
+      markDecisionAnnouncedAsInformationOnlyV1(decision.decisionId, target);
+    }
+    return;
+  }
+  clearDecisionAnnouncedAsInformationOnlyV1(decision.decisionId);
   // A record predating the `gating` field (or one from a call site that
   // regresses and omits it) is treated as blocking — absence is never
   // positive evidence, so an unknown gating state must not downgrade a
@@ -798,7 +918,7 @@ export function notifyPendingWorkflowDecision(decision: WorkflowDecisionV1, targ
   // this surface.
   if (isBlocking) {
     NotificationRouter.showWarning(
-      `Decision needed — ${taskLabel} (${stageName}): ${decision.whatHappened}`,
+      `${decision.gating?.waitingCommand?.trim() ? decisionHeadingV1(decision) : "Decision needed"} — ${taskLabel} (${stageName}): ${decision.whatHappened}`,
       undefined,
       undefined,
       undefined,
@@ -884,6 +1004,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * the next time a write for that task succeeds. */
   private warnedTasks = new Set<string>();
   private readonly operationsSub: vscode.Disposable;
+  /** bugs5 Step 1: re-announces cards that a running operation held back, once it ends. */
+  private readonly heldDecisionsSub: vscode.Disposable;
   private readonly decisionsSub: vscode.Disposable;
   private readonly chatHistorySub: vscode.Disposable;
   /** Set only once wired from extension.ts (see ChatInteractionServicesV1's doc comment). */
@@ -1087,6 +1209,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       this.lastOperationsSignatureV1 = signature;
       this.scheduleReactiveRenderV1();
     });
+    // bugs5 Step 1: the same operation-end signal `deferredOptionRunV1` listens to. A card that was
+    // announced "For information" (its only action held back) is announced as "Decision needed"
+    // once, when that action is available again and the card is still pending.
+    this.heldDecisionsSub = taskOperations.onDidEnd(() => {
+      // Let the registry finish removing the ended operation before the live state is read.
+      const timer = setTimeout(() => {
+        renotifyHeldDecisionsV1<ChatTarget>({
+          getViewedPending: (decisionId) => this.workflowDecisionStore.get(decisionId),
+          hasActionableOption: hasActionableOptionV1,
+          notify: notifyPendingWorkflowDecision,
+        });
+      }, 250);
+      timer.unref?.();
+    });
     // A decision resolved (or posted) from anywhere else — another window,
     // an automated dispatch, a different provider instance sharing this same
     // Memento — must not leave THIS panel showing a stale card for a record
@@ -1129,6 +1265,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   dispose(): void {
     setChatRevealHandlerV1(undefined);
     this.operationsSub.dispose();
+    this.heldDecisionsSub.dispose();
     this.decisionsSub.dispose();
     this.chatHistorySub.dispose();
     this.schedulingIntentSub.dispose();
@@ -1714,6 +1851,49 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * Dispatches nothing, writes nothing to `task.md`, and — when the card was
    * what a paused task waited on — says what will move the task instead.
    */
+  /** Remembered idle-reconcile dismissals, by task, for the flag's generation that was dismissed. */
+  private readIdleReconcileDismissalsV1(): IdleReconcileDismissalsV1 {
+    return this.state.get<IdleReconcileDismissalsV1>(IDLE_RECONCILE_DISMISSALS_STATE_KEY_V1, {});
+  }
+
+  private async recordIdleReconcileDismissalV1(
+    taskFolderPath: string,
+    progress: Parameters<typeof idleReconcileGenerationV1>[0]
+  ): Promise<void> {
+    await this.state.update(
+      IDLE_RECONCILE_DISMISSALS_STATE_KEY_V1,
+      recordIdleReconcileDismissalV1(
+        this.readIdleReconcileDismissalsV1(),
+        normalizePath(taskFolderPath),
+        idleReconcileGenerationV1(progress)
+      )
+    );
+  }
+
+  /**
+   * bugs5 Step 6: Dismiss on the idle "checklist is flagged unreliable" card. The card is not a
+   * stored decision, so the dismissal is remembered for the flag's current generation: it stays
+   * hidden after a reload, and comes back only when a round sets the flag again.
+   */
+  private async dismissIdleReconcileCardV1(
+    taskFolderPath: string,
+    canonicalId: string | undefined,
+    stage: TaskStage | undefined
+  ): Promise<void> {
+    const read = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath)).catch(() => undefined);
+    if (read?.ok) {
+      await this.recordIdleReconcileDismissalV1(taskFolderPath, read.decoded.progress);
+    }
+    const identity: ChatIdentity = { canonicalId: canonicalId ?? taskFolderPath, taskFolderPath };
+    await this.append(
+      "assistant",
+      `Dismissed "This task's plan checklist is flagged unreliable". Nothing was run and task.md was not changed. ` +
+        "The card stays hidden until a round flags the checklist again.",
+      stage ?? (read?.ok ? read.decoded.progress.currentStage : "impl"),
+      identity
+    );
+  }
+
   private async dismissWorkflowDecisionV1(
     decisionId: string,
     ctx: RelayedResolutionContextV1 | undefined
@@ -1734,6 +1914,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     const read = await readTaskProgressStrictV1(vscode.Uri.file(decision.taskCanonicalId)).catch(() => undefined);
     const status = read && read.ok ? read.decoded.progress.status : undefined;
+    // bugs5 Step 6: dismissing the real reconcile card must not make the idle one appear in its
+    // place, so it records the same dismissal for the flag's current generation.
+    if (decision.decisionKey === "reconcilePlanChecklist" && read?.ok) {
+      await this.recordIdleReconcileDismissalV1(decision.taskCanonicalId, read.decoded.progress);
+    }
     const identity = this.identityForDecision(decision, ctx);
     if (identity) {
       await this.append(
@@ -1742,6 +1927,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           holdsTask: decision.gating?.holdsTaskPaused === true && status === "paused",
           ...(status !== undefined ? { taskStatus: status } : {}),
           stage: decision.stage,
+          // bugs5 Step 9: dismissing a card a running command waits on ends that command; say so.
+          ...(decision.gating?.waitingCommand !== undefined
+            ? {
+                waitingCommand: decision.gating.waitingCommand,
+                ...(decision.gating.waitingNothingDone !== undefined
+                  ? { waitingNothingDone: decision.gating.waitingNothingDone }
+                  : {}),
+              }
+            : {}),
         }),
         decision.stage,
         identity
@@ -1952,11 +2146,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     effect: WorkflowDecisionOptionEffectV1
   ): Promise<void> {
     const detail = option.description ? ` ${option.description}` : "";
-    if (effect.kind === "doNothing") {
+    // bugs5 Step 7: an effect that says what it does next is recorded in those words.
+    if (effect.recordedNext !== undefined) {
+      await this.append("assistant", describeRecordedChoiceV1(option.label, effect.recordedNext) + detail, stage, identity);
+      if (effect.kind === "doNothing") {
+        return;
+      }
+    } else if (effect.kind === "doNothing") {
       await this.append("assistant", `Recorded: "${option.label}" — this does nothing further.${detail}`, stage, identity);
       return;
+    } else {
+      await this.append("assistant", `Recorded: "${option.label}" — applying now.${detail}`, stage, identity);
     }
-    await this.append("assistant", `Recorded: "${option.label}" — applying now.${detail}`, stage, identity);
     try {
       const result = await vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
       if (result === false) {
@@ -2953,6 +3154,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         targetCanonicalId = clickIdentity?.canonicalId;
       }
       let outcomeOk = false;
+      if (optionId === DISMISS_DECISION_OPTION_ID_V1 && targetTaskFolderPath) {
+        await this.dismissIdleReconcileCardV1(targetTaskFolderPath, targetCanonicalId, this.target?.stage);
+        await this.render();
+        return { ok: true, transitioned: true };
+      }
       if (optionId === "reconcile" && targetTaskFolderPath) {
         const commandResult = await vscode.commands.executeCommand("vs-code-ai-helper.reconcilePlanChecklistConfirmed", {
           taskFolderPath: targetTaskFolderPath,
@@ -3021,6 +3227,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const knownDecision = this.workflowDecisionStore.get(decisionId);
     const refusalStage = knownDecision?.stage ?? panelTarget?.stage;
     const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
+    // bugs5 Step 3: "Apply when Fast Forward next pauses". With an operation running the answer is
+    // kept on the card (which stays open) and carried out when the task is free; with none running
+    // it is simply Apply.
+    if (knownDecision && buildHeldTicksAnswerOptionsV1(knownDecision).some((o) => o.optionId === optionId && o.runsWhenTaskFree)) {
+      const live = getLiveTaskOperationV1(knownDecision.taskCanonicalId);
+      if (live) {
+        const identity = this.identityForDecision(knownDecision, ctx);
+        if (identity) {
+          await this.keepAnswerUntilTaskFreeV1(knownDecision, optionId, identity, describeLiveTaskOperationV1(live));
+        }
+        await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
+        return { ok: true };
+      }
+      optionId = APPLY_OPTION_ID_V1;
+    }
     const result = await this.workflowDecisionStore.resolve(decisionId, optionId);
     const clickTaskLabel = clickIdentity
       ? formatNotificationTaskLabelV1(
@@ -3113,10 +3334,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
                 .map((d) => `"${truncateChecklistItemTextV1(d.whatHappened, 80)}"`)
                 .join(", ")}.`
             : "";
+        // bugs5 Step 7: "this does nothing further" is for choices that truly change nothing; a
+        // choice that sets `recordedNext` is recorded in its own words.
         const ackText =
-          option.effect.kind === "doNothing"
-            ? `Recorded: "${option.label}" — this does nothing further. ${option.consequence}`
-            : `Recorded: "${option.label}" — applying now. ${option.consequence}${closedNote}`;
+          option.recordedNext !== undefined
+            ? `${describeRecordedChoiceV1(option.label, option.recordedNext)} ${option.consequence}${closedNote}`
+            : option.effect.kind === "doNothing"
+              ? `Recorded: "${option.label}" — this does nothing further. ${option.consequence}`
+              : `Recorded: "${option.label}" — applying now. ${option.consequence}${closedNote}`;
         await this.append("assistant", ackText, decision.stage, identity);
       }
       if (option.effect.kind === "command" && ctx?.skipEffect !== true) {
@@ -3150,7 +3375,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // admission and preflight for minutes before it registers an operation (the
         // reported four silent minutes). Watch for that gap while the command is in
         // flight, not only after it returns.
-        const startupAnnouncer = identity ? this.createStartupAnnouncerV1(identity, decision.stage, clickTaskLabel) : undefined;
+        const startupAnnouncer = identity ? this.createStartupAnnouncerV1(identity, decision.stage, option.label) : undefined;
         startupAnnouncer?.start();
         try {
           // Some dispatched commands (e.g. goToReviewAndApplyV1) report a
@@ -3286,6 +3511,130 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
+   * bugs5 Step 3: accepts "Apply when Fast Forward next pauses" while an operation runs. The answer
+   * is stored on the decision record (so a reload keeps it and a replacement card inherits it), the
+   * card stays open, and the chat says so.
+   */
+  private async keepAnswerUntilTaskFreeV1(
+    decision: WorkflowDecisionV1,
+    optionId: string,
+    identity: ChatIdentity,
+    runningDescription: string
+  ): Promise<void> {
+    const option = buildHeldTicksAnswerOptionsV1(decision).find((candidate) => candidate.optionId === optionId);
+    if (!option) return;
+    const stored = await this.workflowDecisionStore.recordDeferredAnswer(decision.decisionId, {
+      kind: "applyAndDispatch",
+      optionId,
+      acceptedAt: new Date().toISOString(),
+      itemKeys: offeredTickItemsOfV1(decision),
+    });
+    if (!stored) return;
+    await this.append(
+      "assistant",
+      `Recorded: "${option.label}" — ${option.recordedNext ?? "your answer is kept"}. ${runningDescription} is running. ` +
+        HELD_CARD_STAYS_OPEN_NOTE_V1,
+      decision.stage,
+      identity
+    );
+    this.armKeptAnswerV1(decision.decisionId, decision.taskCanonicalId, option.label, decision.stage, identity);
+  }
+
+  /**
+   * bugs5 Steps 3 and 10: waits for the task to be free, then applies the ticks the kept answer
+   * covers (those still offered by the card as it is now, which may be a newer review's) and
+   * dispatches the next action as Apply does. Items on the card that the answer never saw are not
+   * ticked: they get a fresh card. Also called on activation, because the waiter map is memory only.
+   */
+  private armKeptAnswerV1(
+    decisionId: string,
+    taskPath: string,
+    optionLabel: string,
+    stage: TaskStage,
+    identity: ChatIdentity
+  ): void {
+    armDeferredOptionRunV1({
+      key: `kept-answer:${decisionId}`,
+      isTaskBusy: () => getLiveTaskOperationV1(taskPath) !== undefined,
+      subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
+      carryOut: async (): Promise<DeferredRunOutcomeV1> => {
+        const current = this.workflowDecisionStore.get(decisionId);
+        const answer = current?.deferredAnswer;
+        if (!current || current.state !== "pending" || !answer) {
+          return { kind: "notCarriedOut", reason: "the card is no longer open." };
+        }
+        const offered = offeredTickItemsOfV1(current);
+        const covered = answer.itemKeys.filter((item) => offered.includes(item));
+        const apply = current.options.find((candidate) => candidate.optionId === APPLY_OPTION_ID_V1);
+        if (covered.length === 0 || !apply || apply.effect.kind !== "command") {
+          return { kind: "notCarriedOut", reason: "none of the items you answered for are on the card any more." };
+        }
+        const read = await readTaskProgressStrictV1(vscode.Uri.file(taskPath)).catch(() => undefined);
+        if (!read?.ok || read.decoded.progress.currentStage !== current.stage) {
+          return { kind: "notCarriedOut", reason: "the task is no longer at the stage this card was raised at." };
+        }
+        const firstArg = (apply.effect.args?.[0] ?? {}) as Record<string, unknown>;
+        try {
+          const result = await vscode.commands.executeCommand(apply.effect.command, {
+            ...firstArg,
+            offeredItems: covered,
+          });
+          if (result === false) {
+            return { kind: "notCarriedOut", reason: "the action did not complete (see the notification)." };
+          }
+          if (isWorkflowDecisionCommandResultV1(result) && result.outcome === "refused") {
+            return { kind: "notCarriedOut", reason: result.message ?? "the action declined to run." };
+          }
+        } catch (error) {
+          return { kind: "notCarriedOut", reason: error instanceof Error ? error.message : String(error) };
+        }
+        await this.workflowDecisionStore.clearDeferredAnswer(decisionId, true);
+        if (offered.length > covered.length) {
+          // The newer review's other items were never answered: raise a fresh card for them.
+          await Promise.resolve(
+            vscode.commands.executeCommand("vs-code-ai-helper.applyReviewerVerifiedTicks", {
+              taskFolderPath: taskPath,
+              canonicalId: current.taskCanonicalId,
+              reviewStage: current.stage,
+            })
+          ).catch(() => undefined);
+        }
+        return { kind: "done" };
+      },
+      report: async (outcome): Promise<void> => {
+        try {
+          if (outcome.kind !== "done") {
+            await this.workflowDecisionStore.clearDeferredAnswer(decisionId);
+          }
+          await this.append("assistant", describeDeferredOptionOutcomeV1(optionLabel, outcome), stage, identity);
+          if (sameIdentity(this.target, identity)) await this.render();
+        } catch {
+          // The chat is best-effort here; the answer itself is already durable.
+        }
+      },
+    });
+  }
+
+  /** bugs5 Step 3: re-arms kept answers after a reload (the waiter map is memory only). */
+  rearmKeptAnswersV1(): void {
+    for (const decision of this.workflowDecisionStore.listWithPendingDeferredAnswer()) {
+      if (decision.state !== "pending" || decision.deferredAnswer?.kind !== "applyAndDispatch") continue;
+      // No panel is open at activation, so the identity comes from the record itself.
+      const identity: ChatIdentity = { canonicalId: decision.taskCanonicalId, taskFolderPath: decision.taskCanonicalId };
+      const option = buildHeldTicksAnswerOptionsV1(decision).find(
+        (candidate) => candidate.optionId === decision.deferredAnswer?.optionId
+      );
+      this.armKeptAnswerV1(
+        decision.decisionId,
+        decision.taskCanonicalId,
+        option?.label ?? "Apply when Fast Forward next pauses",
+        decision.stage,
+        identity
+      );
+    }
+  }
+
+  /**
    * bugs3 Step 12: a decision's dispatch (Move on → Publish Checks) can return
    * before the action it arranged has registered its operation: the task still
    * holds the admission claim the dispatch took, and the checks start after the
@@ -3334,7 +3683,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * operation mirror has nothing to print; this fills that gap (the reported four
    * minutes between the claim and the first command), then a second line after 90 s.
    */
-  private createStartupAnnouncerV1(identity: ChatIdentity, stage: TaskStage, taskLabel: string | undefined): StartupAnnouncerV1 {
+  private createStartupAnnouncerV1(identity: ChatIdentity, stage: TaskStage, actionName: string): StartupAnnouncerV1 {
     const startedAt = Date.now();
     let preparingLineSaid = false;
     let stillPreparingLineSaid = false;
@@ -3343,8 +3692,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const say = (text: string): void => {
       void this.append("assistant", text, stage, identity).catch(() => undefined);
     };
+    // bugs5 Step 18: a Publish Checks run that is going right now has started its commands even when
+    // no task operation is registered for this announcer to see, so it is never "still starting".
+    const publishChecksRunning = (): boolean =>
+      isLivePublishChecksRunV1(readPublishChecksOutcomeV1(identity.taskFolderPath));
     const claimOnly = (): boolean =>
-      taskOperations.getTaskOperations(identity.canonicalId).length === 0 && hasLiveWorkAdmissionBestEffortV1(identity.taskFolderPath);
+      taskOperations.getTaskOperations(identity.canonicalId).length === 0 &&
+      hasLiveWorkAdmissionBestEffortV1(identity.taskFolderPath) &&
+      !publishChecksRunning();
     // Whether the action ever registered an operation: once it has, the operation mirror owns
     // the Started / Progress / Ended lines. An action that said "preparing" and then released
     // the task without ever registering one (a preflight refusal) is closed here, so the chat
@@ -3352,7 +3707,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let operationSeen = false;
     let endedWithoutStartSaid = false;
     const noteOperation = (): void => {
-      if (taskOperations.getTaskOperations(identity.canonicalId).length > 0) {
+      if (taskOperations.getTaskOperations(identity.canonicalId).length > 0 || publishChecksRunning()) {
         operationSeen = true;
       }
     };
@@ -3369,22 +3724,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           !hasLiveWorkAdmissionBestEffortV1(identity.taskFolderPath)
         ) {
           endedWithoutStartSaid = true;
-          say(
-            "Ended — the action released the task before any command started, so nothing ran. " +
-              "The notification above says why; choose the action again when that is resolved."
-          );
+          say(endedBeforeStartLineV1(actionName));
         }
         return;
       }
       preparingSince ??= Date.now();
       if (!preparingLineSaid) {
         preparingLineSaid = true;
-        const text = "Started — the action holds this task and is preparing to run; its progress lines appear here as soon as it begins.";
-        say(text);
-        NotificationRouter.showInformation(taskLabel ? `${taskLabel} — ${text}` : text);
+        // The chat already shows this line, so no second notification repeats it.
+        say(startingLineV1(actionName));
       } else if (!stillPreparingLineSaid && Date.now() - preparingSince >= 90_000) {
         stillPreparingLineSaid = true;
-        say(`Still preparing — ${Math.round(((Date.now() - startedAt) / 60_000) * 10) / 10} min since it took the task; no command has started yet.`);
+        say(stillStartingLineV1(actionName, (Date.now() - startedAt) / 60_000));
       }
     };
     return {
@@ -3499,7 +3850,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const labelFor = (operation: TaskOperationSnapshot): string => operationChatLabelV1(operation, fallbackStage);
     // One "Ended" line per logical operation, carrying its settled outcome
     // (bugs3 Step 3); nested same-label operations do not each post their own.
-    const endedLines = new OperationEndedLineTrackerV1();
+    const endedLines = new OperationEndedLineTrackerV1(taskKey(identity.canonicalId));
     for (const operation of taskOperations.getTaskOperations(identity.canonicalId)) {
       endedLines.register(operation);
       if (operation.waitingForUser) {
@@ -4028,8 +4379,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const progressRead = await readTaskProgressStrictV1(vscode.Uri.file(target.taskFolderPath)).catch(
           () => undefined
         );
-        if (progressRead?.ok && progressRead.decoded.progress.checklistProgressUnreliable) {
-          activeDecisions.push(buildIdleReconcileDecisionV1(target));
+        const idleProgress = progressRead?.ok ? progressRead.decoded.progress : undefined;
+        if (idleProgress?.checklistProgressUnreliable) {
+          // bugs5 Step 6: the card is not built for a completed or archived task, while a dismissal
+          // matches the flag's current generation, or (at Publish) once the task's tracked files
+          // have nothing uncommitted. Git is asked only when every cheaper rule would keep the card,
+          // and once per render pass.
+          const dismissals = this.readIdleReconcileDismissalsV1();
+          const taskKey = normalizePath(target.taskFolderPath);
+          const cheapVerdict = shouldBuildIdleReconcileCardV1({ progress: idleProgress, dismissals, taskKey });
+          const uncommitted =
+            cheapVerdict && idleProgress.currentStage === "publish"
+              ? await trackedFilesHaveUncommittedChangesV1(target.taskFolderPath, idleProgress.implReviewFiles)
+              : undefined;
+          if (
+            shouldBuildIdleReconcileCardV1({
+              progress: idleProgress,
+              dismissals,
+              taskKey,
+              trackedFilesHaveUncommittedChanges: uncommitted,
+            })
+          ) {
+            activeDecisions.push(buildIdleReconcileDecisionV1(target));
+          }
         }
       }
     }
@@ -4064,6 +4436,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // Unknown gating (undefined, predates the field) defaults to blocking —
       // absence is never positive evidence.
       isBlockingDecision,
+      // bugs5 Step 1: "For information" / "<Command> is waiting for your answer" / "Decision needed"
+      // / "Optional", from the same function the notification and copy text use.
+      headingText: decisionHeadingV1(decision),
+      // bugs5 Step 9: a card a running command waits on says, before Dismiss, that Dismiss ends it.
+      ...(decision.gating?.waitingCommand !== undefined
+        ? (() => {
+            const warning = describeWaitingCommandDismissWarningV1(
+              decision.gating.waitingCommand,
+              decision.gating.waitingNothingDone
+            );
+            return {
+              waitingNote: `${decision.gating.waitingCommand} is waiting for this answer. ${warning}`,
+              dismissTitle: warning,
+            };
+          })()
+        : {}),
       };
     });
     const displayInteractions = interactions.map((interaction) => {
@@ -4393,6 +4781,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           background-color: transparent; color: var(--ensemble-primary-foreground);
           border: var(--ensemble-border-width) solid var(--vscode-widget-border);
         }
+        /* bugs5 Step 5: Dismiss closes without acting, so it shares AI Models' grey (Discard Unsaved Changes). */
+        ${ENSEMBLE_DISMISS_BUTTON_CSS_V1}
         /* Part 10 item 13e: a pending legacy question's own bound reply
            control, rendered inline under the question message it answers —
            same "needs a response" left-border treatment as #interaction
@@ -4619,12 +5009,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         chatBtn.textContent='Answer in chat instead';
         chatBtn.title='Leaves the question open and puts the cursor in the message box, so you can reply in your own words.';
         chatBtn.addEventListener('click',()=>{ const box=document.getElementById('message'); if(box){ box.focus(); } });
-        const cancelBtn=document.createElement('button'); cancelBtn.type='button'; cancelBtn.className='secondary'; cancelBtn.textContent='Dismiss';
+        const cancelBtn=document.createElement('button'); cancelBtn.type='button'; cancelBtn.className='ensemble-dismiss'; cancelBtn.textContent='Dismiss';
         // The label alone never said what it discards; the handler settles the
         // interaction as cancelled, so the action that asked does not proceed.
         cancelBtn.title='Dismisses this question without answering. The action that asked it will not continue.';
         cancelBtn.addEventListener('click',()=>{ v.postMessage({type:'cancelInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId}); });
-        actions.appendChild(confirmBtn); actions.appendChild(chatBtn); actions.appendChild(cancelBtn);
+        // bugs5 Step 5: Dismiss first (left), then the action button after it, as in AI Models.
+        actions.appendChild(cancelBtn); actions.appendChild(chatBtn); actions.appendChild(confirmBtn);
         ic.appendChild(actions);
         ic.appendChild(buildMsgMeta(interaction.copyText||'',interaction.atLabel,interaction.atTitle));
         // A question is an interruption that needs a visible reply, not a
@@ -4708,10 +5099,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             const answers=rows.map((r)=>({itemId:r.itemId,choice:r.radios.exclude.checked?'exclude':(r.radios.tick.checked?'tick':'leave'),note:r.ta.value}));
             v.postMessage({type:'submitOpenPlanItemsForm',formId:form.formId,answers});
           });
-          const dismiss=document.createElement('button'); dismiss.type='button'; dismiss.textContent='Dismiss';
+          const dismiss=document.createElement('button'); dismiss.type='button'; dismiss.className='ensemble-dismiss'; dismiss.textContent='Dismiss';
           dismiss.title='Close without applying answers; nothing runs and task.md is unchanged.';
           dismiss.addEventListener('click',()=>{ apply.disabled=true; dismiss.disabled=true; v.postMessage({type:'dismissOpenPlanItemsForm',formId:form.formId}); });
-          actions.appendChild(apply); actions.appendChild(dismiss); box.appendChild(actions);
+          // bugs5 Step 5: Dismiss first (left), then the action button after it.
+          actions.appendChild(dismiss); actions.appendChild(apply); box.appendChild(actions);
           ic.appendChild(box);
         }
       }
@@ -4776,7 +5168,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const err=document.createElement('div'); err.className='interaction-error';
           card.appendChild(err);
           const title=document.createElement('div'); title.className='interaction-title';
-          title.textContent=(dcs.isBlockingDecision!==false)?'Decision needed':'Optional';
+          title.textContent=dcs.headingText||((dcs.isBlockingDecision!==false)?'Decision needed':'Optional');
           card.appendChild(title);
           const what=document.createElement('div'); what.className='interaction-prompt';
           what.textContent=dcs.whatHappened;
@@ -4861,6 +5253,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const pausedNote=document.createElement('div'); pausedNote.className='decision-paused-note';
           pausedNote.textContent='Your choice is recorded immediately, whether the task is paused or active. The action it runs can still refuse on its own terms, and recording your choice does not by itself resume the task — see "Unblocks" above.';
           card.appendChild(pausedNote);
+          if(dcs.waitingNote){
+            const waitingNote=document.createElement('div'); waitingNote.className='decision-paused-note';
+            waitingNote.textContent=dcs.waitingNote;
+            card.appendChild(waitingNote);
+          }
           const actions=document.createElement('div'); actions.className='interaction-actions';
           const confirmBtn=document.createElement('button'); confirmBtn.type='button'; confirmBtn.textContent='Confirm';
           confirmBtn.addEventListener('click',()=>{
@@ -4875,17 +5272,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             for(const r of radios){ r.disabled=true; }
             v.postMessage({type:'resolveWorkflowDecision',decisionId:dcs.decisionId,optionId:checked.value});
           });
-          actions.appendChild(confirmBtn);
           // bugs3 Step 8: every pending card can be dismissed as a fallback.
           // It records who and when, dispatches nothing and leaves task.md alone.
-          const dismissBtn=document.createElement('button'); dismissBtn.type='button'; dismissBtn.textContent='Dismiss';
-          dismissBtn.title='Close this card without choosing. Nothing runs and task.md is not changed.';
+          const dismissBtn=document.createElement('button'); dismissBtn.type='button'; dismissBtn.className='ensemble-dismiss'; dismissBtn.textContent='Dismiss';
+          dismissBtn.title=dcs.dismissTitle||'Close this card without choosing. Nothing runs and task.md is not changed.';
           dismissBtn.addEventListener('click',()=>{
             confirmBtn.disabled=true; dismissBtn.disabled=true;
             for(const r of radios){ r.disabled=true; }
             v.postMessage({type:'resolveWorkflowDecision',decisionId:dcs.decisionId,optionId:'__dismiss__'});
           });
+          // bugs5 Step 5: Dismiss first (left), then the action button after it.
           actions.appendChild(dismissBtn);
+          actions.appendChild(confirmBtn);
           card.appendChild(actions);
           card.appendChild(buildMsgMeta(dcs.copyText||'',dcs.atLabel,dcs.atTitle));
           root.appendChild(card);
@@ -4997,16 +5395,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               sendBtn.disabled=true;sendBtn.textContent='Sent';ta.disabled=true;
               v.postMessage({type:'answerQuestion',questionAt:x.id??x.at,text:val});
             });
-            actions.appendChild(sendBtn);
             // bugs3 Step 8: every pending card can be dismissed. Dismissing
             // records the dismissal, runs nothing and writes nothing to task.md.
-            const dismissBtn=document.createElement('button');dismissBtn.type='button';dismissBtn.textContent='Dismiss';
+            const dismissBtn=document.createElement('button');dismissBtn.type='button';dismissBtn.className='ensemble-dismiss';dismissBtn.textContent='Dismiss';
             dismissBtn.title='Close this question without answering. Nothing runs and task.md is not changed.';
             dismissBtn.addEventListener('click',()=>{
               dismissBtn.disabled=true;sendBtn.disabled=true;ta.disabled=true;
               v.postMessage({type:'dismissQuestion',questionAt:x.id??x.at});
             });
+            // bugs5 Step 5: Dismiss first (left), then the action button after it.
             actions.appendChild(dismissBtn);
+            actions.appendChild(sendBtn);
             replyWrap.appendChild(actions);
             row.appendChild(replyWrap);
           }

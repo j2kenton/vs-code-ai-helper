@@ -19,12 +19,19 @@ export function configureWorkflowDecisionStateV1(state: vscode.Memento | undefin
 function decisionStoreStateV1(context: vscode.ExtensionContext): vscode.Memento {
   return decisionStateV1 ?? context.workspaceState;
 }
+
+/** The decision store over the same state the poster uses, or `undefined` before activation. */
+export function openWorkflowDecisionStoreV1(): WorkflowDecisionStoreV1 | undefined {
+  const context = getExtensionContextV1();
+  return context ? new WorkflowDecisionStoreV1(decisionStoreStateV1(context)) : undefined;
+}
 import {
   WorkflowDecisionStoreV1,
   clearWorkflowDecisionOrphanedV1,
   markWorkflowDecisionOrphanedV1,
 } from "../state/workflowDecisionStoreV1";
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { describeDeferredAnswerCarryOverV1 } from "../commands/verifiedTicksHeldOptionsV1";
 import {
   ACTIVATION_ID_V1,
   describeOrphanedAwaitedDecisionV1,
@@ -291,6 +298,20 @@ export async function postWorkflowDecisionV1(
     // record is returned so the caller still sees "a decision exists" rather
     // than the no-extension-context `undefined`.
     return result.decision;
+  }
+  if (result.deferredCarryOver !== undefined) {
+    // bugs5 Step 3: the card that held the owner's kept answer was replaced by a newer review's.
+    // Say what carried over and what is new, once, whatever else this post does.
+    try {
+      await appendChatMessageV1(target.taskFolderPath, {
+        role: "assistant",
+        text: describeDeferredAnswerCarryOverV1(result.deferredCarryOver),
+        stage: result.decision.stage,
+        at: new Date().toISOString(),
+      }, target.canonicalId);
+    } catch {
+      // Best-effort: the kept answer itself is already on the replacement record.
+    }
   }
   if (input.quietRepost === true && result.updatedInPlace === true) {
     // The standing card was refreshed where it already sits (same decision id,

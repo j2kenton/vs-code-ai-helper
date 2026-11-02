@@ -117,13 +117,25 @@ void describe("describeOwedContinuationRefusalV1 — the refusal explainer's req
     assert.match(message, /could not be enumerated \(recorded as unknown\)/);
   });
 
-  void it("a dispatched record states retrying cannot help and that it is never re-fired automatically", () => {
+  void it("a dispatched record states retrying cannot help, and does not claim the sweep never re-fires it", () => {
     const message = describeOwedContinuationRefusalV1(makeRecord({ dispatch: "dispatched" }), [], 0);
     assert.match(message, /retrying this action will not/i);
-    assert.match(message, /never re-fired automatically, even once its lease expires/i);
+    assert.doesNotMatch(message, /never re-fired automatically/i);
+    assert.match(message, /recovery sweep reclaims and re-arms it automatically/i);
     // Must NOT claim the lease expiring re-arms it — that is the false
     // guidance this round corrects (a dispatched record is never re-armed).
     assert.doesNotMatch(message, /lease to expire and the continuation to re-arm/i);
+  });
+
+  void it("a record the owner cancelled says it is held until Run Implementation, with no 'wait' advice", () => {
+    const message = describeOwedContinuationRefusalV1(
+      makeRecord({ dispatch: "pending", leaseUntil: undefined, ownerHold: { at: "2026-11-01T18:00:35.000Z", cause: "cancelled" } }),
+      [],
+      0
+    );
+    assert.match(message, /You cancelled it, so it is held/);
+    assert.match(message, /Choose Run Implementation/);
+    assert.doesNotMatch(message, /no action is needed/);
   });
 
   void it("a dispatched record's remedy says lease expiry does not restart it, and offers reload-and-rerun", () => {

@@ -204,6 +204,21 @@ export interface CardDismissalContextV1 {
   readonly taskStatus?: "creating" | "active" | "paused" | "completed" | "archived";
   /** The stage the card was raised on. */
   readonly stage?: TaskStage;
+  /**
+   * bugs5 Step 9: the name of the running command that was waiting on this card ("Commit & Push").
+   * Dismissing that card ends the command, and the line says so.
+   */
+  readonly waitingCommand?: string;
+  /** What the command would have done ("committed"): "…nothing was committed." */
+  readonly waitingNothingDone?: string;
+}
+
+/**
+ * bugs5 Step 9: what the card says before Dismiss when a running command waits on it.
+ * "Dismissing stops this Commit & Push; nothing is committed."
+ */
+export function describeWaitingCommandDismissWarningV1(command: string, nothingDone?: string): string {
+  return `Dismissing stops this ${command}${nothingDone ? `; nothing is ${nothingDone}` : ""}.`;
 }
 
 /**
@@ -212,6 +227,14 @@ export interface CardDismissalContextV1 {
  * dismissing never silently leaves a stuck task.
  */
 export function describeCardDismissalV1(what: string, context: CardDismissalContextV1): string {
+  if (context.waitingCommand !== undefined) {
+    const cmd = context.waitingCommand;
+    return (
+      `Dismissed ${what}. ${cmd} stopped because the confirmation was dismissed` +
+      `${context.waitingNothingDone ? `; nothing was ${context.waitingNothingDone}` : ""}. ` +
+      `Choose ${cmd} to start again.`
+    );
+  }
   const base = `Dismissed ${what}. Nothing was run and task.md was not changed.`;
   if (!context.holdsTask) {
     return base;

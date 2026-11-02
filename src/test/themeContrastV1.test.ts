@@ -264,8 +264,8 @@ void describe("settings webview — dark provider button background", () => {
     const ref = ruleBody(html, "body.vscode-dark button.provider-signin");
     const refHover = ruleBody(html, "body.vscode-dark button.provider-signin:hover");
     for (const sel of [
-      "body.vscode-dark #discard-btn",
-      "body.vscode-dark #discard-providers-btn",
+      // Both Discard Unsaved Changes buttons carry the shared `ensemble-dismiss` class (bugs5 Step 5).
+      "body.vscode-dark button.ensemble-dismiss",
       "body.vscode-dark button.add-backup",
     ]) {
       const rest = ruleBody(html, sel);

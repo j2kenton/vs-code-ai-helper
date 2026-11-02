@@ -113,6 +113,12 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve.",
     reopen: "Preserve — same rationale as checklistProgressUnreliable.",
   },
+  checklistProgressUnreliableSetAt: {
+    migration: "Validate ISO timestamp/current optionality; absent on new tasks and on records predating this field.",
+    nextStage: "Preserve — travels with checklistProgressUnreliable, whose generation it identifies.",
+    markTaskDone: "Preserve.",
+    reopen: "Preserve — same rationale as checklistProgressUnreliable.",
+  },
   checklistProgressUnreliableClaims: {
     migration: "Validate bounded non-empty string array/current optionality; absent on new tasks and on records predating this field.",
     nextStage: "Preserve — travels with checklistProgressUnreliable, whose latching claims it records.",
@@ -272,6 +278,36 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
       "Validate per-stage map of bounded non-empty model-id strings with canonical stage keys only.",
     nextStage:
       "Clear the departing-stage entry; retain other entries (companion to fallbackActive; same deliberate departing-vs-destination change from updateTaskProgressStage as fallbackActive's row).",
+    markTaskDone: "Clear the current-stage entry.",
+    reopen: "Clear selected and later-stage entries; retain earlier entries.",
+  },
+  fallbackChainFingerprint: {
+    migration: "Validate per-stage map of bounded non-empty string tokens.",
+    nextStage: "Clear the departing-stage entry; retain other entries.",
+    markTaskDone: "Clear the current-stage entry.",
+    reopen: "Clear selected and later-stage entries; retain earlier entries.",
+  },
+  fallbackFailedModelId: {
+    migration: "Validate per-stage map of bounded non-empty string tokens.",
+    nextStage: "Clear the departing-stage entry; retain other entries.",
+    markTaskDone: "Clear the current-stage entry.",
+    reopen: "Clear selected and later-stage entries; retain earlier entries.",
+  },
+  fallbackFailureReason: {
+    migration: "Validate per-stage map of bounded string failure messages.",
+    nextStage: "Clear the departing-stage entry; retain other entries.",
+    markTaskDone: "Clear the current-stage entry.",
+    reopen: "Clear selected and later-stage entries; retain earlier entries.",
+  },
+  fallbackFailedAt: {
+    migration: "Validate per-stage map of ISO timestamp strings.",
+    nextStage: "Clear the departing-stage entry; retain other entries.",
+    markTaskDone: "Clear the current-stage entry.",
+    reopen: "Clear selected and later-stage entries; retain earlier entries.",
+  },
+  fallbackResetTime: {
+    migration: "Validate per-stage map of ISO timestamp strings.",
+    nextStage: "Clear the departing-stage entry; retain other entries.",
     markTaskDone: "Clear the current-stage entry.",
     reopen: "Clear selected and later-stage entries; retain earlier entries.",
   },
@@ -554,6 +590,7 @@ export function applyNextStagePolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableSetAt: progress.checklistProgressUnreliableSetAt,
     checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/32/Wave I review fix (2026-09-17): describes who
@@ -600,6 +637,11 @@ export function applyNextStagePolicyV1(
     scheduledResumeTime: undefined,
     fallbackActive: deactivateFallbackEntry(progress.fallbackActive, departing),
     fallbackModelId: clearMapEntry(progress.fallbackModelId, departing),
+    fallbackChainFingerprint: clearMapEntry(progress.fallbackChainFingerprint, departing),
+    fallbackFailedModelId: clearMapEntry(progress.fallbackFailedModelId, departing),
+    fallbackFailureReason: clearMapEntry(progress.fallbackFailureReason, departing),
+    fallbackFailedAt: clearMapEntry(progress.fallbackFailedAt, departing),
+    fallbackResetTime: clearMapEntry(progress.fallbackResetTime, departing),
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
     reviewRejections: progress.reviewRejections,
@@ -652,6 +694,7 @@ export function applyMarkTaskDonePolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableSetAt: progress.checklistProgressUnreliableSetAt,
     checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
@@ -694,6 +737,11 @@ export function applyMarkTaskDonePolicyV1(
     scheduledResumeTime: undefined,
     fallbackActive: deactivateFallbackEntry(progress.fallbackActive, progress.currentStage),
     fallbackModelId: clearMapEntry(progress.fallbackModelId, progress.currentStage),
+    fallbackChainFingerprint: clearMapEntry(progress.fallbackChainFingerprint, progress.currentStage),
+    fallbackFailedModelId: clearMapEntry(progress.fallbackFailedModelId, progress.currentStage),
+    fallbackFailureReason: clearMapEntry(progress.fallbackFailureReason, progress.currentStage),
+    fallbackFailedAt: clearMapEntry(progress.fallbackFailedAt, progress.currentStage),
+    fallbackResetTime: clearMapEntry(progress.fallbackResetTime, progress.currentStage),
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
     reviewRejections: progress.reviewRejections,
@@ -763,9 +811,19 @@ export function applyReopenPolicyV1(
   }
 
   let fallbackModelId = progress.fallbackModelId;
+  let fallbackChainFingerprint = progress.fallbackChainFingerprint;
+  let fallbackFailedModelId = progress.fallbackFailedModelId;
+  let fallbackFailureReason = progress.fallbackFailureReason;
+  let fallbackFailedAt = progress.fallbackFailedAt;
+  let fallbackResetTime = progress.fallbackResetTime;
   for (const stage of STAGE_ORDER) {
     if (stageIndex(stage) >= selectedIndex) {
       fallbackModelId = clearMapEntry(fallbackModelId, stage);
+      fallbackChainFingerprint = clearMapEntry(fallbackChainFingerprint, stage);
+      fallbackFailedModelId = clearMapEntry(fallbackFailedModelId, stage);
+      fallbackFailureReason = clearMapEntry(fallbackFailureReason, stage);
+      fallbackFailedAt = clearMapEntry(fallbackFailedAt, stage);
+      fallbackResetTime = clearMapEntry(fallbackResetTime, stage);
     }
   }
 
@@ -781,6 +839,7 @@ export function applyReopenPolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableSetAt: progress.checklistProgressUnreliableSetAt,
     checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
@@ -814,6 +873,11 @@ export function applyReopenPolicyV1(
     scheduledResumeTime: undefined,
     fallbackActive,
     fallbackModelId,
+    fallbackChainFingerprint,
+    fallbackFailedModelId,
+    fallbackFailureReason,
+    fallbackFailedAt,
+    fallbackResetTime,
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
     reviewRejections: progress.reviewRejections,
@@ -889,9 +953,19 @@ export function applyPlanRevisionPolicyV1(
     }
   }
   let fallbackModelId = progress.fallbackModelId;
+  let fallbackChainFingerprint = progress.fallbackChainFingerprint;
+  let fallbackFailedModelId = progress.fallbackFailedModelId;
+  let fallbackFailureReason = progress.fallbackFailureReason;
+  let fallbackFailedAt = progress.fallbackFailedAt;
+  let fallbackResetTime = progress.fallbackResetTime;
   for (const stage of STAGE_ORDER) {
     if (stageIndex(stage) >= planIndex) {
       fallbackModelId = clearMapEntry(fallbackModelId, stage);
+      fallbackChainFingerprint = clearMapEntry(fallbackChainFingerprint, stage);
+      fallbackFailedModelId = clearMapEntry(fallbackFailedModelId, stage);
+      fallbackFailureReason = clearMapEntry(fallbackFailureReason, stage);
+      fallbackFailedAt = clearMapEntry(fallbackFailedAt, stage);
+      fallbackResetTime = clearMapEntry(fallbackResetTime, stage);
     }
   }
 
@@ -907,6 +981,7 @@ export function applyPlanRevisionPolicyV1(
     displayName: progress.displayName,
     checklistProgressUnreliable: progress.checklistProgressUnreliable,
     checklistProgressUnreliableReason: progress.checklistProgressUnreliableReason,
+    checklistProgressUnreliableSetAt: progress.checklistProgressUnreliableSetAt,
     checklistProgressUnreliableClaims: progress.checklistProgressUnreliableClaims,
     zeroChangeImplRounds: undefined,
     // v1 fixes 2, item 8/Wave I: describes who acts next for the CURRENT
@@ -953,6 +1028,11 @@ export function applyPlanRevisionPolicyV1(
     scheduledResumeTime: undefined,
     fallbackActive,
     fallbackModelId,
+    fallbackChainFingerprint,
+    fallbackFailedModelId,
+    fallbackFailureReason,
+    fallbackFailedAt,
+    fallbackResetTime,
     reviewAttemptId: undefined,
     reviewScoreHistory: progress.reviewScoreHistory,
     reviewRejections: progress.reviewRejections,

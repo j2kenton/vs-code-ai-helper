@@ -487,19 +487,29 @@ void describe("shouldEscalateChurnCeiling", () => {
     );
   });
 
-  void it("bugs4 item 22: a round that declared a blocker [narrowed:…] resets the run, so the ceiling does not fire", () => {
-    const narrowed = identity({ id: "b2", lineage: { kind: "narrowed", refId: "b1" } });
+  void it("bugs5 item 10: a [narrowed:…] tag alone does not restart the count; it restarts only when a best-so-far value improves", () => {
+    const narrowed = (n: number) => identity({ id: `b${n}`, lineage: { kind: "narrowed", refId: "b1" } });
     const history = [
       entry(5, { taskFixableCount: 1, blockers: [identity({ id: "b1" })] }),
-      entry(5, { taskFixableCount: 1, blockers: [identity({ id: "b1", lineage: { kind: "same", refId: "b1" } })] }),
-      entry(5, { taskFixableCount: 1, blockers: [identity({ id: "b1", lineage: { kind: "same", refId: "b1" } })] }),
-      entry(5, { taskFixableCount: 1, blockers: [narrowed] }),
+      entry(5, { taskFixableCount: 1, blockers: [narrowed(2)] }),
+      entry(5, { taskFixableCount: 1, blockers: [narrowed(3)] }),
+      entry(5, { taskFixableCount: 1, blockers: [narrowed(4)] }),
     ];
-    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 0);
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 3);
     assert.strictEqual(
-      shouldEscalateChurnCeiling({ history, stage: "impl-high-review", taskFixableCount: 1, churnCeilingRounds: 2 }),
-      false
+      shouldEscalateChurnCeiling({ history, stage: "impl-high-review", taskFixableCount: 1, churnCeilingRounds: 3 }),
+      true
     );
+    // The same narrowing with a higher score than ever before restarts the count.
+    const rising = [...history.slice(0, 3), entry(6, { taskFixableCount: 1, blockers: [narrowed(4)] })];
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(rising, "impl-high-review"), 0);
+  });
+
+  void it("bugs5 item 10: a count that swings 2 → 1 → 2 → 1 → 2 does not keep resetting the ceiling", () => {
+    const counts = [2, 2, 1, 2, 1, 2, 1, 2];
+    const history = counts.map((taskFixableCount) => entry(5, { taskFixableCount }));
+    // The best (1) was reached at index 2; the five rounds after it gained nothing.
+    assert.strictEqual(roundsWithoutTaskFixableDecrease(history, "impl-high-review"), 5);
   });
 
   void it("bugs4 item 22 control: rounds that keep declaring the same blocker [same:…] with nothing narrowed still escalate", () => {

@@ -24,6 +24,11 @@ import {
 } from "./activeFastForwardRunsV1";
 import { readTextIfExists } from "./fileUtils";
 import {
+  MANY_UNBUILT_ITEMS_THRESHOLD_V1,
+  describeReviewRunSummaryV1,
+  summarizeReviewRunV1,
+} from "./reviewRunSummaryV1";
+import {
   hasNarrowingPrefixV1,
   findNarrowingBlockerV1,
   findPlanStageNarrowingBlockerV1,
@@ -59,7 +64,13 @@ import {
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import * as path from "path";
-import { BlockerResolver, parseReviewVerifiedCompleteV1, ReviewBlocker } from "./reviewReadiness";
+import {
+  AGENT_CAN_GATHER_RE,
+  BlockerResolver,
+  parseOwnerDecisionsNeededV1,
+  parseReviewVerifiedCompleteV1,
+  ReviewBlocker,
+} from "./reviewReadiness";
 import { KEEP_ITERATING_SEQUENCE_NOTE_V1 } from "./plateauFixCycleV1";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
 import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "./effectiveReviewProgress";
@@ -615,7 +626,7 @@ function buildPlateauKeepIteratingOptionV1(
             resumeFastForwardV1: {
               attemptNumber: fastForwardState.attemptNumber,
               maxAttempts: fastForwardState.maxAttempts,
-              ...stampFastForwardResumeProvenanceV1(taskFolderPath),
+              ...stampFastForwardResumeProvenanceV1(taskFolderPath, stage),
             },
           },
         ],
@@ -741,6 +752,14 @@ export interface EscalationPlateauContextV1 {
    * the reason the stage is open.
    */
   readonly taskFixableIncludesUnbuiltWork?: boolean;
+  /**
+   * bugs5 Step 22: how many distinct open plan items the task-fixable unbuilt-work blockers name. At
+   * {@link MANY_UNBUILT_ITEMS_THRESHOLD_V1} or more the card recommends Implementation, which builds
+   * them all in one round, rather than an Apply Review per item.
+   */
+  readonly unbuiltItemsNamedCount?: number;
+  /** bugs5 Step 22: one line on how far the run has got (rounds run, score range, settled items). */
+  readonly runProgressNote?: string;
   /**
    * bugs4 items 18/21: how many of the most recent consecutive Apply Review rounds closed none of
    * the open plan items (`applyReviewRoundsClosedNoneV1`). Absent when not measured.
@@ -927,6 +946,8 @@ export function buildEscalationDecisionV1(
       allBlockersCarriedGates = false,
       taskFixableAllUnbuiltWork = false,
       taskFixableIncludesUnbuiltWork = false,
+      unbuiltItemsNamedCount = 0,
+      runProgressNote,
       applyReviewRoundsClosedNone = 0,
       provisionalTicks = 0,
       reviewAffirmsOpenItemsBuilt = false,
@@ -1056,6 +1077,31 @@ export function buildEscalationDecisionV1(
             },
           ]
         : []),
+      ...(() => {
+        const gatherable = allBlockerDescriptions?.filter((desc) => AGENT_CAN_GATHER_RE.test(desc)) ?? [];
+        return gatherable.map((desc, index) => {
+          const cost = AGENT_CAN_GATHER_RE.exec(desc)?.[1]?.trim() ?? "low cost";
+          // With several gather options on one card, a short name of the blocker tells the buttons apart.
+          const shortName = desc.replace(/\s+/g, " ").trim().slice(0, 48);
+          // Option ids must be unique on a card: the first keeps the plain id, later ones are numbered.
+          return {
+            optionId: index === 0 ? "aiGatherEvidence" : `aiGatherEvidence${index + 1}`,
+            label:
+              gatherable.length > 1
+                ? `Let the AI gather it: ${shortName}${desc.length > shortName.length ? "…" : ""} (about ${cost})`
+                : `Let the AI gather it (about ${cost})`,
+            resumeKind: "continue" as const,
+            consequence:
+              `Resumes the task and runs an Apply Review whose work is only this blocker: "${desc}". ` +
+              "The review's other blockers are left alone this round.",
+            effect: {
+              kind: "command" as const,
+              command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+              args: [{ taskFolderPath: target.taskFolderPath, focusBlocker: desc }],
+            },
+          };
+        });
+      })(),
     ];
 
     // 2026-09-04 review follow-up (completion blocker, new): this label
@@ -1128,6 +1174,19 @@ export function buildEscalationDecisionV1(
                   `not done, and ${unbuiltWorkReferences.length === 1 ? "that item is" : "those items are"} still open)`
                 : "") +
               ", which Implementation builds and another review round does not.",
+          }
+        : // bugs5 Step 22: the grouped blocker names many unbuilt items. An Apply Review builds one or two
+          // per round; Implementation builds them all in one.
+          planItemsOpen > 0 &&
+          taskFixableCount > 0 &&
+          taskFixableIncludesUnbuiltWork &&
+          unbuiltItemsNamedCount >= MANY_UNBUILT_ITEMS_THRESHOLD_V1
+        ? {
+            kind: "option",
+            optionId: "buildRemaining",
+            reasoning:
+              `The blocker names ${unbuiltItemsNamedCount} unbuilt plan items. An Apply Review builds one or two ` +
+              "per round, while Implementation builds them all in one round.",
           }
         : applyReviewNotMoving
         ? {
@@ -1237,6 +1296,7 @@ export function buildEscalationDecisionV1(
               },
             ]
           : []),
+        ...(runProgressNote ? [{ label: "How far this run has got", detail: runProgressNote }] : []),
         ...(narrowing
           ? [
               { label: "Plan item", detail: narrowing.itemText },
@@ -1909,9 +1969,14 @@ const PLAN_ORDER_BLOCKER_RE =
 const ROUND_CANNOT_COMPLETE_RE = /\b(human gate|hand[- ]?off|a measurement)\b/i;
 
 /** RC4 item 4: the literal prefix plan/impl reviews use for evidence only the owner can gather. */
-const OWNER_EVIDENCE_PREFIX_RE = /^\W*owner evidence needed\b/i;
+export const OWNER_EVIDENCE_PREFIX_RE = /^\W*owner evidence needed\b/i;
 
-function classifyEnvironmentalBlockerV1(description: string): "owner-decision" | "external-status" | "owner-evidence" {
+export type EnvironmentalBlockerKindV1 = "owner-decision" | "external-status" | "owner-evidence" | "agent-gatherable";
+
+export function classifyEnvironmentalBlockerV1(description: string): EnvironmentalBlockerKindV1 {
+  if (AGENT_CAN_GATHER_RE.test(description)) {
+    return "agent-gatherable";
+  }
   if (OWNER_EVIDENCE_PREFIX_RE.test(description)) {
     return "owner-evidence";
   }
@@ -1923,6 +1988,49 @@ function classifyEnvironmentalBlockerV1(description: string): "owner-decision" |
     return "external-status";
   }
   return "owner-decision";
+}
+
+/**
+ * bugs5 Step 22: determine whether a blocker requires an owner decision.
+ */
+export function isOwnerDecisionBlockerV1(
+  blockerOrDesc: string | (Pick<ReviewBlocker, "description"> & { resolver?: string; category?: string }),
+  ownerDecisionBlocks?: readonly { readonly id: string; readonly planPurpose?: string }[]
+): boolean {
+  const desc = typeof blockerOrDesc === "string" ? blockerOrDesc : blockerOrDesc.description ?? "";
+  if (AGENT_CAN_GATHER_RE.test(desc)) {
+    return false;
+  }
+  if (hasNarrowingPrefixV1(desc)) {
+    return true;
+  }
+  if (OWNER_EVIDENCE_PREFIX_RE.test(desc)) {
+    return true;
+  }
+  if (
+    /^\W*(?:owner decision (?:needed|required)|needs (?:an? )?owner decision|owner approval (?:needed|required)|needs (?:an? )?owner approval)\b/i.test(
+      desc
+    )
+  ) {
+    return true;
+  }
+  if (ownerDecisionBlocks && ownerDecisionBlocks.length > 0) {
+    const descLower = desc.toLowerCase();
+    if (
+      ownerDecisionBlocks.some(
+        (b) =>
+          descLower.includes(b.id.toLowerCase()) ||
+          (b.planPurpose && descLower.includes(b.planPurpose.toLowerCase()))
+      )
+    ) {
+      return true;
+    }
+  }
+  // A blocker a round can clear is never owner-only, whatever words its text happens to contain.
+  if (typeof blockerOrDesc !== "string" && blockerOrDesc.resolver === "task-fixable") {
+    return false;
+  }
+  return PLAN_ORDER_BLOCKER_RE.test(desc) || ROUND_CANNOT_COMPLETE_RE.test(desc);
 }
 
 /** Resolve the deliberately narrow post-install move-on case. */
@@ -2281,15 +2389,11 @@ async function postReviewPlateauDecisionV1(
   } catch {
     narrowing = undefined;
   }
-  // RC7 item 1: every remaining blocker is a narrowing or owner evidence.
+  // RC7 item 1 & bugs5 Step 22: every remaining blocker is a narrowing, owner decision or owner evidence.
+  const ownerDecisionBlocks = parseOwnerDecisionsNeededV1(evidence.content);
   const allBlockersNeedOwnerDecision =
     normalized.blockers.length > 0 &&
-    normalized.blockers.every(
-      (b) =>
-        hasNarrowingPrefixV1(b.description) ||
-        OWNER_EVIDENCE_PREFIX_RE.test(b.description) ||
-        classifyEnvironmentalBlockerV1(b.description) === "owner-evidence"
-    );
+    normalized.blockers.every((b) => isOwnerDecisionBlockerV1(b, ownerDecisionBlocks));
   // bugs3 Step 7: owner evidence the plan itself defers to named later steps
   // is a carried gate, not a hold on this stage — and when it depends on a
   // resource the plan will create, pausing for the owner to gather it cannot
@@ -2349,6 +2453,29 @@ async function postReviewPlateauDecisionV1(
         b.category === "completion" &&
         isUnbuiltWorkBlockerV1(b.description ?? "", planOfRecordText)
     );
+  // bugs5 Step 22: the distinct open items the unbuilt-work blockers name, and how far the run has got.
+  const unbuiltItemsNamedCount =
+    taskFixableIncludesUnbuiltWork && planOfRecordText !== undefined
+      ? new Set(
+          normalized.blockers
+            .filter((b) => b.resolver === "task-fixable" && b.origin !== "mechanical" && b.category === "completion")
+            .flatMap((b) =>
+              resolveBlockerPlanReferencesV1(b.description ?? "", planOfRecordText)
+                .filter((r) => r.kind !== "part" && r.open > 0)
+                .map((r) => r.reference)
+            )
+        ).size
+      : 0;
+  let runProgressNote: string | undefined;
+  try {
+    const runRead = await readTaskProgressStrictV1(folderUri, {
+      expectedTaskFolder: path.basename(target.taskFolderPath),
+    });
+    const runSummary = runRead.ok ? summarizeReviewRunV1(runRead.decoded.progress.reviewScoreHistory ?? [], stage) : undefined;
+    runProgressNote = runSummary ? describeReviewRunSummaryV1(runSummary) : undefined;
+  } catch {
+    runProgressNote = undefined;
+  }
   let applyReviewRoundsClosedNone = 0;
   let provisionalTicks = 0;
   let reviewAffirmsOpenItemsBuilt = false;
@@ -2473,6 +2600,8 @@ async function postReviewPlateauDecisionV1(
       allBlockersCarriedGates: carriedEvidence.allCarried,
       taskFixableAllUnbuiltWork,
       taskFixableIncludesUnbuiltWork,
+      unbuiltItemsNamedCount,
+      ...(runProgressNote ? { runProgressNote } : {}),
       applyReviewRoundsClosedNone,
       provisionalTicks,
       reviewAffirmsOpenItemsBuilt,

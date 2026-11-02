@@ -99,6 +99,8 @@ import { registerOpenRetainedPromptCommand } from "./commands/openRetainedPrompt
 import { registerOpenPlanNonGoalsCommand } from "./commands/openPlanNonGoalsV1";
 import { registerDecideOpenPlanItemsCommandV1 } from "./commands/decideOpenPlanItemsV1";
 import { registerOwnerTestRunCommandsV1 } from "./commands/ownerTestRunCardV1";
+import { registerOwnerPlanDecisionCommandV1 } from "./commands/ownerPlanDecisionCommandV1";
+import { registerPartialScopeDecisionCommandV1 } from "./commands/partialScopeDecisionV1";
 import { registerEnablePublishBackupCommandV1 } from "./commands/enablePublishBackupV1";
 import { registerAcceptPlanItemNarrowingCommandV1 } from "./commands/acceptPlanItemNarrowingV1";
 import {
@@ -127,7 +129,10 @@ import { registerKimiReadConfigCommands } from "./commands/kimiReadConfigOfferV1
 import { registerUndeliveredPromptEditsCommands } from "./commands/undeliveredPromptEditsOfferV1";
 import { registerHandoffChecksCommandsV1 } from "./commands/handoffChecksV1";
 import { registerSettleChecklistItemCommandV1 } from "./commands/settleChecklistItem";
-import { registerApplyReviewerVerifiedTicksCommands } from "./commands/applyReviewerVerifiedTicks";
+import {
+  rearmAcceptedTicksV1,
+  registerApplyReviewerVerifiedTicksCommands,
+} from "./commands/applyReviewerVerifiedTicks";
 import { registerPlanRevisionCommandsV1 } from "./commands/planRevisionV1";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
@@ -197,7 +202,8 @@ import { installOperationNotificationBridge } from "./utils/operationNotificatio
 import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
-import { recoverAbandonedPublishChecksRunV1 } from "./utils/publishChecksOutcomeV1";
+import { readPublishChecksOutcomeV1, recoverAbandonedPublishChecksRunV1 } from "./utils/publishChecksOutcomeV1";
+import { announceInterruptedChecksRunV1 } from "./utils/interruptedChecksNoticeV1";
 import { retireFreeTextQuestionsFromEarlierActivationV1 } from "./utils/cardLifecycleV1";
 import { runWithRoundProcessTaskFolderV1 } from "./state/roundProcessContextV1";
 import type { OperationKind } from "./utils/operationTaxonomy";
@@ -207,6 +213,8 @@ import { normalizePath, resolveTaskRootCandidates } from "./utils/taskRoot";
 import { finishFinalization, recoverFinalizationTree } from "./state/finalizationJournal";
 import { PendingOperationsStore } from "./state/pendingOperationsStore";
 import { recoverActivationCheckpoint } from "./state/taskActivationCoordinator";
+import { isStateLockHeldErrorV1, retryWhileStateLockHeldV1 } from "./state/stateLockRetryV1";
+import { postStateLockGiveUpNoticeV1, STATE_LOCK_GIVE_UP_CHAT_TEXT_V1 } from "./utils/stateLockGiveUpNoticeV1";
 import { readTaskProgressStrictV1 } from "./services/taskProgressReaderV1";
 import type { WorkflowDecisionV1 } from "./types/workflowDecisionV1";
 import { IncompleteTask } from "./types/incompleteTask";
@@ -419,6 +427,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   configureWorkflowDecisionStateV1(decisionsState);
   const chatViewProvider = new ChatViewProvider(decisionsState);
   context.subscriptions.push(chatViewProvider);
+  // bugs5 Steps 2-3 / item 10: answers the owner gave while a round was running live on the
+  // decision record, but the waiter that carries them out is memory only, so re-arm after a reload.
+  {
+    const rearmTimer = setTimeout(() => {
+      chatViewProvider.rearmKeptAnswersV1();
+      void rearmAcceptedTicksV1(chatViewProvider.workflowDecisionStore);
+    }, 3_000);
+    rearmTimer.unref?.();
+    context.subscriptions.push({ dispose: () => clearTimeout(rearmTimer) });
+  }
   // With no stage conversation selected, the Chat With AI panel defaults to
   // the global assistant instead of a "select a task first" blocked state.
   chatViewProvider.setDefaultTargetFactory(resolveGlobalAssistantTarget);
@@ -1329,7 +1347,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const checkpointRecoveries = mutatingRoots.map((root) =>
       recoverActivationCheckpoint(root, currentTaskStore).then(summary => {
         if (summary) NotificationRouter.showWarning(summary);
-      }).catch(err => console.error("Activation checkpoint recovery failed", err))
+      }).catch(err => {
+        if (!isStateLockHeldErrorV1(err)) {
+          console.error("Activation checkpoint recovery failed", err);
+          return;
+        }
+        // bugs5 Step 11: the previous extension host's lease has not expired yet (an update restart).
+        // Startup does not wait for it; the recovery keeps trying for longer than the lease lasts.
+        void retryWhileStateLockHeldV1(() => recoverActivationCheckpoint(root, currentTaskStore), {
+          onRetry: (attempt, delayMs) =>
+            console.warn(`Activation checkpoint recovery: state lock held, retry ${attempt} in ${delayMs / 1000}s`),
+        })
+          .then(summary => {
+            if (summary) NotificationRouter.showWarning(summary);
+          })
+          .catch(retryErr => {
+            console.error("Activation checkpoint recovery failed after retries", retryErr);
+            const currentId = currentTaskStore.get();
+            const currentTask = currentId ? inventory.getTaskById(currentId) : undefined;
+            void postStateLockGiveUpNoticeV1({ taskFolderPath: currentTask?.taskFolderPath, canonicalId: currentId }).then((posted) => {
+              if (!posted) {
+                NotificationRouter.showWarning(STATE_LOCK_GIVE_UP_CHAT_TEXT_V1);
+              }
+            });
+          });
+      })
     );
     startupGateReady = Promise.all([
       ...strandedDeletionSweeps,
@@ -1412,6 +1454,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerOpenPlanNonGoalsCommand(context);
   registerDecideOpenPlanItemsCommandV1(context);
   registerOwnerTestRunCommandsV1(context);
+  registerOwnerPlanDecisionCommandV1(context);
+  registerPartialScopeDecisionCommandV1(context);
   registerEnablePublishBackupCommandV1(context);
   registerAcceptPlanItemNarrowingCommandV1(context, inventory, currentTaskStore);
   registerHeldAdmissionMarkerCommandsV1(context);
@@ -2292,9 +2336,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // bugs3 Step 12: a Publish Checks run that was still "running" when its window stopped
     // is settled as interrupted (its outcome unknown), never left reading "Not yet reviewed".
     for (const task of inventory.getTasks()) {
-      await recoverAbandonedPublishChecksRunV1(vscode.Uri.file(task.taskFolderPath), {
+      const abandonedRunId = readPublishChecksOutcomeV1(task.taskFolderPath);
+      const recovered = await recoverAbandonedPublishChecksRunV1(vscode.Uri.file(task.taskFolderPath), {
         ownRunIsLive: () => taskOperations.getTaskOperations(task.taskFolderPath).length > 0,
-      }).catch((err) => console.error("Publish Checks run recovery failed", err));
+      }).catch((err) => {
+        console.error("Publish Checks run recovery failed", err);
+        return false;
+      });
+      if (recovered) {
+        // bugs5 Step 11: say so in the chat, once per run, with the way back.
+        await announceInterruptedChecksRunV1({
+          taskFolderPath: task.taskFolderPath,
+          taskName: task.progress.displayName,
+          runId: (abandonedRunId?.outcome === "running" ? abandonedRunId.operationId : undefined) ?? abandonedRunId?.at ?? new Date().toISOString(),
+        }).catch((err) => console.error("Interrupted Publish Checks notice failed", err));
+      }
       // bugs3 Step 8: a free-text question asked by an earlier activation has no command
       // waiting on it any more; withdraw it and say how to run its action again.
       await retireFreeTextQuestionsFromEarlierActivationV1(task.taskFolderPath, task.canonicalId ?? task.taskFolderPath).catch(

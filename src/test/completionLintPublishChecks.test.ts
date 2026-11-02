@@ -579,7 +579,8 @@ void describe("upsertCompletionChecksReportV1", () => {
       // State B — a review step follows: offer the Publish review.
       const stateB = publishNextStepOfferV1(publishNextStepFromActionsV1(["checks", "review"]));
       assert.equal(stateB.action.command, "vs-code-ai-helper.runReviewWithAI");
-      assert.match(stateB.sentence, /Publish review/);
+      // bugs5 Step 18: the offer names the second part of Publish.
+      assert.match(stateB.sentence, /Part 2 is the AI review/);
       // State A — the review action is gone: offer Commit & Push, never a review.
       const stateA = publishNextStepOfferV1(publishNextStepFromActionsV1(["checks"]));
       assert.equal(stateA.action.command, "vs-code-ai-helper.commitAndPushTask");

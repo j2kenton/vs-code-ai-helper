@@ -552,23 +552,43 @@ export function clearStageFallbackReservation(
   progress: TaskProgress,
   stage: TaskStage
 ): TaskProgress {
-  if (!progress.fallbackActive?.[stage] && !progress.fallbackModelId?.[stage]) {
+  if (
+    !progress.fallbackActive?.[stage] &&
+    !progress.fallbackModelId?.[stage] &&
+    !progress.fallbackChainFingerprint?.[stage] &&
+    !progress.fallbackFailedModelId?.[stage] &&
+    !progress.fallbackFailureReason?.[stage] &&
+    !progress.fallbackFailedAt?.[stage] &&
+    !progress.fallbackResetTime?.[stage]
+  ) {
     return progress;
   }
 
   const fallbackActive = { ...progress.fallbackActive };
   const fallbackModelId = { ...progress.fallbackModelId };
+  const fallbackChainFingerprint = { ...progress.fallbackChainFingerprint };
+  const fallbackFailedModelId = { ...progress.fallbackFailedModelId };
+  const fallbackFailureReason = { ...progress.fallbackFailureReason };
+  const fallbackFailedAt = { ...progress.fallbackFailedAt };
+  const fallbackResetTime = { ...progress.fallbackResetTime };
+
   delete fallbackActive[stage];
   delete fallbackModelId[stage];
+  delete fallbackChainFingerprint[stage];
+  delete fallbackFailedModelId[stage];
+  delete fallbackFailureReason[stage];
+  delete fallbackFailedAt[stage];
+  delete fallbackResetTime[stage];
 
   return {
     ...progress,
-    fallbackActive: Object.keys(fallbackActive).length > 0
-      ? fallbackActive
-      : undefined,
-    fallbackModelId: Object.keys(fallbackModelId).length > 0
-      ? fallbackModelId
-      : undefined,
+    fallbackActive: Object.keys(fallbackActive).length > 0 ? fallbackActive : undefined,
+    fallbackModelId: Object.keys(fallbackModelId).length > 0 ? fallbackModelId : undefined,
+    fallbackChainFingerprint: Object.keys(fallbackChainFingerprint).length > 0 ? fallbackChainFingerprint : undefined,
+    fallbackFailedModelId: Object.keys(fallbackFailedModelId).length > 0 ? fallbackFailedModelId : undefined,
+    fallbackFailureReason: Object.keys(fallbackFailureReason).length > 0 ? fallbackFailureReason : undefined,
+    fallbackFailedAt: Object.keys(fallbackFailedAt).length > 0 ? fallbackFailedAt : undefined,
+    fallbackResetTime: Object.keys(fallbackResetTime).length > 0 ? fallbackResetTime : undefined,
   };
 }
 

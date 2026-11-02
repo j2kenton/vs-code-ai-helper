@@ -31,6 +31,7 @@ void describe("Commit & Push and Release ask in chat, never in a pop-up", () => 
     for (const decisionKey of [
       "commitPushReviewMessage",
       "commitPushCompletionChecksFailed",
+      "commitPushRunChecksNow",
       "commitPushExistingStagedChanges",
       "commitPushIncludeTaskFolder",
       "commitPushIncludeRunArtifacts",
@@ -48,13 +49,19 @@ void describe("Commit & Push and Release ask in chat, never in a pop-up", () => 
   });
 
   void it("Publish Anyway notification buttons only open the chat offer", () => {
-    for (const file of ["commands/reviewActions.ts", "commands/setTaskStage.ts"]) {
+    // bugs5 Step 15: moving to Publish no longer runs the checks inline or posts a Publish Anyway warning
+    // (setTaskStage dispatches Publish Checks instead), so only the review actions still post the offer.
+    for (const file of ["commands/reviewActions.ts"]) {
       const source = read(file);
       assert.ok(
         source.includes('actionLabel: "Publish Anyway"'),
         `${file} must post the Publish Anyway action as a chat offer`
       );
     }
+    assert.ok(
+      !read("commands/setTaskStage.ts").includes('actionLabel: "Publish Anyway"'),
+      "commands/setTaskStage.ts must not post a Publish Anyway warning when moving to Publish"
+    );
     const allowlist = JSON.parse(read("../scripts/toastAllowlistV1.json")) as {
       directActionEntries: { file: string; snippet: string }[];
     };

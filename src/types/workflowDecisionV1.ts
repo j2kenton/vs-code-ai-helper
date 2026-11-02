@@ -32,9 +32,15 @@ import { HandoffGatingV1 } from "./handoffGuidanceV1";
 
 /** One selectable effect of choosing a decision's option. */
 export type WorkflowDecisionOptionEffectV1 =
-  | { readonly kind: "command"; readonly command: string; readonly args?: readonly unknown[] }
+  | {
+      readonly kind: "command";
+      readonly command: string;
+      readonly args?: readonly unknown[];
+      /** bugs5 Step 7: what choosing this does next, for the chat's "Recorded" line (local interactions). */
+      readonly recordedNext?: string;
+    }
   /** A legitimate "do nothing" choice — resolves the decision without dispatching anything. */
-  | { readonly kind: "doNothing" };
+  | { readonly kind: "doNothing"; readonly recordedNext?: string };
 
 /**
  * RC2 item 9/8: a decision option's `command` effect may resolve with this
@@ -101,6 +107,17 @@ export interface WorkflowDecisionOptionV1 {
    * check `postWorkflowDecisionV1` runs against every option before posting.
    */
   readonly disabled?: boolean;
+  /**
+   * bugs5 Step 3: choosing this option while an operation runs is accepted now and carried out when
+   * the task is free, instead of being refused for racing the operation. The card stays open
+   * with a {@link WorkflowDecisionDeferredAnswerV1} on it until then.
+   */
+  readonly runsWhenTaskFree?: boolean;
+  /**
+   * bugs5 Step 7: what choosing this option does next, in the owner's words. The chat writes
+   * `Recorded: "<label>" — <recordedNext>.` from it instead of the generic effect-based line.
+   */
+  readonly recordedNext?: string;
   /** Required when `disabled` is true — why, e.g. "resume the task first". */
   readonly disabledReason?: string;
 }
@@ -222,6 +239,29 @@ export interface WorkflowDecisionV1 {
   readonly liveReference?: WorkflowDecisionLiveReferenceV1;
   /** How an awaited decision ended, when it did not end by being answered in the chat. */
   readonly completionReason?: WorkflowDecisionCompletionReasonV1;
+  /** bugs5 Steps 2-3: an answer accepted while an operation runs, carried out when it ends. */
+  readonly deferredAnswer?: WorkflowDecisionDeferredAnswerV1;
+}
+
+/**
+ * bugs5 Steps 2-3: an answer the owner gave while an operation was running on the task. It is
+ * stored on the decision record (persisted, so it survives a reload) and carried out at the first
+ * point where it no longer races the running action.
+ *
+ * - `applyAndDispatch`: "Apply when Fast Forward next pauses". The card stays pending; when the
+ *   task is free the offered ticks are applied and the stage's next action is dispatched.
+ * - `ticksOnly`: "Apply the N ticks now" while a round is open. The card is resolved; the ticks
+ *   are merged as soon as that round ends, before Fast Forward's next decision, and nothing is
+ *   dispatched.
+ */
+export interface WorkflowDecisionDeferredAnswerV1 {
+  readonly kind: "applyAndDispatch" | "ticksOnly";
+  readonly optionId: string;
+  readonly acceptedAt: string;
+  /** The offered items the answer covers (the item texts, which are the merge's own keys). */
+  readonly itemKeys: readonly string[];
+  /** Set once the ticks were merged (ticksOnly) so a second sweep does not repeat the line. */
+  readonly carriedOutAt?: string;
 }
 
 export type CreateWorkflowDecisionResultV1 =

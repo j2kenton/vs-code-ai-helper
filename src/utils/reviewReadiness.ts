@@ -17,6 +17,7 @@
  * regardless of readiness, so a low score can never render as a down arrow).
  */
 
+import { createHash } from "crypto";
 import { BlockerLineageDeclaration, TaskProgress, TaskStage } from "../types/taskProgress";
 
 /**
@@ -534,6 +535,9 @@ const VERIFIED_COMPLETE_EVIDENCE_LINE_RE = /^\s+evidence:\s*(.+?)\s*$/;
  */
 const BLOCKER_LINE_RE =
   /^\s*[-*]\s*(?:\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*)?\[\s*(task-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(?:\[\s*(new|same\s*:\s*[\w-]+|narrowed\s*:\s*[\w-]+)\s*\]\s*)?(.+?)\s*$/i;
+
+/** bugs5 Step 24: agent-gatherable evidence form */
+export const AGENT_CAN_GATHER_RE = /\bagent can gather\s*\((?:cost:\s*)?([^)]+)\)/i;
 
 /**
  * Parse a blocker line's optional THIRD bracket (`[new]`, `[same:<id>]`,
@@ -1440,9 +1444,13 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
       continue;
     }
     const lineage = parseLineageBracket(lineageRaw);
+    let resolvedResolver = resolver.toLowerCase() as BlockerResolver;
+    if (resolvedResolver === "environmental" && AGENT_CAN_GATHER_RE.test(description)) {
+      resolvedResolver = "task-fixable";
+    }
     blockers.push({
       category: (category ?? "completion").toLowerCase() as BlockerCategory,
-      resolver: resolver.toLowerCase() as BlockerResolver,
+      resolver: resolvedResolver,
       description,
       origin: "reviewer",
       ...(lineage ? { lineage } : {}),
@@ -1604,4 +1612,333 @@ export function isStrictPerfectReview(content: string): boolean {
     return /^Readiness:\s*10(?:\.0+)?\/10$/.test(line);
   }
   return false;
+}
+
+/**
+ * bugs5 Step 23: parsed owner decision block from review or implementation output.
+ */
+export interface ParsedOwnerDecisionOptionV1 {
+  readonly id: string;
+  readonly label: string;
+  readonly consequence: string;
+  readonly tradeOffs?: string;
+  readonly planAction?: {
+    readonly kind: "exclude" | "reword" | "approveDeviation";
+    readonly itemText?: string;
+    /** Checklist items the option settles (verbatim text), when it marks itself `[exclude]`. */
+    readonly items?: readonly string[];
+    readonly newText?: string;
+  };
+  /**
+   * True when choosing this option keeps the plan as written (it starts "Reject", "Keep the plan", ...).
+   * The choice is still recorded as the owner's decision, but the blocker is not set aside.
+   */
+  readonly rejects?: boolean;
+}
+
+export interface ParsedOwnerDecisionBlockV1 {
+  readonly id: string;
+  readonly planPurpose: string;
+  readonly problem: string;
+  readonly options: readonly ParsedOwnerDecisionOptionV1[];
+  readonly recommendation?: {
+    readonly optionId: string;
+    readonly reason: string;
+  };
+  readonly technicalDetails?: string;
+  readonly rawContentHash: string;
+  readonly rawContent: string;
+}
+
+type OwnerDecisionFieldV1 = "id" | "purpose" | "problem" | "options" | "recommendation" | "planItems" | "technical";
+
+function classifyOwnerDecisionLabelV1(label: string): OwnerDecisionFieldV1 | undefined {
+  const l = label.toLowerCase().replace(/[`*_]/g, "").trim();
+  if (l === "id") {
+    return "id";
+  }
+  if (/^plan items?\b/.test(l)) {
+    return "planItems";
+  }
+  if (/\bpurpose\b|\bplan is for\b|^what this part/.test(l)) {
+    return "purpose";
+  }
+  if (/\bundecided\b|\bwent wrong\b|^problem\b/.test(l)) {
+    return "problem";
+  }
+  if (/^(?:each )?options?\b/.test(l)) {
+    return "options";
+  }
+  if (/^recommend/.test(l)) {
+    return "recommendation";
+  }
+  if (/^technical\b|^details\b/.test(l)) {
+    return "technical";
+  }
+  return undefined;
+}
+
+/** An option that keeps the plan as written rather than approving a change to it. */
+const OWNER_DECISION_REJECT_RE =
+  /^\W*(?:reject|revert|decline|rebuild|keep (?:the )?plan|keep (?:it )?as planned|build (?:it )?as planned|implement (?:it )?as planned|require|do not approve|don't approve|not approve)/i;
+
+function slugOwnerDecisionTextV1(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[`*_]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/** The text of a `## <heading>` section, up to the next level-2 heading or HTML comment. */
+function ownerDecisionSectionV1(content: string, heading: string): string | undefined {
+  const match = new RegExp(`(?:^|\\n)##[ \\t]+${heading}[ \\t]*\\n([\\s\\S]*?)(?=\\n##(?!#)|\\n<!--|$)`, "i").exec(content);
+  const body = match?.[1]?.trim();
+  if (!body || /^_?none\.?_?$/i.test(body)) {
+    return undefined;
+  }
+  return body;
+}
+
+/** Splits a section into its `###` sub-blocks (the whole body when it has none). */
+function splitOwnerDecisionBlocksV1(sectionBody: string): string[] {
+  const starts = [...sectionBody.matchAll(/(?:^|\n)(###+[ \t]+[^\n]+)/g)].map(
+    (m) => (m.index ?? 0) + (m[0].startsWith("\n") ? 1 : 0)
+  );
+  if (starts.length === 0) {
+    return [sectionBody];
+  }
+  return starts.map((start, i) => sectionBody.slice(start, starts[i + 1] ?? sectionBody.length).trim());
+}
+
+function parseOwnerDecisionOptionV1(
+  text: string,
+  planItems: readonly string[]
+): { option: ParsedOwnerDecisionOptionV1; recommended: boolean } | undefined {
+  let rest = text.trim();
+  const excludes = /\[\s*exclude\s*\]/i.test(rest);
+  rest = rest.replace(/\s*\[\s*exclude\s*\]/gi, "");
+  const recommended = /\(\s*recommended\s*\)/i.test(rest);
+  rest = rest.replace(/\s*\(\s*recommended\s*\)/gi, "");
+  let explicitId: string | undefined;
+  const idMatch = /^([A-Za-z][\w-]*)\s*:\s+(\S[\s\S]*)$/.exec(rest);
+  if (idMatch) {
+    explicitId = idMatch[1];
+    rest = idMatch[2] ?? "";
+  }
+  // Split the label from its trade-offs only at a SPACED dash or a colon, never inside a word ("hand-off").
+  const split = /^(.+?)\s+[—–-]\s+([\s\S]+)$/.exec(rest) ?? /^(.+?):\s+([\s\S]+)$/.exec(rest);
+  const label = (split ? split[1] ?? "" : rest).replace(/[`*]/g, "").trim();
+  const consequence = (split ? split[2] ?? "" : "").trim();
+  if (label.length === 0) {
+    return undefined;
+  }
+  const id = explicitId ?? slugOwnerDecisionTextV1(label);
+  return {
+    recommended,
+    option: {
+      id,
+      label,
+      ...(OWNER_DECISION_REJECT_RE.test(label) || OWNER_DECISION_REJECT_RE.test(id) ? { rejects: true } : {}),
+      consequence: consequence || `Applies "${label}".`,
+      ...(consequence ? { tradeOffs: consequence } : {}),
+      ...(excludes && planItems.length > 0 ? { planAction: { kind: "exclude" as const, items: planItems } } : {}),
+    },
+  };
+}
+
+/**
+ * bugs5 Step 23: parse `## Owner decisions needed` blocks from review output. Fields are recognised by
+ * their label (`id`, what the plan part is for, what is undecided, options, recommendation, plan items,
+ * technical details), so the order and bullet style the reviewer uses do not matter. An option marked
+ * `[exclude]` settles the block's `Plan items:` (backticked, verbatim checklist text) when chosen.
+ */
+export function parseOwnerDecisionsNeededV1(content: string): readonly ParsedOwnerDecisionBlockV1[] {
+  const sectionBody = ownerDecisionSectionV1(content, "Owner decisions needed");
+  if (!sectionBody) {
+    return [];
+  }
+  const results: ParsedOwnerDecisionBlockV1[] = [];
+  splitOwnerDecisionBlocksV1(sectionBody).forEach((rawBlock, idx) => {
+    if (!rawBlock) {
+      return;
+    }
+    let id = `owner-decision-${idx + 1}`;
+    let body = rawBlock;
+    const heading = /^###+[ \t]+([^\n]+)/.exec(rawBlock);
+    if (heading?.[1]) {
+      id = slugOwnerDecisionTextV1(heading[1]) || id;
+      body = rawBlock.slice(heading[0].length);
+    }
+    const fields = new Map<OwnerDecisionFieldV1, string[]>();
+    let current: OwnerDecisionFieldV1 | undefined;
+    for (const rawLine of body.split("\n")) {
+      const line = rawLine.replace(/\*\*/g, "").trimEnd();
+      const labelled = /^\s*(?:[-*]\s+)?([^:\n]{1,80}?)\s*:\s*(.*)$/.exec(line);
+      const labelledField = labelled ? classifyOwnerDecisionLabelV1(labelled[1] ?? "") : undefined;
+      if (labelled && labelledField !== undefined) {
+        current = labelledField;
+        if (labelled[2]) {
+          fields.set(current, [...(fields.get(current) ?? []), labelled[2]]);
+        }
+        continue;
+      }
+      const bare = /^\s*(?:[-*]\s+|#{3,}\s+)?([^:\n]{1,60}?)\s*:?\s*$/.exec(line);
+      const bareField = bare ? classifyOwnerDecisionLabelV1(bare[1] ?? "") : undefined;
+      if (bare && bareField !== undefined) {
+        current = bareField;
+        continue;
+      }
+      if (current !== undefined && line.trim().length > 0) {
+        fields.set(current, [...(fields.get(current) ?? []), line]);
+      }
+    }
+    const joined = (field: OwnerDecisionFieldV1): string =>
+      (fields.get(field) ?? []).map((l) => l.trim()).join(" ").trim();
+
+    const explicitId = /[A-Za-z0-9_-]+/.exec(joined("id"))?.[0];
+    if (explicitId) {
+      id = explicitId.toLowerCase();
+    }
+    const planItems = [...joined("planItems").matchAll(/`([^`]+)`/g)].map((m) => (m[1] ?? "").trim()).filter(Boolean);
+
+    const options: ParsedOwnerDecisionOptionV1[] = [];
+    let markerRecommendedId: string | undefined;
+    let pending: string | undefined;
+    const flush = (): void => {
+      if (pending === undefined) {
+        return;
+      }
+      const parsed = parseOwnerDecisionOptionV1(pending, planItems);
+      pending = undefined;
+      if (parsed) {
+        options.push(parsed.option);
+        if (parsed.recommended && markerRecommendedId === undefined) {
+          markerRecommendedId = parsed.option.id;
+        }
+      }
+    };
+    for (const line of fields.get("options") ?? []) {
+      const bullet = /^\s*(?:[-*]|\d+[.)])\s+(\S[\s\S]*)$/.exec(line);
+      if (bullet) {
+        flush();
+        pending = bullet[1];
+      } else if (pending !== undefined) {
+        pending += ` ${line.trim()}`;
+      }
+    }
+    flush();
+    if (options.length === 0) {
+      options.push(
+        {
+          id: "approve",
+          label: "Approve and update plan",
+          consequence: "Approves this choice and records the owner decision in plan-final.md.",
+        },
+        {
+          id: "reject",
+          label: "Reject and require implementation as planned",
+          consequence: "Rejects this choice and requires the plan to be implemented as originally approved.",
+        }
+      );
+    }
+
+    // The recommendation names an option by id or label; resolve it so the card never points at nothing.
+    let recommendation: ParsedOwnerDecisionBlockV1["recommendation"];
+    const recText = joined("recommendation");
+    if (recText) {
+      const lead = /^(.+?)(?:\s+[—–-]\s+|:\s+|\.\s|$)/.exec(recText);
+      const leadKey = slugOwnerDecisionTextV1(lead?.[1] ?? recText);
+      const reason = (lead ? recText.slice(lead[0].length) : "").trim() || recText;
+      const hit =
+        options.find((o) => slugOwnerDecisionTextV1(o.id) === leadKey) ??
+        options.find((o) => leadKey.length >= 3 && slugOwnerDecisionTextV1(o.label).startsWith(leadKey));
+      if (hit) {
+        recommendation = { optionId: hit.id, reason };
+      }
+    }
+    if (!recommendation && markerRecommendedId) {
+      recommendation = { optionId: markerRecommendedId, reason: "Marked as recommended by the reviewer." };
+    }
+
+    const technicalDetails = (fields.get("technical") ?? []).join("\n").trim();
+    results.push({
+      id,
+      planPurpose: joined("purpose") || "Owner decision needed on plan item",
+      problem: joined("problem") || body.trim().slice(0, 300),
+      options,
+      ...(recommendation ? { recommendation } : {}),
+      ...(technicalDetails ? { technicalDetails } : {}),
+      rawContentHash: createHash("sha256").update(rawBlock.trim(), "utf8").digest("hex"),
+      rawContent: rawBlock.trim(),
+    });
+  });
+  return results;
+}
+
+/**
+ * bugs5 Step 23: parse `## Plan deviations` section from implementation/apply output.
+ */
+export function parsePlanDeviationsV1(content: string): readonly ParsedOwnerDecisionBlockV1[] {
+  const sectionBody = ownerDecisionSectionV1(content, "Plan deviations");
+  if (!sectionBody) {
+    return [];
+  }
+
+  const items: string[] = [];
+  if (/(?:^|\n)###+[ \t]/.test(sectionBody)) {
+    items.push(...splitOwnerDecisionBlocksV1(sectionBody));
+  } else {
+    // Bullet items
+    const bullets = [...sectionBody.matchAll(/(?:^|\n)\s*[-*]\s+([^\n]+(?:\n(?!\s*[-*]\s+)[^\n]+)*)/g)];
+    if (bullets.length > 0) {
+      for (const b of bullets) {
+        if (b && b[1]) {
+          items.push(b[1].trim());
+        }
+      }
+    } else {
+      // Paragraphs
+      const paragraphs = sectionBody.split(/\n\s*\n/).map((p) => p.trim()).filter((p) => p.length > 0);
+      items.push(...paragraphs);
+    }
+  }
+
+  const results: ParsedOwnerDecisionBlockV1[] = [];
+  for (let idx = 0; idx < items.length; idx++) {
+    const raw = items[idx];
+    if (!raw || /^(?:none|n\/a|no (?:plan )?deviations?)\b[\s.]*$/i.test(raw.replace(/^#+[^\n]*\n?/, "").trim())) {
+      continue;
+    }
+    const rawContentHash = createHash("sha256").update(raw.trim(), "utf8").digest("hex");
+    // Keyed by content, not position: a different deviation in a later round is a different card.
+    const id = `plan-deviation-${rawContentHash.slice(0, 8)}`;
+    results.push({
+      id,
+      planPurpose: "Plan deviation reported by round",
+      problem: raw,
+      options: [
+        {
+          id: "approve-deviation",
+          label: "Approve plan deviation",
+          consequence: "Accepts this deviation and records owner approval in plan-final.md.",
+          planAction: { kind: "approveDeviation" },
+        },
+        {
+          id: "reject-deviation",
+          label: "Reject plan deviation",
+          consequence: "Rejects this deviation; next round must implement according to original plan.",
+          rejects: true,
+        },
+      ],
+      recommendation: {
+        optionId: "approve-deviation",
+        reason: "Review and approve if the deviation is acceptable.",
+      },
+      rawContentHash,
+      rawContent: raw.trim(),
+    });
+  }
+
+  return results;
 }

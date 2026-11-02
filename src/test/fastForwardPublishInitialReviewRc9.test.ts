@@ -248,9 +248,12 @@ void describe("source wiring (RC9 item 2)", () => {
   });
 
   void it("(c) the !initialContent branch dispatches the review with no card between the checks gate and the dispatch", () => {
-    const checksGate = ffSource.indexOf("savedChecksPassed");
+    // bugs5 Step 15: the gate itself may raise the "failed on the same code" card, but it then
+    // returns; the check is on the path that goes on to dispatch, from the end of the gate.
+    const gateStart = ffSource.indexOf("savedChecksPassed");
+    const checksGate = ffSource.indexOf("if (!initialContent) {", gateStart);
     const dispatchAt = ffSource.indexOf("runReviewForFolder(extensionUri", branchStart);
-    assert.ok(checksGate > 0 && dispatchAt > checksGate);
+    assert.ok(gateStart > 0 && checksGate > gateStart && dispatchAt > checksGate);
     assert.doesNotMatch(ffSource.slice(checksGate, dispatchAt), /offerActionInChatV1\(/);
     const baselineAt = branch.indexOf("Date.now()");
     assert.ok(baselineAt > 0 && baselineAt < branch.indexOf("runReviewForFolder(extensionUri"));

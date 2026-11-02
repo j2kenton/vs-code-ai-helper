@@ -185,6 +185,16 @@ export interface TaskProgress {
   fallbackActive?: Partial<Record<TaskStage, boolean>>;
   /** Stored model ID for the backup that is currently carrying a stage. */
   fallbackModelId?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: chain fingerprint at the time fallback was remembered */
+  fallbackChainFingerprint?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: model that failed when fallback was triggered */
+  fallbackFailedModelId?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: failure reason formatted by provider-error formatter */
+  fallbackFailureReason?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: timestamp when the failure occurred */
+  fallbackFailedAt?: Partial<Record<TaskStage, string>>;
+  /** bugs5 Step 25: provider reset time if given */
+  fallbackResetTime?: Partial<Record<TaskStage, string>>;
   /** Monotonic token identifying the review run allowed to finalize this stage. */
   reviewAttemptId?: string;
   /** Per-round review score trail. */
@@ -244,6 +254,8 @@ export interface TaskProgress {
    * not only the weaker unticked-item count. Absent on records written
    * before this field existed. */
   checklistProgressUnreliableReason?: string;
+  /** When `checklistProgressUnreliable` was last set (ISO timestamp); the flag's generation (bugs5 Step 6). */
+  checklistProgressUnreliableSetAt?: string;
   /** The claim texts the latching round reported that matched no plan item
    * (bugs4 Step 15, item 22); bounded, written and cleared with the latch. */
   checklistProgressUnreliableClaims?: string[];
@@ -392,6 +404,10 @@ export interface ImplRecoveryV1 {
   failedProvider?: string;
   /** Model that failed, triggering or holding the recovery. */
   failedModel?: string;
+  /** bugs5 Step 14 (mirror of `src/types/taskProgress.ts`): the owner cancelled or paused; the sweep leaves it alone. */
+  ownerHold?: { at: string; cause: "cancelled" | "paused" };
+  /** bugs5 Step 13 (mirror): automatic re-arms of a finished-but-uncleared continuation. */
+  automaticRearms?: number;
 }
 
 /** `TaskProgress.reviewInvalidatedByRound` — which stage's review an incomplete round invalidated, and when. */
@@ -635,13 +651,17 @@ export interface PlanRevisionStateV1 {
  *  - `rejected-degenerate`: a review round with no parseable `Readiness:
  *    N/10` line — a failed attempt wearing a review's clothes, not a
  *    review (see `TaskProgress.reviewRejections`).
+ *  - `continuation-report-produced` (bugs5 Step 13): a recovery continuation
+ *    wrote the report it was dispatched to produce; changing no files is its
+ *    mandate, so it is a success, never a provider failure.
  */
 export type RoundOutcomeClassificationV1 =
   | "edits-produced"
   | "genuine-no-op"
   | "provider-failure-empty"
   | "cancelled"
-  | "rejected-degenerate";
+  | "rejected-degenerate"
+  | "continuation-report-produced";
 
 /** One row of `TaskProgress.roundOutcomes`. */
 export interface RoundOutcomeEntryV1 {

@@ -68,6 +68,15 @@ fs.writeFileSync(
   "utf8"
 );
 
+// bugs5 Step 27: a review compares its scope with the working tree's changes, so the fixture repo starts clean
+// (its task folder lives under the task root, which that comparison leaves out).
+fs.appendFileSync(path.join(REAL_ROOT, ".git", "info", "exclude"), "context-pack.md\n");
+execFileSync("git", ["add", "package.json"], { cwd: REAL_ROOT });
+execFileSync(
+  "git",
+  ["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture"],
+  { cwd: REAL_ROOT }
+);
 const PRIVATE_STORAGE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-ff-callsites-rc8-private-"));
 const PRIVATE_STORAGE_ROOT_ID = configureWorkflowPrivateStorageRootV1(PRIVATE_STORAGE_ROOT);
 setChatInteractionTransactionStoreV1(

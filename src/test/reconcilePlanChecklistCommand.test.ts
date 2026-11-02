@@ -1859,7 +1859,16 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.match(continueOption.consequence, /Resumes Fast Forward at iteration 2 of 5/);
       assert.equal(continueOption.effect.kind, "command");
       if (continueOption.effect.kind === "command") {
-        assert.deepEqual(continueOption.effect.args, [
+        const [arg] = (continueOption.effect.args ?? []) as Array<{
+          resumeFastForwardV1?: { fastForwardCapturedAtMsV1?: unknown };
+        }>;
+        // bugs5 Step 19: the card also records when it captured the run (a clock value), so check it
+        // is present and compare the rest.
+        assert.equal(typeof arg?.resumeFastForwardV1?.fastForwardCapturedAtMsV1, "number");
+        const { fastForwardCapturedAtMsV1: _capturedAt, ...resumeRest } = arg?.resumeFastForwardV1 ?? {};
+        assert.equal(continueOption.effect.args?.length, 1);
+        assert.deepEqual(
+          { ...arg, resumeFastForwardV1: resumeRest },
           {
             taskFolderPath: folder,
             resumeFastForwardV1: {
@@ -1868,8 +1877,8 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
               fastForwardSessionIdV1: getFastForwardSessionIdV1(),
               fastForwardRunEpochV1: getFastForwardRunEpochV1(folder),
             },
-          },
-        ]);
+          }
+        );
       }
     } finally {
       clearFastForwardRunActiveV1(folder);

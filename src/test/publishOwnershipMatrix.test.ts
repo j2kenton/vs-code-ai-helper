@@ -1730,10 +1730,13 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     try {
       await setTaskStage(inv, currentStore, { taskFolderPath: folderPath, stage: "publish" }, "jump");
 
-      // setTaskStage.ts has no auto-publish scheduling path at all — landing
-      // on Publish via a manual jump only ever computes the preflight result
-      // for its own nudge (below), never a scheduling decision.
-      assert.equal(dispatches.length, 0, "a manual jump onto Publish must never schedule the publish chain automatically, regardless of preflight outcome");
+      // bugs5 Step 15: landing on Publish via a manual jump dispatches the registered Publish Checks
+      // (so the run is visible and its result saved) and never schedules commit and push.
+      assert.deepEqual(
+        dispatches.map((d) => d.command),
+        ["vs-code-ai-helper.runPublishChecks"],
+        "a manual jump onto Publish schedules only Publish Checks, never commit and push"
+      );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }
       wsStub.restore();
@@ -1743,7 +1746,7 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     }
   });
 
-  void it("setTaskStage: manual jump onto Publish with a failing preflight still never auto-publishes, but still warns with a Publish Anyway action", async () => {
+  void it("setTaskStage: manual jump onto Publish runs no inline preflight (bugs5 Step 15), so it neither warns nor offers Publish Anyway itself", async () => {
     const { folderPath } = makeTaskFolder(`jump-fail-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     const provider = new StatusTreeProvider();
     initNotificationRouter(provider);
@@ -1752,6 +1755,7 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
     const inv = makeInventoryStub(folderPath, "impl-low-review");
     const currentStore = makeCurrentTaskStoreStub();
     const dispatches: AutomationDispatch[] = [];
+    let preflightCalls = 0;
     const backing = new Map<string, unknown>();
     const memento = {
       keys: (): readonly string[] => [...backing.keys()],
@@ -1773,29 +1777,25 @@ void describe("Publish auto-run ownership matrix — manual entry routes (comman
         dispatches.push(dispatch);
         return Promise.resolve(true);
       }),
-      patch(publishPreflightModule, "checkPublishPreflight", () =>
-        Promise.resolve({ ok: false, reason: "Completion checks did not pass." })),
+      patch(publishPreflightModule, "checkPublishPreflight", () => {
+        preflightCalls += 1;
+        return Promise.resolve({ ok: false, reason: "Completion checks did not pass." });
+      }),
     ];
     try {
       await setTaskStage(inv, currentStore, { taskFolderPath: folderPath, stage: "publish" }, "jump");
 
-      assert.equal(dispatches.length, 0, "a failed preflight must never schedule the publish chain");
-      // setTaskStage.ts surfaces the failing-checks warning unconditionally on
-      // landing on Publish and offers Publish Anyway in the task's chat.
-      const warning = provider
-        .getEntries()
-        .find((entry) => entry.actionCommand?.command === "vs-code-ai-helper.openWorkflowDecision");
-      assert.ok(warning, "a Publish Anyway warning should appear for the failing preflight");
+      assert.equal(preflightCalls, 0, "the hidden inline checks run is gone");
+      assert.deepEqual(
+        dispatches.map((d) => d.command),
+        ["vs-code-ai-helper.runPublishChecks"],
+        "only the registered Publish Checks are scheduled; commit and push never is"
+      );
+      // The failure card and its recommended fix come from the registered Publish Checks run itself.
       const offer = new WorkflowDecisionStoreV1(memento)
         .listPending()
         .find((d) => d.decisionKey === "chatActionOffer:commitAndPushTask");
-      assert.ok(offer, "the chat offers the Publish Anyway action");
-      assert.equal(offer.options.find((o) => o.optionId === "runAction")?.label, "Publish Anyway");
-      assert.deepEqual(offer.options.find((o) => o.optionId === "runAction")?.effect, {
-        kind: "command",
-        command: "vs-code-ai-helper.commitAndPushTask",
-        args: [{ taskFolderPath: folderPath }],
-      });
+      assert.equal(offer, undefined, "no Publish Anyway offer is raised by the stage move");
     } finally {
       __extensionContextV1TestOnly.reset();
       for (const p of patches.reverse()) { p.restore(); }
@@ -2724,7 +2724,7 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
     return calls;
   }
 
-  void it("setTaskStage: manual jump onto Publish scopes the preflight to the task's implReviewFiles", async () => {
+  void it("setTaskStage: manual jump onto Publish no longer runs a preflight at all (bugs5 Step 15)", async () => {
     const { folderPath } = makeTaskFolder(`scope-jump-${Math.floor(Math.random() * 1e9)}`, "impl-low-review");
     // Advancing out of a review stage now validates that stage's own
     // completion artifact before it reaches the Publish preflight. This
@@ -2743,8 +2743,7 @@ void describe("Publish auto-run ownership matrix — implReviewFiles scope consi
       const calls = await captureRelevantFiles(async () => {
         await setTaskStage(inv, currentStore, { taskFolderPath: folderPath, stage: "publish" }, "jump");
       });
-      assert.equal(calls.length, 1, "expected exactly one checkPublishPreflight call");
-      assert.deepEqual(calls[0], scopeFiles);
+      assert.equal(calls.length, 0, "setTaskStage runs no checkPublishPreflight; Publish Checks are dispatched instead");
     } finally {
       dispatchPatch.restore();
       wsStub.restore();

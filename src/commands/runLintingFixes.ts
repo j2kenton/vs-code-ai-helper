@@ -132,6 +132,8 @@ import {
   writePublishFixNoteV1,
 } from "../utils/publishChecksFreshness";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
+import { readPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
+import { describeNoUsableChecksResultV1 } from "../utils/publishChecksFailureNoticeV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import type { decideAdmissionReleaseSafetyV1 } from "../state/recordedCliStopV1";
 
@@ -896,8 +898,11 @@ export async function runLintingFixes(
   const lastReport = resolvedTask.progress.lintPayload;
   if (!lastReport) {
     // No usable lintPayload: checks never ran, or the recorded result did not
-    // survive. One line either way, no AI work.
-    const notRunNotice = `${taskLabel}: Publish Checks have not run yet. Run them first.`;
+    // survive. One line either way, no AI work. bugs5 Step 16: once a run has happened the line
+    // says what became of it (cancelled, interrupted, still running), never "have not run yet".
+    const notRunNotice = `${taskLabel}: ${describeNoUsableChecksResultV1(
+      readPublishChecksOutcomeV1(resolvedTask.taskFolderPath)
+    )}`;
     NotificationRouter.showWarning(
       notRunNotice,
       undefined,

@@ -83,6 +83,7 @@ import {
   recordReviewInvalidatedByRound,
   resolveRoundV1,
   setIncompleteRoundContinuations,
+  setZeroChangeImplRounds,
   setNextActorV1,
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
@@ -505,6 +506,17 @@ export interface ImplementationRecoveryInputV1 {
    * this stage before.
    */
   readonly forceMode?: ImplRecoveryModeV1;
+  /**
+   * bugs5 Step 13: set when the triggering round was itself a claimed continuation. A continuation
+   * that ends without a usable report is recorded as `provider-failure-empty`, so the no-progress
+   * and fallback-provider breakers count it like any other round that produced nothing.
+   */
+  readonly continuationRoundOutcome?: {
+    readonly attemptId: string;
+    readonly modelId?: string;
+    readonly providerId?: string;
+    readonly dispatchMode?: ImplementationDispatchModeV1;
+  };
 }
 
 export interface BegunImplementationRecoveryV1 {
@@ -624,6 +636,20 @@ export async function beginImplementationRecoveryV1(
   const runTerminalizeRoundV1 = (): Promise<TerminalizeRoundResultV1> => terminalizeRoundV1(input.sourceRoundIdHint ?? sourceAttemptId, sourceState, sourceOutcome, {
     taskFolderUri: folderUri,
     fallbackToAnyLiveRow: input.sourceRoundIdHint === undefined,
+    ...(input.continuationRoundOutcome
+      ? {
+          roundOutcomeClassification: {
+            classification: "provider-failure-empty" as const,
+            stage: "impl" as const,
+            attemptId: input.continuationRoundOutcome.attemptId,
+            ...(input.continuationRoundOutcome.modelId ? { modelId: input.continuationRoundOutcome.modelId } : {}),
+            ...(input.continuationRoundOutcome.providerId ? { providerId: input.continuationRoundOutcome.providerId } : {}),
+            ...(input.continuationRoundOutcome.dispatchMode
+              ? { dispatchMode: input.continuationRoundOutcome.dispatchMode }
+              : {}),
+          },
+        }
+      : {}),
     synthesizeIfMissing: () => ({
       roundId: sourceAttemptId,
       stage: input.postRunReviewStage,
@@ -646,6 +672,15 @@ export async function beginImplementationRecoveryV1(
         });
       continuations = (current.incompleteRoundContinuations ?? 0) + 1;
       let next = setIncompleteRoundContinuations(current, continuations);
+      // bugs5 Step 13: a continuation that produced neither a usable report nor any file change is a
+      // sterile round, so the no-progress breaker's streak counts it like any other.
+      if (
+        input.continuationRoundOutcome !== undefined &&
+        quarantinedPaths.length === 0 &&
+        !input.filesChangedUnknown
+      ) {
+        next = setZeroChangeImplRounds(next, (current.zeroChangeImplRounds ?? 0) + 1);
+      }
       if (quarantinedPaths.length > 0) {
         next = quarantinePendingImplReviewFiles(next, [...quarantinedPaths]);
       }
@@ -957,6 +992,19 @@ export async function beginImplementationRecoveryV1(
  * boundary is what "outside the quarantined plus previously-reviewed scope"
  * is measured against.
  */
+/**
+ * bugs5 Step 13: how many times the sweep may re-arm a continuation that ran and finished without
+ * clearing the owed state. The first attempt is the transition's own dispatch, so one re-arm is
+ * the second attempt; after that the owner is asked. Re-dispatch after a crash or reload does not
+ * count (nothing finished), so it stays automatic.
+ */
+export const MAX_AUTOMATIC_CONTINUATION_REARMS_V1 = 1;
+
+/** True when the owed continuation has already been re-armed as often as the sweep may do on its own. */
+export function isAutomaticRearmLimitReachedV1(record: Pick<ImplRecoveryV1, "automaticRearms">): boolean {
+  return (record.automaticRearms ?? 0) > MAX_AUTOMATIC_CONTINUATION_REARMS_V1;
+}
+
 export interface ClaimedImplRecoveryV1 {
   /** The owed recovery record as of run start (post-claim), if any. */
   readonly record: ImplRecoveryV1 | undefined;
@@ -999,6 +1047,8 @@ export async function claimImplRecoveryDispatchV1(
         dispatch: "dispatched",
         attemptId: freshToken("impl-continuation"),
         leaseOwner: currentOwner,
+        // bugs5 Step 14: a claim is a deliberate start, so any owner hold ends here.
+        ownerHold: undefined,
         ...(options?.operationId ? { operationId: options.operationId } : {}),
       };
       record = claimed;
@@ -1138,6 +1188,8 @@ export async function releaseImplRecoveryClaimV1(
     operationId?: string;
     attemptId?: string;
     leaseOwner?: string;
+    /** bugs5 Step 14: the owner cancelled, so the sweep must not re-arm it on its own. */
+    ownerHold?: "cancelled" | "paused";
   }
 ): Promise<TaskProgress | undefined> {
   let released: TaskProgress | undefined;
@@ -1183,6 +1235,13 @@ export async function releaseImplRecoveryClaimV1(
       leaseUntil: undefined,
       operationId: undefined,
       attemptId: undefined,
+      ...(options?.ownerHold ? { ownerHold: { at: new Date().toISOString(), cause: options.ownerHold } } : {}),
+      // bugs5 Step 13: a round that ran and ended without clearing the owed state used up one
+      // automatic re-arm. An owner hold is not a failure, and a record that was never claimed
+      // (still pending) has had no round to count.
+      ...(recovery.dispatch === "dispatched" && !options?.ownerHold
+        ? { automaticRearms: (recovery.automaticRearms ?? 0) + 1 }
+        : {}),
       ...(options?.failedProvider ? { failedProvider: options.failedProvider } : {}),
       ...(options?.failedModel ? { failedModel: options.failedModel } : {}),
       ...(options?.reason ? { reason: options.reason } : {}),

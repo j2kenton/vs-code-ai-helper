@@ -43,7 +43,14 @@ function decision(overrides: Partial<WorkflowDecisionV1> = {}): WorkflowDecision
     whatHappened: "High-Level Code Review is clean, but this task's plan checklist is flagged as behind.",
     whyUserNeeded: "x",
     options: [
-      { optionId: "moveOn", resumeKind: "advance", label: "Move on", consequence: "Advances.", effect: { kind: "doNothing" } },
+      {
+        optionId: "moveOn",
+        resumeKind: "advance",
+        label: "Move on",
+        consequence: "Advances.",
+        // bugs5 Step 1: a card with no enabled action is "For information", so the action is a real command.
+        effect: { kind: "command", command: "ensemble.moveOn" },
+      },
       { optionId: "notNow", resumeKind: "unpause", label: "Not now", consequence: "Does nothing.", effect: { kind: "doNothing" } },
     ],
     recommendation: { kind: "option", optionId: "moveOn", reasoning: "r" },

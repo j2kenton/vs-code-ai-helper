@@ -16,7 +16,6 @@ import {
 } from "../utils/stageTransition";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
-import { checkPublishPreflight } from "../utils/publishPreflight";
 import { ensureStageModelConfigured } from "../utils/modelSelection";
 import { scheduleAutomationChain } from "../utils/automationChain";
 import {
@@ -27,7 +26,6 @@ import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
-import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { LifecycleStageMismatchError } from "../actions/rows/lifecyclePolicyRejection";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 
@@ -522,39 +520,31 @@ export async function setTaskStage(
   // Refresh the inventory so the new stage is visible immediately
   await inventory.refresh();
 
-  let publishPreflight: Awaited<ReturnType<typeof checkPublishPreflight>> | undefined;
-  if (newStage === "publish") {
-    publishPreflight = await checkPublishPreflight(taskFolderUri, task.progress.implReviewFiles);
-    await inventory.refresh();
-  }
-
   NotificationRouter.showInformation(
     `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)} set to stage: ${STAGE_DISPLAY_NAMES[newStage]}`
   );
 
-  // Commit and push is never scheduled automatically — landing on Publish
-  // (from any entry point) never runs it; only the user's own "Commit and
-  // Push" button click does. Failing completion checks are still worth
-  // surfacing immediately, with a one-click "Publish Anyway" affordance,
-  // instead of only being discovered later inside Commit and Push's own gate.
-  if (newStage === "publish" && publishPreflight?.ok === false) {
-    const publishAnywayNotice =
-      `${formatNotificationTaskLabelV1(task.progress.displayName, task.folderName)}: ${publishPreflight.reason}. ` +
-      "Publish once checks pass, or use Publish Anyway from Commit and Push.";
-    NotificationRouter.showWarning(
-      publishAnywayNotice /* taskLabel */,
-      undefined,
-      undefined,
-      undefined,
-      await offerActionInChatV1({
-        taskFolderPath: task.taskFolderPath,
-        actionLabel: "Publish Anyway",
-        command: "vs-code-ai-helper.commitAndPushTask",
-        args: [{ taskFolderPath: task.taskFolderPath }],
-        noticeText: publishAnywayNotice,
-        optional: true,
-      })
-    );
+  // bugs5 Step 15: moving to Publish used to run the full checks right here, with no registered
+  // operation and no saved result (the hidden 35-minute run). It no longer runs anything inline.
+  // A move that continues a card's flow (`cancelResultOutV1` is supplied by `resumeAndSetTaskStageV1`)
+  // dispatches its own next action afterwards: Fast Forward runs the checks through
+  // `runFastForwardPublishChecksV1`, and the plain "Advance to Publish" runs the stage action.
+  // Any other move dispatches Publish Checks through its normal Started/Progress/Ended wrapper, so
+  // the run is registered and its result is saved. Commit and push is never scheduled automatically.
+  if (newStage === "publish" && cancelResultOutV1 === undefined) {
+    await scheduleAutomationChain({
+      command: "vs-code-ai-helper.runPublishChecks",
+      arg: { taskFolderPath: task.taskFolderPath },
+      taskKey: task.taskFolderPath,
+      chainId: "publish-checks-on-entry",
+      intent: {
+        trigger: "Publish Checks after moving the task to Publish",
+        settingKey: undefined,
+        expectedTiming: "immediately — this stage move dispatches it now",
+        willRetry: false,
+        retryNote: "Not retried automatically if dropped — choose Run Publish Checks.",
+      },
+    });
   }
 
   // Persist this task as the current task so the keyboard shortcut router and

@@ -62,6 +62,7 @@ import {
 import { CreateWorkflowDecisionInputV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { TASK_PROGRESS_FILENAME, TaskProgress } from "../types/taskProgress";
 import { acquireWorkAdmissionV1 } from "../state/workAdmissionV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { taskOperations } from "../utils/taskOperations";
 import {
   applyReviewerVerifiedTicksConfirmedV1,
@@ -1006,22 +1007,26 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
     try {
       provider.resolveWebviewView(fake.view);
       const html = fake.view.webview.html;
+      // bugs5 Step 1: the host-computed `headingText` ("For information", "<Command> is waiting for
+      // your answer", "Decision needed", "Optional") wins; the fallback below is for a render that
+      // predates it.
       const match = html.match(
-        /title\.textContent=(\(dcs\.isBlockingDecision!==false\)\?'Decision needed':'Optional');/
+        /title\.textContent=(dcs\.headingText\|\|\(\(dcs\.isBlockingDecision!==false\)\?'Decision needed':'Optional'\));/
       );
       assert.ok(
         match,
-        "expected the decision card title in the webview script to be computed from dcs.isBlockingDecision, not hardcoded"
+        "expected the decision card title in the webview script to be computed from dcs.headingText / dcs.isBlockingDecision, not hardcoded"
       );
       const expression = match[1]!;
-      const computeTitle = (isBlockingDecision: boolean | undefined): unknown =>
-        vm.runInNewContext(expression, { dcs: { isBlockingDecision } });
+      const computeTitle = (isBlockingDecision: boolean | undefined, headingText?: string): unknown =>
+        vm.runInNewContext(expression, { dcs: { isBlockingDecision, headingText } });
       assert.equal(computeTitle(true), "Decision needed");
       assert.equal(computeTitle(false), "Optional");
       // Absence (a decision predating the gating field) must default to
       // blocking, matching the host-side predicate's own "absence is never
       // positive evidence" rule.
       assert.equal(computeTitle(undefined), "Decision needed");
+      assert.equal(computeTitle(false, "For information"), "For information");
     } finally {
       notify.restore();
       cmds.restore();
@@ -1231,14 +1236,19 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       let texts: string[] = [];
       for (let retry = 0; retry < 40; retry++) {
         texts = (await readChatHistory(folder)).map((entry) => entry.text);
-        if (texts.some((text) => text.startsWith("Ended — the action released the task"))) break;
+        if (texts.some((text) => text.startsWith("Do it stopped before it started"))) break;
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
-      const started = texts.findIndex((text) => text.startsWith("Started — the action holds this task and is preparing"));
-      const ended = texts.findIndex((text) => text.startsWith("Ended — the action released the task before any command started"));
-      assert.ok(started >= 0, "the preparing line is said once the claim is observed");
+      // bugs5 Step 18: the lines name the action the owner chose and use no internal terms.
+      const started = texts.findIndex((text) => text === "Do it is starting — wait here; progress appears below.");
+      const ended = texts.findIndex((text) => text.startsWith("Do it stopped before it started, so nothing ran."));
+      assert.ok(started >= 0, "the starting line is said once the claim is observed");
       assert.ok(ended > started, "and closed by an Ended line after it");
-      assert.equal(texts.filter((text) => text.startsWith("Started — the action holds this task")).length, 1);
+      assert.equal(texts.filter((text) => text.includes("is starting — wait here")).length, 1);
+      assert.ok(
+        texts.every((text) => !/holds this task|admission|no command has started/.test(text)),
+        "no internal wording reaches the chat"
+      );
     } finally {
       commandsObj._executeCommandOverride = originalCommand;
       notify.restore();
@@ -4783,6 +4793,207 @@ void describe("Chat With AI — own-write render exactly-once (RC2 item 11, Step
       assert.equal(renderCalls, 1, "expected a direct fallback render when the write's own event never fired");
     } finally {
       provider.dispose();
+    }
+  });
+});
+
+void describe("bugs5 Step 6: Dismiss on the idle 'checklist is flagged unreliable' card", () => {
+  void it("records a Dismissed line, hides the card across a reload, and a new generation brings it back", async () => {
+    const folder = makeFolder();
+    const memento = makeMemento();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    const target = { canonicalId: folder, taskFolderPath: folder, stage: "impl" as const };
+    const flagGeneration = async (setAt: string): Promise<void> => {
+      await patchTaskProgressStrictV1(vscode.Uri.file(folder), (progress) => ({
+        ...progress,
+        checklistProgressUnreliable: true,
+        checklistProgressUnreliableReason: "claims did not match any plan item",
+        checklistProgressUnreliableSetAt: setAt,
+      }));
+    };
+    const idleCards = (fake: FakeWebviewView): readonly WorkflowDecisionV1[] =>
+      lastDecisions(fake).filter((d) => d.decisionId.startsWith("idle-reconcile:"));
+    try {
+      await flagGeneration("2026-11-01T18:00:00.000Z");
+
+      const first = new ChatViewProvider(memento);
+      const firstView = makeFakeWebviewView();
+      first.resolveWebviewView(firstView.view);
+      await first.open(target);
+      await waitForStateMessage(firstView);
+      const cards = idleCards(firstView);
+      assert.equal(cards.length, 1, "the idle card is shown while the flag is set");
+
+      await firstView.send({ type: "resolveWorkflowDecision", decisionId: cards[0]!.decisionId, optionId: "__dismiss__" });
+      const entries = (lastState(firstView)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      assert.ok(
+        entries.some((e) => e.role === "assistant" && /^Dismissed "This task's plan checklist is flagged unreliable"/.test(e.text)),
+        "a Dismissed line is recorded in the chat"
+      );
+      assert.equal(idleCards(firstView).length, 0, "the card is gone after Dismiss");
+      first.dispose();
+
+      // A reload: a new provider over the same stored state still hides it.
+      const second = new ChatViewProvider(memento);
+      const secondView = makeFakeWebviewView();
+      second.resolveWebviewView(secondView.view);
+      await second.open(target);
+      await waitForStateMessage(secondView);
+      assert.equal(idleCards(secondView).length, 0, "the card stays hidden after a reload");
+      second.dispose();
+
+      // A new round sets the flag again: a new generation, so the card comes back.
+      await flagGeneration("2026-11-01T19:30:00.000Z");
+      const third = new ChatViewProvider(memento);
+      const thirdView = makeFakeWebviewView();
+      third.resolveWebviewView(thirdView.view);
+      await third.open(target);
+      await waitForStateMessage(thirdView);
+      assert.equal(idleCards(thirdView).length, 1, "the card returns when a round flags the checklist again");
+      third.dispose();
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("dismissing the real reconcile card does not make the idle card appear in its place", async () => {
+    const folder = makeFolder();
+    const memento = makeMemento();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs();
+    const target = { canonicalId: folder, taskFolderPath: folder, stage: "impl" as const };
+    try {
+      await patchTaskProgressStrictV1(vscode.Uri.file(folder), (progress) => ({
+        ...progress,
+        checklistProgressUnreliable: true,
+        checklistProgressUnreliableSetAt: "2026-11-01T18:00:00.000Z",
+      }));
+      const provider = new ChatViewProvider(memento);
+      const view = makeFakeWebviewView();
+      const posted = await provider.workflowDecisionStore.post(
+        decisionInput(folder, { decisionId: "real-reconcile", decisionKey: "reconcilePlanChecklist" })
+      );
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+      provider.resolveWebviewView(view.view);
+      await provider.open(target);
+      await waitForStateMessage(view);
+      await view.send({ type: "resolveWorkflowDecision", decisionId: "real-reconcile", optionId: "__dismiss__" });
+      const remaining = lastDecisions(view);
+      assert.equal(remaining.length, 0, "neither the real card nor an idle replacement is shown");
+      provider.dispose();
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      safeRemoveDir(folder);
+    }
+  });
+});
+
+void describe("bugs5 Steps 7 and 9: a card a running command waits on", () => {
+  const commitPushCard = (folder: string): CreateWorkflowDecisionInputV1 =>
+    decisionInput(folder, {
+      decisionId: "cp-1",
+      decisionKey: "commitPushFinalScopeConfirmation",
+      stage: "publish",
+      options: [
+        {
+          optionId: "commitAndPush",
+          label: "Commit & Push",
+          consequence: "Stages these files, commits them, and pushes the branch.",
+          recordedNext: "staging, committing and pushing now",
+          resumeKind: "continue",
+          effect: { kind: "doNothing" },
+        },
+        {
+          optionId: "viewFullList",
+          label: "View Full List",
+          consequence: "Shows every file, then asks this same question again.",
+          recordedNext: "showing the list; the confirmation is offered again",
+          resumeKind: "continue",
+          effect: { kind: "doNothing" },
+        },
+        {
+          optionId: "cancel",
+          label: "Not now",
+          consequence: "Nothing is staged, committed or pushed. Choose Commit & Push again when you're ready.",
+          recordedNext: "stopped; nothing was staged, committed or pushed",
+          resumeKind: "continue",
+          effect: { kind: "doNothing" },
+        },
+      ],
+      recommendation: { kind: "option", optionId: "commitAndPush", reasoning: "Looks right." },
+      gating: {
+        holdsTaskPaused: false,
+        unblocksProgress: true,
+        detail: "the commit and push",
+        waitingCommand: "Commit & Push",
+        waitingNothingDone: "committed",
+      },
+    });
+
+  void it("records each choice in its own words, never 'this does nothing further'", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const view = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      const posted = await provider.workflowDecisionStore.post(commitPushCard(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+      provider.resolveWebviewView(view.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "publish" });
+      await waitForStateMessage(view);
+      const [card] = lastDecisions(view) as ReadonlyArray<WorkflowDecisionV1 & { headingText?: string; dismissTitle?: string; waitingNote?: string }>;
+      assert.equal(card?.headingText, "Commit & Push is waiting for your answer");
+      assert.match(card?.waitingNote ?? "", /Dismissing stops this Commit & Push; nothing is committed\./);
+      assert.match(card?.dismissTitle ?? "", /Dismissing stops this Commit & Push; nothing is committed\./);
+
+      await view.send({ type: "resolveWorkflowDecision", decisionId: "cp-1", optionId: "commitAndPush" });
+      const entries = (lastState(view)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const recorded = entries.find((e) => e.role === "assistant" && e.text.startsWith("Recorded:"));
+      assert.ok(recorded, "a Recorded line is written");
+      assert.match(recorded.text, /^Recorded: "Commit & Push" — staging, committing and pushing now\./);
+      assert.doesNotMatch(recorded.text, /does nothing further/);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("Dismiss says the command stopped, that nothing was committed, and how to start again", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const view = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      await provider.workflowDecisionStore.post(commitPushCard(folder));
+      provider.resolveWebviewView(view.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "publish" });
+      await waitForStateMessage(view);
+      await view.send({ type: "resolveWorkflowDecision", decisionId: "cp-1", optionId: "__dismiss__" });
+      const entries = (lastState(view)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const dismissed = entries.find((e) => e.role === "assistant" && e.text.startsWith("Dismissed"));
+      assert.ok(dismissed);
+      assert.match(
+        dismissed.text,
+        /Commit & Push stopped because the confirmation was dismissed; nothing was committed\. Choose Commit & Push to start again\./
+      );
+      assert.doesNotMatch(dismissed.text, /Nothing was run and task\.md was not changed/);
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
     }
   });
 });

@@ -10,6 +10,12 @@ import {
 } from "./reviewReadiness";
 import { publishNextStepAfterChecksV1 } from "./stageArtifactRequirementsV1";
 import { runGitCommand } from "./gitRepoInfo";
+import {
+  describeOutcomeBlockingReuseV1,
+  readPublishChecksOutcomeV1,
+  type PublishChecksOutcomeV1,
+} from "./publishChecksOutcomeV1";
+import { describeChecksNotCountedForReviewV1 } from "./publishChecksFailureNoticeV1";
 
 /**
  * Freshness stamp for `publish-review.md` (plan PART 2, step 6; plan item 17,
@@ -29,6 +35,12 @@ export interface PublishChecksFreshnessStampV1 {
   completedAt: string;
   scopeId: string;
   treeFingerprint?: string;
+  /**
+   * bugs5 Step 17: the algorithm that produced `treeFingerprint` (`TREE_FINGERPRINT_VERSION_V1`).
+   * Absent on stamps written before it existed; those used the index-entry algorithm and are never
+   * reused (see `checkPublishChecksReuseEligibilityV1`).
+   */
+  fingerprintVersion?: number;
   /**
    * bugs3 Step 15: digest of the ordered commands the run actually executed.
    * Absent on stamps written before it existed (a legacy record), which are
@@ -85,6 +97,8 @@ export function isFingerprintExcludedPathV1(relPath: string): boolean {
     normalized.endsWith("/runs/raw-check-output.log") ||
     normalized.endsWith("/raw-check-output.log") ||
     normalized === "raw-check-output.log" ||
+    // bugs5 Step 16: per-run raw logs (runs/raw-check-output-<runId>.log).
+    /(^|\/)raw-check-output-[^/]+\.log$/.test(normalized) ||
     normalized === "publish-review.md" ||
     normalized === "publish-checks.md" ||
     normalized.endsWith("/publish-review.md") ||
@@ -109,90 +123,194 @@ export function isReusedPublishChecksRunStillCurrentV1(
 }
 
 /**
- * Deterministically computes a SHA-256 fingerprint of verification-relevant
- * repository state: tracked index entries, tracked working-tree files (modes,
- * symlink targets, content), and untracked non-ignored files, excluding
+ * bugs5 Step 17: version of the fingerprint algorithm. Version 2 hashes each path's CONTENT identity
+ * (blob id and file mode), so staging or unstaging identical content gives the same value. A stamp
+ * written without this version used the old index-entry algorithm and can never match a version 2
+ * fingerprint, so reuse refuses it with an explicit reason instead of a bare "fingerprint changed".
+ */
+export const TREE_FINGERPRINT_VERSION_V1 = 2 as const;
+
+/** What a tree fingerprint was built from: one record per path, so two snapshots can be compared by path. */
+export interface TreeFingerprintSnapshotV1 {
+  readonly fingerprint: string;
+  /** Path (repository-relative, `/` separators) to its content record. */
+  readonly records: ReadonlyMap<string, string>;
+}
+
+/** Git's own blob id for content held in memory (used for symlink targets, which `hash-object` would follow). */
+function gitBlobIdOfV1(content: Buffer | string): string {
+  const buffer = typeof content === "string" ? Buffer.from(content, "utf8") : content;
+  return crypto.createHash("sha1").update(`blob ${buffer.length}\0`).update(buffer).digest("hex");
+}
+
+/** Blob ids for regular files through git, so clean/autocrlf filters give the id the index would hold. */
+async function hashWorktreeFilesV1(scopeFolder: string, relPaths: readonly string[]): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  const chunkSize = 100;
+  for (let offset = 0; offset < relPaths.length; offset += chunkSize) {
+    const chunk = relPaths.slice(offset, offset + chunkSize);
+    try {
+      const { stdout } = await runGitCommand(scopeFolder, "hash-object", ["--", ...chunk]);
+      const ids = stdout.split("\n").filter((line) => line.length > 0);
+      if (ids.length === chunk.length) {
+        chunk.forEach((relPath, index) => {
+          const id = ids[index];
+          if (id !== undefined) {
+            result.set(relPath, id);
+          }
+        });
+        continue;
+      }
+    } catch {
+      // fall through to the raw-content hash below
+    }
+    for (const relPath of chunk) {
+      try {
+        result.set(relPath, gitBlobIdOfV1(await fs.promises.readFile(path.join(scopeFolder, relPath))));
+      } catch {
+        // missing while hashing: left out, so the path reads as absent
+      }
+    }
+  }
+  return result;
+}
+
+/**
+ * Deterministically computes the per-path content records and a SHA-256 fingerprint of
+ * verification-relevant repository state: each tracked or untracked non-ignored path is reduced to
+ * its content blob id and file mode (the index blob for unchanged tracked files, the working-tree
+ * content for modified and untracked files, a symlink's target for symlinks). Whether a path is
+ * staged is NOT part of the record, except the index stage number of an unmerged entry. Excludes
  * explicitly designated build outputs and check logs.
  */
-export async function computeTreeFingerprintV1(scopeFolder: string): Promise<string | undefined> {
+export async function computeTreeFingerprintSnapshotV1(
+  scopeFolder: string
+): Promise<TreeFingerprintSnapshotV1 | undefined> {
   try {
     const { stdout: indexStdout } = await runGitCommand(scopeFolder, "ls-files", ["-s", "-z"]);
     const { stdout: modifiedStdout } = await runGitCommand(scopeFolder, "ls-files", ["-m", "-z"]);
     const { stdout: untrackedStdout } = await runGitCommand(scopeFolder, "ls-files", ["-o", "--exclude-standard", "-z"]);
+    let honourFileMode = true;
+    try {
+      const { stdout } = await runGitCommand(scopeFolder, "config", ["--get", "core.fileMode"]);
+      honourFileMode = stdout.trim().toLowerCase() !== "false";
+    } catch {
+      // unset: git's default (true) applies
+    }
 
-    const records: string[] = [];
-
-    // 1. Tracked index entries (<mode> <sha> <stage>\t<path>\0)
-    const indexEntries = indexStdout.split("\0");
-    for (const entry of indexEntries) {
-      if (!entry.trim()) {
-        continue;
-      }
+    // 1. Index entries: <mode> <sha> <stage>\t<path>\0. Stage 0 is the normal entry.
+    const indexRecords = new Map<string, string>();
+    const unmerged = new Map<string, string[]>();
+    for (const entry of indexStdout.split("\0")) {
       const tabIdx = entry.indexOf("\t");
-      if (tabIdx === -1) {
+      if (!entry.trim() || tabIdx === -1) {
         continue;
       }
-      const meta = entry.slice(0, tabIdx);
+      const [mode, sha, stage] = entry.slice(0, tabIdx).split(" ");
       const relPath = entry.slice(tabIdx + 1);
       if (isFingerprintExcludedPathV1(relPath)) {
         continue;
       }
-      records.push(`index:${meta}:${relPath}`);
+      if (stage && stage !== "0") {
+        const list = unmerged.get(relPath) ?? [];
+        list.push(`${stage}:${mode}:${sha}`);
+        unmerged.set(relPath, list);
+      } else {
+        indexRecords.set(relPath, `${mode}:${sha}`);
+      }
     }
 
-    // 2. Tracked modified files in working tree
-    const modifiedFiles = modifiedStdout.split("\0");
-    for (const relPath of modifiedFiles) {
-      if (!relPath.trim() || isFingerprintExcludedPathV1(relPath)) {
-        continue;
+    // 2. Paths whose working-tree content may differ from the index, and untracked files.
+    const worktreePaths = new Set<string>();
+    for (const relPath of [...modifiedStdout.split("\0"), ...untrackedStdout.split("\0")]) {
+      if (relPath.trim() && !isFingerprintExcludedPathV1(relPath)) {
+        worktreePaths.add(relPath);
       }
-      const fullPath = path.join(scopeFolder, relPath);
+    }
+    const worktreeRecords = new Map<string, string>();
+    const regularFiles: Array<{ relPath: string; mode: string }> = [];
+    for (const relPath of worktreePaths) {
       try {
-        const stat = await fs.promises.lstat(fullPath);
+        const stat = await fs.promises.lstat(path.join(scopeFolder, relPath));
         if (stat.isSymbolicLink()) {
-          const target = await fs.promises.readlink(fullPath);
-          records.push(`worktree:symlink:${stat.mode}:${target}:${relPath}`);
+          const target = await fs.promises.readlink(path.join(scopeFolder, relPath));
+          worktreeRecords.set(relPath, `120000:${gitBlobIdOfV1(target)}`);
         } else if (stat.isFile()) {
-          const content = await fs.promises.readFile(fullPath);
-          const hash = crypto.createHash("sha256").update(content).digest("hex");
-          records.push(`worktree:file:${stat.mode}:${hash}:${relPath}`);
+          const indexed = indexRecords.get(relPath);
+          const executable = (stat.mode & 0o111) !== 0;
+          const mode =
+            !honourFileMode && indexed !== undefined
+              ? indexed.slice(0, indexed.indexOf(":"))
+              : executable
+                ? "100755"
+                : "100644";
+          regularFiles.push({ relPath, mode });
         }
+        // directories (submodules) keep their index record
       } catch {
-        records.push(`worktree:missing:${relPath}`);
+        // deleted from the working tree: no record, the same as a path that is not tracked
+        indexRecords.delete(relPath);
+      }
+    }
+    const blobIds = await hashWorktreeFilesV1(
+      scopeFolder,
+      regularFiles.map((file) => file.relPath)
+    );
+    for (const { relPath, mode } of regularFiles) {
+      const blobId = blobIds.get(relPath);
+      if (blobId === undefined) {
+        indexRecords.delete(relPath);
+      } else {
+        worktreeRecords.set(relPath, `${mode}:${blobId}`);
       }
     }
 
-    // 3. Untracked non-ignored files
-    const untrackedFiles = untrackedStdout.split("\0");
-    for (const relPath of untrackedFiles) {
-      if (!relPath.trim() || isFingerprintExcludedPathV1(relPath)) {
-        continue;
-      }
-      const fullPath = path.join(scopeFolder, relPath);
-      try {
-        const stat = await fs.promises.lstat(fullPath);
-        if (stat.isSymbolicLink()) {
-          const target = await fs.promises.readlink(fullPath);
-          records.push(`untracked:symlink:${stat.mode}:${target}:${relPath}`);
-        } else if (stat.isFile()) {
-          const content = await fs.promises.readFile(fullPath);
-          const hash = crypto.createHash("sha256").update(content).digest("hex");
-          records.push(`untracked:file:${stat.mode}:${hash}:${relPath}`);
-        }
-      } catch {
-        // Ignored if missing
+    const records = new Map<string, string>();
+    for (const [relPath, record] of indexRecords) {
+      records.set(relPath, worktreeRecords.get(relPath) ?? record);
+    }
+    for (const [relPath, record] of worktreeRecords) {
+      if (!records.has(relPath)) {
+        records.set(relPath, record);
       }
     }
+    for (const [relPath, stages] of unmerged) {
+      records.set(relPath, `unmerged:${stages.sort().join(",")}:${worktreeRecords.get(relPath) ?? "absent"}`);
+    }
 
-    records.sort();
     const hasher = crypto.createHash("sha256");
-    for (const rec of records) {
-      hasher.update(rec + "\n");
+    hasher.update(`tree-fingerprint-v${TREE_FINGERPRINT_VERSION_V1}\n`);
+    for (const relPath of [...records.keys()].sort()) {
+      hasher.update(`${relPath}\0${records.get(relPath)}\n`);
     }
-    return hasher.digest("hex");
+    return { fingerprint: hasher.digest("hex"), records };
   } catch {
     return undefined;
   }
+}
+
+/** The fingerprint alone (see `computeTreeFingerprintSnapshotV1`). */
+export async function computeTreeFingerprintV1(scopeFolder: string): Promise<string | undefined> {
+  return (await computeTreeFingerprintSnapshotV1(scopeFolder))?.fingerprint;
+}
+
+/** Paths whose content record differs between two snapshots (added, removed or changed), sorted. */
+export function diffTreeFingerprintSnapshotsV1(
+  before: TreeFingerprintSnapshotV1,
+  after: TreeFingerprintSnapshotV1
+): string[] {
+  const changed: string[] = [];
+  for (const [relPath, record] of before.records) {
+    if (after.records.get(relPath) !== record) {
+      changed.push(relPath);
+    }
+  }
+  for (const relPath of after.records.keys()) {
+    if (!before.records.has(relPath)) {
+      changed.push(relPath);
+    }
+  }
+  return changed.sort();
 }
 
 /** Safe, non-reversible identifier for a verification-scope folder — never the raw path. */
@@ -223,6 +341,9 @@ export function renderPublishChecksFreshnessStamp(stamp: PublishChecksFreshnessS
     `<!-- completed-at: ${stamp.completedAt} -->`,
     `<!-- scope-id: ${stamp.scopeId} -->`,
     ...(stamp.treeFingerprint ? [`<!-- tree-fingerprint: ${stamp.treeFingerprint} -->`] : []),
+    ...(stamp.treeFingerprint && stamp.fingerprintVersion !== undefined
+      ? [`<!-- fingerprint-version: ${stamp.fingerprintVersion} -->`]
+      : []),
     ...(stamp.commandIdentity ? [`<!-- command-identity: ${stamp.commandIdentity} -->`] : []),
     PUBLISH_CHECKS_STAMP_END,
   ].join("\n");
@@ -438,6 +559,7 @@ export function parsePublishChecksFreshnessStamp(
   const scopeId = readStampField(block, "scope-id");
   const treeFingerprint = readStampField(block, "tree-fingerprint");
   const commandIdentity = readStampField(block, "command-identity");
+  const fingerprintVersionRaw = Number(readStampField(block, "fingerprint-version"));
   if (
     formatVersionRaw !== String(PUBLISH_CHECKS_STAMP_FORMAT_VERSION) ||
     !runId ||
@@ -454,6 +576,7 @@ export function parsePublishChecksFreshnessStamp(
     completedAt,
     scopeId,
     ...(treeFingerprint ? { treeFingerprint } : {}),
+    ...(treeFingerprint && Number.isInteger(fingerprintVersionRaw) ? { fingerprintVersion: fingerprintVersionRaw } : {}),
     ...(commandIdentity ? { commandIdentity } : {}),
   };
 }
@@ -808,7 +931,13 @@ export async function writePublishChecksFreshnessStampV1(
 ): Promise<void> {
   await withPublishChecksReportLockV1(taskFolderUri, async () => {
     const existing = await readPublishChecksFile(taskFolderUri);
-    const section = renderPublishChecksFreshnessStamp(stamp);
+    // Every writer fingerprints with the current algorithm, so a stamp that carries a fingerprint
+    // is marked with that algorithm's version here, in one place.
+    const section = renderPublishChecksFreshnessStamp(
+      stamp.treeFingerprint && stamp.fingerprintVersion === undefined
+        ? { ...stamp, fingerprintVersion: TREE_FINGERPRINT_VERSION_V1 }
+        : stamp
+    );
     await writeFileAtomicV1(
       publishChecksPath(taskFolderUri),
       mergePublishChecksFreshnessStamp(existing, section)
@@ -1010,14 +1139,24 @@ export async function checkPublishChecksFreshnessV1(
  * problem.
  */
 export function describePublishChecksFreshnessFailureV1(
-  check: Exclude<PublishChecksFreshnessCheckV1, { status: "valid" }>
+  check: Exclude<PublishChecksFreshnessCheckV1, { status: "valid" }>,
+  /**
+   * bugs5 Step 17: the task's run record. When one exists the "missing" case says what became of the run
+   * (cancelled, failed, passed but the files changed while it ran, ...) and never "have not been run yet".
+   */
+  outcome?: PublishChecksOutcomeV1
 ): string {
   switch (check.status) {
-    case "missing":
+    case "missing": {
+      const ranButNotCounted = describeChecksNotCountedForReviewV1(outcome);
+      if (ranButNotCounted !== undefined) {
+        return ranButNotCounted;
+      }
       return (
         "Publish Checks have not been run yet for this task. Run Publish Checks before requesting " +
         "a Publish review."
       );
+    }
     case "unreadableHead":
       return (
         "The current commit could not be resolved for this task's Publish verification scope, so " +
@@ -1062,6 +1201,13 @@ export async function checkPublishChecksReuseEligibilityV1(
    */
   expectedCommandIdentity?: string
 ): Promise<PublishChecksReuseEligibilityResultV1> {
+  // bugs5 Step 10: the latest run record decides first. A cancelled or interrupted run with no failure of
+  // its own leaves the earlier completed pass (`lastCompleted`) standing; a later failure or a run still
+  // going does not. No record on disk means nothing blocks.
+  const blockedByOutcome = describeOutcomeBlockingReuseV1(readPublishChecksOutcomeV1(taskFolderUri.fsPath));
+  if (blockedByOutcome !== undefined) {
+    return { eligible: false, reason: `Latest run record: ${blockedByOutcome}` };
+  }
   const stamp = await readPublishChecksFreshnessStampV1(taskFolderUri);
   const currentFingerprint = await computeTreeFingerprintV1(scopeFolder);
   const freshness = classifyPublishChecksFreshnessV1(stamp, scopeFolder, headCommitSha);
@@ -1070,6 +1216,12 @@ export async function checkPublishChecksReuseEligibilityV1(
   }
   if (!stamp?.treeFingerprint) {
     return { eligible: false, reason: "Stamp does not contain a tree fingerprint (ineligible for reuse)" };
+  }
+  if (stamp.fingerprintVersion !== TREE_FINGERPRINT_VERSION_V1) {
+    return {
+      eligible: false,
+      reason: "The recorded checks were stamped by an older Ensemble; run the checks once more",
+    };
   }
   if (!currentFingerprint || currentFingerprint !== stamp.treeFingerprint) {
     return { eligible: false, reason: "Working tree fingerprint has changed since checks ran" };

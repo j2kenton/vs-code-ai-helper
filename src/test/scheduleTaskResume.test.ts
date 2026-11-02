@@ -974,7 +974,9 @@ void test("armAll does NOT reclaim a stale dispatched implRecovery that has lost
       `must not post a reclaim notification; got: ${JSON.stringify(surface.entries)}`
     );
     assert.ok(
-      surface.entries.some((e) => e.level === "warning" && /could not be reclaimed/.test(e.message)),
+      // bugs5 Step 1: a card whose only option is "leave it paused" has nothing to choose, so it is
+      // announced "For information" at INFO level rather than as a warning.
+      surface.entries.some((e) => (e.level === "warning" || e.level === "info") && /could not be reclaimed/.test(e.message)),
       `expected the unrecoverable-recovery escalation; got: ${JSON.stringify(surface.entries)}`
     );
   } finally {
@@ -1008,7 +1010,7 @@ void test("armAll's watchdog pauses a task that is active with nothing running, 
     // durable pause-fence generation captured at commit time — a fresh task
     // (no prior fence activity) captures generation 0.
     assert.equal(after.watchdogPauseFenceGeneration, 0);
-    const escalation = surface.entries.find((e) => e.level === "warning" && /was stalled/.test(e.message));
+    const escalation = surface.entries.find((e) => (e.level === "warning" || e.level === "info") && /was stalled/.test(e.message));
     assert.ok(escalation, `expected a stalled-task escalation; got: ${JSON.stringify(surface.entries)}`);
     // v1 fixes item 1, Part 1a step 7: "a watchdog pause must carry the
     // action that undoes it" — posted as a durable WorkflowDecisionV1
@@ -1533,7 +1535,7 @@ void test("armAll's watchdog GENERIC route (no implRecovery, no open round-ledge
     assert.equal(after.status, "paused", "the task must end up paused by exactly one of the two racing sweeps");
     assert.equal(after.pausedReason, STALLED_ACTIVE_TASK_PAUSE_REASON_V1);
 
-    const escalations = surface.entries.filter((e) => e.level === "warning" && /was stalled/.test(e.message));
+    const escalations = surface.entries.filter((e) => (e.level === "warning" || e.level === "info") && /was stalled/.test(e.message));
     assert.equal(
       escalations.length,
       1,

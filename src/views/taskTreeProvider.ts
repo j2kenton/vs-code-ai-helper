@@ -64,6 +64,8 @@ import {
 } from "../utils/implementationChecklist";
 import { onDidChangeChatHistoryV1, readChatInteractions } from "../utils/chatHistoryStore";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import { readPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
+import { describePublishRowStatusV1, PUBLISH_ROW_TOOLTIP_V1 } from "../utils/publishRowStatusV1";
 import { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { isTaskStatusHiddenFromDecisionsV1 } from "../services/hostDecisionMirrorV1";
 import { renderHandoffFieldLineV1, renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
@@ -884,6 +886,20 @@ export class StageNode extends vscode.TreeItem {
         (isReviewStage(stage) &&
           hasActiveOperationTargetingStage(tKey, "review", stage, (s) => REVIEW_TARGETS[s], true)));
 
+    // bugs5 Steps 11 and 18: before the Publish review has scored, the row says which part of Publish
+    // has got to, and an interrupted checks run never reads as running.
+    const publishPartLabel =
+      stage === "publish"
+        ? describePublishRowStatusV1({
+            outcome: readPublishChecksOutcomeV1(task.folderUri.fsPath),
+            hasScore: readiness !== undefined && readiness.label !== "—/10",
+            checksOperationLive: taskOperations
+              .getTaskOperations(tKey)
+              .some((operation) => /publish checks/i.test(operation.label) && operation.state === "running"),
+            reviewRunning: isRunning,
+          })
+        : undefined;
+
     if (isRunning) {
       this.iconPath = new vscode.ThemeIcon("loading~spin", new vscode.ThemeColor("charts.blue"));
       // Review rows carry the score, so a rerun in flight names the previous
@@ -904,7 +920,9 @@ export class StageNode extends vscode.TreeItem {
       // `checklistProgressUnreliable` latch stands it down, which keeps the
       // plain "running" rather than a number nothing is maintaining.
       this.description =
-        isReviewStage(stage) && readiness?.label
+        publishPartLabel !== undefined
+          ? publishPartLabel
+          : isReviewStage(stage) && readiness?.label
           ? `running... (previous: ${readiness.label})`
           : stage === "impl" && implementationProgress
             ? `running... (${formatChecklistPercentV1(implementationProgress.complete, implementationProgress.total)}%)`
@@ -949,7 +967,7 @@ export class StageNode extends vscode.TreeItem {
       // line; this closes the remaining gap where `tryReadReadiness` returns
       // `undefined` outright because no artifact exists yet.
       const readinessLabel = isReviewStage(stage)
-        ? (readiness ? readiness.label : "—/10")
+        ? (publishPartLabel ?? (readiness ? readiness.label : "—/10"))
         : undefined;
       // The implementation row's counterpart: the live checklist percentage
       // from plan-final.md, over the FIXED total (implementationChecklist.ts's
@@ -1189,6 +1207,9 @@ export class StageNode extends vscode.TreeItem {
         ? "\n\n⏳ Review in progress: re-evaluating this artifact against the current HEAD."
         : `\n\n⚠ This review examined commit ${readiness.staleReviewedSha}, which is no longer HEAD — ` +
           "re-run Review with AI to assess the current state.";
+    }
+    if (stage === "publish") {
+      tooltipStr += `\n\n${PUBLISH_ROW_TOOLTIP_V1}`;
     }
     if (stage === "impl" && (implementationProgress?.closedBeforeImplementation ?? 0) > 0) {
       const closedBefore = implementationProgress!.closedBeforeImplementation!;
@@ -1460,6 +1481,21 @@ export async function describeReviewStageScoreV1(
   const isRunning =
     taskOperations.getActiveStages(taskPath).includes(stage) ||
     hasActiveOperationTargetingStage(taskPath, "review", stage, (s) => REVIEW_TARGETS[s], false);
+  // bugs5 Steps 11 and 18: the same Publish part text as the tree row, before a score exists.
+  const publishPartLabel =
+    stage === "publish"
+      ? describePublishRowStatusV1({
+          outcome: readPublishChecksOutcomeV1(folderUri.fsPath),
+          hasScore: readiness !== undefined && readiness.label !== "—/10",
+          checksOperationLive: taskOperations
+            .getTaskOperations(taskPath)
+            .some((operation) => /publish checks/i.test(operation.label) && operation.state === "running"),
+          reviewRunning: isRunning,
+        })
+      : undefined;
+  if (publishPartLabel !== undefined) {
+    return publishPartLabel;
+  }
   if (isRunning) {
     return readiness?.label ? `running... (previous: ${readiness.label})` : "running...";
   }

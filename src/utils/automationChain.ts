@@ -428,7 +428,7 @@ function terminalizeDeclinedAutomationBestEffortV1(
       : String(callbackError)
     : statedReason !== undefined
       ? `the dispatched command declined to run and no round was started: ${statedReason}`
-      : "the dispatched command declined to run and no round was started";
+      : `the dispatched command declined to run and no round was started; ${dispatch.command} recorded no cause (see this task's chat and the Ensemble output panel)`;
   void recordTerminalIntentBestEffortV1(intentId, callbackFailed ? "failed" : "cancelled");
   terminalizeGenericAutomationRoundBestEffortV1(
     dispatch.taskKey,

@@ -1785,6 +1785,14 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
                 // regress to the untrusted "no provenance at all" shape.
                 fastForwardSessionIdV1: getFastForwardSessionIdV1(),
                 fastForwardRunEpochV1: getFastForwardRunEpochV1(folderUri.fsPath),
+                // bugs5 Step 19: capture time and stage, so the answer can be checked against the task's own
+                // records after a restart.
+                fastForwardCapturedAtMsV1: (
+                  keepIterating.effect as unknown as {
+                    args: { resumeFastForwardV1: { fastForwardCapturedAtMsV1: number } }[];
+                  }
+                ).args[0]!.resumeFastForwardV1.fastForwardCapturedAtMsV1,
+                fastForwardStageV1: "impl-high-review",
               },
             },
           ],
@@ -2786,6 +2794,62 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       assert.match(reason, /\(impl-summary\.md\)$/);
       assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing"));
       assert.ok(decision.options.some((o) => o.optionId === "keepItemOpen"));
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("bugs5 Step 22 item 1: stops and escalates on the first review when every blocker holding the score needs the owner", async () => {
+    const store = new Map<string, string>();
+    installMemStore(store);
+    initNotificationRouter(new RecordingSurface());
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folderUri = makeTaskFolderUri("owner-decision-first-review");
+    seedProgress(
+      store,
+      folderUri,
+      baseProgress({ status: "active", currentStage: "impl-high-review", reviewAttemptId: "attempt-owner-dec" })
+    );
+    const content = [
+      "Readiness: 6/10",
+      "",
+      "<!-- blockers:start -->",
+      "- [completion] [environmental] Owner decision needed: Step 6 admission token hand-off vs marker substitute",
+      "<!-- blockers:end -->",
+      "",
+      "## Owner decisions needed",
+      "",
+      "### Step 6 admission-token owner decision",
+      "- id: step-6-admission",
+      "- what this part of the plan is for: Token hand-off during form submission.",
+      "- what is undecided or went wrong: The round built a marker instead of a token hand-off.",
+      "- options:",
+      "  - approve: Approve the simpler design (Recommended) — trade-off: simpler code.",
+      "  - buildToken: Require the token hand-off — trade-off: strictly matches original plan.",
+      "- recommendation: approve — simpler design.",
+      "- technical details: Detailed internal explanation.",
+    ].join("\n");
+    try {
+      const { escalated } = await handleReviewRoutingOutcome({
+        folderUri,
+        targetStage: "impl-high-review",
+        reviewAttemptId: "attempt-owner-dec",
+        content,
+        score: 6,
+        threshold: 7,
+      });
+      assert.strictEqual(escalated, true, "escalates on the first review when all blockers holding score need owner");
+      assert.strictEqual(readProgress(store, folderUri).status, "paused");
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((d) => d.decisionKey === "reviewPlateauEscalation");
+      assert.ok(decision, "plateau escalation card is posted");
+      assert.ok(
+        decision.options.some((o) => o.optionId === "handleMyself" || o.optionId === "changePlan"),
+        "card options include owner resolution"
+      );
     } finally {
       deactivateNotificationRouter();
       __extensionContextV1TestOnly.reset();

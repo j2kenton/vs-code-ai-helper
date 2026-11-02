@@ -22,7 +22,7 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
-import { checkPublishPreflight } from "../utils/publishPreflight";
+import { checkPublishPreflight, endPreflightReasonSentenceV1 } from "../utils/publishPreflight";
 import { CompletionLintResult } from "../utils/completionLint";
 
 // completionLint.ts and gitRepoInfo.ts are required (not `import`ed) so their
@@ -80,6 +80,18 @@ function failingLint(summary: string): CompletionLintResult {
     missingScripts: [],
   };
 }
+
+void describe("endPreflightReasonSentenceV1 (bugs5 Step 16)", () => {
+  void it("ends a reason with exactly one full stop, never the doubled 'failed..'", () => {
+    assert.equal(
+      endPreflightReasonSentenceV1("Completion checks did not pass: 2 completion check(s) failed."),
+      "Completion checks did not pass: 2 completion check(s) failed."
+    );
+    assert.equal(endPreflightReasonSentenceV1("Completion checks did not pass."), "Completion checks did not pass.");
+    assert.equal(endPreflightReasonSentenceV1("The repo has no remote"), "The repo has no remote.");
+    assert.doesNotMatch(endPreflightReasonSentenceV1("failed. "), /\.\./);
+  });
+});
 
 void describe("checkPublishPreflight", () => {
   void it("resolves ok:true when git is ready and completion checks pass", async () => {

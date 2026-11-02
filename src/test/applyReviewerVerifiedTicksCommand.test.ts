@@ -442,15 +442,25 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
       assert.ok(applyOption, "the apply option must be offered");
       assert.equal(applyOption.label, "Apply 1 Reviewer-Verified Tick and resume Fast Forward (iteration 1 of 3)");
       assert.match(applyOption.consequence, /Resumes Fast Forward at iteration 1 of 3/);
-      assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
-        taskFolderPath: result.folder,
-        resumeFastForwardV1: {
-          attemptNumber: 1,
-          maxAttempts: 3,
-          fastForwardSessionIdV1: getFastForwardSessionIdV1(),
-          fastForwardRunEpochV1: getFastForwardRunEpochV1(folder),
-        },
-      });
+      const lastCall = resumeAndApplyCurrentStageActionCalls.at(-1) as
+        | { resumeFastForwardV1?: { fastForwardCapturedAtMsV1?: unknown } }
+        | undefined;
+      // bugs5 Step 19: the card also records when it captured the run (a clock value), so check it
+      // is present and compare the rest.
+      assert.equal(typeof lastCall?.resumeFastForwardV1?.fastForwardCapturedAtMsV1, "number");
+      const { fastForwardCapturedAtMsV1: _capturedAt, ...resumeRest } = lastCall?.resumeFastForwardV1 ?? {};
+      assert.deepEqual(
+        { ...lastCall, resumeFastForwardV1: resumeRest },
+        {
+          taskFolderPath: result.folder,
+          resumeFastForwardV1: {
+            attemptNumber: 1,
+            maxAttempts: 3,
+            fastForwardSessionIdV1: getFastForwardSessionIdV1(),
+            fastForwardRunEpochV1: getFastForwardRunEpochV1(folder),
+          },
+        }
+      );
     } finally {
       clearFastForwardRunActiveV1(folder);
       clearFastForwardRunPausedProvenanceV1(folder);

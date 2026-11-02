@@ -191,6 +191,6 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
     const savedRead = slice.indexOf("const savedChecksPayload");
     const passCheck = slice.indexOf("if (!savedChecksPassed)");
     assert.ok(savedRead > 0 && passCheck > savedRead, "the pass check must follow the saved-result read");
-    assert.match(slice, /Publish Checks have not passed/);
+    assert.match(slice, /describePublishChecksFailureV1\(savedChecksPayload\)[\s\S]*nothing has changed since/);
   });
 });

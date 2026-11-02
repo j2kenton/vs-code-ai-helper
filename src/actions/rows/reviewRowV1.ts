@@ -25,6 +25,7 @@ import {
   describePublishChecksFreshnessFailureV1,
   type PublishChecksFreshnessCheckV1,
 } from "../../utils/publishChecksFreshness";
+import { readPublishChecksOutcomeV1 } from "../../utils/publishChecksOutcomeV1";
 import { stepProgressLabelV1 } from "../../utils/stepLabelsV1";
 import { extractCompletionChecksSectionV1, mergeCompletionChecksSection } from "../../utils/completionLint";
 import { extractScopeCheckSectionV1, mergeScopeCheckSection } from "../../utils/publishScopeCheck";
@@ -243,7 +244,7 @@ export function describePublishPromotionGuardFailureV1(
       `saved. ${retry}`
     );
   }
-  return `${describePublishChecksFreshnessFailureV1(check)} The review was not saved.`;
+  return `${describePublishChecksFreshnessFailureV1(check, readPublishChecksOutcomeV1(guard.taskFolderPath))} The review was not saved.`;
 }
 
 /** Generous enough for any realistic publish-review.md; a read this size

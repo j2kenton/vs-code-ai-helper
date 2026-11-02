@@ -1,5 +1,12 @@
 import * as vscode from "vscode";
-import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
+import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
+import { findAllTasksStrictV1 } from "../services/taskProgressDiscoveryV1";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { clearStageFallbackReservation } from "../utils/taskProgressTransforms";
+import { listRememberedFallbacksV1 } from "../utils/rememberedFallbackV1";
+import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
+import { getConfiguredTaskRoot } from "../utils/taskRoot";
+import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import {
   clearTaskStageModels,
   describeCliDiscoveryFallbackV1,
@@ -20,9 +27,11 @@ import {
   setUnsavedSettingsWarningEnabled,
 } from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
+import { ENSEMBLE_DISMISS_BUTTON_CSS_V1 } from "./sharedButtonStylesV1";
 import {
   CLI_PROVIDERS,
   CliProviderDefinition,
+  describeModelWithProviderV1,
   getProviderAccountEntry,
   PROVIDER_ACCOUNT_ENTRIES,
   ProviderAccountEntry,
@@ -36,6 +45,7 @@ type IncomingMessage =
   | { type: "saveSettings"; settings: ModelSettings }
   | { type: "saveProviders"; enabledProviders: Record<string, boolean> }
   | { type: "refreshModels" }
+  | { type: "clearRememberedFallback"; taskFolderPath: string; stage: string; taskName?: string }
   | { type: "validationError"; message: string }
   | { type: "providerSignIn"; providerId: string }
   | { type: "providerUsage"; providerId: string }
@@ -278,6 +288,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // the panel permanently blank. Waiting for the webview to announce
           // it's ready avoids that race regardless of timing.
           await this._postInit(webviewView.webview);
+          void this._postRememberedFallbacks(webviewView.webview);
           if (shouldDiscoverModelsOnDemandV1(resolveEnsembleHostRoleV1(), hasUndiscoveredCliProvidersV1())) {
             void this._discoverModelsOnDemand(webviewView.webview);
           }
@@ -336,6 +347,11 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             console.warn("[settingsView] Model refresh failed", error);
           }
           await this._postProvidersRefresh(webviewView.webview);
+          break;
+        }
+        case "clearRememberedFallback": {
+          await this._clearRememberedFallback(data.taskFolderPath, data.stage, data.taskName);
+          await this._postRememberedFallbacks(webviewView.webview);
           break;
         }
         case "providerSignIn": {
@@ -550,6 +566,59 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       console.warn("[settingsView] On-demand model discovery failed", error);
     }
     await this._postProvidersRefresh(webview);
+  }
+
+  /**
+   * bugs5 Step 25: the fallbacks Ensemble is remembering on open tasks, so the owner can see why a stage keeps
+   * running on a backup and clear it. Best-effort: an unreadable task is left out.
+   */
+  private async _postRememberedFallbacks(webview: vscode.Webview): Promise<void> {
+    const tasks: Array<{ folderPath: string; name: string; progress: TaskProgress }> = [];
+    for (const ws of vscode.workspace.workspaceFolders ?? []) {
+      try {
+        const found = await findAllTasksStrictV1(vscode.Uri.joinPath(ws.uri, getConfiguredTaskRoot()));
+        for (const task of found.tasks) {
+          tasks.push({
+            folderPath: task.folderUri.fsPath,
+            name: task.progress.displayName ?? task.folderName,
+            progress: task.progress,
+          });
+        }
+      } catch {
+        // Skip a workspace whose tasks cannot be listed.
+      }
+    }
+    void webview.postMessage({
+      type: "rememberedFallbacks",
+      items: listRememberedFallbacksV1(tasks, describeModelWithProviderV1),
+    });
+  }
+
+  /** Clears one task's remembered fallback for a stage; refuses, in plain words, while a round holds the task. */
+  private async _clearRememberedFallback(taskFolderPath: string, stage: string, taskName?: string): Promise<void> {
+    if (!AI_MODEL_STAGES.includes(stage as TaskStage)) {
+      return;
+    }
+    const taskLabel = formatNotificationTaskLabelV1(taskName, taskFolderPath);
+    if (hasLiveWorkAdmissionBestEffortV1(taskFolderPath)) {
+      NotificationRouter.showWarning(
+        `${taskLabel}: a round is running, so its remembered model for ${STAGE_DISPLAY_NAMES[stage as TaskStage]} cannot be cleared now. ` +
+          "Clear it when the round has ended."
+      );
+      return;
+    }
+    try {
+      await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (current) =>
+        clearStageFallbackReservation(current, stage as TaskStage)
+      );
+      NotificationRouter.showInformation(
+        `${taskLabel}: cleared the remembered model for ${STAGE_DISPLAY_NAMES[stage as TaskStage]}. The next round starts at the first model in its chain.`
+      );
+    } catch (error) {
+      NotificationRouter.showWarning(
+        `${taskLabel}: could not clear the remembered model: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
   }
 
   /** Shared provider-row view-model builder — see _postInit and _postProvidersRefresh. */
@@ -842,18 +911,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
              (Discard Unsaved Changes, + Add backup model). */
           body.vscode-dark button.provider-signin,
           body.vscode-dark button.provider-usage,
-          body.vscode-dark #discard-btn,
-          body.vscode-dark #discard-providers-btn,
           body.vscode-dark button.add-backup {
             background-color: color-mix(in srgb, var(--vscode-foreground) 15%, var(--vscode-editor-background));
           }
           body.vscode-dark button.provider-signin:hover,
           body.vscode-dark button.provider-usage:hover,
-          body.vscode-dark #discard-btn:hover,
-          body.vscode-dark #discard-providers-btn:hover,
           body.vscode-dark button.add-backup:hover {
             background-color: color-mix(in srgb, var(--vscode-foreground) 25%, var(--vscode-editor-background));
           }
+          /* Discard Unsaved Changes: the shared close-without-acting button (also used for Dismiss in Chat). */
+          ${ENSEMBLE_DISMISS_BUTTON_CSS_V1}
           .stage-row {
             padding: var(--ensemble-space-3) 0 var(--ensemble-space-2);
             border-bottom: var(--ensemble-border-width) solid var(--vscode-widget-border);
@@ -1037,7 +1104,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         </div>
 
         <div class="btn-container" id="model-settings-buttons" hidden>
-          <button id="discard-btn" class="secondary" disabled title="Revert unsaved model selection changes back to the last saved settings"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M6.78 1.72a.75.75 0 0 1 0 1.06L4.06 5.5H9a5.75 5.75 0 0 1 0 11.5H4.25a.75.75 0 0 1 0-1.5H9a4.25 4.25 0 0 0 0-8.5H4.06l2.72 2.72a.75.75 0 1 1-1.06 1.06l-4-4a.75.75 0 0 1 0-1.06l4-4a.75.75 0 0 1 1.06 0z"/></svg>Discard Unsaved Changes</button>
+          <button id="discard-btn" class="secondary ensemble-dismiss" disabled title="Revert unsaved model selection changes back to the last saved settings"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M6.78 1.72a.75.75 0 0 1 0 1.06L4.06 5.5H9a5.75 5.75 0 0 1 0 11.5H4.25a.75.75 0 0 1 0-1.5H9a4.25 4.25 0 0 0 0-8.5H4.06l2.72 2.72a.75.75 0 1 1-1.06 1.06l-4-4a.75.75 0 0 1 0-1.06l4-4a.75.75 0 0 1 1.06 0z"/></svg>Discard Unsaved Changes</button>
           <button id="save-btn" disabled title="Save the current model selection"><svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false"><path d="M13.78 4.22a.75.75 0 0 1 0 1.06l-7.25 7.25a.75.75 0 0 1-1.06 0L2.22 9.28a.75.75 0 0 1 1.06-1.06L6 10.94l6.72-6.72a.75.75 0 0 1 1.06 0z"/></svg>Save Model Selection</button>
         </div>
 
@@ -1285,8 +1352,39 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 if (!input) input = document.getElementById('primary-input-' + message.stage);
                 if (input) input.focus();
               }
+            } else if (message.type === 'rememberedFallbacks') {
+              rememberedFallbackItems = Array.isArray(message.items) ? message.items : [];
             }
+            // The stage rows are rebuilt by init and providersRefreshed, so the remembered-model notes are
+            // re-attached after every message (idempotent).
+            renderRememberedFallbacks();
           });
+
+          // bugs5 Step 25: a stage that keeps running on a backup because Ensemble remembered it says so on
+          // the stage, with a Clear button that returns the stage to the first model in its chain.
+          let rememberedFallbackItems = [];
+          function renderRememberedFallbacks() {
+            document.querySelectorAll('.remembered-fallback').forEach(node => node.remove());
+            rememberedFallbackItems.forEach(item => {
+              const row = document.getElementById('row-' + item.stage);
+              if (!row) return;
+              const note = document.createElement('div');
+              note.className = 'provider-discovery-note remembered-fallback';
+              note.setAttribute('role', 'note');
+              note.textContent = 'Task "' + item.taskName + '" is using ' + item.modelLabel + ': ' + item.cause + '. ';
+              const clear = document.createElement('button');
+              clear.type = 'button';
+              clear.className = 'secondary';
+              clear.textContent = 'Clear';
+              clear.title = 'Forget the remembered model for this task, so its next round starts at the first model in this chain';
+              clear.addEventListener('click', () => {
+                clear.disabled = true;
+                vscode.postMessage({ type: 'clearRememberedFallback', taskFolderPath: item.taskFolderPath, stage: item.stage, taskName: item.taskName });
+              });
+              note.appendChild(clear);
+              row.appendChild(note);
+            });
+          }
 
           // Delegated dirty-tracking: rows in #stages-tbody are rebuilt by
           // renderTable() on every 'init' message, so a single listener on
@@ -1871,9 +1969,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                   ? '<details class="provider-warning"><summary>Warning</summary><p>' + escapeHtml(provider.permissionWarning) + '</p></details>'
                   : '')
               ).join('') +
-              '<div class="btn-container"><button id="refresh-models-btn" class="secondary" title="Ask every installed CLI for its current model list and update the pickers below, without reloading the window">Refresh models</button>' +
-              '<button id="discard-providers-btn" class="secondary" disabled title="Revert unsaved provider selection changes back to the last saved settings">' + DISCARD_ICON_SVG + 'Discard Unsaved Changes</button>' +
+              '<div class="btn-container">' +
+              '<button id="discard-providers-btn" class="secondary ensemble-dismiss" disabled title="Revert unsaved provider selection changes back to the last saved settings">' + DISCARD_ICON_SVG + 'Discard Unsaved Changes</button>' +
               '<button id="save-providers-btn" disabled title="Save the enabled provider selection">' + SAVE_ICON_SVG + 'Save Provider Selection</button></div>' +
+              // bugs5 Step 28: Refresh models sits on its own line under the provider buttons, with a note
+              // saying what it does. It re-reads this machine's model lists and touches nothing saved.
+              '<div class="btn-container refresh-models-row">' +
+              '<button id="refresh-models-btn" class="secondary" title="Ask every installed CLI for its current model list and update the pickers below, without reloading the window">Refresh models</button></div>' +
+              '<div class="provider-discovery-note refresh-models-note" role="note">' +
+              'Re-reads the model lists from the AI tools installed on this machine. Doesn\\'t change your saved choices or other machines.</div>' +
               '</fieldset>';
             container.querySelectorAll('[data-signin-provider]').forEach(button => {
               button.addEventListener('click', () => {

@@ -177,14 +177,26 @@ export function isFastForwardRunPausedProvenanceCurrentV1(
  * INVALIDATES a pause recorded here when the same run goes on to end for an
  * unrelated reason (success, stall, exhausted attempts, an error).
  */
-export function stampFastForwardResumeProvenanceV1(taskFolderPath: string): {
+export function stampFastForwardResumeProvenanceV1(
+  taskFolderPath: string,
+  stage?: string
+): {
   readonly fastForwardSessionIdV1: string;
   readonly fastForwardRunEpochV1: number;
+  /**
+   * bugs5 Step 19: when the card captured these details, and at which stage. The in-memory
+   * session/epoch pair above dies with the window; these two let the answer be checked against
+   * the task's own records after a restart (see `decideDurableFastForwardResumeV1`).
+   */
+  readonly fastForwardCapturedAtMsV1: number;
+  readonly fastForwardStageV1?: string;
 } {
   recordFastForwardRunPausedV1(taskFolderPath);
   return {
     fastForwardSessionIdV1: getFastForwardSessionIdV1(),
     fastForwardRunEpochV1: getFastForwardRunEpochV1(taskFolderPath),
+    fastForwardCapturedAtMsV1: Date.now(),
+    ...(stage !== undefined ? { fastForwardStageV1: stage } : {}),
   };
 }
 

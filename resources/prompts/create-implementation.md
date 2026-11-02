@@ -31,7 +31,10 @@ Read the final plan below and produce an implementation checklist in Markdown:
 
   A LOW-priority item follows the same shape but ends by naming what is being traded off, e.g. "Priority: LOW — a failure here surfaces as an error dialog immediately; skipping this check only costs a rerun, never bad data."
 - End with a "Verification" section listing how to confirm the work is done (behaviours to check; test runs appear only as "Verified by Publish Checks:" items or manual hand-off items). Evidence for a manual-verification item (a run log line, a file/line, a query result) is written below its guidance once it exists, never instead of the five elements above.
+- A required "Plan deviations" section (under "## Plan deviations") listing any intentional deviation from the approved plan with what was changed, why, and trade-offs (state "None." if there are no deviations).
 - Items under "Behaviour to confirm" describe what a person can observe (a screen, a message, a file's contents). They never contain a claim that a test, build, lint or type-check was run or passed; those claims belong only to "Verified by Publish Checks:" items. A "Behaviour to confirm" item must be checkable by reading the code. Any part that needs a test, lint, type-check or build run goes into the excluded "Verified by Publish Checks:" item, or into an excluded owner step when Publish Checks do not cover it, never into a behaviour item.
+
+Owner evidence: before recording that an item requires owner evidence, consider what can be safely gathered by an agent directly: run a CLI in a throwaway folder outside the workspace, read accessible files, or run a read-only command. "Owner evidence needed" must state which of these it needs (the owner's machine, an account, a payment, or the owner's judgement) and why an agent cannot obtain it.
 
 Do not add work the plan does not call for. Do not create, write, or edit any file yourself — output ONLY the complete checklist document as your response text; Ensemble replaces the authoritative plan-of-record file at {{planFinalPath}} in place.
 

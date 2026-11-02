@@ -86,7 +86,9 @@ void describe("RC5 source wiring", () => {
     // The run branch's closing brace precedes the saved-result read, so the
     // read is reached whether or not the checks were run here.
     assert.match(slice.slice(ranBranchStart, savedRead), /return false;\n {6}\}\n {4}\}\n/);
-    assert.match(slice, /Publish Checks have not passed/);
+    assert.match(slice, /describePublishChecksFailureV1\(savedChecksPayload\)[\s\S]*nothing has changed since/);
+    // bugs5 Step 15: the failed result is not re-run; the fix round is offered instead.
+    assert.match(slice, /actionLabel: "Fix Linting & Code Errors"/);
   });
 
   void it("reads the persisted effective verdict, so a missing script is never rebuilt into a pass", () => {

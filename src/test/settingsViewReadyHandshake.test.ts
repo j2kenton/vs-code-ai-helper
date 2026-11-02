@@ -45,7 +45,9 @@ function createFakeWebviewView() {
       return { dispose() {} };
     },
     postMessage(message: FakeMessage) {
-      if (listenerAttached) {
+      if (listenerAttached && message.type !== "rememberedFallbacks") {
+        // "rememberedFallbacks" is an advisory side channel (bugs5 Step 25) sent after init; the handshake
+        // tests below are about the init/focusStage protocol and count only those messages.
         postedMessages.push(message);
       }
       return Promise.resolve(listenerAttached);
@@ -902,7 +904,7 @@ void describe("SettingsViewProvider webview — AI Models tab labels and Discard
     );
     assert.match(
       html,
-      /<button id="discard-btn" class="secondary" disabled title="[^"]+"><svg[^>]*aria-hidden="true"[^>]*><path[^>]*\/><\/svg>Discard Unsaved Changes<\/button>/
+      /<button id="discard-btn" class="secondary ensemble-dismiss" disabled title="[^"]+"><svg[^>]*aria-hidden="true"[^>]*><path[^>]*\/><\/svg>Discard Unsaved Changes<\/button>/
     );
     assert.doesNotMatch(html, /Reset to Defaults/);
     // Save Provider Selection starts disabled (enabled only once a checkbox
@@ -1143,7 +1145,7 @@ void describe("SettingsViewProvider webview — provider selection Discard Unsav
     const html = extractWebviewHtml();
     assert.match(
       html,
-      /<button id="discard-providers-btn" class="secondary" disabled title="[^"]+">' \+ DISCARD_ICON_SVG \+ 'Discard Unsaved Changes<\/button>/
+      /<button id="discard-providers-btn" class="secondary ensemble-dismiss" disabled title="[^"]+">' \+ DISCARD_ICON_SVG \+ 'Discard Unsaved Changes<\/button>/
     );
     const discardBtnIcon = /<button id="discard-btn"[^>]*><svg[^>]*><path d="([^"]+)"/.exec(html);
     const providerDiscardIcon = /const DISCARD_ICON_SVG = '<svg[^>]*><path d="([^"]+)"/.exec(html);

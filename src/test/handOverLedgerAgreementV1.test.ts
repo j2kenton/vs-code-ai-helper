@@ -290,6 +290,30 @@ void describe("warnHandOverNotStartedV1 agrees with the ledger (bugs4 item 4)", 
     );
   });
 
+  void it("bugs5 Step 14: while a continuation is owed, no Run Implementation or Run Review card is raised", async () => {
+    const owed = {
+      sourceAttemptId: "src",
+      reason: "r",
+      trigger: "summaryRejected" as const,
+      mode: "unconstrained" as const,
+      dispatch: "pending" as const,
+      at: new Date().toISOString(),
+    };
+    for (const kind of ["implementation", "review"] as const) {
+      await withTask(
+        (dir) => progressWith([], { implRecovery: owed }, dir),
+        async (dir, memento) => {
+          await warnHandOverNotStartedV1(vscode.Uri.file(dir), "t", "impl", "declined", kind);
+          assert.deepEqual(
+            new WorkflowDecisionStoreV1(memento).listPending(dir).filter((d) => d.decisionKey.startsWith("chatActionOffer:")),
+            [],
+            `${kind}: the continuation is the next step, so no competing card`
+          );
+        }
+      );
+    }
+  });
+
   void it("an in-chain terminal round that did not hand over keeps the genuine cause alongside what the round did", async () => {
     const ended = new Date(Date.now() - 1000).toISOString();
     await withTask(
@@ -385,6 +409,23 @@ void describe("warnHandOverNotStartedV1 agrees with the ledger (bugs4 item 4)", 
     const text = describeDeclinedHandOverV1("implementation", undefined);
     assert.match(text, /Run Implementation command returned without starting a round and recorded no cause/);
     assert.doesNotMatch(text, /did not provide its refusal reason/);
+  });
+
+  void it("bugs5 Step 14: no production source can show 'did not provide its refusal reason'", () => {
+    const srcRoot = path.join(process.cwd(), "src");
+    const offenders: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name !== "test") walk(full);
+        } else if (entry.name.endsWith(".ts") && fs.readFileSync(full, "utf8").includes("did not provide its refusal reason")) {
+          offenders.push(path.relative(srcRoot, full));
+        }
+      }
+    };
+    walk(srcRoot);
+    assert.deepEqual(offenders, []);
   });
 
   void it("the manual step names the stage once: an Implementation hand-over at the Implementation stage never reads 'Run Implementation on Implementation'", async () => {

@@ -171,6 +171,18 @@ export interface HandoffGatingV1 {
   readonly holdsTaskPaused: boolean;
   readonly unblocksProgress: boolean;
   readonly detail: string;
+  /**
+   * bugs5 Step 1: the name of the running command that is waiting on this answer
+   * ("Commit & Push"). A card that sets it is blocking and headed
+   * "<Command> is waiting for your answer", never "Optional".
+   */
+  readonly waitingCommand?: string;
+  /**
+   * What the waiting command would have done ("committed"), so the card can say before Dismiss
+   * "Dismissing stops this Commit & Push; nothing is committed." and the chat after it "…nothing
+   * was committed." Only meaningful with `waitingCommand`.
+   */
+  readonly waitingNothingDone?: string;
 }
 
 /**

@@ -23,7 +23,11 @@ import {
   recoverAbandonedPublishChecksRunV1,
   settleUnrecordedPublishChecksRunV1,
 } from "../utils/publishChecksOutcomeV1";
-import { ensurePublishReviewArtifactExistsV1 } from "../utils/publishChecksFreshness";
+import {
+  ensurePublishReviewArtifactExistsV1,
+  readPublishChecksFreshnessStampV1,
+  writePublishChecksFreshnessStampV1,
+} from "../utils/publishChecksFreshness";
 
 const folders: string[] = [];
 
@@ -402,5 +406,91 @@ void describe("per-command exit codes in the running record (bugs3 Step 12)", ()
       "a preflight cancel records a cancelled outcome before the operation settles"
     );
     assert.match(source, /operation\.settleAs\("cancelled", `Publish Checks were cancelled before any command started/);
+  });
+});
+
+void describe("an earlier result survives a run that did not finish (bugs5 Step 10)", () => {
+  const STAMP = {
+    formatVersion: 1,
+    runId: "run-1",
+    verifiedCommitSha: "abc1234abc1234",
+    completedAt: "2026-11-01T05:40:14.000Z",
+    scopeId: "scope-1",
+    treeFingerprint: "fp-1",
+  } as const;
+
+  async function withPassedRun(): Promise<ReturnType<typeof taskFolder>> {
+    const task = taskFolder();
+    await ensurePublishReviewArtifactExistsV1(task.uri);
+    await recordPublishChecksRunningV1(task.uri, "op-1", () => new Date("2026-11-01T05:20:00.000Z"));
+    await recordPublishChecksOutcomeV1(task.uri, { outcome: "passed", at: "2026-11-01T05:40:14.000Z", operationId: "op-1" });
+    await writePublishChecksFreshnessStampV1(task.uri, STAMP);
+    return task;
+  }
+
+  void it("a pass remembers how long its run took, from the running record's start", async () => {
+    const task = await withPassedRun();
+    const passed = readPublishChecksOutcomeV1(task.dir);
+    assert.equal(passed?.outcome === "passed" ? passed.durationMs : undefined, 20 * 60_000 + 14_000);
+  });
+
+  void it("a new run carries the last completed result, and so does the interrupted record it becomes", async () => {
+    const task = await withPassedRun();
+    await recordPublishChecksRunningV1(task.uri, "op-2");
+    const running = readPublishChecksOutcomeV1(task.dir);
+    assert.equal(running?.outcome === "running" ? running.lastCompleted?.outcome : undefined, "passed");
+    assert.equal(running?.outcome === "running" ? running.lastCompleted?.at : undefined, "2026-11-01T05:40:14.000Z");
+
+    const recovered = await recoverAbandonedPublishChecksRunV1(task.uri, { ownRunIsLive: () => false });
+    assert.equal(recovered, true);
+    const interrupted = readPublishChecksOutcomeV1(task.dir);
+    assert.equal(interrupted?.outcome, "interrupted");
+    assert.equal(interrupted?.outcome === "interrupted" ? interrupted.lastCompleted?.outcome : undefined, "passed");
+  });
+
+  void it("a cancelled run carries the last completed result too", async () => {
+    const task = await withPassedRun();
+    await recordPublishChecksRunningV1(task.uri, "op-2");
+    await recordPublishChecksOutcomeV1(task.uri, { outcome: "cancelled", at: "2026-11-01T06:00:00.000Z", cause: "cancelled from the chat" });
+    const cancelled = readPublishChecksOutcomeV1(task.dir);
+    assert.equal(cancelled?.outcome === "cancelled" ? cancelled.lastCompleted?.outcome : undefined, "passed");
+  });
+
+  void it("a run that is cancelled or interrupted leaves the passing stamp alone", async () => {
+    const task = await withPassedRun();
+    await recordPublishChecksRunningV1(task.uri, "op-2");
+    await recordPublishChecksOutcomeV1(task.uri, { outcome: "cancelled", at: "2026-11-01T06:00:00.000Z", cause: "c" });
+    assert.deepEqual(await readPublishChecksFreshnessStampV1(task.uri), { ...STAMP, fingerprintVersion: 2 });
+    await recordPublishChecksOutcomeV1(task.uri, {
+      outcome: "interrupted",
+      at: "2026-11-01T06:05:00.000Z",
+      finishedCommands: [{ command: "pnpm run lint", exitCode: 0 }],
+      unknownCommands: ["pnpm run test"],
+    });
+    assert.deepEqual(await readPublishChecksFreshnessStampV1(task.uri), { ...STAMP, fingerprintVersion: 2 });
+  });
+
+  void it("a failed run, and a run interrupted after one of its own commands failed, remove the stamp", async () => {
+    const failed = await withPassedRun();
+    await recordPublishChecksOutcomeV1(failed.uri, { outcome: "failed", at: "2026-11-01T06:00:00.000Z", failedCommands: ["pnpm run test"] });
+    assert.equal(await readPublishChecksFreshnessStampV1(failed.uri), undefined);
+
+    const interrupted = await withPassedRun();
+    await recordPublishChecksOutcomeV1(interrupted.uri, {
+      outcome: "interrupted",
+      at: "2026-11-01T06:05:00.000Z",
+      finishedCommands: [{ command: "pnpm run lint", exitCode: 1 }],
+      unknownCommands: [],
+    });
+    assert.equal(await readPublishChecksFreshnessStampV1(interrupted.uri), undefined);
+  });
+
+  void it("runPublishChecks no longer wipes the stamp when a run starts", () => {
+    const source = fs.readFileSync(path.resolve(__dirname, "..", "..", "src", "commands", "runPublishChecks.ts"), "utf8");
+    const start = source.indexOf("const beforeSnapshot = await computeTreeFingerprintSnapshotV1(scopeGuess);");
+    const checks = source.indexOf("checkOutcome = await runChecksFailedFirstV1({", start);
+    assert.ok(start > 0 && checks > start);
+    assert.doesNotMatch(source.slice(start, checks), /invalidatePublishChecksFreshnessStampOnDiskV1\(taskFolderUri\)/);
+    assert.match(source, /if \(!freshStampWritten\) \{\s*await invalidatePublishChecksFreshnessStampOnDiskV1/);
   });
 });

@@ -112,13 +112,22 @@ void describe("offerActionInChatV1 (RC7 item 4)", () => {
       assert.equal(decisions.length, 1, "repeated recovery refreshes the existing decision");
       assert.match(decisions[0]?.whatHappened ?? "", /outcome is unknown/);
       const recovery = decisions[0]?.options.find((option) => option.optionId === "runAction");
-      assert.equal(recovery?.label, "Run Publish Checks");
+      // bugs5 Step 12: what was interrupted is restarted by name, and the stage's other real
+      // actions are listed, none with a consequence that only repeats its label.
+      assert.equal(recovery?.label, "Run Publish Checks again");
       assert.deepEqual(recovery?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.runPublishChecks",
         args: [{ taskFolderPath: dir }],
       });
-      const inspect = decisions[0]?.options.find((option) => option.optionId === "alternative1");
+      assert.deepEqual(
+        decisions[0]?.options.map((option) => option.label),
+        ["Run Publish Checks again", "Fix Linting & Code Errors", "Commit & Push", "Complete Task", "View Run Log", "Not now"]
+      );
+      for (const option of decisions[0]?.options ?? []) {
+        assert.notEqual(option.consequence, `Runs "${option.label}" for this task now.`, option.label);
+      }
+      const inspect = decisions[0]?.options.find((option) => option.label === "View Run Log");
       assert.equal(inspect?.label, "View Run Log");
       assert.equal(inspect?.resumeKind, "unpause", "an inspect-only alternative must not claim to resume the task");
       assert.deepEqual(inspect?.effect, {
@@ -329,7 +338,8 @@ void describe("converted call sites (RC7 item 4)", () => {
   const SITES: ReadonlyArray<{ file: string; label: string; command: string; count: number; noDirectTitle?: boolean }> = [
     { file: "utils/pausedTaskRefusalV1.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 1 },
     { file: "commands/taskCreationRecovery.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 2 },
-    { file: "commands/runPublishChecks.ts", label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", count: 2 },
+    // bugs5 Step 17: a third offer, "passed, but these files changed while they ran: run them again".
+    { file: "commands/runPublishChecks.ts", label: "Run Publish Checks", command: "vs-code-ai-helper.runPublishChecks", count: 3 },
     { file: "commands/scheduleTaskResume.ts", label: "Complete Stage & Move On", command: "vs-code-ai-helper.nextStage", count: 1 },
     { file: "commands/reviewActions.ts", label: "Complete Stage & Move On", command: "vs-code-ai-helper.nextStage", count: 1 },
     { file: "commands/resumeTask.ts", label: "Resume", command: "vs-code-ai-helper.resumeTask", count: 1 },

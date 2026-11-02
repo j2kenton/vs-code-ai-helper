@@ -186,6 +186,10 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "commands/scheduleTaskResume.ts", optionId: "runNow", occurrence: 1, resumeKind: "continue", dispatchProof: "scheduleTaskResume.test.ts: runNow (quota variant) dispatches immediately" },
   { file: "commands/scheduleTaskResume.ts", optionId: "resumeTask", occurrence: 0, resumeKind: "unpause", dispatchProof: "scheduledQuotaRerunV1.test.ts: resumes the task without starting the action" },
   { file: "commands/scheduleTaskResume.ts", optionId: "changeModel", occurrence: 0, resumeKind: "unpause", dispatchProof: "scheduleTaskResume.test.ts: opens stage model settings" },
+  // bugs5 Step 13: the re-arm-limit card (the automatic retry stopped after two attempts).
+  { file: "commands/scheduleTaskResume.ts", optionId: "retry", occurrence: 0, resumeKind: "continue", dispatchProof: "implRecoveryDispatch.test.ts: the limit card's Retry runs runOwedContinuationNow" },
+  { file: "commands/scheduleTaskResume.ts", optionId: "leaveOwed", occurrence: 0, resumeKind: "unpause", dispatchProof: "implRecoveryDispatch.test.ts: the limit card's Leave it owed is doNothing" },
+  { file: "commands/scheduleTaskResume.ts", optionId: "discard", occurrence: 0, resumeKind: "continue", dispatchProof: "implRecoveryDispatch.test.ts: the limit card's Discard runs discardOwedImplRecoveryV1" },
 
   // src/commands/handoffChecksV1.ts
   { file: "commands/handoffChecksV1.ts", optionId: "tick-${index}", occurrence: 0, resumeKind: "continue", dispatchProof: "handoffChecksV1 tick options re-post the successor card or dispatch the stage action" },
@@ -456,6 +460,9 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("commands/scheduleTaskResume.ts", "runNow", 1), { kind: "runtime-test", proofFiles: ["scheduleTaskResume.test.ts"] }],
   [rowKey("commands/scheduleTaskResume.ts", "resumeTask", 0), { kind: "runtime-test", proofFiles: ["scheduledQuotaRerunV1.test.ts"] }],
   [rowKey("commands/scheduleTaskResume.ts", "changeModel", 0), { kind: "runtime-test", proofFiles: ["scheduleTaskResume.test.ts"] }],
+  [rowKey("commands/scheduleTaskResume.ts", "retry", 0), { kind: "runtime-test", proofFiles: ["implRecoveryDispatch.test.ts"] }],
+  [rowKey("commands/scheduleTaskResume.ts", "leaveOwed", 0), { kind: "trivial-no-dispatch" }],
+  [rowKey("commands/scheduleTaskResume.ts", "discard", 0), { kind: "runtime-test", proofFiles: ["implRecoveryDispatch.test.ts"] }],
 
   // handoffChecksV1.ts: classified `continue` per the plan's Step 2
   // ("Ensemble performs the adjustment... after the adjustment succeeds,

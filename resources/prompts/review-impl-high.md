@@ -25,7 +25,17 @@ End your response with this marker on its own line (the numbers below are an exa
 
 The denominator is always the whole plan and never shrinks: every top-level item counts toward it for the life of the task, including one later marked excluded. One plan is one task, so there is no smaller scope to count against — a round that finishes an 8-item part of a 25-item checklist reports `8/25`, never `8/8`. This holds even when the plan divides itself into named parts, phases, or lettered sections: a plan may be implemented one part per round, but every part belongs to this task, and the marker measures the task's progress through the whole checklist. Never narrow the denominator on your own judgement that something belongs to a later task, and never adopt a division the plan claims to make across tasks — report the plan-wide count and note the discrepancy in your verdict.
 
-Owner evidence: when a round declined a step because it needs a web page, documentation, or a live provider CLI run, file `- [completion] [environmental] Owner evidence needed: <the exact evidence>` as the blocker — it is an owner decision, never `needs-toolchain`.
+Owner evidence: before recording "owner evidence needed", first try what can be safely done yourself: run a CLI against a throwaway folder outside the workspace, read files you have access to, or run a read-only command. Save any gathered evidence under the task's `evidence/` folder and record what was tried. "Owner evidence needed" is reserved for what truly requires the owner (their machine, account, payment, or judgement) — state which of these is required and why an agent cannot obtain it. When evidence can be gathered by an agent at a cost (provider usage, runtime), file `- [completion] [task-fixable] Agent can gather (cost: <estimate>): <description>` instead.
+
+Owner decisions needed: for each blocker only the owner can settle (an unapproved plan deviation, an open design choice, or owner evidence), include an `## Owner decisions needed` block. Each block must provide:
+- an id (e.g. `### step-6-decision`)
+- what this part of the plan is for (in plain words)
+- what is undecided or what went wrong (in plain words)
+- each option in plain words, with its trade-offs
+- a recommendation and the reason for it
+- a separate paragraph of technical details (internal functions, file paths, tokens)
+
+Write each block as labelled lines: `Id:`, `Plan purpose:`, `Problem:`, `Options:` (one bullet per option, `- <label> — <trade-offs>`), `Recommendation:` (the recommended option's label, then the reason), `Plan items:` and `Technical details:`. Put every blocker's text in plain words first; internal names go only under `Technical details:`. In `Plan items:` quote, in backticks and verbatim, the checklist items the decision settles, and add `[exclude]` to the option that drops them from the plan. An option that keeps the plan as written starts with "Keep the plan" or "Reject". Raise the decision once: do not file the same blocker again as a task-fixable blocker.
 
 Narrowing: when a ticked checklist item was only partly done and the round's evidence says the rest does not apply, only the owner may narrow the item. File `- [completion] [environmental] Narrowing needs an owner decision: `<the checklist item text, verbatim, in backticks>` — <what was not done>` as the blocker, never `task-fixable` (a round may not narrow the plan, so sending it back to a round cannot clear it). A plan whose tick is disputed is not complete: keep the score below the ready threshold while the narrowing is undecided, otherwise the blocker will not raise the owner card.
 
@@ -73,6 +83,7 @@ Readiness: N/10
 - Architectural blockers (if any).
 - Completion blockers (if any).
 - Review-confidence blockers (if any).
+- Owner decisions needed (if any blocker only the owner can settle, under `## Owner decisions needed`).
 - Non-blocking suggestions (if any).
 
 Record which commit you reviewed. End your response with these markers on their own lines, using the exact values shown below (copy them — do not compute or guess a SHA or a fingerprint yourself):
