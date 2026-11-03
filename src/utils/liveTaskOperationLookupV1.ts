@@ -11,6 +11,8 @@ export interface LiveTaskOperationV1 {
   readonly label: string;
   /** The registry id of the operation, so a card can offer to cancel exactly this one. */
   readonly operationId?: string;
+  /** True when the operation runs in another window (mirrored from the runner), so this window never sees it end. */
+  readonly mirrored?: boolean;
   /** Epoch ms the operation started, when known. */
   readonly startedAt?: number;
   /** What it is doing right now ("tests", "iteration 3/5"), when it reported something. */

@@ -431,7 +431,11 @@ void describe("nextStage command → auto-review chain (command-layer end-to-end
         (n): n is StatusEntry =>
           !("kind" in n) && n.message.includes("Review") && n.message.includes("completed")
       );
-      assert.equal(terminalEntries.length, 1, "exactly one persistent terminal entry for the review");
+      assert.equal(
+        terminalEntries.length,
+        1,
+        `exactly one persistent terminal entry for the review; got: ${JSON.stringify(terminalEntries.map((e) => e.message))}`
+      );
       assert.ok(
         (provider.getEntries?.() ?? []).some((e: { message: string }) =>
           e.message.includes("advanced to")),

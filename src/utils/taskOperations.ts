@@ -1399,7 +1399,13 @@ setLiveTaskOperationLookupV1((taskFolderPath) => {
   // The most recent running operation that reported something names the current phase.
   const reporting = [...ops].reverse().find((op) => op.state === "running" && (op.detail ?? op.activity));
   const activity = reporting?.detail ?? reporting?.activity;
-  return { label: root.label, operationId: root.id, startedAt: root.startedAt, ...(activity ? { activity } : {}) };
+  return {
+    label: root.label,
+    operationId: root.id,
+    startedAt: root.startedAt,
+    ...(root.id.startsWith(MIRRORED_OPERATION_ID_PREFIX) ? { mirrored: true } : {}),
+    ...(activity ? { activity } : {}),
+  };
 });
 
 // bugs3 Step 19: a card that refers to one running operation asks about that

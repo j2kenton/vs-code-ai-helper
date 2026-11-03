@@ -107,7 +107,7 @@ void describe("invokeCommitPushRowV1 — questions outcome presentation", () => 
 
     const originalInvokeLifecycleRowV1 = productionRuntimeModule.invokeLifecycleRowV1;
     productionRuntimeModule.invokeLifecycleRowV1 = (): Promise<TaskActionOutcomeV1> =>
-      Promise.resolve({ kind: "duplicateRejected", code: "operationAlreadyRunning" });
+      Promise.resolve({ kind: "recoveryRequired", code: "taskProgressRecoveryRequired" });
 
     try {
       await invokeCommitPushRowV1(fakeResolvedTask(taskFolderPath), {
@@ -118,6 +118,31 @@ void describe("invokeCommitPushRowV1 — questions outcome presentation", () => 
         surface.entries.some((e) => e.level === "error" && /could not start/.test(e.message)),
         `an unrecognized pre-execute rejection must still surface the generic error; got: ${JSON.stringify(surface.entries)}`
       );
+    } finally {
+      productionRuntimeModule.invokeLifecycleRowV1 = originalInvokeLifecycleRowV1;
+      deactivateNotificationRouter();
+    }
+  });
+
+  // chat1 Steps 18 and 19: a task another action holds gets the one plain holder warning, never the
+  // generic error and never the bare outcome code.
+  void it("shows one plain held-task warning, not the generic error, when another action holds the task", async () => {
+    const taskFolderPath = "C:\\fake\\plans\\task_1";
+    const surface = new RecordingSurface();
+    initNotificationRouter(surface);
+
+    const originalInvokeLifecycleRowV1 = productionRuntimeModule.invokeLifecycleRowV1;
+    productionRuntimeModule.invokeLifecycleRowV1 = (): Promise<TaskActionOutcomeV1> =>
+      Promise.resolve({ kind: "duplicateRejected", code: "operationAlreadyRunning" });
+
+    try {
+      await invokeCommitPushRowV1(fakeResolvedTask(taskFolderPath), {
+        inventory: {} as TaskInventory,
+      });
+
+      assert.equal(surface.entries.length, 1, JSON.stringify(surface.entries));
+      assert.equal(surface.entries[0]?.level, "warning");
+      assert.ok(!/could not start|duplicateRejected|operationAlreadyRunning/.test(surface.entries[0]?.message ?? ""));
     } finally {
       productionRuntimeModule.invokeLifecycleRowV1 = originalInvokeLifecycleRowV1;
       deactivateNotificationRouter();

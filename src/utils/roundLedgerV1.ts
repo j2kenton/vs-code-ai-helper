@@ -266,7 +266,7 @@ import {
   type ForeignTaskArtifactSnapshotV1,
 } from "./foreignTaskArtifactContainmentV1";
 import { normalizePath } from "./taskRoot";
-import { isOperationLiveByIdV1 } from "./liveTaskOperationLookupV1";
+import { getLiveTaskOperationV1, isOperationLiveByIdV1 } from "./liveTaskOperationLookupV1";
 import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
 import {
   claimRoundNotificationV1,
@@ -973,9 +973,14 @@ export async function terminalizeRoundV1(
     try {
       const outcomeHead = `Ended: ${stepOutcomeNameV1(entry.mode, STAGE_DISPLAY_NAMES[entry.stage] ?? entry.stage)} — ${entry.state}`;
       const outcomeDetail = roundOutcomeDetailOfV1(outcomeText, outcomeHead);
+      // The ledger row carries the coordinator's operation id, which is not the registry's id for
+      // the operation that ran it, so the by-id lookup alone never matches. A local root operation
+      // holding the task will end through the bridge, which carries every detail kept for the task.
+      const holder = getLiveTaskOperationV1(options.taskFolderUri.fsPath);
       const operationStillLive =
         entry.operationId !== undefined &&
-        isOperationLiveByIdV1(options.taskFolderUri.fsPath, entry.operationId) === true;
+        (isOperationLiveByIdV1(options.taskFolderUri.fsPath, entry.operationId) === true ||
+          (holder?.operationId !== undefined && holder.mirrored !== true));
       if (operationStillLive && entry.operationId !== undefined) {
         if (outcomeDetail !== undefined) {
           stashRoundOutcomeDetailV1(normalizePath(options.taskFolderUri.fsPath), entry.operationId, outcomeDetail);
