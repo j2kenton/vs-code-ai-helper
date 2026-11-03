@@ -494,7 +494,7 @@ void describe("applyReviewerVerifiedTicks — happy path", () => {
     );
     const applyOption = result.decision?.options.find((o) => o.optionId === "apply");
     assert.ok(applyOption, "the apply option must be offered");
-    assert.equal(applyOption.label, "Apply 1 Reviewer-Verified Tick and try again (one cycle)");
+    assert.equal(applyOption.label, "Apply 1 Reviewer-Verified Tick and try again (one cycle, then stops)");
     assert.match(applyOption.consequence, /does not start or resume Fast Forward/);
     assert.deepEqual(resumeAndApplyCurrentStageActionCalls.at(-1), {
       taskFolderPath: result.folder,

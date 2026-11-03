@@ -3,6 +3,7 @@ import { normalizePath } from "../utils/taskRoot";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
 import { HandoffGuidanceFieldsV1 } from "../types/handoffGuidanceV1";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
+import { logChatStatusToNotificationsV1 } from "../utils/chatStatusLogV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { openAutomationRoundLedgerRowBestEffortV1 } from "../utils/roundLedgerV1";
 import { terminalizeGenericAutomationRoundBestEffortV1 } from "../utils/automationChain";
@@ -969,6 +970,12 @@ export async function announceAutoStartBestEffortV1(input: {
           ...(input.intentId !== undefined ? { intentId: input.intentId } : {}),
         },
         input.taskKey
+      );
+      // chat1 Step 5: the chat no longer renders this line; Notifications keeps it, naming the task.
+      void logChatStatusToNotificationsV1(
+        input.taskKey,
+        text.replace(/^_+|_+$/g, ""),
+        progressResult.decoded.progress.currentStage
       );
     } catch (error) {
       // The row was flipped to "open" above; if the chat append fails, close

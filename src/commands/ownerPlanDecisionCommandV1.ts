@@ -19,6 +19,7 @@ import { getPlanRevisionV1, settleChecklistItemV1 } from "../utils/implementatio
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
+import { logChatStatusToNotificationsV1 } from "../utils/chatStatusLogV1";
 import { postWorkflowDecisionV1, PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
 import {
   ParsedOwnerDecisionBlockV1,
@@ -187,7 +188,9 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
     text: outcome,
     stage: arg.stage,
     at: nowIso,
+    kind: "outcome",
   }).catch(() => undefined);
+  void logChatStatusToNotificationsV1(arg.taskFolderPath, outcome, arg.stage);
 }
 
 /** Command handler for recording an owner plan decision. */
@@ -208,12 +211,15 @@ export async function recordOwnerPlanDecisionV1(
       report: () => Promise.resolve(),
     });
 
+    const heldText = `Your choice "${arg.optionLabel}" for ${arg.blockerId} is recorded. It is written to plan-final.md as soon as the running round ends.`;
     await appendChatMessageV1(arg.taskFolderPath, {
       role: "assistant",
-      text: `Your choice "${arg.optionLabel}" for ${arg.blockerId} is recorded. It is written to plan-final.md as soon as the running round ends.`,
+      text: heldText,
       stage: arg.stage,
       at: new Date().toISOString(),
+      kind: "outcome",
     }).catch(() => undefined);
+    void logChatStatusToNotificationsV1(arg.taskFolderPath, heldText, arg.stage);
 
     return { outcome: "done" };
   }

@@ -43,6 +43,7 @@ interface FakeElement {
   title: string;
   type: string;
   disabled: boolean;
+  hidden?: boolean;
   readonly style: Record<string, string>;
   readonly dataset: Record<string, string>;
   readonly children: FakeElement[];
@@ -70,6 +71,10 @@ interface FakeElement {
   /** Every message/`textContent` painted anywhere under this element. */
   text(): string;
 }
+
+/** Which elements the panel scrolled into view or focused (reset by the tests that read them). */
+const scrollLog: string[] = [];
+const focusLog: string[] = [];
 
 function makeElement(tagName: string, id = ""): FakeElement {
   const attributes = new Map<string, string>();
@@ -120,10 +125,10 @@ function makeElement(tagName: string, id = ""): FakeElement {
     setAttribute: (name, value) => void attributes.set(name, value),
     removeAttribute: (name) => void attributes.delete(name),
     getAttribute: (name) => attributes.get(name) ?? null,
-    focus: () => undefined,
+    focus: () => void focusLog.push(element.getAttribute("data-card-id") ?? element.tagName),
     blur: () => undefined,
     remove: () => undefined,
-    scrollIntoView: () => undefined,
+    scrollIntoView: () => void scrollLog.push(element.getAttribute("data-card-id") ?? element.tagName),
     querySelector: () => null,
     querySelectorAll: () => {
       // Only the 'input,textarea' form-control query the draft capture uses.
@@ -166,6 +171,8 @@ function runPanel(): PanelHarness {
     "error",
     "busy-indicator",
     "busy-text",
+    "busy-detail",
+    "busy-actions",
     "steering-note",
     "form",
     "message",
@@ -186,6 +193,9 @@ function runPanel(): PanelHarness {
     console,
     setTimeout,
     clearTimeout,
+    // The strip refreshes its "N min" every 30 s; a stub keeps a test from holding the process open.
+    setInterval: () => 1,
+    clearInterval: () => undefined,
     requestAnimationFrame: (callback: () => void) => callback(),
     acquireVsCodeApi: () => ({
       postMessage: (message: unknown) => void outbound.push(message),
@@ -345,6 +355,255 @@ void describe("the chat panel's interaction and decision cards", () => {
     copy.listeners.get("click")![0]!({});
     assert.deepEqual(panel.clipboardWrites, ["Decision needed\nA round failed."]);
     assert.equal(panel.outbound.length, outboundBefore);
+  });
+
+  // chat1 Steps 9, 11, 12, 14, 15, 16: one card lifecycle.
+  const cardOf = (
+    cardId: string,
+    state: string,
+    outcome: string,
+    expanded: boolean,
+    title = "Decision needed: A round failed."
+  ): Record<string, unknown> => ({ cardId, kind: "decision", title, state, outcome, expanded });
+  const timelineOf = (...values: Record<string, unknown>[]): Record<string, unknown> =>
+    stateMessage({ decisions: [], timeline: values.map((value) => ({ type: "decision", value })) });
+  // Messages built inside the vm context carry that context's prototypes; compare them as plain data.
+  const plain = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+  const buttons = (root: FakeElement): FakeElement[] => {
+    const found: FakeElement[] = [];
+    const visit = (element: FakeElement): void => {
+      if (element.tagName === "BUTTON") found.push(element);
+      element.children.forEach(visit);
+    };
+    visit(root);
+    return found;
+  };
+
+  void it("gives an open card a header button that is expanded, names the outcome and toggles with aria-expanded", () => {
+    const panel = runPanel();
+    const d = decision({ card: cardOf("d1", "open", "needs your answer", true) });
+    panel.post(timelineOf(d));
+    const [header] = findByClass(panel.byId("messages"), "card-header");
+    assert.ok(header, "the card must have a header");
+    assert.equal(header.tagName, "BUTTON");
+    assert.equal(header.type, "button");
+    assert.equal(header.getAttribute("aria-expanded"), "true");
+    assert.ok(header.getAttribute("aria-controls"), "the header must point at its body");
+    assert.match(header.text(), /Decision needed: A round failed\. — needs your answer/);
+    const [body] = findByClass(panel.byId("messages"), "card-body");
+    assert.equal(body?.id, header.getAttribute("aria-controls"));
+    assert.equal(body?.hidden, false);
+    const before = panel.outbound.length;
+    header.listeners.get("click")![0]!({});
+    assert.equal(header.getAttribute("aria-expanded"), "false");
+    assert.equal((body as unknown as { hidden: boolean }).hidden, true);
+    assert.deepEqual(plain(panel.outbound.slice(before)), [{ type: "toggleCard", cardId: "d1", state: "open", expanded: false }]);
+    header.listeners.get("click")![0]!({});
+    assert.equal(header.getAttribute("aria-expanded"), "true");
+  });
+
+  void it("keeps a finished decision card read-only and collapsed: every option, the chosen one marked, no live controls", () => {
+    const panel = runPanel();
+    const d = decision({
+      state: "resolved",
+      resolvedOptionId: "o2",
+      options: [
+        { optionId: "o1", label: "Retry", consequence: "Runs again.", destructive: false },
+        { optionId: "o2", label: "Skip", consequence: "Moves on.", destructive: false },
+      ],
+      card: cardOf("d1", "answered", "answered: Skip · 03:41", false),
+    });
+    panel.post(timelineOf(d));
+    const root = panel.byId("messages");
+    const [header] = findByClass(root, "card-header");
+    assert.equal(header?.getAttribute("aria-expanded"), "false");
+    assert.match(header?.text() ?? "", /answered: Skip · 03:41/);
+    assert.equal((findByClass(root, "card-body")[0] as unknown as { hidden: boolean }).hidden, true);
+    const text = root.text();
+    assert.match(text, /Retry/);
+    assert.match(text, /Skip ✓ Chosen/);
+    assert.doesNotMatch(text, /Retry ✓ Chosen/);
+    const labels = buttons(root).map((button) => button.textContent);
+    assert.ok(!labels.includes("Confirm") && !labels.includes("Dismiss"), `no live buttons, found ${labels.join(",")}`);
+    const inputs = root.querySelectorAll();
+    assert.equal(inputs.length, 0, "no radio buttons or text boxes on a finished card");
+  });
+
+  void it("shows a trimmed finished card as one collapsed line that says its details are no longer kept", () => {
+    const panel = runPanel();
+    panel.post(
+      timelineOf({
+        decisionId: "old",
+        createdAt: "2026-09-20T10:00:00.000Z",
+        trimmed: true,
+        card: { cardId: "old", kind: "decision", title: "Earlier card", state: "retired", outcome: "details no longer kept", expanded: false },
+      })
+    );
+    const root = panel.byId("messages");
+    assert.match(findByClass(root, "card-header")[0]?.text() ?? "", /Earlier card — details no longer kept/);
+    assert.match(root.text(), /details are no longer kept/);
+  });
+
+  void it("a Dismiss that fails enables the card's controls again and shows the reason inside the card", () => {
+    const panel = runPanel();
+    const d = decision({ card: cardOf("d1", "open", "needs your answer", true) });
+    panel.post(timelineOf(d));
+    const root = panel.byId("messages");
+    const dismiss = buttons(root).find((button) => button.textContent === "Dismiss")!;
+    const confirm = buttons(root).find((button) => button.textContent === "Confirm")!;
+    dismiss.listeners.get("click")![0]!({});
+    assert.equal(dismiss.disabled, true);
+    assert.equal(confirm.disabled, true);
+    assert.deepEqual(plain(panel.outbound.at(-1)), { type: "resolveWorkflowDecision", decisionId: "d1", optionId: "__dismiss__" });
+    panel.post({ type: "cardActionResult", cardId: "d1", action: "dismiss", ok: false, reason: "Dismiss did not go through." });
+    assert.equal(dismiss.disabled, false);
+    assert.equal(confirm.disabled, false);
+    const [error] = findByClass(root, "interaction-error");
+    assert.equal(error?.textContent, "Dismiss did not go through.");
+    assert.equal(error?.style.display, "block");
+  });
+
+  void it("a Dismiss that works leaves the card as the host repaints it", () => {
+    const panel = runPanel();
+    const d = decision({ card: cardOf("d1", "open", "needs your answer", true) });
+    panel.post(timelineOf(d));
+    const dismiss = buttons(panel.byId("messages")).find((button) => button.textContent === "Dismiss")!;
+    dismiss.listeners.get("click")![0]!({});
+    panel.post({ type: "cardActionResult", cardId: "d1", action: "dismiss", ok: true });
+    assert.equal(dismiss.disabled, true, "success changes nothing here; the host repaint shows the card as dismissed");
+  });
+
+  void it("a cancelled interaction that fails comes back enabled with its reason", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ interactions: [interaction({ card: { cardId: "interaction:op1:i1", kind: "interaction", title: "Needs your reply", state: "open", outcome: "needs your answer", expanded: true } })] }));
+    const card = panel.byId("interaction");
+    const dismiss = buttons(card).find((button) => button.textContent === "Dismiss")!;
+    dismiss.listeners.get("click")![0]!({});
+    assert.equal(dismiss.disabled, true);
+    panel.post({ type: "cardActionResult", cardId: "interaction:op1:i1", action: "dismiss", ok: false, reason: "No longer open." });
+    assert.equal(dismiss.disabled, false);
+    assert.equal(findByClass(card, "interaction-error")[0]?.textContent, "No longer open.");
+  });
+
+  void it("an answered interaction keeps its questions and the answer given, read-only, with 'answered … — resuming'", () => {
+    const panel = runPanel();
+    panel.post(
+      stateMessage({
+        interactions: [
+          interaction({
+            answeredSummary: "Left",
+            answers: [{ questionId: "q1", kind: "singleChoice", state: "answered", selectedOptionId: "a" }],
+            card: { cardId: "interaction:op1:i1", kind: "interaction", title: "Needs your reply", state: "answered", outcome: "answered: Left — resuming", expanded: false },
+          }),
+        ],
+      })
+    );
+    const card = panel.byId("interaction");
+    assert.match(findByClass(card, "card-header")[0]?.text() ?? "", /answered: Left — resuming/);
+    assert.match(card.text(), /Which way\?/);
+    assert.match(card.text(), /✓ Chosen: Left/);
+    assert.doesNotMatch(card.text(), /Answered: Left|Resuming…/);
+    assert.equal(card.querySelectorAll().length, 0);
+    assert.deepEqual(buttons(card).map((button) => button.getAttribute("aria-expanded")).filter(Boolean), ["false"]);
+  });
+
+  void it("a settled interaction stays as a collapsed read-only card with its outcome (chat1 Step 9)", () => {
+    const panel = runPanel();
+    panel.post(
+      stateMessage({
+        interactions: [
+          interaction({
+            state: "resumed",
+            readOnly: true,
+            answers: [{ questionId: "q1", kind: "singleChoice", state: "answered", selectedOptionId: "a" }],
+            card: { cardId: "interaction:op1:i1", kind: "interaction", title: "Needs your reply", state: "answered", outcome: "answered: Left", expanded: false },
+          }),
+          interaction({
+            interactionId: "i2",
+            state: "cancelled",
+            readOnly: true,
+            card: { cardId: "interaction:op1:i2", kind: "interaction", title: "Needs your reply", state: "dismissed", outcome: "dismissed", expanded: false },
+          }),
+        ],
+      })
+    );
+    const headers = findByClass(panel.byId("interaction"), "card-header");
+    assert.deepEqual(headers.map((header) => header.getAttribute("aria-expanded")), ["false", "false"]);
+    assert.match(headers[0]?.text() ?? "", /answered: Left/);
+    assert.match(headers[1]?.text() ?? "", /dismissed/);
+    const text = panel.byId("interaction").text();
+    assert.match(text, /✓ Chosen: Left/);
+    assert.match(text, /Not answered/, "a dismissed interaction shows no answer, not 'Skipped'");
+    assert.equal(panel.byId("interaction").querySelectorAll().length, 0, "no inputs");
+    assert.equal(buttons(panel.byId("interaction")).filter((button) => button.textContent === "Dismiss").length, 0);
+  });
+
+  void it("a settled open-items form stays as a collapsed read-only card (chat1 Step 9)", () => {
+    const panel = runPanel();
+    panel.post(
+      stateMessage({
+        openPlanItemsForms: [
+          {
+            formId: "f".repeat(32),
+            state: "applied",
+            readOnly: true,
+            items: [{ itemId: "id-1", itemText: "First open item", occurrence: 1, reason: "needs a human" }],
+            card: { cardId: "form:" + "f".repeat(32), kind: "form", title: "Decide the open plan items", state: "answered", outcome: "answered: applied", expanded: false },
+          },
+        ],
+      })
+    );
+    const card = panel.byId("interaction");
+    assert.match(findByClass(card, "card-header")[0]?.text() ?? "", /answered: applied/);
+    assert.match(card.text(), /First open item/);
+    assert.match(card.text(), /Reason from the round: needs a human/);
+    assert.equal(card.querySelectorAll().length, 0, "no radio buttons or text boxes");
+    assert.equal(buttons(card).filter((button) => button.textContent === "Apply" || button.textContent === "Dismiss").length, 0);
+  });
+
+  void it("wraps a pending question and a settled one in the same header", () => {
+    const panel = runPanel();
+    panel.post(
+      stateMessage({
+        entries: [],
+        timeline: [
+          { type: "message", value: { role: "question", text: "Which file?", at: "2026-09-20T10:00:00.000Z", atLabel: "10:00", awaitingAnswer: true, card: { cardId: "question:a", kind: "question", title: "Question: Which file?", state: "open", outcome: "needs your answer", expanded: true } } },
+          { type: "message", value: { role: "question", text: "Old?", at: "2026-09-20T09:00:00.000Z", atLabel: "09:00", settlementLine: "Dismissed by you.", card: { cardId: "question:b", kind: "question", title: "Question: Old?", state: "dismissed", outcome: "dismissed · 09:05", expanded: false } } },
+        ],
+      })
+    );
+    const headers = findByClass(panel.byId("messages"), "card-header");
+    assert.deepEqual(headers.map((header) => header.getAttribute("aria-expanded")), ["true", "false"]);
+    assert.match(headers[1]?.text() ?? "", /dismissed · 09:05/);
+  });
+
+  void it("scrolls a card that arrives after the first paint into view, and never takes focus", () => {
+    const panel = runPanel();
+    const first = decision({ card: cardOf("d1", "open", "needs your answer", true) });
+    panel.post(timelineOf(first));
+    assert.deepEqual(scrollLog.filter((id) => id === "d1"), [], "the first paint only records the cards that are there");
+    scrollLog.length = 0;
+    focusLog.length = 0;
+    const second = decision({ decisionId: "d2", card: cardOf("d2", "open", "needs your answer", true, "Decision needed: Second.") });
+    panel.post(timelineOf(first, second));
+    assert.deepEqual(scrollLog, ["d2"], "only the card that just arrived is scrolled into view");
+    assert.deepEqual(focusLog, [], "scrolling a new card never moves focus");
+    scrollLog.length = 0;
+    panel.post(timelineOf(first, second));
+    assert.deepEqual(scrollLog, [], "a repaint of the same cards scrolls nothing");
+  });
+
+  void it("the Open run log button posts through the panel's own API", () => {
+    const panel = runPanel();
+    const d = decision({
+      card: cardOf("d1", "open", "needs your answer", true),
+      evidence: [{ label: "Run log", detail: "see the file", openFilePath: "/w/t1/run.log" }],
+    });
+    panel.post(timelineOf(d));
+    const open = buttons(panel.byId("messages")).find((button) => button.textContent === "Open run log");
+    assert.ok(open, "the evidence line must carry an Open run log button");
+    open.listeners.get("click")![0]!({});
+    assert.deepEqual(plain(panel.outbound.at(-1)), { type: "openDecisionEvidence", filePath: "/w/t1/run.log" });
   });
 
   void it("renders an empty, untitled time span — never Invalid/NaN — when the record carried no usable time", () => {
@@ -552,6 +811,110 @@ void describe("the chat panel's inline script", () => {
     assert.equal(panel.byId("busy-text").textContent, "Waiting for your answer");
     panel.post(stateMessage({ waitingForUser: false }));
     assert.equal(panel.byId("busy-indicator").style.display, "none");
+  });
+
+  void describe("chat1 Step 6: the live run strip", () => {
+    const strip = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+      operationId: "op-7",
+      label: "Apply Review — High-Level Code Review",
+      model: "Claude Sonnet 5.5",
+      startedAt: Date.now() - 4 * 60_000,
+      sinceClock: "13:58",
+      latest: "pnpm run lint · 1/12 complete",
+      waiting: false,
+      cancellable: true,
+      ...overrides,
+    });
+
+    void it("shows what runs, on which model, since when, and its latest progress", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip() }));
+      const indicator = panel.byId("busy-indicator");
+      assert.equal(indicator.style.display, "block");
+      assert.equal(panel.byId("busy-text").textContent, "Running: Apply Review — High-Level Code Review");
+      const detail = panel.byId("busy-detail").textContent;
+      assert.match(detail, /Claude Sonnet 5\.5/);
+      assert.match(detail, /since 13:58 \(4 min\)/);
+      assert.match(detail, /pnpm run lint · 1\/12 complete/);
+    });
+
+    void it("updates in place from a runStrip message: no new conversation entry, no repaint of it", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip() }));
+      const rowsBefore = panel.byId("messages").children.length;
+      panel.post({ type: "runStrip", runStrip: strip({ latest: "2/12 complete" }) });
+      assert.match(panel.byId("busy-detail").textContent, /2\/12 complete/);
+      assert.equal(panel.byId("messages").children.length, rowsBefore, "the transcript is untouched");
+    });
+
+    void it("is hidden when the run ends, and replaced rather than stacked", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip() }));
+      panel.post({ type: "runStrip", runStrip: strip({ operationId: "op-8", label: "Publish Checks" }) });
+      assert.equal(panel.byId("busy-text").textContent, "Running: Publish Checks");
+      assert.equal(panel.byId("busy-actions").children.length, 2, "one set of links, not two");
+      panel.post({ type: "runStrip", runStrip: null });
+      assert.equal(panel.byId("busy-indicator").style.display, "none");
+      assert.equal(panel.byId("busy-text").textContent, "");
+      assert.equal(panel.byId("busy-detail").textContent, "");
+      assert.equal(panel.byId("busy-actions").children.length, 0);
+    });
+
+    void it("offers Show in Notifications, and Stop only for an operation that can be cancelled", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip() }));
+      const links = panel.byId("busy-actions").children;
+      assert.deepEqual(
+        links.map((link) => link.textContent),
+        ["Show in Notifications", "Stop"]
+      );
+      links[0]!.listeners.get("click")![0]!({});
+      links[1]!.listeners.get("click")![0]!({});
+      assert.deepEqual(JSON.parse(JSON.stringify(panel.outbound.slice(-2))), [
+        { type: "showRunInNotifications" },
+        { type: "stopRunFromStrip", operationId: "op-7" },
+      ]);
+      panel.post({ type: "runStrip", runStrip: strip({ operationId: "op-9", cancellable: false }) });
+      assert.deepEqual(
+        panel.byId("busy-actions").children.map((link) => link.textContent),
+        ["Show in Notifications"]
+      );
+    });
+
+    void it("announces only a change of label, not each progress tick", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip() }));
+      const label = panel.byId("busy-text");
+      let labelWrites = 0;
+      let current = label.textContent;
+      Object.defineProperty(label, "textContent", {
+        get: () => current,
+        set: (value: string) => {
+          labelWrites += 1;
+          current = value;
+        },
+      });
+      panel.post({ type: "runStrip", runStrip: strip({ latest: "3/12 complete" }) });
+      panel.post({ type: "runStrip", runStrip: strip({ latest: "4/12 complete" }) });
+      assert.equal(labelWrites, 0, "the live region is not rewritten for a progress tick");
+      panel.post({ type: "runStrip", runStrip: strip({ label: "Publish Checks" }) });
+      assert.equal(labelWrites, 1);
+    });
+
+    void it("says the run waits for the owner, and keeps the waiting banner when only a child waits", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip({ waiting: true }), waitingForUser: true, waitingForUserSource: "liveOperation" }));
+      assert.match(panel.byId("busy-text").textContent, /waiting for your answer/);
+      panel.post(stateMessage({ runStrip: null, waitingForUser: true, waitingForUserSource: "liveOperation" }));
+      assert.equal(panel.byId("busy-text").textContent, "Waiting for your answer");
+    });
+
+    void it("keeps the reason Send is disabled while a run is in progress", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip(), busy: true, busyLabel: "Implementation Review" }));
+      assert.equal(panel.byId("send-btn").disabled, true);
+      assert.match(panel.byId("send-reason").textContent, /Available when Implementation Review finishes/);
+    });
   });
 
   void it("shows the non-steering note on a task chat and hides it on the global chat", () => {

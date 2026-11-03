@@ -15,6 +15,8 @@ import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { missingCompletionArtifactsV1 } from "../utils/stageArtifactRequirementsV1";
 import { retirePendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisionDispatchV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { describeTaskActionFailureV1 } from "../utils/taskActionOutcomeTextV1";
+import { reportTaskHeldRefusalV1 } from "../utils/taskHeldRefusalNoticeV1";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -247,10 +249,26 @@ export async function markTaskDone(
       taskDisplayName: resolvedTask.progress.displayName,
     });
     if (outcome.kind !== "completed") {
+      // chat1 Steps 18 and 19: another action holds the task: say what, since when and what to do, in
+      // one entry. The refused operation's own end entry is skipped so the owner sees it once.
+      if (
+        reportTaskHeldRefusalV1({
+          outcome,
+          taskFolderPath: taskFolderUri.fsPath,
+          canonicalId: resolvedTask.canonicalId,
+          progress: resolvedTask.progress,
+          folderName: resolvedTask.folderName,
+          op,
+          attemptedAction: "Complete Task",
+          attemptedVerb: "complete",
+        })
+      ) {
+        return;
+      }
       const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
-      op.settleAs("failed", detail);
+      op.settleAs("failed", detail, { reportedByCommand: true });
       NotificationRouter.showError(
-        `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: could not complete — ${detail}.`
+        `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: could not complete — ${describeTaskActionFailureV1(outcome)}.`
       );
       return;
     }

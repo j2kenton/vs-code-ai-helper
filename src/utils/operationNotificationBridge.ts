@@ -9,6 +9,7 @@ import { offerActionInChatV1 } from "./chatActionOfferV1";
 import { appendChatMessageV1 } from "./chatHistoryStore";
 import { planInterruptedRecoveryV1 } from "./interruptedRecoveryPlanV1";
 import { readInterruptedRecoveryStateV1 } from "./interruptedRecoveryStateV1";
+import { takeRoundOutcomeDetailsForTaskV1 } from "./roundOutcomeDetailV1";
 
 /**
  * The centralized operation → Notifications-section terminal-entry policy
@@ -50,6 +51,10 @@ export function terminalEntryFor(
   if (snap.parentId !== undefined) {
     return undefined;
   }
+  // chat1 Step 19: the command already reported this refusal or failure in its own entry.
+  if (snap.reportedByCommandV1 === true && (snap.state === "refused" || snap.state === "failed")) {
+    return undefined;
+  }
   if (
     snap.kind !== undefined &&
     policyForKind(snap.kind).notification === "terminal-on-failure-only" &&
@@ -78,6 +83,13 @@ export function terminalEntryFor(
       ? snap.cancelReasonV1
       : snap.detail;
   const suffix = detail ? ` (${detail})` : "";
+  // chat1 Step 5: a failed or refused operation says why it did, so no end entry reads just
+  // "failed". The reason is what the owner of the operation recorded when it settled.
+  const settleReason =
+    (snap.state === "failed" || snap.state === "refused") && snap.endReasonV1 !== undefined
+      ? snap.endReasonV1.trim().replace(/[.\s]+$/, "")
+      : "";
+  const reasonSuffix = settleReason && !(detail && detail.includes(settleReason)) ? `: ${settleReason}` : "";
   const modelSuffix = snap.modelId ? ` — model: ${describeModelWithProviderV1(snap.modelId)}` : "";
   // Name the stage where the snapshot has one, unless the label already says it.
   const stageName = snap.stage !== undefined ? STAGE_DISPLAY_NAMES[snap.stage] : undefined;
@@ -86,7 +98,7 @@ export function terminalEntryFor(
   return {
     // The quoted name is a render-time decision: the snapshot's semantic
     // `taskName` (including persisted snapshots) stays unquoted.
-    message: `${snap.label} — ${formatTaskNameForDisplay(notificationTaskDisplayNameV1(snap.taskName, snap.key))}${stageText}: ${stateText}${modelSuffix}${suffix}`,
+    message: `${snap.label} — ${formatTaskNameForDisplay(notificationTaskDisplayNameV1(snap.taskName, snap.key))}${stageText}: ${stateText}${reasonSuffix}${modelSuffix}${suffix}`,
     level,
     sourceOperationId: snap.id,
     // Only present when set — keeps `terminalEntryFor` output free of
@@ -168,15 +180,29 @@ export async function offerInterruptedOperationRecoveryV1(
 export function installOperationNotificationBridge(): vscode.Disposable {
   return taskOperations.onDidEnd((snap) => {
     const entry = terminalEntryFor(snap);
+    // chat1 Step 5: a round that ended under this root operation left its detail (score, files
+    // changed, run log) here rather than as a chat line; it is part of this one end entry. Child
+    // operations never get an end entry, so their rounds' details wait for the root.
+    const roundDetails = snap.parentId === undefined ? takeRoundOutcomeDetailsForTaskV1(snap.key) : [];
     if (!entry) {
+      if (roundDetails.length > 0) {
+        // No end entry for this operation (a quiet success): the round's detail gets its own.
+        NotificationRouter.showInformation(
+          `${snap.label} — ${formatTaskNameForDisplay(notificationTaskDisplayNameV1(snap.taskName, snap.key))}: ${roundDetails.join(" — ")}`,
+          undefined,
+          undefined,
+          snap.id
+        );
+      }
       return;
     }
+    const message = roundDetails.length > 0 ? `${entry.message} — ${roundDetails.join(" — ")}` : entry.message;
     if (entry.level === "error") {
-      NotificationRouter.showError(entry.message, undefined, entry.resultTargetUri, entry.sourceOperationId);
+      NotificationRouter.showError(message, undefined, entry.resultTargetUri, entry.sourceOperationId);
     } else if (entry.level === "warning") {
-      NotificationRouter.showWarning(entry.message, undefined, entry.resultTargetUri, entry.sourceOperationId);
+      NotificationRouter.showWarning(message, undefined, entry.resultTargetUri, entry.sourceOperationId);
     } else {
-      NotificationRouter.showInformation(entry.message, undefined, entry.resultTargetUri, entry.sourceOperationId);
+      NotificationRouter.showInformation(message, undefined, entry.resultTargetUri, entry.sourceOperationId);
     }
   });
 }

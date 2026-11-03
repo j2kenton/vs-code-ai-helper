@@ -170,7 +170,7 @@ function trustedResumeConsequenceSuffixV1(attemptNumber: number, maxAttempts: nu
   );
 }
 
-const SINGLE_CYCLE_LABEL_SUFFIX_V1 = " and try again (one cycle)";
+const SINGLE_CYCLE_LABEL_SUFFIX_V1 = " and try again (one cycle, then stops)";
 const SINGLE_CYCLE_CONSEQUENCE_SUFFIX_V1 =
   " This runs one cycle and stops there — this was not raised by an active Fast Forward run (or that run " +
   "has since ended), so it does not start or resume Fast Forward.";

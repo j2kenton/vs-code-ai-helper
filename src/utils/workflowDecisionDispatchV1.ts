@@ -50,6 +50,7 @@ import { retirePendingQuestionsV1 } from "./cardLifecycleV1";
 import { recommendationPreconditionsV1 } from "./recommendationPreconditionsV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
+import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
 
 /**
  * Apply `recommendationPreconditionsV1` to every option of a decision about
@@ -636,7 +637,9 @@ export async function withdrawWorkflowDecisionsByKeyV1(
           text: `Withdrawn: ${reason}`,
           stage: decision.stage,
           at: new Date().toISOString(),
+          kind: "outcome",
         }, target.canonicalId).catch(() => undefined);
+        void logChatStatusToNotificationsV1(target.taskFolderPath, `Withdrawn: ${reason}`, decision.stage);
       }
     } catch (err) {
       console.error(`Failed to withdraw workflow decision "${decision.decisionId}"`, err);
@@ -702,7 +705,9 @@ export async function retirePendingWorkflowDecisionsForTaskV1(
           text: `Withdrawn: ${reason}`,
           stage: decision.stage,
           at: new Date().toISOString(),
+          kind: "outcome",
         }, target.canonicalId).catch(() => undefined);
+        void logChatStatusToNotificationsV1(target.taskFolderPath, `Withdrawn: ${reason}`, decision.stage);
       }
     } catch (err) {
       console.error(`Failed to retire workflow decision "${decision.decisionId}"`, err);
@@ -724,7 +729,9 @@ async function announceDroppedAwaitedDecisionV1(decision: WorkflowDecisionV1): P
     text: describeOrphanedAwaitedDecisionV1(decision),
     stage: decision.stage,
     at: new Date().toISOString(),
+    kind: "outcome",
   }, decision.taskCanonicalId).catch(() => undefined);
+  void logChatStatusToNotificationsV1(folder, describeOrphanedAwaitedDecisionV1(decision), decision.stage);
 }
 
 /**

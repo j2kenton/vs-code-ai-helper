@@ -265,6 +265,15 @@ import {
   detectForeignTaskArtifactChangesV1,
   type ForeignTaskArtifactSnapshotV1,
 } from "./foreignTaskArtifactContainmentV1";
+import { normalizePath } from "./taskRoot";
+import { isOperationLiveByIdV1 } from "./liveTaskOperationLookupV1";
+import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
+import {
+  claimRoundNotificationV1,
+  releaseRoundNotificationV1,
+  roundOutcomeDetailOfV1,
+  stashRoundOutcomeDetailV1,
+} from "./roundOutcomeDetailV1";
 
 const roundArtifactSnapshotsV1 = new Map<string, ForeignTaskArtifactSnapshotV1>();
 
@@ -919,36 +928,69 @@ export async function terminalizeRoundV1(
     }
   }
   const mayPostOutcomeLine = claimTerminalLineV1(terminalLineKey, "ledger") && !observerLinePersisted;
+  let outcomeText: string | undefined;
   try {
-    if (!mayPostOutcomeLine) {
-      return { ok: true, alreadyTerminal: false, entry, progress: patched };
-    }
-    await appendChatMessageV1(
-      options.taskFolderUri.fsPath,
-      {
-        role: "assistant",
-        text: formatRoundOutcomeMessageV1(
-          entry,
-          entry.continuationOf
-            ? patched.roundLedger?.find((candidate) => candidate.roundId === entry.continuationOf)?.startedAt
-            : undefined,
-          patched,
-          [options.chatAttributionNote, foreignArtifactNote].filter(Boolean).join("\n\n") || undefined
-        ),
-        stage: entry.stage,
-        at: entry.endedAt ?? new Date().toISOString(),
-        kind: "outcome",
-        roundId: entry.roundId,
-        ...(entry.intentId !== undefined ? { intentId: entry.intentId } : {}),
-        ...(entry.operationId !== undefined ? { endedOperationId: entry.operationId } : {}),
-      },
-      options.canonicalId ?? options.taskFolderUri.fsPath
+    outcomeText = formatRoundOutcomeMessageV1(
+      entry,
+      entry.continuationOf
+        ? patched.roundLedger?.find((candidate) => candidate.roundId === entry.continuationOf)?.startedAt
+        : undefined,
+      patched,
+      [options.chatAttributionNote, foreignArtifactNote].filter(Boolean).join("\n\n") || undefined
     );
+    if (mayPostOutcomeLine) {
+      await appendChatMessageV1(
+        options.taskFolderUri.fsPath,
+        {
+          role: "assistant",
+          text: outcomeText,
+          stage: entry.stage,
+          at: entry.endedAt ?? new Date().toISOString(),
+          kind: "outcome",
+          roundId: entry.roundId,
+          ...(entry.intentId !== undefined ? { intentId: entry.intentId } : {}),
+          ...(entry.operationId !== undefined ? { endedOperationId: entry.operationId } : {}),
+        },
+        options.canonicalId ?? options.taskFolderUri.fsPath
+      );
+    }
   } catch {
     // Best-effort only — the ledger write above is authoritative and already
     // landed; reconciliation pass (b) repairs a missing outcome message.
     // Give the claim back so that repair is not suppressed by the registry.
-    releaseLedgerTerminalLineV1(terminalLineKey);
+    if (mayPostOutcomeLine) {
+      releaseLedgerTerminalLineV1(terminalLineKey);
+    }
+  }
+
+  // chat1 Step 5: the chat does not render this line, so Notifications carries it, once. This is
+  // independent of who posted the chat line: when the operation observer already posted its
+  // "Ended" line (or a persisted one exists after a reload), the round's detail is still owed to
+  // Notifications. While the operation that ran the round is live, the detail is folded into that
+  // operation's end entry; otherwise the round gets its own entry. A separate claim keeps a
+  // repeated terminalization of the same round from sending it twice.
+  if (outcomeText !== undefined && claimRoundNotificationV1(terminalLineKey)) {
+    try {
+      const outcomeHead = `Ended: ${stepOutcomeNameV1(entry.mode, STAGE_DISPLAY_NAMES[entry.stage] ?? entry.stage)} — ${entry.state}`;
+      const outcomeDetail = roundOutcomeDetailOfV1(outcomeText, outcomeHead);
+      const operationStillLive =
+        entry.operationId !== undefined &&
+        isOperationLiveByIdV1(options.taskFolderUri.fsPath, entry.operationId) === true;
+      if (operationStillLive && entry.operationId !== undefined) {
+        if (outcomeDetail !== undefined) {
+          stashRoundOutcomeDetailV1(normalizePath(options.taskFolderUri.fsPath), entry.operationId, outcomeDetail);
+        }
+      } else {
+        void logChatStatusToNotificationsV1(
+          options.taskFolderUri.fsPath,
+          outcomeText.replace(/^_+|_+$/g, ""),
+          entry.stage,
+          entry.state === "failed" ? "warning" : "info"
+        );
+      }
+    } catch {
+      releaseRoundNotificationV1(terminalLineKey);
+    }
   }
 
   return { ok: true, alreadyTerminal: false, entry, progress: patched };

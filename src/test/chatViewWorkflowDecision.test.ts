@@ -267,6 +267,15 @@ function lastState(fake: FakeWebviewView): Record<string, unknown> | undefined {
   return fake.posted.filter((m) => m.type === "state").pop();
 }
 
+/**
+ * chat1 Steps 2 and 3: acknowledgements such as "Recorded: …", "Dismissed …" and "Withdrawn: …" are
+ * status lines. They are stored in `chat-v1.json` tagged `outcome` (or `activity`), logged to
+ * Notifications, and not posted to the panel as transcript entries; read them from the store.
+ */
+async function storedStatusLines(folder: string): Promise<Array<{ role: string; text: string; kind?: string }>> {
+  return (await readChatHistory(folder)).filter((entry) => entry.kind === "outcome" || entry.kind === "activity");
+}
+
 /** Polls for a condition against the most recently posted "state" message —
  * state re-renders asynchronously via `taskOperations.onDidChange` ->
  * `render()`, not synchronously with `taskOperations.begin`/`end`. */
@@ -1064,10 +1073,16 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "wait" });
 
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.text.includes("Wait"));
-      assert.ok(ack, "expected a transcript entry acknowledging the resolved decision");
+      assert.ok(ack, "expected a stored entry acknowledging the resolved decision");
       assert.match(ack.text, /does nothing further/i);
+      assert.equal(ack.kind, "outcome", "a status line, tagged at its source");
+      assert.deepEqual(
+        ((lastState(fake)?.entries as Array<{ text: string }> | undefined) ?? []).filter((e) => e.text.includes("Wait")),
+        [],
+        "the acknowledgement is not a chat entry"
+      );
 
       const persisted = await readChatHistory(folder);
       assert.equal(persisted.length, 1, "the acknowledgement must actually be written to the transcript, not only rendered");
@@ -1093,9 +1108,9 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
 
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.text.includes("Do it"));
-      assert.ok(ack, "expected a transcript entry acknowledging the resolved decision");
+      assert.ok(ack, "expected a stored entry acknowledging the resolved decision");
       assert.match(ack.text, /applying now/i);
     } finally {
       notify.restore();
@@ -1192,8 +1207,19 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       const texts = entries.map((entry) => entry.text);
       assert.ok(texts.some((text) => /Started Publish Checks — Publish(?::.*)? at \d{2}:\d{2}/.test(text)));
       assert.ok(texts.some((text) => text.includes("lint, test, verify:workflow-safety")));
-      assert.ok(texts.some((text) => text.includes("Progress: Publish Checks — Publish: test")));
       assert.ok(texts.some((text) => text.includes("Ended Publish Checks — succeeded")));
+      // chat1 Steps 3 and 4: no per-tick Progress line; Started is `activity`, Ended is `outcome`.
+      assert.ok(!texts.some((text) => text.startsWith("Progress:")), "progress belongs to the live strip");
+      assert.equal(entries.find((entry) => entry.text.startsWith("Started Publish Checks"))?.kind, "activity");
+      assert.equal(entries.find((entry) => entry.text.startsWith("Ended Publish Checks"))?.kind, "outcome");
+      // chat1 Step 2: and the chat posted to the panel shows none of those status lines.
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const posted = lastState(fake) as { entries?: Array<{ text: string }>; timeline?: Array<{ type: string; value: { text?: string } }> };
+      const shown = (posted.entries ?? []).map((entry) => entry.text);
+      assert.ok(shown.every((text) => !/^(Started|Ended|Progress:|Resumed)/.test(text)), shown.join("\n"));
+      assert.ok(
+        (posted.timeline ?? []).every((item) => item.type !== "message" || !/^(Started|Ended|Progress:)/.test(item.value.text ?? ""))
+      );
     } finally {
       commandsObj._executeCommandOverride = originalCommand;
       notify.restore();
@@ -1431,7 +1457,10 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         [{ id: "vs-code-ai-helper.goToReviewAndApply", args: ["arg1"] }],
         "the command must still be dispatched exactly once"
       );
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = [
+        ...(await storedStatusLines(folder)),
+        ...((lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? []),
+      ];
       const applyingAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /applying now/i.test(e.text));
       assert.ok(applyingAck, "expected the immediate 'applying now' acknowledgement before the command resolves");
       const failureAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /did not complete/i.test(e.text));
@@ -1579,7 +1608,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       await fake.send({ type: "resolveWorkflowDecision", decisionId: "apply-ticks-1", optionId: "apply" });
 
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.text.includes('Recorded: "Apply 2 Reviewer-Verified Ticks and resume the task"'));
       assert.ok(ack, "expected the confirmation line for the Apply option");
       assert.match(
@@ -1651,7 +1680,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       await fake.send({ type: "resolveWorkflowDecision", decisionId: "other-1", optionId: "leaveIt" });
 
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.text.includes('Recorded: "Leave it paused'));
       assert.ok(ack, "expected the confirmation line for the doNothing option");
       assert.doesNotMatch(
@@ -1703,7 +1732,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "letItRun" });
 
       assert.equal(cmds.calls.length, 0, "a doNothing option must never dispatch a command");
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.text.includes("Keep running Implementation"));
       assert.ok(ack, "expected a transcript entry acknowledging the resolved decision");
       assert.match(ack.text, /does nothing further/i);
@@ -1933,7 +1962,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         [{ id: "vs-code-ai-helper.openAiModels", args: [] }],
         "the chosen option's bound command must actually be dispatched"
       );
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.role === "assistant" && /applying now/i.test(e.text));
       assert.ok(ack, "expected an 'applying now' acknowledgement, matching the decision-card effect path");
 
@@ -1982,7 +2011,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       await fake.send({ type: "confirmInteraction", operationId, interactionId, answers: VALID_ANSWERS });
 
       assert.deepEqual(cmds.calls, [], "a doNothing effect must dispatch no command");
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.role === "assistant" && /does nothing further/i.test(e.text));
       assert.ok(ack, "expected a 'does nothing further' acknowledgement for the doNothing option");
     } finally {
@@ -2597,9 +2626,9 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         answers: VALID_ANSWERS,
       });
 
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.role === "assistant" && /Recorded: your answer was submitted/.test(e.text));
-      assert.ok(ack, "expected an answer-only submission to be acknowledged directly in the transcript");
+      assert.ok(ack, "expected an answer-only submission to be acknowledged directly in the stored transcript");
     } finally {
       notify.restore();
       cmds.restore();
@@ -3297,6 +3326,11 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
           `run-status plumbing ("${goneMarker}") no longer belongs in Chat With AI`
         );
       }
+      // chat1 Step 6: "is it running?" has exactly one answer, the strip: a single element, replaced
+      // in place by `runStrip` messages and never appended to the transcript.
+      assert.equal(html.split('id="busy-indicator"').length - 1, 1, "one strip element");
+      assert.match(html, /s\.type==='runStrip'/, "progress ticks arrive as their own message");
+      assert.equal(html.includes("Progress:"), false, "the webview writes no Progress line of its own");
     } finally {
       provider.dispose();
     }
@@ -3352,13 +3386,21 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
 
       // Poll for the immediate submission acknowledgement while Resume is
       // still held open by resumeGate — proving it does not wait on it.
-      await waitForState(fake, (s) => {
-        const entries = (s.entries as Array<{ role: string; text: string }> | undefined) ?? [];
-        return entries.some(
-          (e) => e.role === "assistant" && /Recorded: your answer was submitted\. Resuming…/.test(e.text)
-        );
-      });
-      let entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      // chat1: the acknowledgements are status lines, so they are read from the stored transcript.
+      let entries = await storedStatusLines(folder);
+      for (
+        let retry = 0;
+        retry < 200 &&
+        !entries.some((e) => e.role === "assistant" && /Recorded: your answer was submitted\. Resuming…/.test(e.text));
+        retry++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        entries = await storedStatusLines(folder);
+      }
+      assert.ok(
+        entries.some((e) => e.role === "assistant" && /Recorded: your answer was submitted\. Resuming…/.test(e.text)),
+        "the submission is acknowledged while resume() is still held open"
+      );
       assert.ok(
         !entries.some((e) => e.role === "assistant" && /^Resumed/.test(e.text)),
         "the resume-completion message must not appear before resume() has actually resolved"
@@ -3367,7 +3409,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       releaseResume?.();
       await sendPromise;
 
-      entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      entries = await storedStatusLines(folder);
       assert.ok(
         entries.some((e) => e.role === "assistant" && /^Resumed — the action is continuing\./.test(e.text)),
         "expected the resume outcome to be acknowledged once resume() actually completes"
@@ -3550,16 +3592,18 @@ void describe("Chat With AI — a pending 'applyReviewerVerifiedTicks' decision 
       // up the freshly-appended message, exactly like any other transcript
       // write that lands mid-render.
       await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
-      await waitForState(fake, (s) => {
-        const entries = (s.entries as Array<{ role: string; text: string }> | undefined) ?? [];
-        return entries.some((e) => e.role === "assistant" && e.text.startsWith("Withdrawn: "));
-      });
-
-      const entries = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
-      assert.ok(
-        entries.some((e) => e.role === "assistant" && e.text.startsWith("Withdrawn: ")),
-        "expected a transcript line recording why the card was withdrawn"
-      );
+      let stored = await storedStatusLines(folder);
+      for (let retry = 0; retry < 200 && !stored.some((e) => e.text.startsWith("Withdrawn: ")); retry++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        stored = await storedStatusLines(folder);
+      }
+      // chat1: the line is a status line — stored as an `outcome`, logged to Notifications, not a chat entry.
+      const withdrawn = stored.find((e) => e.role === "assistant" && e.text.startsWith("Withdrawn: "));
+      assert.ok(withdrawn, "expected a stored line recording why the card was withdrawn");
+      assert.equal(withdrawn.kind, "outcome");
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl-high-review" });
+      const shown = (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      assert.ok(!shown.some((e) => e.text.startsWith("Withdrawn: ")), "and the chat does not show it");
     } finally {
       realFs.restore();
       notify.restore();
@@ -4488,10 +4532,9 @@ void describe("Chat With AI — RC2 item 8, Step 38: the real three-card scenari
         // Click Apply on the ticks card.
         await fake.send({ type: "resolveWorkflowDecision", decisionId: ticksDecision.decisionId, optionId: "apply" });
 
-        const entriesAfterTicks =
-          (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+        const entriesAfterTicks = await storedStatusLines(folder);
         const ticksAck = entriesAfterTicks.find((e) =>
-          e.text.includes('Recorded: "Apply 2 Reviewer-Verified Ticks and try again (one cycle)"')
+          e.text.includes('Recorded: "Apply 2 Reviewer-Verified Ticks and try again (one cycle, then stops)"')
         );
         assert.ok(ticksAck, "expected the confirmation line for the ticks card's Apply option");
         assert.match(
@@ -4827,10 +4870,10 @@ void describe("bugs5 Step 6: Dismiss on the idle 'checklist is flagged unreliabl
       assert.equal(cards.length, 1, "the idle card is shown while the flag is set");
 
       await firstView.send({ type: "resolveWorkflowDecision", decisionId: cards[0]!.decisionId, optionId: "__dismiss__" });
-      const entries = (lastState(firstView)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       assert.ok(
         entries.some((e) => e.role === "assistant" && /^Dismissed "This task's plan checklist is flagged unreliable"/.test(e.text)),
-        "a Dismissed line is recorded in the chat"
+        "a Dismissed line is recorded in the task's stored chat (and logged to Notifications)"
       );
       assert.equal(idleCards(firstView).length, 0, "the card is gone after Dismiss");
       first.dispose();
@@ -4956,7 +4999,7 @@ void describe("bugs5 Steps 7 and 9: a card a running command waits on", () => {
       assert.match(card?.dismissTitle ?? "", /Dismissing stops this Commit & Push; nothing is committed\./);
 
       await view.send({ type: "resolveWorkflowDecision", decisionId: "cp-1", optionId: "commitAndPush" });
-      const entries = (lastState(view)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const recorded = entries.find((e) => e.role === "assistant" && e.text.startsWith("Recorded:"));
       assert.ok(recorded, "a Recorded line is written");
       assert.match(recorded.text, /^Recorded: "Commit & Push" — staging, committing and pushing now\./);
@@ -4981,7 +5024,7 @@ void describe("bugs5 Steps 7 and 9: a card a running command waits on", () => {
       await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "publish" });
       await waitForStateMessage(view);
       await view.send({ type: "resolveWorkflowDecision", decisionId: "cp-1", optionId: "__dismiss__" });
-      const entries = (lastState(view)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+      const entries = await storedStatusLines(folder);
       const dismissed = entries.find((e) => e.role === "assistant" && e.text.startsWith("Dismissed"));
       assert.ok(dismissed);
       assert.match(

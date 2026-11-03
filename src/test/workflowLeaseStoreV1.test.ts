@@ -24,12 +24,18 @@ void describe("workflowLeaseStoreV1", () => {
 
   void it("rejects a duplicate acquisition with the stable coordinator outcome", () => {
     const store = createWorkflowLeaseStoreV1();
-    const first = store.acquire("binding-a", "generatePlan.v1", allocateHex128IdV1());
+    const firstOperationId = allocateHex128IdV1();
+    const first = store.acquire("binding-a", "generatePlan.v1", firstOperationId);
     assert.equal(first.ok, true);
     const second = store.acquire("binding-a", "draft.v1", allocateHex128IdV1());
     assert.equal(second.ok, false);
-    if (!second.ok) {
-      assert.deepEqual(second.outcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+    if (!second.ok && first.ok) {
+      // chat1 Step 18: the refusal says who holds the task.
+      assert.deepEqual(second.outcome, {
+        kind: "duplicateRejected",
+        code: "operationAlreadyRunning",
+        holder: { actionKey: "generatePlan.v1", operationId: firstOperationId, acquiredAt: first.lease.acquiredAt },
+      });
     }
     // A different task binding is unaffected.
     assert.equal(store.acquire("binding-b", "draft.v1", allocateHex128IdV1()).ok, true);
@@ -107,8 +113,12 @@ void describe("workflowLeaseStoreV1", () => {
         allocateHex128IdV1()
       );
       assert.equal(impostor.ok, false);
-      if (!impostor.ok) {
-        assert.deepEqual(impostor.outcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+      if (!impostor.ok && acquired.ok) {
+        assert.deepEqual(impostor.outcome, {
+          kind: "duplicateRejected",
+          code: "operationAlreadyRunning",
+          holder: { actionKey: "commitPush.v1", operationId: realOperationId, acquiredAt: acquired.lease.acquiredAt },
+        });
       }
     });
 

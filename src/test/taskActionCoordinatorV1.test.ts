@@ -2778,7 +2778,8 @@ void describe("taskActionCoordinatorV1", () => {
     );
     assert.equal(held.ok, true);
     const outcome = await harness.coordinator.executeAction(baseRequest());
-    assert.deepEqual(outcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+    assert.equal(outcome.kind, "duplicateRejected");
+    assert.equal(outcome.kind === "duplicateRejected" ? outcome.holder?.actionKey : undefined, "otherAction.v1");
     assert.equal(harness.selection.opened, 0);
     assert.equal(harness.selection.reserved, 0);
   });
@@ -2886,8 +2887,10 @@ void describe("taskActionCoordinatorV1", () => {
         cancellationToken: fakeToken(),
       });
 
-      assert.deepEqual(unrelatedOutcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
-      assert.deepEqual(impostorOutcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+      for (const rejected of [unrelatedOutcome, impostorOutcome] as { kind?: string; code?: string }[]) {
+        assert.equal(rejected.kind, "duplicateRejected");
+        assert.equal(rejected.code, "operationAlreadyRunning");
+      }
       assert.equal(outcome.kind, "completed");
       // Exactly one provider invocation actually ran: the legitimate child.
       assert.equal(harness.promoted.length, 1);
@@ -2943,7 +2946,7 @@ void describe("taskActionCoordinatorV1", () => {
     const duplicate = await harness.coordinator.admitAction(baseRequest());
     assert.equal(duplicate.kind, "settled");
     if (duplicate.kind === "settled") {
-      assert.deepEqual(duplicate.outcome, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+      assert.equal(duplicate.outcome.kind, "duplicateRejected");
     }
     harness.leaseStore.release(held.ok ? held.lease.leaseId : "");
 
@@ -4638,7 +4641,7 @@ void describe("taskActionCoordinatorV1", () => {
     );
     assert.equal(held.ok, true);
     const duplicate = await resume();
-    assert.deepEqual(duplicate, { kind: "duplicateRejected", code: "operationAlreadyRunning" });
+    assert.equal(duplicate.kind, "duplicateRejected");
     if (held.ok) {
       harness.leaseStore.release(held.lease.leaseId);
     }

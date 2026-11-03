@@ -81,8 +81,13 @@ class WorkflowLeaseStoreImplV1 implements WorkflowLeaseStoreV1 {
     actionKey: ActionKeyV1,
     operationId: OperationIdV1
   ): TaskOperationLeaseAcquireResultV1 {
-    if (this.leasesByBinding.has(taskBindingId)) {
-      return { ok: false, outcome: duplicateRejectedV1() };
+    const held = this.leasesByBinding.get(taskBindingId);
+    if (held !== undefined) {
+      // chat1 Step 18: the refusal carries who holds the task.
+      return {
+        ok: false,
+        outcome: duplicateRejectedV1({ actionKey: held.actionKey, operationId: held.operationId, acquiredAt: held.acquiredAt }),
+      };
     }
     const lease: TaskOperationLeaseV1 = {
       leaseId: allocateHex128IdV1(),
@@ -107,7 +112,14 @@ class WorkflowLeaseStoreImplV1 implements WorkflowLeaseStoreV1 {
       // duplicate. This is the entire safety property — a child can only
       // ever be granted to the operation that already exclusively holds the
       // binding, never to an unrelated caller.
-      return { ok: false, outcome: duplicateRejectedV1() };
+      return {
+        ok: false,
+        outcome: duplicateRejectedV1(
+          parent === undefined
+            ? undefined
+            : { actionKey: parent.actionKey, operationId: parent.operationId, acquiredAt: parent.acquiredAt }
+        ),
+      };
     }
     const lease: TaskOperationLeaseV1 = {
       leaseId: allocateHex128IdV1(),

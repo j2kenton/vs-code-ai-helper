@@ -74,6 +74,12 @@ import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
 import { listLiveRoundLeaseIdsV1 } from "../state/roundLeaseV1";
 import { reconcileOrphanedRoundLedgerRowsV1 } from "../utils/roundLedgerReconciliationV1";
+import {
+  claimTerminalLineV1,
+  resetTerminalLinesV1,
+  terminalLineKeyForRoundV1,
+} from "../utils/terminalLineEmitterV1";
+import { clearRoundOutcomeDetailsV1 } from "../utils/roundOutcomeDetailV1";
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 const runnerRegistryModule = require("../runners/runnerRegistry") as Record<string, unknown>;
@@ -356,6 +362,47 @@ function installWorkspaceFoldersStub(): { restore: () => void } {
 }
 
 void describe("terminalizeRoundV1 (Part 4 step 12/13/47)", () => {
+  // chat1 Step 5: the observer posting its own "Ended" line first must not drop the round's detail
+  // from Notifications, and a repeated terminalization must not send it twice.
+  void it("still sends the round's ending to Notifications once when the observer line came first", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const notices: string[] = [];
+    initNotificationRouter({
+      addEntry: (...args: unknown[]): void => {
+        notices.push(String(args[0]));
+      },
+    });
+    clearRoundOutcomeDetailsV1();
+    resetTerminalLinesV1();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("round_observer_first");
+      assert.equal(
+        claimTerminalLineV1(terminalLineKeyForRoundV1({ roundId: "round-open-1" }, folderPath), "operation"),
+        true,
+        "the observer claims the terminal line first"
+      );
+
+      const first = await terminalizeRoundV1("round-open-1", "completed", undefined, { taskFolderUri: folderUri });
+      assert.equal(first.ok, true);
+      const messages = await readChatHistory(folderPath, folderPath);
+      assert.equal(messages.filter((m) => m.kind === "outcome").length, 0, "no second chat line");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const ending = notices.filter((n) => /Ended:/.test(n));
+      assert.equal(ending.length, 1, `the round's ending reaches Notifications once: ${JSON.stringify(notices)}`);
+
+      await terminalizeRoundV1("round-open-1", "completed", undefined, { taskFolderUri: folderUri });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      assert.equal(notices.filter((n) => /Ended:/.test(n)).length, 1, "a repeat sends nothing more");
+    } finally {
+      deactivateNotificationRouter();
+      resetTerminalLinesV1();
+      clearRoundOutcomeDetailsV1();
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
   void it("reports foreign task artifacts changed during a round in the terminal chat outcome", async () => {
     const fsBridge = installFsBridge();
     const wsStub = installWorkspaceFoldersStub();

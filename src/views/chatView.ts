@@ -19,6 +19,23 @@ import {
   stillStartingLineV1,
 } from "../utils/startupAnnouncerLinesV1";
 import { operationChatLabelV1 } from "../utils/stepLabelsV1";
+import { logChatStatusToNotificationsV1 } from "../utils/chatStatusLogV1";
+import { isConversationEntryV1 } from "./chatTranscriptFilterV1";
+import {
+  cardViewFromDecisionV1,
+  cardViewFromSettlementV1,
+  formSettlementV1,
+  interactionSettlementV1,
+  trimmedCardViewV1,
+  type ChatCardViewV1,
+} from "./chatCardLifecycleV1";
+import {
+  CARD_EXPAND_CHOICES_KEY_V1,
+  forgetStaleCardExpandChoicesV1,
+  isCardExpandedV1,
+  readCardExpandChoicesV1,
+  saveCardExpandChoiceV1,
+} from "./chatCardExpandStateV1";
 import { NotificationRouter, getNotificationRouterStatus } from "../utils/notificationRouter";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import {
@@ -45,7 +62,8 @@ import {
 import { applyOpenPlanItemsFormSubmissionV1, dismissOpenPlanItemsFormV1 } from "../commands/decideOpenPlanItemsV1";
 import { stripAttributionHeaders } from "../utils/fileUtils";
 import { writeRunLog } from "../utils/runLog";
-import { formatDisplayTimestampPairV1, formatTimestampForDisplay } from "../utils/timeFormat";
+import { formatDisplayTimestampPairV1, formatTimeHHmm, formatTimestampForDisplay } from "../utils/timeFormat";
+import { buildRunStripV1, runStripChangedV1, type RunStripV1 } from "./chatRunStripV1";
 import {
   appendOwnerEvidenceThenV1,
   OWNER_EVIDENCE_ANSWER_MARKER_V1,
@@ -380,6 +398,10 @@ function isDismissQuestionMessage(value: unknown): value is DismissQuestionMessa
  * dispatches nothing.
  */
 export const DISMISS_DECISION_OPTION_ID_V1 = "__dismiss__";
+
+/** chat1 Step 15: what a card says inside itself when Dismiss left it open. */
+export const CARD_DISMISS_STILL_OPEN_REASON_V1 =
+  "Dismiss did not go through, so the card is still open. Try again, or check the Notifications view for the reason.";
 
 interface InteractionActionMessage {
   /**
@@ -819,12 +841,47 @@ export function describeInteractionAnswersV1(interaction: {
   return parts.join("; ");
 }
 
+/** chat1 Step 8: a card's one-line title: its heading plus the first line of what happened, kept short. */
+export function decisionCardTitleV1(headingText: string, whatHappened: string): string {
+  const firstLine = (whatHappened.split(/\r?\n/)[0] ?? "").replace(/\s+/g, " ").trim();
+  const cut = firstLine.length > 90 ? `${firstLine.slice(0, 87).trimEnd()}…` : firstLine;
+  return cut.length > 0 ? `${headingText}: ${cut}` : headingText;
+}
+
+/**
+ * chat1 Step 8: the finished decisions of one task's stage that the chat keeps showing, read-only and
+ * collapsed. A withdrawn or replaced record is left out when a fresher record of the same card exists,
+ * because that one is what the owner sees; every other finished record stays.
+ */
+export function settledDecisionsForTimelineV1(
+  all: readonly WorkflowDecisionV1[],
+  stage: TaskStage
+): WorkflowDecisionV1[] {
+  const forStage = all.filter((decision) => decision.stage === stage);
+  return forStage.filter((decision) => {
+    if (decision.state === "pending") return false;
+    if (decision.state !== "withdrawn" && decision.state !== "superseded") return true;
+    const created = Date.parse(decision.createdAt);
+    return !forStage.some(
+      (other) =>
+        other.decisionId !== decision.decisionId &&
+        other.decisionKey === decision.decisionKey &&
+        Date.parse(other.createdAt) > created
+    );
+  });
+}
+
+/** The card fields every card kind carries to the page: the view plus whether it is shown expanded. */
+export interface ChatCardPayloadV1 extends ChatCardViewV1 {
+  readonly expanded: boolean;
+}
+
 /** Merge durable transcript records and workspace-state decision cards by
  * their recorded time. A decision anchor wins over its `createdAt` fallback
  * and sits immediately after the message that announced it. */
 function buildChatTimelineV1<
   T extends { readonly at: string; readonly decisionId?: string },
-  D extends WorkflowDecisionV1
+  D extends { readonly decisionId: string; readonly createdAt: string }
 >(entries: readonly T[], decisions: readonly D[]): Array<{ type: "message"; value: T } | { type: "decision"; value: D }> {
   const anchorAt = new Map<string, string>();
   for (const entry of entries) {
@@ -1059,6 +1116,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * a different `detail`/`waitingForUser`) still repaints immediately.
    */
   private lastOperationsSignatureV1: string | undefined;
+  /**
+   * chat1 Step 6: the live run strip. It is posted as its own `runStrip` message, at most once a
+   * second, and never through a full render (RC2 item 11): progress ticks change only this line.
+   */
+  private lastRunStripV1: RunStripV1 | undefined;
+  private lastRunStripPostAtV1 = 0;
+  private runStripPostTimerV1: ReturnType<typeof setTimeout> | undefined;
   private operationTraceWriteQueueV1: Promise<void> = Promise.resolve();
   /**
    * Coalesces renders requested by the four reactive subscriptions below
@@ -1182,6 +1246,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return JSON.stringify(ops.map((op) => [op.id, op.state, op.waitingForUser, op.startedAt]));
   }
 
+  /** The strip for this panel's task: what is running now, or undefined when nothing is. */
+  private currentRunStripV1(): RunStripV1 | undefined {
+    const target = this.target;
+    if (!target || target.kind === "global") return undefined;
+    return buildRunStripV1(taskOperations.getTaskOperations(target.canonicalId), target.stage, (epochMs) =>
+      formatTimeHHmm(new Date(epochMs))
+    );
+  }
+
+  /** Post the strip if it changed, at most once a second; a burst of ticks costs one trailing post. */
+  private scheduleRunStripPostV1(): void {
+    if (!this.view || this.runStripPostTimerV1 !== undefined) return;
+    const wait = Math.max(0, this.lastRunStripPostAtV1 + 1000 - Date.now());
+    this.runStripPostTimerV1 = setTimeout(() => {
+      this.runStripPostTimerV1 = undefined;
+      const strip = this.currentRunStripV1();
+      if (!this.view || !runStripChangedV1(this.lastRunStripV1, strip)) return;
+      this.lastRunStripV1 = strip;
+      this.lastRunStripPostAtV1 = Date.now();
+      void this.view.webview.postMessage({ type: "runStrip", runStrip: strip ?? null });
+    }, wait);
+    this.runStripPostTimerV1.unref?.();
+  }
+
   constructor(private readonly state: vscode.Memento) {
     setChatRevealHandlerV1((decisionId) => this.revealForOwnerCardV1(decisionId));
     this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
@@ -1204,6 +1292,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // full render here.
     this.operationsSub = taskOperations.onDidChange(() => {
       if (!this.target || !this.view) return;
+      // chat1 Step 6: progress ticks update only the strip, in place.
+      this.scheduleRunStripPostV1();
       const signature = this.computeOperationsSignatureV1();
       if (signature === this.lastOperationsSignatureV1) return;
       this.lastOperationsSignatureV1 = signature;
@@ -1269,6 +1359,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.decisionsSub.dispose();
     this.chatHistorySub.dispose();
     this.schedulingIntentSub.dispose();
+    if (this.runStripPostTimerV1 !== undefined) {
+      clearTimeout(this.runStripPostTimerV1);
+      this.runStripPostTimerV1 = undefined;
+    }
   }
 
   setDefaultTargetFactory(factory: () => Promise<ChatTarget | undefined>): void {
@@ -1330,6 +1424,48 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         void this.render();
         return;
       }
+      // chat1 Step 6: the strip's two links. Notifications has no way to select one row, so the link
+      // focuses the view; Stop is the cancel the Notifications row uses, for an operation of this task.
+      if (message && typeof message === "object" && (message as { type?: unknown }).type === "showRunInNotifications") {
+        await vscode.commands.executeCommand("vs-code-ai-helper.statusView.focus");
+        return;
+      }
+      if (
+        message &&
+        typeof message === "object" &&
+        (message as { type?: unknown }).type === "stopRunFromStrip" &&
+        typeof (message as { operationId?: unknown }).operationId === "string"
+      ) {
+        const operationId = (message as { operationId: string }).operationId;
+        if (
+          this.target &&
+          taskOperations.getTaskOperations(this.target.canonicalId).some((op) => op.id === operationId)
+        ) {
+          await vscode.commands.executeCommand("vs-code-ai-helper.cancelOperation", { id: operationId });
+        }
+        return;
+      }
+      // chat1 Step 13: the owner expanded or collapsed one card. The page already toggled; this saves the
+      // choice with the state the card was in, so a re-render or a window reload shows the same.
+      if (
+        message &&
+        typeof message === "object" &&
+        (message as { type?: unknown }).type === "toggleCard" &&
+        typeof (message as { cardId?: unknown }).cardId === "string" &&
+        typeof (message as { expanded?: unknown }).expanded === "boolean" &&
+        typeof (message as { state?: unknown }).state === "string"
+      ) {
+        const toggle = message as { cardId: string; expanded: boolean; state: string };
+        const knownStates = ["open", "answered", "dismissed", "withdrawn", "retired"];
+        if (toggle.cardId.length <= 300 && knownStates.includes(toggle.state)) {
+          await saveCardExpandChoiceV1(this.state, {
+            cardId: toggle.cardId,
+            state: toggle.state as ChatCardViewV1["state"],
+            expanded: toggle.expanded,
+          });
+        }
+        return;
+      }
       if (isOpenDecisionEvidenceMessageV1(message) && this.target) {
         const candidate = path.resolve(message.filePath);
         const relative = path.relative(path.resolve(this.target.taskFolderPath), candidate);
@@ -1344,7 +1480,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         return;
       }
       if (isResolveWorkflowDecisionMessage(message)) {
-        await this.resolveWorkflowDecision(message.decisionId, message.optionId);
+        if (message.optionId === DISMISS_DECISION_OPTION_ID_V1) {
+          await this.reportCardDismissV1(message.decisionId, async () => {
+            await this.resolveWorkflowDecision(message.decisionId, message.optionId);
+            return this.workflowDecisionStore.get(message.decisionId)?.state === "pending"
+              ? CARD_DISMISS_STILL_OPEN_REASON_V1
+              : undefined;
+          });
+        } else {
+          await this.resolveWorkflowDecision(message.decisionId, message.optionId);
+        }
         return;
       }
       if (isAnswerQuestionMessage(message)) {
@@ -1355,12 +1500,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       if (isDismissQuestionMessage(message)) {
         if (this.target) {
-          await this.dismissQuestionCard(this.target, message.questionAt, this.target.stage);
+          const target = this.target;
+          await this.reportCardDismissV1(`question:${message.questionAt}`, async () =>
+            (await this.dismissQuestionCard(target, message.questionAt, target.stage))
+              ? undefined
+              : CARD_DISMISS_STILL_OPEN_REASON_V1
+          );
         }
         return;
       }
       if (message && typeof message === "object" && (message as { type?: unknown }).type === "dismissOpenPlanItemsForm" && typeof (message as { formId?: unknown }).formId === "string") {
-        await this.dismissOpenPlanItemsForm((message as { formId: string }).formId);
+        const formId = (message as { formId: string }).formId;
+        await this.reportCardDismissV1(`form:${formId}`, async () => {
+          await this.dismissOpenPlanItemsForm(formId);
+          return undefined;
+        });
         return;
       }
       if (isSubmitOpenPlanItemsFormMessage(message)) {
@@ -1375,7 +1529,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if (message.type === "submitInteractionAnswers") {
           await this.submitInteractionAnswers(clientRef, message.answers);
         } else if (message.type === "cancelInteraction") {
-          await this.cancelInteraction(clientRef);
+          await this.reportCardDismissV1(`interaction:${clientRef.operationId}:${clientRef.interactionId}`, () =>
+            this.cancelInteraction(clientRef)
+          );
         } else if (message.type === "confirmInteraction") {
           // Resume ONLY on a confirmed submit: resuming an action whose
           // answer never landed would run it against a question it has no
@@ -1748,7 +1904,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
      * Marks this message as the terminal "Ended …" line of a tracked operation
      * (bugs3 Step 3), so reconciliation can recognise it after a reload.
      */
-    endedOperationId?: string
+    endedOperationId?: string,
+    /**
+     * chat1 Step 3: tags a machine status line (`activity` for a start, `outcome` for an ending or
+     * an acknowledgement) so the transcript never renders it as conversation. Absent on conversation.
+     */
+    kind?: "activity" | "outcome"
   ): Promise<void> {
     if (!identity) return;
     const message: ChatMessage = {
@@ -1757,6 +1918,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       stage,
       at: new Date().toISOString(),
       pending,
+      ...(kind !== undefined ? { kind } : {}),
       ...(endedOperationId !== undefined ? { endedOperationId } : {}),
       // A question gets a stable id at creation so a reply can bind to THIS
       // question even if another one shares the same millisecond `at` (see
@@ -1782,6 +1944,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
+   * chat1 Steps 3 and 5: write a status line ("Recorded: …", "Dismissed …", "Withdrawn: …") that is
+   * not conversation. It is kept in the task's chat file tagged `kind: "outcome"`, so the transcript
+   * never renders it as a turn, and logged to Notifications with the task named, so nothing is lost.
+   */
+  private async appendStatusLineV1(
+    text: string,
+    stage: TaskStage,
+    identity: ChatIdentity | undefined = this.target,
+    level: "info" | "warning" = "info"
+  ): Promise<void> {
+    if (!identity) return;
+    await this.append("assistant", text, stage, identity, false, undefined, undefined, "outcome");
+    void logChatStatusToNotificationsV1(identity.taskFolderPath, text, stage, level);
+  }
+
+  /**
    * Reply to ONE specific pending legacy free-text question — the bound
    * answer channel Part 10 item 13e requires: a question's own reply control
    * (never the shared chat-send box) is the only thing that can settle it.
@@ -1804,8 +1982,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * dispatch nothing and write nothing to `task.md`. When the task is paused
    * on the card, the transcript line names what will move it instead.
    */
-  async dismissQuestionCard(identity: ChatIdentity | undefined, questionKey: string, stage: TaskStage): Promise<void> {
-    if (!identity) return;
+  async dismissQuestionCard(identity: ChatIdentity | undefined, questionKey: string, stage: TaskStage): Promise<boolean> {
+    if (!identity) return false;
     const ownWriteGenerationV1 = this.reactiveRenderRequestGenerationV1;
     const taskLabel = formatNotificationTaskLabelV1(
       await resolveChatTaskDisplayNameV1(identity.taskFolderPath),
@@ -1823,15 +2001,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       NotificationRouter.showWarning(
         `${taskLabel} — Could not dismiss the question (${error instanceof Error ? error.message : String(error)}). It is still open.`
       );
-      return;
+      return false;
     }
     if (!closed) {
       NotificationRouter.showInformation(`${taskLabel} — That question is no longer open, so there is nothing to dismiss.`);
     } else {
       const read = await readTaskProgressStrictV1(vscode.Uri.file(identity.taskFolderPath)).catch(() => undefined);
       const status = read && read.ok ? read.decoded.progress.status : undefined;
-      await this.append(
-        "assistant",
+      await this.appendStatusLineV1(
         describeCardDismissalV1("the question", {
           holdsTask: status === "paused",
           ...(status !== undefined ? { taskStatus: status } : {}),
@@ -1844,6 +2021,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (sameIdentity(this.target, identity)) {
       await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
+    return true;
   }
 
   /**
@@ -1885,8 +2063,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await this.recordIdleReconcileDismissalV1(taskFolderPath, read.decoded.progress);
     }
     const identity: ChatIdentity = { canonicalId: canonicalId ?? taskFolderPath, taskFolderPath };
-    await this.append(
-      "assistant",
+    await this.appendStatusLineV1(
       `Dismissed "This task's plan checklist is flagged unreliable". Nothing was run and task.md was not changed. ` +
         "The card stays hidden until a round flags the checklist again.",
       stage ?? (read?.ok ? read.decoded.progress.currentStage : "impl"),
@@ -1921,8 +2098,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     const identity = this.identityForDecision(decision, ctx);
     if (identity) {
-      await this.append(
-        "assistant",
+      await this.appendStatusLineV1(
         describeCardDismissalV1(`"${truncateChecklistItemTextV1(decision.whatHappened, 80)}"`, {
           holdsTask: decision.gating?.holdsTaskPaused === true && status === "paused",
           ...(status !== undefined ? { taskStatus: status } : {}),
@@ -2148,15 +2324,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const detail = option.description ? ` ${option.description}` : "";
     // bugs5 Step 7: an effect that says what it does next is recorded in those words.
     if (effect.recordedNext !== undefined) {
-      await this.append("assistant", describeRecordedChoiceV1(option.label, effect.recordedNext) + detail, stage, identity);
+      await this.appendStatusLineV1(describeRecordedChoiceV1(option.label, effect.recordedNext) + detail, stage, identity);
       if (effect.kind === "doNothing") {
         return;
       }
     } else if (effect.kind === "doNothing") {
-      await this.append("assistant", `Recorded: "${option.label}" — this does nothing further.${detail}`, stage, identity);
+      await this.appendStatusLineV1(`Recorded: "${option.label}" — this does nothing further.${detail}`, stage, identity);
       return;
     } else {
-      await this.append("assistant", `Recorded: "${option.label}" — applying now.${detail}`, stage, identity);
+      await this.appendStatusLineV1(`Recorded: "${option.label}" — applying now.${detail}`, stage, identity);
     }
     try {
       const result = await vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
@@ -2269,7 +2445,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (closed) {
       const read = await readTaskProgressStrictV1(vscode.Uri.file(identity.taskFolderPath));
       const status = read.ok ? read.decoded.progress.status : undefined;
-      await this.append("assistant", describeCardDismissalV1("the open plan items form", {
+      await this.appendStatusLineV1(describeCardDismissalV1("the open plan items form", {
         holdsTask: status === "paused", ...(status ? { taskStatus: status } : {}), stage: closed.stage,
       }), closed.stage, identity);
     } else {
@@ -2295,7 +2471,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         NotificationRouter.showWarning(`${taskLabel} — ${result.message}`);
         await this.append("assistant", `Could not apply: ${result.message} Your selections are kept.`, identity.stage, identity);
       } else if (result.kind === "applied") {
-        await this.append("assistant", `Recorded: ${result.message}`, identity.stage, identity);
+        await this.appendStatusLineV1(`Recorded: ${result.message}`, identity.stage, identity);
       } else {
         NotificationRouter.showInformation(`${taskLabel} — ${result.message}`);
       }
@@ -2334,7 +2510,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (!result.ok) {
       await this.append("assistant", result.message, identity.stage, identity);
     } else {
-      await this.append("assistant", successMessage, identity.stage, identity);
+      await this.appendStatusLineV1(successMessage, identity.stage, identity);
       // Run OUTSIDE the queued call above (see
       // `settleLocalOnlyInteractionAnswersV1`'s doc comment): by this point
       // the interaction's "resumed" settlement has already landed, so a
@@ -2516,8 +2692,30 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * reaches `NotificationRouter` reads identically to the click never
    * registering, which is exactly the ambiguity this task exists to close.
    */
-  private async cancelInteraction(clientRef: ChatInteractionClientRefV1): Promise<void> {
-    if (!this.target) return;
+  /**
+   * chat1 Step 15: run one Dismiss and tell the page how it went. `run` returns the reason the card is
+   * still open, or undefined when it is finished. On a failure the page enables the card's controls again
+   * and shows the reason inside the card, so Dismiss never looks like it did nothing.
+   */
+  private async reportCardDismissV1(cardId: string, run: () => Promise<string | undefined>): Promise<void> {
+    let reason: string | undefined;
+    try {
+      reason = await run();
+    } catch (error) {
+      reason = `Dismiss did not go through (${error instanceof Error ? error.message : String(error)}). The card is still open.`;
+    }
+    await this.view?.webview.postMessage({
+      type: "cardActionResult",
+      cardId,
+      action: "dismiss",
+      ok: reason === undefined,
+      ...(reason !== undefined ? { reason } : {}),
+    });
+  }
+
+  /** Returns why the question is still open, or undefined when it was cancelled. */
+  private async cancelInteraction(clientRef: ChatInteractionClientRefV1): Promise<string | undefined> {
+    if (!this.target) return "There is no open chat to dismiss this question in.";
     const identity = this.target;
     const taskLabel = formatNotificationTaskLabelV1(identity.taskName, identity.taskFolderPath);
     let cancelled = false;
@@ -2568,8 +2766,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (cancelled) {
       const read = await readTaskProgressStrictV1(vscode.Uri.file(identity.taskFolderPath)).catch(() => undefined);
       const status = read && read.ok ? read.decoded.progress.status : undefined;
-      await this.append(
-        "assistant",
+      await this.appendStatusLineV1(
         `${describeCardDismissalV1("the question", { holdsTask: status === "paused", ...(status !== undefined ? { taskStatus: status } : {}), stage: identity.stage })} The action that asked it will not continue.`,
         identity.stage,
         identity
@@ -2580,6 +2777,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (sameIdentity(this.target, identity)) {
       await this.renderAfterOwnWriteV1(ownWriteGenerationV1);
     }
+    return cancelled ? undefined : (declineMessage ?? CARD_DISMISS_STILL_OPEN_REASON_V1);
   }
 
   /**
@@ -2816,7 +3014,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         NotificationRouter.showWarning(`${taskLabel} — ${declineMessage}`);
       }
       if (resumed) {
-        await this.append("assistant", successMessage, identity.stage, identity);
+        await this.appendStatusLineV1(successMessage, identity.stage, identity);
       } else if (declineMessage) {
         await this.append("assistant", declineMessage, identity.stage, identity);
       }
@@ -3065,8 +3263,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             stage: decision.stage,
             at: new Date().toISOString(),
             pending: false,
+            kind: "outcome",
           })
         ).catch(() => undefined);
+        void logChatStatusToNotificationsV1(target.taskFolderPath, `Withdrawn: ${reason}`, decision.stage);
       }
     }
     // The runner's own render-time net still governs its decisions.
@@ -3342,7 +3542,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             : option.effect.kind === "doNothing"
               ? `Recorded: "${option.label}" — this does nothing further. ${option.consequence}`
               : `Recorded: "${option.label}" — applying now. ${option.consequence}${closedNote}`;
-        await this.append("assistant", ackText, decision.stage, identity);
+        await this.appendStatusLineV1(ackText, decision.stage, identity);
       }
       if (option.effect.kind === "command" && ctx?.skipEffect !== true) {
         // bugs3 Step 2: the answer was accepted a few awaits ago. Read the live
@@ -3530,8 +3730,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       itemKeys: offeredTickItemsOfV1(decision),
     });
     if (!stored) return;
-    await this.append(
-      "assistant",
+    await this.appendStatusLineV1(
       `Recorded: "${option.label}" — ${option.recordedNext ?? "your answer is kept"}. ${runningDescription} is running. ` +
         HELD_CARD_STAYS_OPEN_NOTE_V1,
       decision.stage,
@@ -3690,7 +3889,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     let preparingSince: number | undefined;
     let timer: ReturnType<typeof setInterval> | undefined;
     const say = (text: string): void => {
-      void this.append("assistant", text, stage, identity).catch(() => undefined);
+      // chat1 Step 3: a start line is status, not conversation; the live strip shows it.
+      void this.append("assistant", text, stage, identity, false, undefined, undefined, "activity").catch(
+        () => undefined
+      );
     };
     // bugs5 Step 18: a Publish Checks run that is going right now has started its commands even when
     // no task operation is registered for this announcer to see, so it is never "still starting".
@@ -3840,9 +4042,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   /** Mirror live operation events into the conversation that started them. */
   private traceDecisionOperationV1(identity: ChatIdentity, fallbackStage: TaskStage): vscode.Disposable {
     const known = new Map<string, { signature: string; snapshot: TaskOperationSnapshot; waiting: boolean }>();
-    const queueMessage = (text: string, stage: TaskStage, endedOperationId?: string): void => {
+    // chat1 Step 3: these are status lines, tagged at the source so the transcript never renders them
+    // as conversation (`activity` for a start or resume, `outcome` for the ending). Notifications
+    // already carries the running row and the end-of-operation entry for each of them.
+    const queueMessage = (
+      text: string,
+      stage: TaskStage,
+      kind: "activity" | "outcome",
+      endedOperationId?: string
+    ): void => {
       this.operationTraceWriteQueueV1 = this.operationTraceWriteQueueV1
-        .then(() => this.append("assistant", text, stage, identity, false, undefined, endedOperationId))
+        .then(() => this.append("assistant", text, stage, identity, false, undefined, endedOperationId, kind))
         .catch((error) => console.warn("Could not append operation progress to Chat:", error));
     };
     const signatureOf = (operation: TaskOperationSnapshot): string =>
@@ -3869,15 +4079,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           known.set(operation.id, { signature, snapshot: operation, waiting: false });
           queueMessage(
             `Started ${labelFor(operation)} at ${formatTimestampForDisplay(new Date(operation.startedAt))}.`,
-            stage
+            stage,
+            "activity"
           );
           continue;
         }
         if (prior.waiting && !operation.waitingForUser) {
-          queueMessage(`Resumed ${labelFor(operation)}.`, stage);
+          queueMessage(`Resumed ${labelFor(operation)}.`, stage, "activity");
         }
         if (prior.signature !== signature) {
-          queueMessage(`Progress: ${labelFor(operation)}.`, stage);
+          // chat1 Step 4: no per-tick "Progress:" line. The live strip and the running row in
+          // Notifications show the latest progress; only the remembered state moves on.
           known.set(operation.id, { signature, snapshot: operation, waiting: operation.waitingForUser });
         }
       }
@@ -3886,7 +4098,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (!known.has(operation.id)) return;
       const endedLine = endedLines.ended(operation);
       if (endedLine !== undefined) {
-        queueMessage(endedLine, operation.stage ?? fallbackStage, operation.id);
+        queueMessage(endedLine, operation.stage ?? fallbackStage, "outcome", operation.id);
       }
       known.delete(operation.id);
     });
@@ -4113,13 +4325,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           target.taskFolderPath,
           target.canonicalId,
           target.kind === "global" ? undefined : target.stage
-        ).catch(() => [] as ChatDocumentInteractionV1[])).filter((i) => i.state === "unresolved");
+        ).catch(() => [] as ChatDocumentInteractionV1[]));
+        // chat1 Step 9: settled interactions and forms stay in the chat as read-only, collapsed cards
+        // (the page shows no inputs for them); only the unresolved ones wait on the owner.
         if (target.kind !== "global") {
-          openPlanItemsForms = (
-            await readOpenPlanItemsFormsV1(target.taskFolderPath, target.canonicalId, target.stage).catch(
-              () => [] as OpenPlanItemsFormV1[]
-            )
-          ).filter((f) => f.state === "open");
+          openPlanItemsForms = await readOpenPlanItemsFormsV1(target.taskFolderPath, target.canonicalId, target.stage).catch(
+            () => [] as OpenPlanItemsFormV1[]
+          );
         }
       } catch (error) {
         // A transcript that fails to read (e.g. corrupt and unquarantinable —
@@ -4405,7 +4617,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
       }
     }
-    const displayDecisions = activeDecisions.map((decision) => {
+    // chat1 Step 8: finished cards stay in the timeline, read-only and collapsed. A decision whose record
+    // was trimmed away (the store keeps 200) still has its anchor line in the transcript; it shows as a
+    // one-line "details no longer kept" card, never as a bare text line.
+    const settledDecisions: readonly WorkflowDecisionV1[] = target
+      ? settledDecisionsForTimelineV1(
+          this.workflowDecisionStore.listForTask(
+            target.kind === "global" ? GLOBAL_ASSISTANT_CANONICAL_ID : target.canonicalId
+          ),
+          target.stage
+        )
+      : [];
+    const knownDecisionIds = new Set<string>([
+      ...activeDecisions.map((decision) => decision.decisionId),
+      ...(target
+        ? this.workflowDecisionStore
+            .listForTask(target.kind === "global" ? GLOBAL_ASSISTANT_CANONICAL_ID : target.canonicalId)
+            .map((decision) => decision.decisionId)
+        : []),
+    ]);
+    const expandChoices = readCardExpandChoicesV1(this.state);
+    const currentCardStates = new Map<string, ChatCardViewV1["state"]>();
+    const toCardPayload = (view: ChatCardViewV1): ChatCardPayloadV1 => {
+      currentCardStates.set(view.cardId, view.state);
+      return { ...view, expanded: isCardExpandedV1(expandChoices, view.cardId, view.state) };
+    };
+    const displayDecisions = [...activeDecisions, ...settledDecisions].map((decision) => {
       const gatingLine = renderHandoffFieldLineV1(
         "decisionRecord",
         "gating",
@@ -4420,11 +4657,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       const { atLabel, atTitle } = anchored.atLabel
         ? anchored
         : formatDisplayTimestampPairV1(decision.createdAt);
+      const headingText = decisionHeadingV1(decision);
       return {
       ...decision,
       gatingLine,
       atLabel,
       atTitle,
+      // chat1 Steps 10-12: the one lifecycle view every card kind carries to the page.
+      card: toCardPayload(cardViewFromDecisionV1(decision, decisionCardTitleV1(headingText, decision.whatHappened))),
       copyText: buildDecisionCopyTextV1(decision, gatingLine, isBlockingDecision),
       isGating: decision.gating?.holdsTaskPaused === true,
       // Headline/severity predicate — distinct from `isGating` above (which
@@ -4454,17 +4694,76 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         : {}),
       };
     });
+    const trimmedDecisionCards = [
+      ...new Map(
+        entries
+          .filter((entry) => entry.kind === "decision" && entry.decisionId !== undefined && !knownDecisionIds.has(entry.decisionId))
+          .map((entry) => [entry.decisionId!, entry] as const)
+      ).values(),
+    ].map((entry) => ({
+      decisionId: entry.decisionId!,
+      createdAt: entry.at,
+      trimmed: true as const,
+      card: toCardPayload(trimmedCardViewV1(entry.decisionId!, "decision", "Earlier card")),
+    }));
+    const timelineDecisions: readonly { readonly decisionId: string; readonly createdAt: string }[] = [
+      ...displayDecisions,
+      ...trimmedDecisionCards,
+    ];
     const displayInteractions = interactions.map((interaction) => {
       const answeredSummary = this.confirmingInteractionsV1.has(`${interaction.operationId}:${interaction.interactionId}`)
         ? describeInteractionAnswersV1(interaction)
         : undefined;
+      // chat1 Step 9: an answered interaction keeps its questions and answers, read-only, with its
+      // outcome "answered: … — resuming" until the run settles; once settled it stays as a finished card
+      // with its own outcome (answered, dismissed, or closed with the reason).
+      const cardId = `interaction:${interaction.operationId}:${interaction.interactionId}`;
+      const stored = interactionSettlementV1(interaction, describeInteractionAnswersV1(interaction));
+      const settlement =
+        stored !== undefined
+          ? stored
+          : answeredSummary !== undefined
+            ? ({ kind: "answered", choice: answeredSummary, resuming: true } as const)
+            : undefined;
       return {
         ...interaction,
         ...formatDisplayTimestampPairV1(interaction.postedAt),
         copyText: buildInteractionCopyTextV1(interaction),
+        card: toCardPayload(cardViewFromSettlementV1(cardId, "interaction", "Needs your reply", settlement)),
         ...(answeredSummary !== undefined ? { answeredSummary } : {}),
+        ...(stored !== undefined ? { readOnly: true } : {}),
       };
     });
+    // Question cards and open-items forms are cards too: the page wraps each in the same header.
+    const questionCardFor = (entry: (typeof displayEntries)[number], index: number): ChatCardPayloadV1 | undefined => {
+      if (entry.role !== "question") return undefined;
+      const cardId = `question:${entry.id ?? entry.at}`;
+      const title = `Question: ${entry.text.replace(/\s+/g, " ").trim().slice(0, 70)}`;
+      if (awaitingQuestionIndices.has(index)) {
+        return toCardPayload(cardViewFromSettlementV1(cardId, "question", title));
+      }
+      if (entry.settlement !== undefined) {
+        return toCardPayload(
+          cardViewFromSettlementV1(cardId, "question", title, {
+            kind: entry.settlement.kind === "dismissed" ? "dismissed" : "retired",
+            ...(entry.settlement.kind !== "dismissed" ? { reason: entry.settlement.reason } : {}),
+            at: entry.settlement.at,
+          })
+        );
+      }
+      return undefined;
+    };
+    const cardedEntries = displayEntries.map((entry, index) => {
+      const card = questionCardFor(entry, index);
+      return card !== undefined ? { ...entry, card } : entry;
+    });
+    const displayOpenPlanItemsForms = openPlanItemsForms.map((form) => ({
+      ...form,
+      card: toCardPayload(
+        cardViewFromSettlementV1(`form:${form.formId}`, "form", "Decide the open plan items", formSettlementV1(form))
+      ),
+      ...(form.state !== "open" ? { readOnly: true } : {}),
+    }));
     // The ledger read/write below still runs for the global assistant's
     // consumers elsewhere (task tree, status bar): `recordOwedContinuation`
     // keeps their "what happens next" surfaces fresh even though this panel
@@ -4557,15 +4856,40 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           ? { value: 1, tooltip: "Waiting for you" }
           : undefined;
     }
+    // chat1 Step 2: the transcript is conversation only. The timeline is built from every entry first,
+    // because a `decision` anchor still places its card by time; the anchors and status lines are
+    // then dropped from what is posted. They stay in `chat-v1.json` and in Notifications.
+    const renderedDecisionIds = new Set(timelineDecisions.map((decision) => decision.decisionId));
+    const isVisibleEntry = (entry: (typeof displayEntries)[number]): boolean =>
+      isConversationEntryV1(entry, { renderedDecisionIds });
+    const conversationEntries = cardedEntries.filter(isVisibleEntry);
+    const conversationTimeline = buildChatTimelineV1(cardedEntries, timelineDecisions).filter(
+      (item) => item.type === "decision" || isVisibleEntry(item.value)
+    );
+    // A saved expand choice only applies while the card is still in the state it was made in; drop the
+    // ones that no longer do, so a card that went back to open starts expanded again.
+    const keptChoices = forgetStaleCardExpandChoicesV1(expandChoices, currentCardStates);
+    if (keptChoices.length !== expandChoices.length) {
+      try {
+        await this.state.update(CARD_EXPAND_CHOICES_KEY_V1, keptChoices);
+      } catch {
+        // Best effort: a stale entry left behind is ignored by isCardExpandedV1 anyway.
+      }
+    }
+    const runStrip = this.currentRunStripV1();
+    this.lastRunStripV1 = runStrip;
+    this.lastRunStripPostAtV1 = Date.now();
     await this.view?.webview.postMessage({
       type: "state",
       target: this.target,
       label,
-      entries: displayEntries,
-      timeline: buildChatTimelineV1(displayEntries, displayDecisions),
+      runStrip: runStrip ?? null,
+      entries: conversationEntries,
+      timeline: conversationTimeline,
       interactions: displayInteractions,
-      openPlanItemsForms,
-      decisions: displayDecisions,
+      openPlanItemsForms: displayOpenPlanItemsForms,
+      // Only the cards still waiting on the owner; finished ones travel in `timeline`, read-only.
+      decisions: displayDecisions.filter((decision) => decision.card.state === "open"),
       busy,
       busyLabel,
       waitingForUser,
@@ -4687,6 +5011,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           font-style: italic;
           color: var(--ensemble-muted-foreground);
         }
+        /* chat1 Step 6: the strip's two links read as links, not as card actions. */
+        #busy-indicator button.strip-link {
+          background: none;
+          border: none;
+          padding: 0;
+          margin-left: var(--ensemble-space-3);
+          font-style: normal;
+          color: var(--vscode-textLink-foreground);
+          text-decoration: underline;
+          cursor: pointer;
+        }
         #empty-notice {
           display: none;
           margin: var(--ensemble-space-2) 0;
@@ -4805,6 +5140,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         #decisions { display: none; }
         .decision-card { margin: 0 0 var(--ensemble-space-3); }
+        /* chat1 Steps 11-12: the shared card header (a real button) and the collapsible body. */
+        .card-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--ensemble-space-1); width: 100%; margin: 0; padding: var(--ensemble-space-1) var(--ensemble-space-2); text-align: left; cursor: pointer; background: transparent; color: var(--vscode-foreground); border: var(--ensemble-border-width) solid var(--vscode-panel-border, var(--vscode-contrastBorder, transparent)); border-radius: var(--ensemble-radius); }
+        .card-header:hover { background: var(--vscode-list-hoverBackground); }
+        .card-header:focus-visible { outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder); outline-offset: 1px; }
+        .card-title { font-weight: 600; }
+        .card-body[hidden] { display: none; }
+        .card-finished > .card-header .card-outcome { color: var(--vscode-descriptionForeground); }
+        .decision-option-readonly { margin: 0 0 var(--ensemble-space-1); }
+        .decision-closed-note, .interaction-answer-given { margin: var(--ensemble-space-1) 0; }
         .decision-why { margin-bottom: var(--ensemble-space-2); }
         .decision-evidence {
           margin: 0 0 var(--ensemble-space-2); padding: var(--ensemble-space-2);
@@ -4834,16 +5178,54 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="decisions" role="list" aria-label="Pending workflow decisions"></div>
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
-      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span></div>
+      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span><span id="busy-detail" aria-live="off"></span><span id="busy-actions"></span></div>
       <div id="steering-note" role="note">Rounds don't read this chat. To change what the next rounds do, ask here to record it in the plan (for example, "add to the plan: skip the memory work"), or edit <code>plan-final.md</code> yourself.</div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" id="send-btn" title="Send message (Enter)">Send</button><span id="send-reason" role="status"></span></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), bd=document.getElementById('busy-detail'), ba=document.getElementById('busy-actions'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
       function targetKey(t){ if(!t) return ''; return t.kind==='global' ? 'global' : (t.canonicalId+':'+t.stage); }
       function isNearBottom(){ return (document.documentElement.scrollHeight-window.scrollY-window.innerHeight)<60; }
       function persistScroll(){ if(currentKey===undefined) return; scrollPositions[currentKey]=window.scrollY; v.setState({scrollPositions:scrollPositions}); }
+      // chat1 Step 6: the live run strip. It sits in the busy indicator and is replaced in place, never
+      // appended. Only its label (busy-text) is a live region, so a progress tick is not announced.
+      let stripState=null, stripHead='', stripTimer, lastWaiting=false, lastWaitingSource;
+      function stripDetailText(st){
+        const parts=[];
+        if(st.model){parts.push(st.model);}
+        parts.push('since '+st.sinceClock+' ('+Math.max(0,Math.floor((Date.now()-st.startedAt)/60000))+' min)');
+        if(st.latest){parts.push(st.latest);}
+        return ' · '+parts.join(' · ');
+      }
+      function stripLink(text,message){
+        const btn=document.createElement('button');btn.type='button';btn.className='strip-link';btn.textContent=text;
+        btn.addEventListener('click',()=>{v.postMessage(message);});
+        return btn;
+      }
+      function renderStrip(st,waitingForUser,waitingSource){
+        stripState=st;lastWaiting=!!waitingForUser;lastWaitingSource=waitingSource;
+        if(st){
+          const head=st.waiting?st.label+' — waiting for your answer':'Running: '+st.label;
+          if(head!==stripHead){bt.textContent=head;stripHead=head;}
+          bd.textContent=stripDetailText(st);
+          if(ba.children.length===0||ba.getAttribute('data-op')!==st.operationId||ba.getAttribute('data-stop')!==String(!!st.cancellable)){
+            ba.replaceChildren();
+            ba.setAttribute('data-op',st.operationId);ba.setAttribute('data-stop',String(!!st.cancellable));
+            ba.appendChild(stripLink('Show in Notifications',{type:'showRunInNotifications'}));
+            if(st.cancellable){ba.appendChild(stripLink('Stop',{type:'stopRunFromStrip',operationId:st.operationId}));}
+          }
+          b.style.display='block';b.title=st.waiting&&waitingSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
+          if(stripTimer===undefined){stripTimer=setInterval(()=>{if(stripState){bd.textContent=stripDetailText(stripState);}},30000);}
+          return;
+        }
+        stripHead='';bd.textContent='';ba.replaceChildren();ba.removeAttribute('data-op');ba.removeAttribute('data-stop');
+        if(stripTimer!==undefined){clearInterval(stripTimer);stripTimer=undefined;}
+        if(waitingForUser){
+          bt.textContent='Waiting for your answer';b.style.display='block';
+          b.title=waitingSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
+        }else{bt.textContent='';b.style.display='none';b.title='';}
+      }
       window.addEventListener('scroll', persistScroll);
       // Renders one structured-question interaction (plan §6.1's universal
       // question flow) with typed Answer/Resume/Cancel controls. Answer
@@ -4881,22 +5263,103 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         meta.appendChild(copyBtn);meta.appendChild(time);
         return meta;
       }
+      // chat1 Steps 11-14: every card kind shares one header. The header is a real button holding the
+      // card's title and outcome, with aria-expanded and aria-controls pointing at the body, so Enter and
+      // Space toggle it and a screen reader announces its state. The page toggles at once and posts
+      // toggleCard so the host saves the choice per card and per card state.
+      var cardSeq=0;
+      var renderedCards=[];
+      var seenCardIds={};
+      function cardViewOf(item,fallbackId,fallbackTitle){
+        return (item&&item.card)||{cardId:fallbackId,title:fallbackTitle,state:'open',outcome:'needs your answer',expanded:true};
+      }
+      function applyCardChrome(card,cv){
+        const parts=Array.from(card.children);
+        const body=document.createElement('div'); body.className='card-body'; body.id='card-body-'+(++cardSeq);
+        for(const part of parts){ body.appendChild(part); }
+        const expanded=cv.expanded!==false;
+        body.hidden=!expanded;
+        const head=document.createElement('button'); head.type='button'; head.className='card-header';
+        head.setAttribute('aria-expanded',expanded?'true':'false');
+        head.setAttribute('aria-controls',body.id);
+        const chev=document.createElement('span'); chev.className='card-chevron'; chev.setAttribute('aria-hidden','true'); chev.textContent=expanded?'▾':'▸';
+        const ttl=document.createElement('span'); ttl.className='card-title'; ttl.textContent=cv.title;
+        const out=document.createElement('span'); out.className='card-outcome'; out.textContent=' — '+cv.outcome;
+        head.appendChild(chev); head.appendChild(ttl); head.appendChild(out);
+        head.addEventListener('click',()=>{
+          const next=head.getAttribute('aria-expanded')!=='true';
+          head.setAttribute('aria-expanded',next?'true':'false');
+          chev.textContent=next?'▾':'▸';
+          body.hidden=!next;
+          v.postMessage({type:'toggleCard',cardId:cv.cardId,state:cv.state,expanded:next});
+        });
+        card.className=card.className+(cv.state==='open'?' card-open':' card-finished');
+        card.setAttribute('data-card-id',cv.cardId);
+        card.setAttribute('data-card-state',cv.state);
+        card.replaceChildren(head,body);
+        renderedCards.push({el:card,cv:cv,controls:card.cardControls||[],body:body,err:parts.find(p=>p.className==='interaction-error')||null});
+      }
+      // A card's builder lists the controls its Dismiss disables in card.cardControls, so a failed
+      // Dismiss can enable them again and say why inside the card.
+      function reportCardActionResult(s){
+        for(const entry of renderedCards){
+          if(entry.cv.cardId!==s.cardId){ continue; }
+          if(s.ok){ return; }
+          for(const control of entry.controls){ control.disabled=false; }
+          if(!entry.err){ entry.err=document.createElement('div'); entry.err.className='interaction-error'; entry.body.appendChild(entry.err); }
+          entry.err.textContent=s.reason||'Dismiss did not go through.'; entry.err.style.display='block';
+        }
+      }
+      // A card id not seen before in this chat is new: it opens expanded (the host decides) and is scrolled
+      // into view without taking focus. The first paint of a chat only records what is there.
+      function noteNewCards(chatKey){
+        const isFirstPaint=!seenCardIds[chatKey];
+        const known=seenCardIds[chatKey]||(seenCardIds[chatKey]={});
+        let newest=null;
+        for(const entry of renderedCards){
+          if(!known[entry.cv.cardId]){
+            known[entry.cv.cardId]=true;
+            if(!isFirstPaint&&entry.cv.state==='open'){ newest=entry.el; }
+          }
+        }
+        if(newest&&newest.scrollIntoView){ newest.scrollIntoView({block:'nearest'}); }
+      }
       function renderInteraction(interaction,append){
         if(!append) ic.replaceChildren();
         if(!interaction){ ic.style.display='none'; return; }
         ic.style.display='block';
+        const box=document.createElement('div'); box.className='interaction-card';
+        ic.appendChild(box);
+        const cv=cardViewOf(interaction,'interaction:'+interaction.operationId+':'+interaction.interactionId,'Needs your reply');
+        renderInteractionBody(interaction,append,box,cv);
+        applyCardChrome(box,cv);
+      }
+      function renderInteractionBody(interaction,append,ic,cv){
         // RC10 item 1: Confirm is being processed and the answers are
         // recorded — a read-only card, no inputs and no buttons, until the
         // resumed round settles the question and it leaves this list.
-        if(typeof interaction.answeredSummary==='string'){
+        if(interaction.readOnly===true||typeof interaction.answeredSummary==='string'){
+          // chat1 Step 9: the card keeps every question and the answer given, read-only; its header says
+          // "answered: … — resuming". There are no inputs and no buttons.
           const done=document.createElement('div'); done.className='interaction-answered';
-          const doneTitle=document.createElement('div'); doneTitle.className='interaction-title';
-          doneTitle.textContent='Answered: '+interaction.answeredSummary;
-          done.appendChild(doneTitle);
-          const resuming=document.createElement('div'); resuming.className='interaction-help'; resuming.textContent='Resuming…';
-          done.appendChild(resuming);
-          done.appendChild(buildMsgMeta(interaction.copyText||'',interaction.atLabel,interaction.atTitle));
+          const answerFor={};
+          for(const a of (interaction.answers||[])){ answerFor[a.questionId]=a; }
+          for(const q of interaction.questions){
+            const row=document.createElement('div'); row.className='interaction-question';
+            const prompt=document.createElement('div'); prompt.className='interaction-prompt'; prompt.textContent=q.prompt;
+            row.appendChild(prompt);
+            const given=answerFor[q.questionId];
+            const labelOf=(id)=>{ const o=(q.options||[]).find(x=>x.optionId===id); return o?o.label:id; };
+            const line=document.createElement('div'); line.className='interaction-answer-given';
+            if(!given||given.state!=='answered'){ line.textContent=(interaction.answers&&interaction.answers.length)?'Skipped':'Not answered'; }
+            else if(q.kind==='text'){ line.textContent=given.value; }
+            else if(q.kind==='singleChoice'){ line.textContent='✓ Chosen: '+labelOf(given.selectedOptionId); }
+            else { line.textContent='✓ Chosen: '+(given.selectedOptionIds||[]).map(labelOf).join(', '); }
+            row.appendChild(line);
+            done.appendChild(row);
+          }
           ic.appendChild(done);
+          ic.appendChild(buildMsgMeta(interaction.copyText||'',interaction.atLabel,interaction.atTitle));
           return;
         }
         const err=document.createElement('div'); err.className='interaction-error';
@@ -5013,16 +5476,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // The label alone never said what it discards; the handler settles the
         // interaction as cancelled, so the action that asked does not proceed.
         cancelBtn.title='Dismisses this question without answering. The action that asked it will not continue.';
-        cancelBtn.addEventListener('click',()=>{ v.postMessage({type:'cancelInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId}); });
+        cancelBtn.addEventListener('click',()=>{
+          // Disabled until the host says how it went: a failed Dismiss enables these again with the reason.
+          cancelBtn.disabled=true; confirmBtn.disabled=true; chatBtn.disabled=true;
+          v.postMessage({type:'cancelInteraction',operationId:interaction.operationId,interactionId:interaction.interactionId});
+        });
         // bugs5 Step 5: Dismiss first (left), then the action button after it, as in AI Models.
         actions.appendChild(cancelBtn); actions.appendChild(chatBtn); actions.appendChild(confirmBtn);
         ic.appendChild(actions);
         ic.appendChild(buildMsgMeta(interaction.copyText||'',interaction.atLabel,interaction.atTitle));
-        // A question is an interruption that needs a visible reply, not a
-        // passive transcript item. Focus its first control when the block is
-        // initially rendered; later unresolved questions keep their own
-        // controls rather than stealing that first focus.
-        if(!append){ requestAnimationFrame(()=>{ const first=ic.querySelector('textarea,input,button'); if(first) first.focus(); }); }
+        ic.cardControls=[cancelBtn,chatBtn,confirmBtn];
+        // chat1 Step 14: a new card is scrolled into view (noteNewCards), and nothing here takes focus.
       }
       function renderInteractions(interactions){
         if(!interactions || !interactions.length){ renderInteraction(undefined,false); return; }
@@ -5043,6 +5507,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const title=document.createElement('div'); title.className='interaction-title';
           title.textContent='Decide the open plan items';
           box.appendChild(title);
+          if(form.readOnly===true){
+            // chat1 Step 9: a settled form keeps its items and reasons, read-only; the header says how it ended.
+            for(const item of form.items){
+              const row=document.createElement('div'); row.className='interaction-question';
+              const label=document.createElement('div'); label.className='interaction-prompt'; label.textContent=item.itemText;
+              row.appendChild(label);
+              if(item.reason){ const help=document.createElement('div'); help.className='interaction-help'; help.textContent='Reason from the round: '+item.reason; row.appendChild(help); }
+              box.appendChild(row);
+            }
+            applyCardChrome(box,cardViewOf(form,'form:'+form.formId,'Decide the open plan items'));
+            ic.appendChild(box);
+            continue;
+          }
           const intro=document.createElement('div'); intro.className='interaction-help';
           intro.textContent='Choose what to do with each item. Items left open stay open. Nothing is written until you press Apply.';
           box.appendChild(intro);
@@ -5104,6 +5581,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           dismiss.addEventListener('click',()=>{ apply.disabled=true; dismiss.disabled=true; v.postMessage({type:'dismissOpenPlanItemsForm',formId:form.formId}); });
           // bugs5 Step 5: Dismiss first (left), then the action button after it.
           actions.appendChild(dismiss); actions.appendChild(apply); box.appendChild(actions);
+          box.cardControls=[dismiss,apply];
+          applyCardChrome(box,cardViewOf(form,'form:'+form.formId,'Decide the open plan items'));
           ic.appendChild(box);
         }
       }
@@ -5165,6 +5644,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         for(const dcs of decisions){
           const card=document.createElement('div'); card.className='decision-card'+(dcs.isGating?' decision-card-gating':'');
           card.setAttribute('data-decision-id',dcs.decisionId);
+          const cv=cardViewOf(dcs,dcs.decisionId,dcs.headingText||'Decision needed');
+          const finished=cv.state!=='open';
+          if(dcs.trimmed){
+            // The store keeps the newest 200 finished records; an older one is a collapsed one-line card.
+            const gone=document.createElement('div'); gone.className='interaction-help';
+            gone.textContent='This card is finished. Its details are no longer kept.';
+            card.appendChild(gone);
+            applyCardChrome(card,cv);
+            root.appendChild(card);
+            continue;
+          }
           const err=document.createElement('div'); err.className='interaction-error';
           card.appendChild(err);
           const title=document.createElement('div'); title.className='interaction-title';
@@ -5192,7 +5682,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
                 continue;
               }
               const line=document.createElement('div'); line.textContent=ev.label+': '+ev.detail;
-              if(ev.openFilePath){ const open=document.createElement('button'); open.type='button'; open.textContent='Open run log'; open.addEventListener('click',()=>vscode.postMessage({type:'openDecisionEvidence',filePath:ev.openFilePath})); line.appendChild(open); }
+              if(ev.openFilePath){ const open=document.createElement('button'); open.type='button'; open.textContent='Open run log'; open.addEventListener('click',()=>v.postMessage({type:'openDecisionEvidence',filePath:ev.openFilePath})); line.appendChild(open); }
               evWrap.appendChild(line);
             }
             card.appendChild(evWrap);
@@ -5200,6 +5690,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const groupName='decision-'+dcs.decisionId;
           const radios=[];
           for(const opt of dcs.options){
+            if(finished){
+              // chat1 Step 11: a finished card keeps every option, read-only, with the chosen one marked.
+              const ro=document.createElement('div'); ro.className='decision-option decision-option-readonly';
+              const roLabel=document.createElement('span');
+              roLabel.textContent=opt.label+(dcs.resolvedOptionId===opt.optionId?' ✓ Chosen':'');
+              ro.appendChild(roLabel);
+              if(opt.destructive){ ro.appendChild(document.createTextNode(' ')); const warn=document.createElement('span'); warn.className='decision-option-destructive'; warn.textContent='⚠ irreversible'; ro.appendChild(warn); }
+              const roConsequence=document.createElement('div'); roConsequence.className='decision-option-consequence'; roConsequence.textContent=opt.consequence;
+              ro.appendChild(roConsequence);
+              card.appendChild(ro);
+              continue;
+            }
             const optWrap=document.createElement('label'); optWrap.className='decision-option'+(opt.disabled?' decision-option-disabled':'');
             const radio=document.createElement('input'); radio.type='radio'; radio.name=groupName; radio.value=opt.optionId;
             if(opt.disabled){ radio.disabled=true; }
@@ -5238,6 +5740,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const gating=document.createElement('div'); gating.className='decision-gating'+(dcs.isGating?' decision-gating-active':'');
           gating.textContent=dcs.gatingLine;
           card.appendChild(gating);
+          if(finished){
+            // No radios, no Confirm, no Dismiss: the outcome line, then the copy and time row.
+            const closedNote=document.createElement('div'); closedNote.className='decision-closed-note'; closedNote.textContent='Outcome: '+cv.outcome;
+            card.appendChild(closedNote);
+            card.appendChild(buildMsgMeta(dcs.copyText||'',dcs.atLabel,dcs.atTitle));
+            applyCardChrome(card,cv);
+            root.appendChild(card);
+            continue;
+          }
           // Paused-answer sequencing (task PART 5, verified against
           // workflowDecisionStoreV1.ts's resolve(): it never reads task-pause
           // state, so a decision is always retained and its effect always
@@ -5286,11 +5797,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           actions.appendChild(confirmBtn);
           card.appendChild(actions);
           card.appendChild(buildMsgMeta(dcs.copyText||'',dcs.atLabel,dcs.atTitle));
+          card.cardControls=[dismissBtn,confirmBtn,...radios.filter(r=>!r.disabled)];
+          applyCardChrome(card,cv);
           root.appendChild(card);
         }
       }
       window.addEventListener('message', event=>{
         const s=event.data;
+        // chat1 Step 6: a progress tick repaints only the strip, never the conversation.
+        if(s.type==='runStrip'){renderStrip(s.runStrip||null,lastWaiting,lastWaitingSource);return;}
+        // chat1 Step 15: how a Dismiss went. On failure the card's controls come back with the reason.
+        if(s.type==='cardActionResult'){reportCardActionResult(s);return;}
         // Scroll to a card that just revealed this view. Never focuses anything:
         // scrollIntoView moves the viewport only. Retried briefly because the
         // card may not be painted yet when the message arrives.
@@ -5347,7 +5864,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             // (verification review, 2026-09-18).
             m.replaceChildren();dc.replaceChildren();dc.style.display='none';renderInteractions([]);
             en.textContent='';en.style.display='none';
-            b.style.display='none';
+            renderStrip(null,false,undefined);
             c.textContent=s.label??'Chat';
             currentKey=failedKey;
             e.textContent=s.unpaintedMessage??s.errorMessage??'';
@@ -5408,15 +5925,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             actions.appendChild(sendBtn);
             replyWrap.appendChild(actions);
             row.appendChild(replyWrap);
+            row.cardControls=[dismissBtn,sendBtn,ta];
           }
           if(x.role==='question'&&x.settlementLine){
             const closedNote=document.createElement('p');closedNote.className='msg-agent';closedNote.textContent=x.settlementLine;
             row.appendChild(closedNote);
           }
+          // chat1 Step 12: an open question and a finished one share the card header.
+          if(x.card){ applyCardChrome(row,x.card); }
           return row;
         }
         m.replaceChildren();
         dc.replaceChildren();dc.style.display='none';
+        renderedCards=[];
         for(const item of (s.timeline||s.entries.map(value=>({type:'message',value})))){
           if(item.type==='decision'){
             const decisionWrap=document.createElement('div');decisionWrap.className='timeline-decision';
@@ -5435,11 +5956,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if(drafts){ restoreDrafts(drafts); }
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
-        if(s.waitingForUser){
-          bt.textContent='Waiting for your answer';b.style.display='block';
-          b.title=s.waitingForUserSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
-        }
-        else{b.style.display='none';b.title='';}
+        renderStrip(s.runStrip||null,!!s.waitingForUser,s.waitingForUserSource);
         // RC3 item 8: Send is disabled only while THIS panel's own task is
         // busy (never while waiting for an answer in this chat, and never
         // for the Global Assistant, which is not tied to one task's run
@@ -5455,6 +5972,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           if(stick){window.scrollTo(0,document.documentElement.scrollHeight);}
           else if(switchedChat&&Object.prototype.hasOwnProperty.call(scrollPositions,nextKey)){window.scrollTo(0,scrollPositions[nextKey]);}
           else if(switchedChat){window.scrollTo(0,document.documentElement.scrollHeight);}
+          noteNewCards(nextKey);
         });
       });
       f.addEventListener('submit',e=>{e.preventDefault();if(sb.disabled){return;}v.postMessage({type:'send',text:i.value});i.value='';});

@@ -276,7 +276,14 @@ void describe("Chat With AI — Confirm runs the resumed round outside the chat 
         release();
         await confirming;
         const after = interactionsOf(posted(fake).pop());
-        assert.equal(after.find((i) => i.interactionId === IID), undefined, "a settled interaction is no longer posted");
+        // chat1 Step 9: once settled it stays as a finished, read-only card with the answer given.
+        const settled = after.find((i) => i.interactionId === IID) as
+          | { readOnly?: boolean; card?: { state: string; outcome: string } }
+          | undefined;
+        assert.ok(settled, "a settled interaction stays in the chat");
+        assert.equal(settled.readOnly, true);
+        assert.equal(settled.card?.state, "answered");
+        assert.equal(settled.card?.outcome, "answered: plan.md");
       }
     );
   });
@@ -744,11 +751,15 @@ void describe("Chat With AI — structured Answer/Resume/Cancel controls", () =>
       assert.equal(stored[0]!.state, "cancelled");
 
       const lastState = fake.posted.filter((m) => m.type === "state").pop();
-      const interactions = lastState!.interactions as ReadonlyArray<{ interactionId: string }> | undefined;
-      assert.ok(
-        !interactions?.some((i) => i.interactionId === ref.interactionId),
-        "a settled interaction no longer renders as pending"
-      );
+      const interactions = lastState!.interactions as
+        | ReadonlyArray<{ interactionId: string; readOnly?: boolean; card: { state: string; outcome: string } }>
+        | undefined;
+      // chat1 Step 9: the dismissed interaction stays as a finished, read-only card.
+      const kept = interactions?.find((i) => i.interactionId === ref.interactionId);
+      assert.ok(kept, "a dismissed interaction stays in the chat");
+      assert.equal(kept.readOnly, true, "and no longer renders as pending");
+      assert.equal(kept.card.state, "dismissed");
+      assert.match(kept.card.outcome, /^dismissed/);
     } finally {
       notify.restore();
       cmds.restore();

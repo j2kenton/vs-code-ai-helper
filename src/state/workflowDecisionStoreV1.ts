@@ -410,6 +410,21 @@ export class WorkflowDecisionStoreV1 {
     );
   }
 
+  /**
+   * chat1 Step 8: every decision recorded for one task, in any state and in post order, so the chat
+   * can keep finished cards in the timeline (read-only, collapsed) instead of dropping them. Unlike
+   * `listPending` it keeps settled records; it still leaves out a pending record marked orphaned,
+   * which is not answerable.
+   */
+  listForTask(taskCanonicalId: string): readonly WorkflowDecisionV1[] {
+    const needle = normalizePath(taskCanonicalId);
+    return this.view().filter(
+      (decision) =>
+        normalizePath(decision.taskCanonicalId) === needle &&
+        !(decision.state === "pending" && isWorkflowDecisionOrphanedV1(decision.decisionId))
+    );
+  }
+
   /** The most recently answered decision of this key for the task whose answer was `optionId`, if any. */
   findLatestResolvedForOption(
     taskCanonicalId: string,

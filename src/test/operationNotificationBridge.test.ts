@@ -31,6 +31,7 @@ function snap(overrides: {
   modelId?: string;
   label?: string;
   taskName?: string;
+  endReasonV1?: string;
 }): TaskOperationSnapshot {
   return {
     id: "op-1",
@@ -47,6 +48,7 @@ function snap(overrides: {
     detail: overrides.detail,
     modelId: overrides.modelId,
     waitingForUser: false,
+    ...(overrides.endReasonV1 !== undefined ? { endReasonV1: overrides.endReasonV1 } : {}),
   };
 }
 
@@ -86,6 +88,35 @@ void describe("terminalEntryFor (taxonomy policy)", () => {
     }));
     assert.match(entry?.message ?? "", /model: sonnet@high \(Claude Code\)/);
     assert.match(entry?.message ?? "", /primary: codex-cli:gpt-6-luna@high cliExit/);
+  });
+
+  void it("chat1 Step 19: no end entry for a refusal or failure the command already reported", () => {
+    const reported = { ...snap({ state: "refused", kind: "complete-task", label: "Complete Task", endReasonV1: "Commit & Push is running" }), reportedByCommandV1: true };
+    assert.equal(terminalEntryFor(reported), undefined);
+    assert.equal(terminalEntryFor({ ...reported, state: "failed" }), undefined);
+    // The flag never hides a completion or a cancellation.
+    assert.ok(terminalEntryFor({ ...reported, state: "succeeded" }));
+    assert.ok(terminalEntryFor({ ...reported, state: "cancelled" }));
+  });
+
+  void it("chat1 Step 5: a failed or refused end entry says why, so none reads just 'failed'", () => {
+    const failed = terminalEntryFor(
+      snap({ state: "failed", kind: "generate-plan", label: "Generate Plan", endReasonV1: "the model returned nothing." })
+    );
+    assert.equal(failed?.message, 'Generate Plan — "task_1": failed: the model returned nothing');
+    const refused = terminalEntryFor(
+      snap({ state: "refused", kind: "apply-review", label: "Apply Review", endReasonV1: "Commit & Push is still running" })
+    );
+    assert.equal(refused?.message, 'Apply Review — "task_1": refused — nothing was started: Commit & Push is still running');
+    // A cancelled or completed operation keeps its own wording; a failure with no recorded reason is unchanged.
+    assert.equal(
+      terminalEntryFor(snap({ state: "failed", kind: "generate-plan", label: "Generate Plan" }))?.message,
+      'Generate Plan — "task_1": failed'
+    );
+    assert.equal(
+      terminalEntryFor(snap({ state: "succeeded", kind: "review", endReasonV1: "ignored" }))?.message,
+      'Review — "task_1": completed'
+    );
   });
 
   void it("records failed roots as error entries", () => {

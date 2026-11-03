@@ -120,6 +120,28 @@ void describe("WorkflowDecisionStoreV1", () => {
     assert.equal(pending[0]!.state, "pending");
   });
 
+  void it("chat1 Step 8: listForTask keeps finished records of one task in any state, in post order", async () => {
+    const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
+    const answered = await store.post(decisionInput({ decisionKey: "a" }));
+    const dismissed = await store.post(decisionInput({ decisionKey: "b" }));
+    const open = await store.post(decisionInput({ decisionKey: "c" }));
+    const other = await store.post(decisionInput({ decisionKey: "d", taskCanonicalId: "/tmp/tasks/task-2" }));
+    assert.ok(answered.ok && dismissed.ok && open.ok && other.ok);
+    if (!answered.ok || !dismissed.ok || !open.ok || !other.ok) return;
+    await store.resolve(answered.decision.decisionId, "doIt");
+    await store.dismiss(dismissed.decision.decisionId, "owner");
+    const listed = store.listForTask("/tmp/tasks/task-1");
+    assert.deepEqual(
+      listed.map((decision) => [decision.decisionId, decision.state]),
+      [
+        [answered.decision.decisionId, "resolved"],
+        [dismissed.decision.decisionId, "dismissed"],
+        [open.decision.decisionId, "pending"],
+      ]
+    );
+    assert.equal(store.listPending("/tmp/tasks/task-1").length, 1, "listPending is unchanged: only the open card");
+  });
+
   void it("rejects posting an invalid decision and does not persist it", async () => {
     const store = new WorkflowDecisionStoreV1(new FakeMemento() as unknown as import("vscode").Memento);
     const posted = await store.post(decisionInput({ whatHappened: "" }));
@@ -577,7 +599,7 @@ void describe("WorkflowDecisionStoreV1 — Fast Forward resume label freshness (
 
     const pending = store.listPending(folder);
     const reconcileOption = pending[0]!.options.find((o) => o.optionId === "reconcile");
-    assert.equal(reconcileOption!.label, "Mark reconciled and try again (one cycle)");
+    assert.equal(reconcileOption!.label, "Mark reconciled and try again (one cycle, then stops)");
     assert.match(reconcileOption!.consequence, /This runs one cycle and stops there/);
     // Purely cosmetic: the dispatch args (the actual safety re-check's input)
     // are untouched by the label refresh.

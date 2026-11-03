@@ -33,22 +33,29 @@ function describeRoundGitDeltaV1(record: import("./roundGitStateV1").RoundGitObs
       console.warn(`Round Git state evidence unavailable for ${record.operationId}: ${record.unavailableReason}`);
     }
   }
-  const parts: string[] = [];
+  // chat1 Step 21: plain words. The attribution label and "index paths" are internal terms; the owner
+  // needs to know which files, that Ensemble can't say who changed them, and what to do.
+  const sentences: string[] = [];
   if (delta) {
-    if (delta.newUnmergedPaths.length) parts.push(`new unmerged paths: ${delta.newUnmergedPaths.join(", ")}`);
-    if (delta.changedIndexEntries.length) parts.push(`changed index paths: ${delta.changedIndexEntries.join(", ")}`);
-    if (delta.addedStashes.length) parts.push(`added stashes: ${delta.addedStashes.map((entry) => entry.selector).join(", ")}`);
-    if (delta.removedStashes.length) parts.push(`removed stashes: ${delta.removedStashes.map((entry) => entry.selector).join(", ")}`);
+    const files = [
+      ...delta.newUnmergedPaths.map((entry) => `${entry} (unresolved conflict)`),
+      ...delta.changedIndexEntries,
+    ];
+    if (files.length) {
+      sentences.push(
+        "Files changed in git while this round ran, and Ensemble can't tell whether the round or someone else " +
+        `changed them: ${files.join(", ")}. Check them before you commit.`
+      );
+    }
+    if (delta.addedStashes.length) sentences.push(`Stashes added: ${delta.addedStashes.map((entry) => entry.selector).join(", ")}.`);
+    if (delta.removedStashes.length) sentences.push(`Stashes removed: ${delta.removedStashes.map((entry) => entry.selector).join(", ")}.`);
   }
   if (record.indexLockSettlement) {
     const lockText = describeIndexLockSettlementV1(record.indexLockSettlement);
-    if (lockText) parts.push(lockText);
+    if (lockText) sentences.push(`${lockText.replace(/[.;]+$/, "")}.`);
   }
-  if (!parts.length) return undefined;
-  const prefix = delta
-    ? `Git state changed during this round (${delta.attribution}): `
-    : "Git state after this round: ";
-  return `${prefix}${parts.join("; ")}. Evidence: round-git-state-v1/${record.operationId}.json`;
+  if (!sentences.length) return undefined;
+  return `${sentences.join(" ")} Evidence: round-git-state-v1/${record.operationId}.json`;
 }
 
 /**
@@ -246,7 +253,11 @@ export interface TaskOperationHandle {
    * return be read as "completed" (pre-1.0.0 fixes register item 8). Calling
    * this more than once keeps the LAST call's state and reason.
    */
-  settleAs(state: "refused" | "failed" | "cancelled" | "interrupted", reason?: string): void;
+  settleAs(
+    state: "refused" | "failed" | "cancelled" | "interrupted",
+    reason?: string,
+    options?: { readonly reportedByCommand?: boolean }
+  ): void;
   /**
    * Who asked this operation (or an ancestor) to stop, once a cancellation was
    * requested through `cancelOperation`; `undefined` when none was (or the
@@ -350,6 +361,12 @@ export interface TaskOperationSnapshot {
    * report the round's own outcome rather than only that a command returned.
    */
   readonly endReasonV1?: string;
+  /**
+   * chat1 Step 19: set through `settleAs(..., { reportedByCommand: true })` when the command already
+   * told the owner about this refusal or failure in its own Notifications entry, so the end-of-operation
+   * entry is not a second one for the same event.
+   */
+  readonly reportedByCommandV1?: boolean;
 }
 
 /**
@@ -388,6 +405,8 @@ interface MutableOperation {
   cancelReasonV1?: string;
   /** See TaskOperationSnapshot.endReasonV1. */
   endReasonV1?: string;
+  /** See TaskOperationSnapshot.reportedByCommandV1. */
+  reportedByCommandV1?: boolean;
   /** Set via TaskOperationHandle.settleAs; read back by runTrackedOperation before end() removes this row. */
   explicitOutcome?: { readonly state: "refused" | "failed" | "cancelled" | "interrupted"; readonly reason?: string };
   /** Who requested the cancellation — see `CancelSourceV1`. */
@@ -739,8 +758,13 @@ export class TaskOperationRegistry implements vscode.Disposable {
         activity: string | undefined,
         options?: { resetElapsedOrigin?: boolean; stageToken?: number; elapsedOrigin?: number }
       ) => this.reportActivity(id, activity, options),
-      settleAs: (state: "refused" | "failed" | "cancelled" | "interrupted", reason?: string) => {
+      settleAs: (
+        state: "refused" | "failed" | "cancelled" | "interrupted",
+        reason?: string,
+        options?: { readonly reportedByCommand?: boolean }
+      ) => {
         operation.explicitOutcome = { state, reason };
+        operation.reportedByCommandV1 = options?.reportedByCommand === true;
         if (state === "cancelled" && reason !== undefined) {
           operation.cancelReasonV1 = reason;
         }

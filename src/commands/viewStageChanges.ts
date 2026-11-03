@@ -124,8 +124,8 @@ async function performStageSwap(node: StageNode | undefined, kind: StageSwapKind
       }
       const choice = await vscode.window.showWarningMessage(
         kind === "revert"
-          ? "Are you sure you want to revert the changes? This restores the stage's file to its previous version."
-          : "Are you sure you want to redo? This restores the content that the last revert replaced.",
+          ? "⚠ irreversible. Are you sure you want to revert the changes? This restores the stage's file to its previous version."
+          : "⚠ irreversible. Are you sure you want to redo? This restores the content that the last revert replaced.",
         { modal: true },
         confirmLabel
       );

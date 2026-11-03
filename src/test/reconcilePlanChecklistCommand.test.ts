@@ -1373,11 +1373,11 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.ok(applyOption, "an Apply Reviewer-Verified Tick(s) option must still be offered");
       assert.equal(
         applyOption.label,
-        "Same as the reviewer-verified ticks card above — apply and try again (one cycle)"
+        "Same as the reviewer-verified ticks card above — apply and try again (one cycle, then stops)"
       );
       assert.match(
         applyOption.label,
-        /and try again \(one cycle\)/,
+        /and try again \(one cycle, then stops\)/,
         "every resumeKind: 'continue' option's label must say what it does next, even when relabelled"
       );
       assert.match(
@@ -1935,7 +1935,7 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       }
       const continueOption = decision.options.find((o) => o.optionId === "continueStage");
       assert.ok(continueOption, "the continueStage option must be offered");
-      assert.equal(continueOption.label, "Resume and continue stage and try again (one cycle)");
+      assert.equal(continueOption.label, "Resume and continue stage and try again (one cycle, then stops)");
       assert.match(continueOption.consequence, /does not start or resume Fast Forward/);
     } finally {
       fs.restore();
@@ -2766,7 +2766,7 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       assert.ok(decision, "a decision must be posted");
       const linkOption = decision.options.find((o) => o.optionId === "linkManualChecks");
       assert.ok(linkOption, "a Link Outstanding Checks option must be offered for the unconfirmed pooled case");
-      assert.match(linkOption.label, /Link 5 Outstanding Checks and try again \(one cycle\)/);
+      assert.match(linkOption.label, /Link 5 Outstanding Checks and try again \(one cycle, then stops\)/);
       assert.equal(linkOption.effect.kind, "command");
       if (linkOption.effect.kind !== "command") {
         throw new Error("unreachable — asserted above");

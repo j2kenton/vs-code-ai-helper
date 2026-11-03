@@ -55,9 +55,22 @@ export type RecoveryRequiredCodeV1 =
   | "chatRecoveryRequired"
   | "taskCreationRecoveryRequired";
 
+/**
+ * chat1 Step 18: who holds the task when an action is refused as a duplicate, so the refusal can say
+ * what is running and since when instead of showing a code. Absent on records written before this
+ * field and where the holder is not known.
+ */
+export interface DuplicateRejectedHolderV1 {
+  readonly actionKey: string;
+  readonly operationId: string;
+  /** ISO time the holder took the task. */
+  readonly acquiredAt: string;
+}
+
 export interface DuplicateRejectedOutcomeV1 {
   readonly kind: "duplicateRejected";
   readonly code: "operationAlreadyRunning";
+  readonly holder?: DuplicateRejectedHolderV1;
 }
 
 /**
@@ -317,8 +330,10 @@ export type TaskActionOutcomeV1 =
   | DuplicateRejectedOutcomeV1;
 
 /** The one duplicate-invocation outcome (plan §10.1's early guard emits it too). */
-export function duplicateRejectedV1(): DuplicateRejectedOutcomeV1 {
-  return { kind: "duplicateRejected", code: "operationAlreadyRunning" };
+export function duplicateRejectedV1(holder?: DuplicateRejectedHolderV1): DuplicateRejectedOutcomeV1 {
+  return holder === undefined
+    ? { kind: "duplicateRejected", code: "operationAlreadyRunning" }
+    : { kind: "duplicateRejected", code: "operationAlreadyRunning", holder };
 }
 
 /**
@@ -990,12 +1005,26 @@ export function decodeTaskActionOutcomeV1(raw: unknown): DecodeTaskActionOutcome
       };
     }
     case "duplicateRejected": {
-      const unknown = unknownOutcomeField(raw, new Set(["kind", "code"]), "duplicateRejected outcome");
+      const unknown = unknownOutcomeField(raw, new Set(["kind", "code", "holder"]), "duplicateRejected outcome");
       if (unknown) {
         return fail(unknown);
       }
       if (raw.code !== "operationAlreadyRunning") {
         return fail(`invalid duplicateRejected outcome "code": ${JSON.stringify(raw.code)}`);
+      }
+      const rawHolder: unknown = raw.holder;
+      if (rawHolder !== undefined) {
+        const h = rawHolder as Record<string, unknown> | null;
+        if (
+          typeof h !== "object" || h === null ||
+          typeof h.actionKey !== "string" || typeof h.operationId !== "string" || typeof h.acquiredAt !== "string"
+        ) {
+          return fail(`invalid duplicateRejected outcome "holder": ${JSON.stringify(rawHolder)}`);
+        }
+        return {
+          ok: true,
+          outcome: duplicateRejectedV1({ actionKey: h.actionKey, operationId: h.operationId, acquiredAt: h.acquiredAt }),
+        };
       }
       return { ok: true, outcome: { kind: "duplicateRejected", code: "operationAlreadyRunning" } };
     }

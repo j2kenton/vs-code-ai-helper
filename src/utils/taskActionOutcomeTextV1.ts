@@ -33,6 +33,7 @@ import {
   TaskActionOutcomeProviderV1,
   TaskActionOutcomeV1,
 } from "../types/taskActionOutcomeV1";
+import { ACTION_NAME_BY_KEY_V1 } from "./busyAdmissionTextV1";
 import { attributionModelLabel } from "./fileUtils";
 import { describeChainCandidatesV1, describeChainRecoveryV1 } from "./chainExhaustionMessageV1";
 import { STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
@@ -248,6 +249,40 @@ export function describeTaskActionOutcomeForLogV1(
     default:
       return `Status: ${(outcome as TaskActionOutcomeV1).kind}`;
   }
+}
+
+export interface TaskHeldRefusalInputV1 {
+  /** The refusal, with the holder when the lease store recorded one. */
+  readonly outcome: { readonly holder?: { readonly actionKey: string; readonly operationId: string; readonly acquiredAt: string } };
+  /** The task's display name, unquoted. */
+  readonly taskLabel: string;
+  /** What the owner tried to do, as the command's name ("Complete Task") and as a verb ("complete"). */
+  readonly attemptedAction: string;
+  readonly attemptedVerb: string;
+  /** The live operation holding the task, when the registry has one. */
+  readonly live?: { readonly label: string; readonly startedAt?: number };
+  /** The holder waits on the owner, or the task has a pending card. */
+  readonly waitsOnOwner: boolean;
+}
+
+/**
+ * chat1 Step 18: the refusal "another action already holds this task" in the owner's words: what holds
+ * it, since when, and what to do. Never the bare outcome code.
+ */
+export function describeTaskHeldRefusalV1(input: TaskHeldRefusalInputV1): string {
+  const holder = input.outcome.holder;
+  const holderName = input.live?.label ?? (holder ? ACTION_NAME_BY_KEY_V1[holder.actionKey] : undefined) ?? "Another action";
+  const sinceMs = input.live?.startedAt ?? (holder ? Date.parse(holder.acquiredAt) : Number.NaN);
+  const since = Number.isFinite(sinceMs)
+    ? ` since ${new Date(sinceMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+    : "";
+  const verb = holderName === "Publish Checks" ? "have" : "has";
+  const head = `Can't ${input.attemptedVerb} ${input.taskLabel}: `;
+  return input.waitsOnOwner
+    ? `${head}${holderName} ${verb} been running${since} and is waiting for you in Chat With AI. ` +
+        `Answer or cancel it there, then ${input.attemptedAction} again.`
+    : `${head}${holderName} ${verb} been running${since}. ` +
+        `Wait for it or stop it from Chat With AI, then ${input.attemptedAction} again.`;
 }
 
 /** User-facing failure clause for a non-completed, non-cancelled, non-questions outcome. */

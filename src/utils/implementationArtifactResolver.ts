@@ -61,6 +61,7 @@ import { hasControlCharacterV1, normalizeRepositoryRelativePathV1 } from "./roun
 // lazy property access on the whole module object resolves correctly by the
 // time either function actually runs.
 import { recoverStageEntryJournalIfPresentV1 } from "./stageEntryJournalV1";
+import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
 
 export interface ResolvedImplementationArtifact {
   /** The URI to use for reading/opening */
@@ -2091,20 +2092,21 @@ async function finalizePlanRevisionLockedV1(
       );
     }
     if (!alreadyEchoed) {
+      const planRevisedText = adopted
+        ? `Plan revised: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items — Implementation and later reviews ` +
+          "re-run." +
+          (adoptedProposal?.ledgerAnnotated === false
+            ? " (the mutating round's own ledger row was no longer available to annotate — the " +
+              "proposal record above is the durable evidence of this completion.)"
+            : "")
+        : `Plan revised on disk: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items, but the durable adoption ` +
+          "record could not be written after 3 attempts — the proposal may still read as in-progress. " +
+          "task-progress.json may need manual repair.";
       await appendChatMessageV1(
         taskFolderUri.fsPath,
         {
           role: "assistant",
-          text: adopted
-            ? `Plan revised: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items — Implementation and later reviews ` +
-              "re-run." +
-              (adoptedProposal?.ledgerAnnotated === false
-                ? " (the mutating round's own ledger row was no longer available to annotate — the " +
-                  "proposal record above is the durable evidence of this completion.)"
-                : "")
-            : `Plan revised on disk: ${oldTotal ?? "?"} → ${newTotal ?? "?"} items, but the durable adoption ` +
-              "record could not be written after 3 attempts — the proposal may still read as in-progress. " +
-              "task-progress.json may need manual repair.",
+          text: planRevisedText,
           stage,
           at: resolvedAt,
           kind: "activity",
@@ -2112,6 +2114,8 @@ async function finalizePlanRevisionLockedV1(
         },
         taskFolderUri.fsPath
       );
+      // chat1 Step 5: the chat no longer renders this line; Notifications keeps it, naming the task.
+      void logChatStatusToNotificationsV1(taskFolderUri.fsPath, planRevisedText, stage, adopted ? "info" : "warning");
     }
   } catch {
     // Best-effort — never blocks the transition this promotion is part of.

@@ -16,6 +16,8 @@ import { deriveTaskBindingV1 } from "../types/taskBindingV1";
 import { runStageEntryPostCommitV1, type StageEntryResultV1 } from "./stageTransition";
 import { recoverStageEntryJournalIfPresentV1 } from "./stageEntryJournalV1";
 import type { ChatTarget } from "../views/chatView";
+import { describeTaskActionFailureV1 } from "./taskActionOutcomeTextV1";
+import { buildTaskHeldRefusalMessageV1 } from "./taskHeldRefusalNoticeV1";
 import * as path from "path";
 
 export { StaleReopenError };
@@ -187,10 +189,22 @@ export async function reopenCompletedTask(
       rejection = { outcome: "failed", message: `Could not reopen the task: ${outcome.detail}` };
       return false;
     }
-    const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
+    // chat1 Steps 18 and 19: never the bare outcome code. A task another action holds says what holds it,
+    // since when and what to do. The caller shows this message as the one notification for the refusal.
+    const held = buildTaskHeldRefusalMessageV1({
+      outcome,
+      taskFolderPath: task.taskFolderPath,
+      canonicalId: task.canonicalId,
+      progress: task.progress,
+      folderName: task.folderName,
+      attemptedAction: "Resume Task",
+      attemptedVerb: "reopen",
+    });
     rejection = {
       outcome: "failed",
-      message: `Could not reopen the task (${detail}). Please refresh the Tasks panel and try again.`,
+      message:
+        held?.message ??
+        `Could not reopen the task (${describeTaskActionFailureV1(outcome)}). Please refresh the Tasks panel and try again.`,
     };
     return false;
   };

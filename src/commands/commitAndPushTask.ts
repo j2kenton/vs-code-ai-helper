@@ -101,6 +101,34 @@ import {
 import { isEffectivelyPausedV1, resolveEffectiveStageTaskStatusV1 } from "../state/effectivePauseStatusV1";
 import { resolveTaskRootCandidates } from "../utils/taskRoot";
 import { buildFullListConfirmMessageV1 } from "../utils/commitPushFullListV1";
+import { describeTaskActionFailureV1 } from "../utils/taskActionOutcomeTextV1";
+import {
+  buildTaskHeldRefusalMessageV1,
+  reportTaskHeldRefusalV1,
+  showTaskHeldRefusalWarningV1,
+} from "../utils/taskHeldRefusalNoticeV1";
+
+/**
+ * chat1 Steps 18 and 19: report a lifecycle row refused because another action holds the task, as the
+ * one holder warning, and settle the composite's operation as `refused` so its end entry is not a
+ * second message. Returns false for any other outcome.
+ */
+function reportCompleteCommitPushHeldV1(
+  outcome: TaskActionOutcomeV1,
+  resolvedTask: ResolvedTaskContext,
+  op: TaskOperationHandle
+): boolean {
+  return reportTaskHeldRefusalV1({
+    outcome,
+    taskFolderPath: resolvedTask.taskFolderPath,
+    canonicalId: resolvedTask.canonicalId,
+    progress: resolvedTask.progress,
+    folderName: resolvedTask.folderName,
+    op,
+    attemptedAction: "Complete, Commit and Push",
+    attemptedVerb: "complete and commit",
+  });
+}
 
 /**
  * A pending `commitPushMetadata.v1` Chat interaction being explicitly
@@ -3491,7 +3519,28 @@ export async function invokeCommitPushRowV1(
   // A pre-execute rejection (ineligible task status, or another coordinator
   // action already holding this task's lease) — nothing has told the user
   // anything yet.
-  const detail = outcome.kind === "failed" ? outcome.code : outcome.kind;
+  // chat1 Steps 18 and 19: plain words, never the bare outcome code. A task another action holds gets
+  // the one holder warning (what holds it, since when, what to do) instead of a generic error.
+  const held = buildTaskHeldRefusalMessageV1({
+    outcome,
+    taskFolderPath: resolvedTask.taskFolderPath,
+    canonicalId: resolvedTask.canonicalId,
+    progress: resolvedTask.progress,
+    folderName: resolvedTask.folderName,
+    attemptedAction: "Commit & Push",
+    attemptedVerb: "commit and push",
+  });
+  if (held !== undefined) {
+    showTaskHeldRefusalWarningV1(held, resolvedTask);
+    await postCommitPushNotStartedInChatV1(
+      resolvedTask,
+      "Another action already holds the task.",
+      "Wait for the other action to finish or stop it, then choose Commit & Push again.",
+      true
+    );
+    return;
+  }
+  const detail = describeTaskActionFailureV1(outcome);
   NotificationRouter.showError(`${commitPushTaskLabel(resolvedTask)} — commit and push could not start: ${detail}.`);
   await postCommitPushNotStartedInChatV1(
     resolvedTask,
@@ -4156,7 +4205,11 @@ export async function completeCommitAndPushTask(
         taskDisplayName: resolvedTask.progress.displayName,
       });
       if (stageOutcome.kind !== "completed") {
-        const detail = stageOutcome.kind === "failed" ? stageOutcome.code : stageOutcome.kind;
+        // chat1 Steps 18 and 19: a task another action holds gets the one holder warning.
+        if (reportCompleteCommitPushHeldV1(stageOutcome, resolvedTask, op)) {
+          return;
+        }
+        const detail = describeTaskActionFailureV1(stageOutcome);
         NotificationRouter.showWarning(
           `${completeTaskLabel}: could not persist completion (${detail}).`
         );
@@ -4182,7 +4235,10 @@ export async function completeCommitAndPushTask(
         taskDisplayName: resolvedTask.progress.displayName,
       });
       if (doneOutcome.kind !== "completed") {
-        const detail = doneOutcome.kind === "failed" ? doneOutcome.code : doneOutcome.kind;
+        if (reportCompleteCommitPushHeldV1(doneOutcome, resolvedTask, op)) {
+          return;
+        }
+        const detail = describeTaskActionFailureV1(doneOutcome);
         NotificationRouter.showError(
           `${completeTaskLabel}: could not persist completion (${detail}). Please try again.`
         );

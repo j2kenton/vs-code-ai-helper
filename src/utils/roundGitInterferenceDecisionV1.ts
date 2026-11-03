@@ -23,13 +23,18 @@ export function roundGitObservationEvidencePathV1(taskFolderPath: string, operat
 function describeStashObservation(observation: RoundGitStashObservationV1): string {
   const describe = (entry: { readonly selector: string; readonly objectId: string; readonly subject: string }): string =>
     `${entry.selector} (${entry.objectId.slice(0, 12)}): ${entry.subject}`;
+  // chat1 Step 21: the operation id and the attribution label are technical; they go to the card's
+  // Details toggle (see `technicalStashDetailV1`), not into the sentence the owner reads.
   return [
-    `operation ${observation.operationId}; attribution: ${observation.attribution}`,
     observation.observedFrom ? `observed from ${observation.observedFrom}` : undefined,
     observation.observedUntil ? `observed until ${observation.observedUntil}` : undefined,
     observation.added.length ? `added: ${observation.added.map(describe).join(", ")}` : undefined,
     observation.removed.length ? `removed: ${observation.removed.map(describe).join(", ")}` : undefined,
   ].filter(Boolean).join("; ");
+}
+
+function technicalStashDetailV1(observation: RoundGitStashObservationV1): string {
+  return `operation ${observation.operationId}; the change was seen in git but could not be tied to the round or to you`;
 }
 
 export function buildRoundGitInterferenceDecisionV1(
@@ -39,13 +44,17 @@ export function buildRoundGitInterferenceDecisionV1(
   readonly whatHappened: string;
   readonly options: readonly WorkflowDecisionOptionV1[];
   readonly recommendation: { readonly kind: "option"; readonly optionId: string; readonly reasoning: string } | { readonly kind: "none"; readonly reasoning: string };
+  readonly evidence?: readonly { readonly label: string; readonly detail: string }[];
 } {
   const description = [
     ...(hold.unmergedPaths.length ? [`unmerged paths: ${hold.unmergedPaths.join(", ")}`] : []),
     ...(hold.stashObservations?.length
-      ? hold.stashObservations.map(describeStashObservation)
-      : hold.stashOperationIds.map((operationId) => `stash changes observed for operation ${operationId}; attribution is unknown`)),
+      ? hold.stashObservations.map((observation) => `stash change (${describeStashObservation(observation)})`)
+      : hold.stashOperationIds.map(() => "a stash change was seen and its cause is unknown")),
   ].join("; ");
+  const technicalDetail = hold.stashObservations?.length
+    ? hold.stashObservations.map(technicalStashDetailV1).join("\n")
+    : hold.stashOperationIds.map((operationId) => `operation ${operationId}; the cause of the change is unknown`).join("\n");
   const actions: WorkflowDecisionOptionV1[] = [
     ...hold.unmergedPaths.map((relativePath, index) => ({
       optionId: `keepWorkingTree${index + 1}`,
@@ -102,6 +111,7 @@ export function buildRoundGitInterferenceDecisionV1(
     recommendation: recommended
       ? { kind: "option", optionId: recommended.optionId, reasoning }
       : { kind: "none", reasoning },
+    ...(technicalDetail.length > 0 ? { evidence: [{ label: "Details", detail: technicalDetail }] } : {}),
   };
 }
 
@@ -126,6 +136,7 @@ export async function offerRoundGitInterferenceDecisionV1(input: {
     whyUserNeeded: "Review the observed paths and stash entries, then choose the exact path or stash record to handle.",
     options: decision.options,
     recommendation: decision.recommendation,
+    ...(decision.evidence !== undefined ? { evidence: decision.evidence } : {}),
     gating: {
       holdsTaskPaused: false,
       unblocksProgress: true,

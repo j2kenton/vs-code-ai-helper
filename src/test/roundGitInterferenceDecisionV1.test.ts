@@ -44,7 +44,8 @@ void describe("round Git interference chat recovery decision", () => {
 
     assert.match(decision.whatHappened, /unmerged paths: src\/a\.ts, src\/b\.ts/);
     assert.match(decision.whatHappened, /observations do not establish who caused a change/);
-    assert.match(decision.whatHappened, /attribution is unknown/);
+    assert.match(decision.whatHappened, /a stash change was seen and its cause is unknown/);
+    assert.doesNotMatch(decision.whatHappened, /attribution|operation op-7/);
     assert.equal(decision.recommendation.kind, "option");
     assert.equal(decision.recommendation.optionId, "keepWorkingTree1");
     assert.deepEqual(decision.options.map((option) => option.label), [
@@ -99,6 +100,12 @@ void describe("round Git interference chat recovery decision", () => {
     assert.equal(decision.options[1]?.label, "Acknowledge stash change: op-9");
     assert.match(decision.whatHappened, /stash@\{0\} \(abcdef123456\): saved work/);
     assert.match(decision.whatHappened, /observed from 2026-01-01T00:00:00.000Z/);
+    // chat1 Step 21: no internal terms in the sentence; the operation id sits in the Details toggle.
+    assert.doesNotMatch(decision.whatHappened, /observed-unattributed|attribution|operation op-9/);
+    assert.deepEqual(decision.evidence, [
+      { label: "Details", detail: "operation op-9; the change was seen in git but could not be tied to the round or to you" },
+    ]);
+    assert.doesNotMatch(JSON.stringify(decision.evidence), /observed-unattributed|attribution/);
     assert.deepEqual(decision.options[0]?.effect, {
       kind: "command",
       command: OPEN_ROUND_GIT_EVIDENCE_COMMAND_V1,

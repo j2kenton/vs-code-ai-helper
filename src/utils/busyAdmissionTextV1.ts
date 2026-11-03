@@ -32,6 +32,29 @@ const ACTION_BY_COMMAND_V1: Readonly<Record<string, string>> = {
   resumeThenDispatchV1: "A resumed stage action",
 };
 
+/**
+ * chat1 Step 18: the same names for the action keys the lease store records
+ * (`DuplicateRejectedOutcomeV1.holder.actionKey`), for when no live operation names the holder.
+ */
+export const ACTION_NAME_BY_KEY_V1: Readonly<Record<string, string>> = {
+  "commitPush.v1": "Commit & Push",
+  "commitPushMetadata.v1": "Commit & Push",
+  "markTaskDone.v1": "Complete Task",
+  "review.v1": "A review",
+  "applyReview.v1": "Apply Review",
+  "applyReviewEdit.v1": "Apply Review",
+  "implementation.v1": "Implementation",
+  "editExecution.v1": "Implementation",
+  "generateImplementation.v1": "Implementation plan generation",
+  "generatePlan.v1": "Plan generation",
+  "fastForward.v1": "Fast Forward",
+  "lint.v1": "Fix Linting & Code Errors",
+  "resumeTask.v1": "A resumed stage action",
+  "nextStage.v1": "Moving to the next stage",
+  "renameTask.v1": "Renaming the task",
+  "draft.v1": "Drafting",
+};
+
 export interface PlainBusyRefusalV1 {
   /** For the owner: what is running, how long, and what they can do. */
   readonly message: string;

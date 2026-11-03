@@ -9,7 +9,9 @@ import { describe, it } from "node:test";
 import { shouldPostGitStateDetailV1 } from "../utils/taskOperations";
 
 void describe("bugs5 Step 20: one Git-state line that updates", () => {
-  const line = "Git state changed during this round (observed-unattributed): changed index paths: a.ts. Evidence: x.json";
+  const line =
+    "Files changed in git while this round ran, and Ensemble can't tell whether the round or someone else changed them: a.ts. " +
+    "Check them before you commit. Evidence: x.json";
 
   void it("posts the first line", () => {
     assert.equal(shouldPostGitStateDetailV1(undefined, line), true);

@@ -20,6 +20,7 @@ import * as os from "os";
 import { withTaskLock } from "../state/taskStateStore";
 import type { TaskStage } from "../types/taskProgress";
 import type { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
 import {
   type ChatMessage,
   type ChatQuestionSettlementV1,
@@ -79,7 +80,8 @@ export async function retirePendingQuestionsV1(
       ...(filter.raisedAtOrBefore !== undefined ? { raisedAtOrBefore: filter.raisedAtOrBefore } : {}),
     }, { state: "stale", reason }));
     for (const form of forms) {
-      await appendChatMessageV1(taskFolderPath, { role: "assistant", text: `Withdrawn: ${reason}`, stage: form.stage, at: new Date().toISOString() }, canonicalId);
+      await appendChatMessageV1(taskFolderPath, { role: "assistant", text: `Withdrawn: ${reason}`, stage: form.stage, at: new Date().toISOString(), kind: "outcome" }, canonicalId);
+      void logChatStatusToNotificationsV1(taskFolderPath, `Withdrawn: ${reason}`, form.stage);
     }
     await expireLocalOnlyInteractionsV1(taskFolderPath, canonicalId, {
       stage: filter.stage,
@@ -142,8 +144,14 @@ export async function retireFreeTextQuestionsFromEarlierActivationV1(
         text: `Withdrawn: ${describeFreeTextWaiterGoneReasonV1(question.text)}.`,
         stage: question.stage,
         at: new Date().toISOString(),
+        kind: "outcome",
       },
       canonicalId
+    );
+    void logChatStatusToNotificationsV1(
+      taskFolderPath,
+      `Withdrawn: ${describeFreeTextWaiterGoneReasonV1(question.text)}.`,
+      question.stage
     );
   }
   return closed;
