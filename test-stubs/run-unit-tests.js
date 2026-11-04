@@ -14,6 +14,20 @@ function discoverUnitTests(root = path.join(__dirname, "..", "out", "test")) {
     .sort((a, b) => a.localeCompare(b));
 }
 
+// How many test files run at once. Node's default is one less than the CPU
+// count, which on a 2-core machine (the cloud devbox) means one file at a
+// time. Measured there on 2026-11-04, a 76-file sample took 69 s with one
+// worker and 43 s with two, with the same 2,036 tests passing. Each file runs
+// in its own process either way, so files still don't share state.
+// ENSEMBLE_TEST_CONCURRENCY overrides it (for example 1, to debug a test
+// that only fails when run alongside others).
+function testConcurrency() {
+  const override = Number.parseInt(process.env.ENSEMBLE_TEST_CONCURRENCY ?? "", 10);
+  if (Number.isInteger(override) && override > 0) return override;
+  const os = require("node:os");
+  return Math.max(1, typeof os.availableParallelism === "function" ? os.availableParallelism() : os.cpus().length);
+}
+
 if (require.main === module) {
   const root = path.join(__dirname, "..");
   // RELATIVE paths, and `cwd` pinned to the repo root so they resolve.
@@ -41,7 +55,7 @@ if (require.main === module) {
   const { result, report } = runWithLeakCheck(root, () =>
     spawnSync(
       process.execPath,
-      ["--require", "./test-stubs/register.js", "--test", ...tests],
+      ["--require", "./test-stubs/register.js", `--test-concurrency=${testConcurrency()}`, "--test", ...tests],
       { stdio: "inherit", cwd: root }
     )
   );
