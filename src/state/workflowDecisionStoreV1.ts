@@ -5,12 +5,14 @@ import {
   createWorkflowDecisionV1,
   normalizeWorkflowDecisionV1,
   WorkflowDecisionCompletionReasonV1,
+  WorkflowDecisionAutoContinueV1,
   WorkflowDecisionDeferredAnswerV1,
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
 } from "../types/workflowDecisionV1";
 import { awaitedRestartGuidanceV1, isAwaitedWaiterLiveV1 } from "../utils/awaitedDecisionWaitersV1";
 import {
+  adaptVerifiedTicksCardToFastForwardStateV1,
   holdDispatchingOptionsWhileOperationLiveV1,
   liveOperationBlockingOptionV1,
   refreshFastForwardResumeOptionLabelsV1,
@@ -29,7 +31,10 @@ import {
   viewEndedLiveReferenceV1,
 } from "../utils/liveReferenceCardV1";
 
+import type { KeepGoingRecordV1, RunBindingV1 } from "../utils/autoContinueKeepGoingV1";
+
 const STORAGE_KEY = "workflowDecisions";
+const KEEP_GOING_STORAGE_KEY_V1 = "workflowDecisionKeepGoing";
 /** The Memento key holding every decision (hostDecisionMirrorV1.ts mirrors it into viewers). */
 export const WORKFLOW_DECISIONS_STORAGE_KEY_V1 = STORAGE_KEY;
 
@@ -282,7 +287,10 @@ export class WorkflowDecisionStoreV1 {
    * lifts by itself when the operation ends.
    */
   private view(): WorkflowDecisionV1[] {
-    return this.all().map(holdDispatchingOptionsWhileOperationLiveV1).map(viewEndedLiveReferenceV1);
+    return this.all()
+      .map(adaptVerifiedTicksCardToFastForwardStateV1)
+      .map(holdDispatchingOptionsWhileOperationLiveV1)
+      .map(viewEndedLiveReferenceV1);
   }
 
   private async saveAll(decisions: readonly WorkflowDecisionV1[]): Promise<void> {
@@ -575,6 +583,85 @@ export class WorkflowDecisionStoreV1 {
       await this.saveAll(next);
       return true;
     });
+  }
+
+  /**
+   * review1 Step 53: store the countdown on a pending decision (persisted, so it survives a reload). Returns false
+   * when the decision is gone or no longer pending. A countdown that was cancelled is never re-armed here: the card
+   * that replaces it arms its own.
+   */
+  async armAutoContinue(decisionId: string, autoContinue: WorkflowDecisionAutoContinueV1): Promise<boolean> {
+    return serializeDecisionWriteV1(this.state, async () => {
+      const existing = this.all();
+      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
+      const current = index === -1 ? undefined : existing[index]!;
+      if (!current || current.state !== "pending" || current.autoContinue !== undefined) {
+        return false;
+      }
+      const next = [...existing];
+      next[index] = { ...current, autoContinue };
+      await this.saveAll(next);
+      return true;
+    });
+  }
+
+  /** Marks a countdown cancelled (an answer, Wait for me, a state change). The card itself is left as it is. */
+  async cancelAutoContinue(decisionId: string, reason: string): Promise<void> {
+    await serializeDecisionWriteV1(this.state, async () => {
+      const existing = this.all();
+      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
+      const current = index === -1 ? undefined : existing[index]!;
+      if (!current?.autoContinue || current.autoContinue.cancelledAt !== undefined) {
+        return;
+      }
+      const next = [...existing];
+      next[index] = {
+        ...current,
+        autoContinue: { ...current.autoContinue, cancelledAt: new Date().toISOString(), cancelledReason: reason },
+      };
+      await this.saveAll(next);
+    });
+  }
+
+  /** review1 Step 54: the run-scoped "and keep going" answers (see autoContinueKeepGoingV1). */
+  listKeepGoing(): readonly KeepGoingRecordV1[] {
+    const raw: unknown = this.state.get<unknown>(KEEP_GOING_STORAGE_KEY_V1, []);
+    if (!Array.isArray(raw)) return [];
+    return (raw as readonly Partial<KeepGoingRecordV1>[]).filter(
+      (record): record is KeepGoingRecordV1 => typeof record?.key === "string" && typeof record?.recordedAt === "string"
+    );
+  }
+
+  async recordKeepGoing(key: string, binding: RunBindingV1): Promise<void> {
+    await serializeDecisionWriteV1(this.state, async () => {
+      const others = this.listKeepGoing().filter((record) => record.key !== key);
+      await this.state.update(
+        KEEP_GOING_STORAGE_KEY_V1,
+        [...others, { key, recordedAt: new Date().toISOString(), binding }].slice(-50)
+      );
+    });
+  }
+
+  async clearKeepGoing(key: string): Promise<void> {
+    await serializeDecisionWriteV1(this.state, async () => {
+      const all = this.listKeepGoing();
+      if (all.some((record) => record.key === key)) {
+        await this.state.update(
+          KEEP_GOING_STORAGE_KEY_V1,
+          all.filter((record) => record.key !== key)
+        );
+      }
+    });
+  }
+
+  /** Pending decisions whose countdown is armed and not cancelled, for the periodic sweep. */
+  listWithArmedAutoContinue(): readonly WorkflowDecisionV1[] {
+    return this.all().filter(
+      (decision) =>
+        decision.state === "pending" &&
+        decision.autoContinue !== undefined &&
+        decision.autoContinue.cancelledAt === undefined
+    );
   }
 
   /** Drops a kept answer (carried out, replaced away, or the owner chose again). */

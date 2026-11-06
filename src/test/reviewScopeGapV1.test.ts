@@ -3,6 +3,8 @@
  * run 141: a tracked scope that holds tests and part of the production files, against a larger change set.
  */
 import * as assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   computeReviewScopeGapV1,
@@ -23,6 +25,33 @@ void describe("isProductionSourceFileV1", () => {
     assert.equal(isProductionSourceFileV1("src/test/fixtures/b.json"), false);
     assert.equal(isProductionSourceFileV1("packages/x/src/a.test.ts"), false);
     assert.equal(isProductionSourceFileV1("docs/a.md"), false);
+  });
+});
+
+void describe("review1 Step 59/60: a file the size budget cut is not reviewed", () => {
+  void it("a tracked file the pack left out joins the not-reviewed list and the count says so", () => {
+    const tracked = prod(10);
+    const omittedByBudget = new Set(tracked.slice(7)); // the pack ran out of room for the last 3
+    const gap = computeReviewScopeGapV1({
+      ledgerFiles: tracked,
+      workingTreeFiles: [],
+      // Exactly what reviewActions does: the scope is the tracked files minus the pack's omitted ones.
+      scopeFiles: tracked.filter((file) => !omittedByBudget.has(file)),
+    });
+    assert.deepEqual([...gap.missing].sort(), [...omittedByBudget].sort());
+    assert.equal(gap.productionChangedCount, 10);
+    assert.equal(gap.productionReviewedCount, 7);
+    assert.match(describeReviewedCountV1(gap), /7 of 10/);
+    assert.match(formatMissingFilesSectionV1(gap), /src\/utils\/file9\.ts/);
+  });
+
+  void it("the review dispatch takes the pack's omitted files out of the scope it reports on", () => {
+    const source = readFileSync(join(__dirname, "..", "..", "src", "commands", "reviewActions.ts"), "utf8");
+    const filter = source.indexOf("written.omittedRelPaths.map(");
+    assert.ok(filter > 0, "the omitted files are read from the written pack");
+    const block = source.slice(filter, filter + 900);
+    assert.match(block, /scopeFiles: scopeGapInput\.scopeFiles\.filter\(/);
+    assert.match(block, /partialScopeVariablesV1\(gap\.missing/);
   });
 });
 

@@ -115,6 +115,14 @@ export function formatPartialScopeVerdictNoteV1(scope: PartialReviewScopeV1, acc
   );
 }
 
+/**
+ * True when a review's verdict says it covered only part of the change and the owner has not accepted the gap
+ * (review1 Step 59). Read from the note `formatPartialScopeVerdictNoteV1` writes, so it needs no side lookup.
+ */
+export function reviewHoldsForPartialScopeV1(content: string): boolean {
+  return REVIEW_PARTIAL_SCOPE_MARKER_RE.test(content) && !/The owner accepted this partial scope\./.test(content);
+}
+
 /** Appends the partial-scope verdict note once; the marker makes it idempotent. */
 export function qualifyReviewForPartialScopeV1(
   content: string,

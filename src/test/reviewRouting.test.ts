@@ -2,9 +2,10 @@ import * as assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import * as reviewRoutingModule from "../utils/reviewRouting";
+import { selectPostReviewDispatchStageV1 } from "../utils/implementationDispatchModeV1";
 import {
   blockerIdentity,
-  chooseAutomaticImplementationDispatchV1,
   decidePostReviewActionV1,
   decideReviewRoute,
   describeTaskFixableBlockersV1,
@@ -1209,71 +1210,47 @@ void describe("decidePostReviewActionV1", () => {
 });
 
 /**
- * wf10 continuation item 17: the automatic loop used to compute
- * `decidePostReviewActionV1` on every dispatch — manual and automatic alike
- * — but only ever ACTED on it for the manual path (posting a decision card).
- * An automation dispatch fell through to Implementation regardless of what
- * the decision said, which is exactly how ten consecutive automatic
- * `# Implementation Run` rounds ran against a blocker frozen at score 6:
- * Implementation only reads the plan checklist and was never told about it.
+ * review1 Step 18: the wf10 automatic Apply Review redirect (`chooseAutomaticImplementationDispatchV1`) is gone. The
+ * round after a review is rendered with that review, so which stage's review it carries is the only choice left.
  */
-void describe("chooseAutomaticImplementationDispatchV1", () => {
-  void it("redirects to Apply Review when the decision is apply-review and the dispatch is automatic", () => {
-    const dispatch = chooseAutomaticImplementationDispatchV1({
-      decision: { action: "apply-review", reviewStage: "impl-high-review", reason: "blockers stand" },
-      isAutomationDispatch: true,
-      continuationOwed: false,
-    });
-    assert.strictEqual(dispatch.kind, "redirect-apply-review");
-    assert.strictEqual(dispatch.kind === "redirect-apply-review" && dispatch.reviewStage, "impl-high-review");
+void describe("selectPostReviewDispatchStageV1 (review1 Step 18)", () => {
+  const history = [
+    { stage: "impl-high-review" as const, at: "2026-11-03T10:00:00.000Z" },
+    { stage: "impl-low-review" as const, at: "2026-11-03T11:00:00.000Z" },
+    { stage: "plan-high-review" as const, at: "2026-11-03T12:00:00.000Z" },
+  ];
+
+  void it("carries the newest implementation review, whichever stage it was", () => {
+    assert.strictEqual(
+      selectPostReviewDispatchStageV1({ recoveryRecord: undefined, history, stages: IMPL_REVIEW_STAGES_V1 }),
+      "impl-low-review"
+    );
   });
 
-  void it("redirects to Apply Review when the decision is 'both' and the dispatch is automatic", () => {
-    const dispatch = chooseAutomaticImplementationDispatchV1({
-      decision: { action: "both", reviewStage: "impl-low-review", reason: "both are valid" },
-      isAutomationDispatch: true,
-      continuationOwed: false,
-    });
-    assert.strictEqual(dispatch.kind, "redirect-apply-review");
-    assert.strictEqual(dispatch.kind === "redirect-apply-review" && dispatch.reviewStage, "impl-low-review");
+  void it("is undefined before the stage's first review, so run-implementation.md is unchanged", () => {
+    assert.strictEqual(
+      selectPostReviewDispatchStageV1({ recoveryRecord: undefined, history: [history[2]!], stages: IMPL_REVIEW_STAGES_V1 }),
+      undefined
+    );
+    assert.strictEqual(
+      selectPostReviewDispatchStageV1({ recoveryRecord: undefined, history: undefined, stages: IMPL_REVIEW_STAGES_V1 }),
+      undefined
+    );
   });
 
-  void it("runs Implementation when the dispatch is manual, even for an apply-review decision", () => {
-    const dispatch = chooseAutomaticImplementationDispatchV1({
-      decision: { action: "apply-review", reviewStage: "impl-high-review", reason: "blockers stand" },
-      isAutomationDispatch: false,
-      continuationOwed: false,
-    });
-    assert.strictEqual(dispatch.kind, "run-implementation");
+  void it("a continuation follows its source round's review", () => {
+    assert.strictEqual(
+      selectPostReviewDispatchStageV1({
+        recoveryRecord: { sourceDispatchMode: "apply-review", sourceReviewStage: "impl-high-review" },
+        history,
+        stages: IMPL_REVIEW_STAGES_V1,
+      }),
+      "impl-high-review"
+    );
   });
 
-  void it("runs Implementation when a continuation is owed, even for an apply-review decision", () => {
-    const dispatch = chooseAutomaticImplementationDispatchV1({
-      decision: { action: "apply-review", reviewStage: "impl-high-review", reason: "blockers stand" },
-      isAutomationDispatch: true,
-      continuationOwed: true,
-    });
-    assert.strictEqual(dispatch.kind, "run-implementation");
-  });
-
-  void it("runs Implementation for 'implementation' and 'none' decisions regardless of dispatch mode", () => {
-    for (const action of ["implementation", "none"] as const) {
-      const dispatch = chooseAutomaticImplementationDispatchV1({
-        decision: { action, reviewStage: "impl-high-review", reason: "n/a" },
-        isAutomationDispatch: true,
-        continuationOwed: false,
-      });
-      assert.strictEqual(dispatch.kind, "run-implementation");
-    }
-  });
-
-  void it("runs Implementation when the decision carries no reviewStage to redirect to", () => {
-    const dispatch = chooseAutomaticImplementationDispatchV1({
-      decision: { action: "apply-review", reason: "no review yet" },
-      isAutomationDispatch: true,
-      continuationOwed: false,
-    });
-    assert.strictEqual(dispatch.kind, "run-implementation");
+  void it("the redirect and its chooser no longer exist", () => {
+    assert.strictEqual("chooseAutomaticImplementationDispatchV1" in reviewRoutingModule, false);
   });
 });
 
@@ -1327,26 +1304,11 @@ void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (
     );
   });
 
-  void it("the preImplementationRouting dialog posts via postWorkflowDecisionV1, falling back to a raw notification only when posting fails", async () => {
+  void it("review1 Step 18: no preImplementationRouting card is raised and nothing redirects an Implementation dispatch", async () => {
     const source = await readReviewActionsSrc();
-    const marker = 'decisionKey: "preImplementationRouting"';
-    const index = source.indexOf(marker);
-    assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
-    const before = source.slice(Math.max(0, index - 400), index);
-    assert.match(
-      before,
-      /postWorkflowDecisionV1/,
-      "preImplementationRouting must be posted through postWorkflowDecisionV1, not built as a raw notification"
-    );
-    const after = source.slice(index, index + 4000);
-    const fallbackOffset = after.indexOf("NotificationRouter.showWarning");
-    assert.ok(fallbackOffset >= 0, "expected a fallback notification for a missing extension context");
-    const guard = after.slice(0, fallbackOffset);
-    assert.match(
-      guard,
-      /if\s*\(!decision\)/,
-      "the fallback notification must be gated on the decision failing to post, not run unconditionally alongside it"
-    );
+    assert.strictEqual(source.includes('decisionKey: "preImplementationRouting"'), false);
+    assert.strictEqual(source.includes("redirectAfterOperationV1"), false);
+    assert.strictEqual(source.includes("chooseAutomaticImplementationDispatchV1"), false);
   });
 
   void it("the sterileRoundRouting recommendation and fallback do not call Implementation futile when sterileBothValid (a task-fixable blocker AND unticked checklist items coexist)", async () => {
@@ -1400,33 +1362,18 @@ void describe("reviewActions.ts's migrated dialogs and enriched ledger entries (
     );
   });
 
-  void it("both migrated dialogs recommend 'Go to Review & Apply' rather than defaulting the recommendation to blindly running Implementation again", async () => {
+  void it("the sterileRoundRouting dialog recommends 'Go to Review & Apply' rather than defaulting the recommendation to blindly running Implementation again", async () => {
     const source = await readReviewActionsSrc();
-    for (const decisionKey of ["sterileRoundRouting", "preImplementationRouting"]) {
-      const marker = `decisionKey: "${decisionKey}"`;
-      const index = source.indexOf(marker);
-      assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
-      const slice = source.slice(index, index + (decisionKey === "preImplementationRouting" ? 6000 : 2200));
-      assert.match(
-        slice,
-        /optionId:\s*"goToReviewAndApply"/,
-        `${decisionKey} must offer a goToReviewAndApply option`
-      );
-      // RC7 item 3: preImplementationRouting recommends "Keep running
-      // Implementation" only when plan items are open and the blockers are
-      // unbuilt work (runningImplementationRecommendedOptionV1); every other
-      // case still falls back to goToReviewAndApply.
-      const recommendationPattern =
-        decisionKey === "preImplementationRouting"
-          ? /recommendation:\s*runningImplementationRecommendedOptionV1\([\s\S]{0,900}optionId:\s*"goToReviewAndApply"/
-          : /recommendation:\s*\{\s*kind:\s*"option",\s*optionId:\s*"goToReviewAndApply"/;
-      assert.match(
-        slice,
-        recommendationPattern,
-        `${decisionKey} must recommend goToReviewAndApply, matching the corrected routing input (an owed ` +
-          "continuation is checked before this dialog is ever reached — see decidePostReviewActionV1)"
-      );
-    }
+    const marker = 'decisionKey: "sterileRoundRouting"';
+    const index = source.indexOf(marker);
+    assert.ok(index >= 0, `expected to find ${marker} in reviewActions.ts`);
+    const slice = source.slice(index, index + 2200);
+    assert.match(slice, /optionId:\s*"goToReviewAndApply"/, "sterileRoundRouting must offer a goToReviewAndApply option");
+    assert.match(
+      slice,
+      /recommendation:\s*\{\s*kind:\s*"option",\s*optionId:\s*"goToReviewAndApply"/,
+      "sterileRoundRouting must recommend goToReviewAndApply"
+    );
   });
 
   void it("every known scheduleAutomationChain trigger in reviewActions.ts carries enriched scheduling-intent metadata", async () => {

@@ -129,6 +129,12 @@ export interface SummaryOnlyContinuationOptionsV1 {
   /** Pin a report correction to the original candidate. Ordinary recovery
    * continuations retain the configured backup chain. */
   readonly restrictToPrimaryModel?: boolean;
+  /**
+   * review1 Step 49: run the diagnostic round instead of a report continuation. Candidates need only vendor-enforced
+   * read-only (not an honoured response contract), and the answer is returned as the result's `summary` for the
+   * caller to save.
+   */
+  readonly diagnosticReadOnly?: boolean;
   /** Observe and persist the exact provider candidate immediately before it
    * is invoked. Backup selection remains owned by the coordinator. */
   readonly onCandidateInvokedV1?: (info: {
@@ -183,7 +189,11 @@ export async function runSummaryOnlyContinuationV1(
     chatDocumentId = allocateHex128IdV1();
   }
 
-  options.onProgress("Producing the missing implementation report (no edits)...");
+  options.onProgress(
+    options.diagnosticReadOnly === true
+      ? "Investigating the failure (read-only, no edits)..."
+      : "Producing the missing implementation report (no edits)..."
+  );
 
   // The same before/after fingerprint snapshot the CLI edit path uses — the
   // delta gate's evidence that the no-edit premise held. The scope factory
@@ -221,7 +231,9 @@ export async function runSummaryOnlyContinuationV1(
     // flow backup (Claude/OpenCode/devpass-code) must never be reserved in
     // place of a summary-only-capable primary. See the option's own doc
     // comment.
-    requireSummaryOnlyCapableText: true,
+    ...(options.diagnosticReadOnly === true
+      ? { requireReadOnlyText: true }
+      : { requireSummaryOnlyCapableText: true }),
     ...(options.restrictToPrimaryModel === true ? { restrictToPrimaryModel: true } : {}),
   });
   const validatedInput: ImplContinuationReportActionInputV1 = {

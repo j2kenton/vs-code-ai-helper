@@ -67,11 +67,21 @@ const PASSING_REVIEW = "# Implementation Review\n\nReadiness: 10/10\n\nEverythin
 const MISSING = ["src/a.ts", "src/b.ts", "src/c.ts"];
 const SUMMARY = "Reviewed 40 of 43 changed files (25 of 28 production files)";
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const partialScopeCardModule = require("../commands/partialScopeDecisionV1") as Record<string, unknown>;
+
 async function routeCompletedReview(
   name: string,
   variables: Record<string, string>,
-  acceptance?: { stage: string; hash: string }
-): Promise<{ entries: RecordingSurface["entries"]; reviewContent: string }> {
+  acceptance?: { stage: string; hash: string },
+  reviewText: string = PASSING_REVIEW
+): Promise<{ entries: RecordingSurface["entries"]; reviewContent: string; cards: Array<Record<string, unknown>> }> {
+  const cards: Array<Record<string, unknown>> = [];
+  const originalPostCard = partialScopeCardModule.postPartialScopeDecisionV1;
+  partialScopeCardModule.postPartialScopeDecisionV1 = (options: Record<string, unknown>): Promise<undefined> => {
+    cards.push(options);
+    return Promise.resolve(undefined);
+  };
   const store: MemStore = new Map();
   const bridge = installMemStore(store);
   const surface = new RecordingSurface();
@@ -87,7 +97,7 @@ async function routeCompletedReview(
     reviewAttemptId: "attempt-partial-scope",
   };
   store.set(vscode.Uri.joinPath(folderUri, "task-progress.json").toString(), JSON.stringify(progress, null, 2));
-  store.set(reviewUri.toString(), PASSING_REVIEW);
+  store.set(reviewUri.toString(), reviewText);
   if (acceptance) {
     store.set(
       vscode.Uri.joinPath(folderUri, PARTIAL_SCOPE_ACCEPTANCE_FILE_V1).toString(),
@@ -135,8 +145,9 @@ async function routeCompletedReview(
       // The advance path beyond the "Auto-advancing" notice needs more of the production harness than this test
       // wires; what it announced before that point is the observable under test.
     }
-    return { entries: surface.entries, reviewContent: store.get(reviewUri.toString()) ?? "" };
+    return { entries: surface.entries, reviewContent: store.get(reviewUri.toString()) ?? "", cards };
   } finally {
+    partialScopeCardModule.postPartialScopeDecisionV1 = originalPostCard;
     for (const [key, value] of originals) {
       settingsModule[key] = value;
     }
@@ -180,6 +191,36 @@ void describe("handleReviewOutcomeV1 — a review over a partial scope does not 
       hash: hashMissingFilesV1(["src/other.ts"]),
     });
     assert.ok(!entries.some((e) => e.message.includes("Auto-advancing stage")));
+  });
+
+  void it("a 7/10 review over a partial scope still raises the partial-scope card (review1 Step 59)", async () => {
+    const { cards, reviewContent } = await routeCompletedReview(
+      "partial-low-score",
+      partialScopeVariablesV1(MISSING, SUMMARY),
+      undefined,
+      "# Implementation Review\n\nReadiness: 7/10\n\nThree things still to fix.\n"
+    );
+    assert.equal(cards.length, 1, "a score under the threshold still gets the way out");
+    assert.equal(cards[0]?.scoreClears, false);
+    assert.equal(cards[0]?.stage, "impl-high-review");
+    assert.deepEqual((cards[0]?.scope as { files: string[] }).files, MISSING);
+    assert.match(reviewContent, /review-scope:\s*partial/);
+  });
+
+  void it("a threshold-clearing review over a partial scope raises the card too, flagged as clearing", async () => {
+    const { cards } = await routeCompletedReview("partial-clearing", partialScopeVariablesV1(MISSING, SUMMARY));
+    assert.equal(cards.length, 1);
+    assert.equal(cards[0]?.scoreClears, true);
+  });
+
+  void it("an accepted gap raises no card", async () => {
+    const { cards } = await routeCompletedReview(
+      "partial-accepted-no-card",
+      partialScopeVariablesV1(MISSING, SUMMARY),
+      { stage: "impl-high-review", hash: hashMissingFilesV1(MISSING) },
+      "# Implementation Review\n\nReadiness: 7/10\n\nThree things still to fix.\n"
+    );
+    assert.equal(cards.length, 0);
   });
 
   void it("a scope that matches the change set adds nothing to the review and advances (control)", async () => {

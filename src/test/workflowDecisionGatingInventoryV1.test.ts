@@ -100,14 +100,6 @@ void describe("WorkflowDecisionV1 creation-site inventory — gating field", () 
   // and no-files-changed dialogs, both migrated off raw
   // `vscode.window.showWarningMessage` (see reviewRouting.ts's
   // `decidePostReviewActionV1` doc comment, "The worse case").
-  void it("reviewActions.ts's preImplementationRouting decision supplies gating", async () => {
-    const source = await readSrc("commands/reviewActions.ts");
-    const slice = sliceAroundDecisionKey(source, "preImplementationRouting");
-    assert.match(slice, /gating:\s*\{/, "the preImplementationRouting decision must supply gating");
-    assert.match(slice, /holdsTaskPaused:\s*false/);
-    assert.match(slice, /unblocksProgress:\s*false/);
-  });
-
   void it("reviewActions.ts's sterileRoundRouting decision supplies gating", async () => {
     const source = await readSrc("commands/reviewActions.ts");
     const slice = sliceAroundDecisionKey(source, "sterileRoundRouting");

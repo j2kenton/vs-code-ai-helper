@@ -3,6 +3,8 @@ import { spawn, execSync, execFileSync } from "child_process";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateLintPayload } from "./taskProgressTransforms";
+import { extractPassedTestFilesFromOutputV1 } from "./evidenceGapV1";
+import { recordPublishChecksPassedFilesV1 } from "./publishChecksPassedFilesV1";
 import { planRawCheckReportV1 } from "./rawCheckReportPathsV1";
 import * as fs from "fs";
 import * as path from "path";
@@ -234,6 +236,11 @@ export interface CompletionLintResult {
    * aren't forced to populate it.
    */
   commandsRun?: string[];
+  /**
+   * review1 Step 34: the test files named in the output of the passing commands, bounded. In memory only (a
+   * passing run keeps no output on disk); Fast Forward reads it right after it ran the checks once.
+   */
+  passedTestFiles?: string[];
   /**
    * What each PASSING command executed, read from its own output: the runner
    * closing summaries it printed, the tests they counted and a fingerprint of
@@ -1571,6 +1578,9 @@ export async function collectCompletionLint(
       const execution = extractFailingTestsV1(check.output);
       return execution.closingSummaries !== undefined ? [{ command: check.command, execution }] : [];
     });
+  const passedTestFiles = [
+    ...new Set(checks.filter((check) => check.code === 0).flatMap((check) => extractPassedTestFilesFromOutputV1(check.output))),
+  ].slice(0, 300);
   const retriedPasses = checks
     .filter((check) => check.code === 0 && check.retryCount > 0)
     .map((check) => ({ command: check.command, retryCount: check.retryCount }));
@@ -1673,6 +1683,7 @@ export async function collectCompletionLint(
       envVarNames: Object.keys(process.env).sort(),
     },
     commandsRun: checks.map((check) => check.command),
+    ...(passedTestFiles.length > 0 ? { passedTestFiles } : {}),
     ...(passedExecutions.length > 0 ? { passedExecutions } : {}),
     monorepoDetected,
     ...(monorepoDetected ? { monorepoChecks } : {}),
@@ -2704,6 +2715,11 @@ export async function runCompletionLint(folderUri: vscode.Uri, relevantFiles?: r
   throwIfPublishChecksCancelledV1(options?.token);
   if (options?.persist === false) return result;
   await persistCompletionLintResultV1(folderUri, result);
+  recordPublishChecksPassedFilesV1(folderUri.fsPath, {
+    runAt: result.runAt,
+    passed: result.passedModuloKnownFlakes ?? result.passed,
+    testFiles: result.passedTestFiles ?? [],
+  });
   return result;
 }
 

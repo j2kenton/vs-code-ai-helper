@@ -24,6 +24,7 @@ import {
   MAX_PLAN_ITEM_EVIDENCE_ENTRIES,
   MAX_PLAN_ITEM_OWNER_DECISIONS,
   MAX_PLAN_ITEM_OWNER_TEST_RUNS,
+  PlanItemEvidenceV1,
   PlanItemOwnerDecisionV1,
   PlanItemReviewerVerificationV1,
   PlanItemTestReportV1,
@@ -39,8 +40,110 @@ import {
   TaskStatus,
 } from "../types/taskProgress";
 import { isMachineMaintainedArtifactPathV1 } from "./implReviewFileSelection";
-import { normalizeChecklistItemTextV1 } from "./implementationChecklist";
+import {
+  listPlanItemContentHashesV1,
+  normalizeChecklistItemTextV1,
+  planItemRowAppliesV1,
+  stripPlanItemAnnotationsV1,
+} from "./implementationChecklist";
 import { extractPublishFailurePathsV1, publishFailureMatchesTestIdentityV1 } from "./publishFailurePlanAssociationV1";
+import { recordOwnerActionInWatchV1 } from "./taskProgressWatchV1";
+
+/**
+ * review1 Step 2: finds the evidence row a new fact about an item belongs on. With the item's content hash
+ * (computed from the plan text the caller read) a row for the same item is reused whatever plan revision it
+ * was recorded at; without it, the old (revision, key) match applies.
+ */
+function locateEvidenceRowV1(
+  records: readonly PlanItemEvidenceV1[],
+  planRevision: string,
+  itemKey: string,
+  itemContentHash: string | undefined,
+  itemOccurrence?: number,
+  level?: PlanItemLevelV1
+): number {
+  if (itemContentHash === undefined) {
+    return records.findIndex((record) => record.planRevision === planRevision && record.itemKey === itemKey);
+  }
+  return records.findIndex(
+    (record) =>
+      record.itemKey === itemKey &&
+      (record.itemContentHash === undefined || record.itemContentHash === itemContentHash) &&
+      // Identical items keep separate rows: a row that recorded its copy only takes facts about that copy.
+      (record.itemOccurrence === undefined || itemOccurrence === undefined || record.itemOccurrence === itemOccurrence) &&
+      // A top-level leaf and an identically worded child hash alike, so a row is only reused at its own level.
+      rowLevelMatchesV1(record.itemNested, level)
+  );
+}
+
+/** Which nesting level an item resolved to, and whether the plan has same-worded twins at both levels. */
+interface PlanItemLevelV1 {
+  readonly nested: boolean;
+  readonly ambiguous: boolean;
+}
+
+function rowLevelMatchesV1(rowNested: boolean | undefined, level: PlanItemLevelV1 | undefined): boolean {
+  if (level === undefined) return true;
+  if (rowNested !== undefined) return rowNested === level.nested;
+  // A row from before the level was recorded: top-level, unless a child would be mistaken for it.
+  return !(level.nested && level.ambiguous);
+}
+
+/** Stamps a row with the revision it was last recorded at and the item's content hash, when known. */
+function stampEvidenceRowV1(
+  row: PlanItemEvidenceV1,
+  planRevision: string,
+  itemContentHash: string | undefined,
+  itemOccurrence?: number,
+  level?: PlanItemLevelV1
+): PlanItemEvidenceV1 {
+  if (itemContentHash === undefined) return row;
+  return {
+    ...row,
+    planRevision,
+    itemContentHash,
+    ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
+    ...(level !== undefined ? { itemNested: level.nested } : {}),
+  };
+}
+
+/**
+ * review1 Step 2: the content hash and copy number (1-based, among items with identical text) a new row is
+ * recorded under. A caller that knows which copy it means passes `occurrence`; otherwise the first copy
+ * that `itemText` names is used, so a fact about one of several identical items never settles the others.
+ */
+function resolvePlanItemIdentityV1(
+  planText: string | undefined,
+  itemText: string,
+  occurrence: number | undefined,
+  nested = false
+): {
+  readonly hash: string | undefined;
+  readonly occurrence: number | undefined;
+  readonly level: PlanItemLevelV1 | undefined;
+} {
+  if (planText === undefined) return { hash: undefined, occurrence: undefined, level: undefined };
+  const wanted = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(itemText));
+  const named = listPlanItemContentHashesV1(planText).filter((entry) => entry.annotationFreeKey === wanted);
+  // The copy number counts among items of one level, so a nested claim names its level (review1 Step 9).
+  const chosen =
+    (occurrence !== undefined
+      ? named.find((entry) => entry.nested === nested && entry.occurrence === occurrence)
+      : undefined) ??
+    named.find((entry) => !entry.nested) ??
+    named[0];
+  return {
+    hash: chosen?.hash,
+    occurrence: chosen === undefined ? undefined : chosen.occurrence,
+    level:
+      chosen === undefined
+        ? undefined
+        : {
+            nested: chosen.nested,
+            ambiguous: named.some((entry) => entry.nested) && named.some((entry) => !entry.nested),
+          },
+  };
+}
 
 export function recordPlanItemClaimEvidenceV1<T extends TaskProgress>(
   progress: T,
@@ -51,13 +154,23 @@ export function recordPlanItemClaimEvidenceV1<T extends TaskProgress>(
     readonly at: string;
     readonly roundId?: string;
     readonly evidence?: string;
+    /** The plan text the revision was computed from; lets the row carry the item's content hash. */
+    readonly planText?: string;
+    /** Which copy of identical items this is (1-based); defaults to the first copy named. */
+    readonly itemOccurrence?: number;
+    /** True when `itemOccurrence` counts among nested items (a child), not top-level ones. */
+    readonly itemNested?: boolean;
   }
 ): T {
   const itemKey = normalizeChecklistItemTextV1(input.itemText);
-  const records = [...(progress.planItemEvidence ?? [])];
-  const existingIndex = records.findIndex(
-    (record) => record.planRevision === input.planRevision && record.itemKey === itemKey
+  const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(
+    input.planText,
+    input.itemText,
+    input.itemOccurrence,
+    input.itemNested === true
   );
+  const records = [...(progress.planItemEvidence ?? [])];
+  const existingIndex = locateEvidenceRowV1(records, input.planRevision, itemKey, itemContentHash, itemOccurrence, level);
   const claim = {
     source: input.source,
     at: input.at,
@@ -71,12 +184,21 @@ export function recordPlanItemClaimEvidenceV1<T extends TaskProgress>(
       (row) => row.source === claim.source && row.roundId === claim.roundId && row.at === claim.at
     );
     if (duplicate) return progress;
-    records[existingIndex] = { ...existing, claims: [...existing.claims, claim].slice(-100) };
+    records[existingIndex] = stampEvidenceRowV1(
+      { ...existing, claims: [...existing.claims, claim].slice(-100) },
+      input.planRevision,
+      itemContentHash,
+      itemOccurrence,
+      level
+    );
   } else {
     records.push({
       planRevision: input.planRevision,
       itemKey,
       itemText: input.itemText.slice(0, 4000),
+      ...(itemContentHash !== undefined ? { itemContentHash } : {}),
+      ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
+      ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
       claims: [claim],
     });
   }
@@ -85,11 +207,12 @@ export function recordPlanItemClaimEvidenceV1<T extends TaskProgress>(
 
 export function recordPlanItemReviewerVerificationV1<T extends TaskProgress>(
   progress: T,
-  input: { readonly planRevision: string; readonly itemText: string; readonly at: string; readonly roundId?: string; readonly evidence: string; readonly testReportRoundIds?: readonly string[] }
+  input: { readonly planRevision: string; readonly itemText: string; readonly at: string; readonly roundId?: string; readonly evidence: string; readonly testReportRoundIds?: readonly string[]; readonly planText?: string; readonly itemOccurrence?: number; readonly itemNested?: boolean }
 ): T {
   const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(input.planText, input.itemText, input.itemOccurrence, input.itemNested === true);
   const records = [...(progress.planItemEvidence ?? [])];
-  const index = records.findIndex((record) => record.planRevision === input.planRevision && record.itemKey === itemKey);
+  const index = locateEvidenceRowV1(records, input.planRevision, itemKey, itemContentHash, itemOccurrence, level);
   const verification: PlanItemReviewerVerificationV1 = {
     at: input.at,
     ...(input.roundId ? { roundId: input.roundId } : {}),
@@ -97,12 +220,24 @@ export function recordPlanItemReviewerVerificationV1<T extends TaskProgress>(
     ...(input.testReportRoundIds?.length ? { testReportRoundIds: [...new Set(input.testReportRoundIds)].slice(0, 100) } : {}),
   };
   if (index < 0) {
-    records.push({ planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000), claims: [], verifications: [verification] });
+    records.push({
+      planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000),
+      ...(itemContentHash !== undefined ? { itemContentHash } : {}),
+      ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
+      ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
+      claims: [], verifications: [verification],
+    });
   } else {
     const current = records[index];
     if (!current) return progress;
     if ((current.verifications ?? []).some((row) => row.at === verification.at && row.roundId === verification.roundId)) return progress;
-    records[index] = { ...current, verifications: [...(current.verifications ?? []), verification].slice(-100) };
+    records[index] = stampEvidenceRowV1(
+      { ...current, verifications: [...(current.verifications ?? []), verification].slice(-100) },
+      input.planRevision,
+      itemContentHash,
+      itemOccurrence,
+      level
+    );
   }
   return { ...progress, planItemEvidence: records.slice(-MAX_PLAN_ITEM_EVIDENCE_ENTRIES) } as T;
 }
@@ -115,18 +250,34 @@ export function recordPlanItemReviewerVerificationV1<T extends TaskProgress>(
  */
 export function recordPlanItemOwnerDecisionV1<T extends TaskProgress>(
   progress: T,
-  input: { readonly planRevision: string; readonly itemText: string; readonly at: string; readonly formId: string; readonly decision: "tick" | "exclude" }
+  input: {
+    readonly planRevision: string; readonly itemText: string; readonly at: string; readonly formId: string;
+    readonly decision: "tick" | "exclude" | "reword";
+    /** The plan text the revision was computed from; lets the row carry the item's content hash. */
+    readonly planText?: string;
+    /** Which copy of identical items this is (1-based); defaults to the first copy named. */
+    readonly itemOccurrence?: number;
+    /** True when `itemOccurrence` counts among nested items (a child), not top-level ones. */
+    readonly itemNested?: boolean;
+  }
 ): T {
   const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(input.planText, input.itemText, input.itemOccurrence, input.itemNested === true);
   const records = [...(progress.planItemOwnerDecisions ?? [])];
-  if (records.some((row) => row.planRevision === input.planRevision && row.itemKey === itemKey &&
-      row.formId === input.formId && row.decision === input.decision)) return progress;
+  if (records.some((row) => row.itemKey === itemKey && row.formId === input.formId && row.decision === input.decision &&
+      (itemContentHash === undefined ? row.planRevision === input.planRevision : row.itemContentHash === itemContentHash))) return progress;
   const decision: PlanItemOwnerDecisionV1 = {
     planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000),
     source: "owner", at: input.at, formId: input.formId, decision: input.decision,
+    ...(itemContentHash !== undefined ? { itemContentHash } : {}),
+      ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
+    ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
   };
   records.push(decision);
-  return { ...progress, planItemOwnerDecisions: records.slice(-MAX_PLAN_ITEM_OWNER_DECISIONS) } as T;
+  const withDecision = { ...progress, planItemOwnerDecisions: records.slice(-MAX_PLAN_ITEM_OWNER_DECISIONS) } as T;
+  // review1 Step 23: the owner's own tick or exclusion is progress for the "is this working?" check. A reword is
+  // Ensemble's own plan write, not the owner settling something.
+  return input.decision === "reword" ? withDecision : (recordOwnerActionInWatchV1(withDecision, "you settled a plan item") as T);
 }
 
 /**
@@ -144,13 +295,29 @@ export function recordPlanItemOwnerTestRunV1<T extends TaskProgress>(
     readonly command: string;
     readonly exitCode: number;
     readonly summary: string;
+    /** The plan text the revision was computed from; lets the run carry each item's content hash. */
+    readonly planText?: string;
   }
 ): T {
   const records = [...(progress.planItemOwnerTestRuns ?? [])];
-  if (records.some((row) => row.formId === input.formId && row.planRevision === input.planRevision)) return progress;
+  if (records.some((row) => row.formId === input.formId)) return progress;
   const itemKeys = [...new Set(input.itemTexts.map(normalizeChecklistItemTextV1))].slice(0, 200);
   if (itemKeys.length === 0) return progress;
+  const itemContentHashes: Record<string, string> = {};
+  const itemOccurrences: Record<string, number> = {};
+  if (input.planText !== undefined) {
+    for (const text of input.itemTexts) {
+      // The same first-copy rule as every other writer: a run recorded against an item's text covers that copy,
+      // never the identical items beside it.
+      const { hash, occurrence } = resolvePlanItemIdentityV1(input.planText, text, undefined);
+      const key = normalizeChecklistItemTextV1(text);
+      if (hash !== undefined && itemContentHashes[key] === undefined) itemContentHashes[key] = hash;
+      if (occurrence !== undefined && itemOccurrences[key] === undefined) itemOccurrences[key] = occurrence;
+    }
+  }
   records.push({
+    ...(Object.keys(itemContentHashes).length > 0 ? { itemContentHashes } : {}),
+    ...(Object.keys(itemOccurrences).length > 0 ? { itemOccurrences } : {}),
     planRevision: input.planRevision,
     source: "owner",
     at: input.at,
@@ -160,23 +327,39 @@ export function recordPlanItemOwnerTestRunV1<T extends TaskProgress>(
     summary: input.summary.slice(0, 8000),
     itemKeys,
   });
-  return { ...progress, planItemOwnerTestRuns: records.slice(-MAX_PLAN_ITEM_OWNER_TEST_RUNS) } as T;
+  return recordOwnerActionInWatchV1(
+    { ...progress, planItemOwnerTestRuns: records.slice(-MAX_PLAN_ITEM_OWNER_TEST_RUNS) } as T,
+    "you recorded a test run"
+  ) as T;
 }
 
 export function recordPlanItemTestReportV1<T extends TaskProgress>(
   progress: T,
-  input: { readonly planRevision: string; readonly itemText: string; readonly report: PlanItemTestReportV1 }
+  input: { readonly planRevision: string; readonly itemText: string; readonly report: PlanItemTestReportV1; readonly planText?: string; readonly itemOccurrence?: number; readonly itemNested?: boolean }
 ): T {
   const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(input.planText, input.itemText, input.itemOccurrence, input.itemNested === true);
   const records = [...(progress.planItemEvidence ?? [])];
-  const index = records.findIndex((record) => record.planRevision === input.planRevision && record.itemKey === itemKey);
+  const index = locateEvidenceRowV1(records, input.planRevision, itemKey, itemContentHash, itemOccurrence, level);
   if (index < 0) {
-    records.push({ planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000), claims: [], testReports: [input.report] });
+    records.push({
+      planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000),
+      ...(itemContentHash !== undefined ? { itemContentHash } : {}),
+      ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
+      ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
+      claims: [], testReports: [input.report],
+    });
   } else {
     const current = records[index];
     if (!current) return progress;
     if ((current.testReports ?? []).some((row) => row.roundId === input.report.roundId && row.command === input.report.command && row.testIdentity === input.report.testIdentity)) return progress;
-    records[index] = { ...current, testReports: [...(current.testReports ?? []), input.report].slice(-100) };
+    records[index] = stampEvidenceRowV1(
+      { ...current, testReports: [...(current.testReports ?? []), input.report].slice(-100) },
+      input.planRevision,
+      itemContentHash,
+      itemOccurrence,
+      level
+    );
   }
   return { ...progress, planItemEvidence: records.slice(-MAX_PLAN_ITEM_EVIDENCE_ENTRIES) } as T;
 }
@@ -207,6 +390,11 @@ export function invalidatePlanItemEvidenceForChangedFilesV1<T extends TaskProgre
         .filter((token) => /(?:^|\/)[^/]+\.[a-z0-9]{1,12}$/i.test(token) && !token.startsWith("-"));
     };
     const reportDependsOnChangedFile = (report: PlanItemTestReportV1): boolean => {
+      // review1 Step 15: a report that recorded its test files, their direct imports and the test-run config
+      // depends on exactly those; an edit to any other file leaves it valid (it is carried forward).
+      if (report.testDependencyStates?.length) {
+        return report.testDependencyStates.some((state) => changed.has(normalizePath(state.path)));
+      }
       if (report.sourceFilesTruncated && changed.size > 0) return true;
       const explicitFiles = [
         ...(report.sourceFiles ?? []),
@@ -233,20 +421,18 @@ export function invalidatePlanItemEvidenceForChangedFilesV1<T extends TaskProgre
   return modified ? { ...progress, planItemEvidence } as T : progress;
 }
 
-/** Preserve claims while invalidating evidence tied to an older acceptance revision. */
-export function invalidatePlanItemEvidenceForPlanRevisionV1<T extends TaskProgress>(
-  progress: T,
-  currentPlanRevision: string
-): T {
+/**
+ * review1 Step 3: drops only the evidence rows whose item is gone from `planText` or whose content no longer
+ * matches (reworded, or a nested child changed). A change elsewhere in the plan — an Owner Decisions note, a
+ * typo fix in another item, an appended line — leaves every other row in place. Replaces the old wipe of
+ * everything recorded at an earlier plan revision.
+ */
+export function prunePlanItemEvidenceForPlanV1<T extends TaskProgress>(progress: T, planText: string): T {
   if (!progress.planItemEvidence?.length) return progress;
-  let modified = false;
-  const planItemEvidence = progress.planItemEvidence.map((record) => {
-    if (record.planRevision === currentPlanRevision) return record;
-    if (!(record.testReports?.length || record.verifications?.length)) return record;
-    modified = true;
-    return { ...record, testReports: [], verifications: [] };
-  });
-  return modified ? { ...progress, planItemEvidence } as T : progress;
+  const entries = listPlanItemContentHashesV1(planText);
+  if (entries.length === 0) return progress;
+  const kept = progress.planItemEvidence.filter((row) => entries.some((entry) => planItemRowAppliesV1(row, entry)));
+  return kept.length === progress.planItemEvidence.length ? progress : { ...progress, planItemEvidence: kept } as T;
 }
 
 /** Invalidate test evidence only when a failed check names its acceptance test. */
@@ -593,108 +779,6 @@ export function clearStageFallbackReservation(
 }
 
 /**
- * Soft cap on the persisted `implReviewFiles` set (item 9's eviction policy,
- * "make the stage chat a record of work" Part 16 step 42). Unbounded growth
- * here — observed at 52 entries after ~53 rounds on a real task, effectively
- * the task's entire touched-file history — guarantees any long-running task
- * eventually produces a review input the transport limit rejects, regardless
- * of how well the context pack's own per-render budget is tuned. A review
- * does not need the whole historical surface; it needs what changed recently
- * plus what the outstanding blockers name.
- */
-export const IMPL_REVIEW_FILES_MAX_ENTRIES_V1 = 40;
-
-/**
- * Apply the eviction policy to an already-unioned, most-recent-first
- * `implReviewFiles` list: a blocker-named path in `preserveRelPaths`
- * (typically the paths an outstanding review blocker names — see
- * `extractBlockerNamedPathsV1`) is never evicted, but it DISPLACES a
- * non-priority entry rather than being added on top — the result is capped
- * at `maxEntries` unconditionally (2026-08-29 review, completion blocker:
- * "eviction can exceed 40 entries" — a prior version kept the newest
- * `maxEntries` entries and then re-added every preserved path outside that
- * window, so a task with even a handful of blocker-named old files could
- * grow past the nominal cap on every round). Preserved paths keep their
- * original position in the returned, most-recent-first order; recency-only
- * entries are dropped, oldest first, to make room for them. If more than
- * `maxEntries` distinct paths are preserved (pathological — a review naming
- * more files than the whole cap), only the most recent `maxEntries` of the
- * preserved paths survive, so the hard cap holds unconditionally.
- */
-export function capImplReviewFilesV1(
-  files: readonly string[],
-  preserveRelPaths: ReadonlySet<string>,
-  maxEntries = IMPL_REVIEW_FILES_MAX_ENTRIES_V1
-): string[] {
-  if (files.length <= maxEntries) {
-    return [...files];
-  }
-  const keep = new Set<string>();
-  for (const file of files) {
-    if (preserveRelPaths.has(file)) {
-      keep.add(file);
-      if (keep.size >= maxEntries) {
-        break;
-      }
-    }
-  }
-  const remainingSlots = Math.max(0, maxEntries - keep.size);
-  let nonPriorityKept = 0;
-  for (const file of files) {
-    if (keep.has(file)) {
-      continue;
-    }
-    if (nonPriorityKept >= remainingSlots) {
-      continue;
-    }
-    keep.add(file);
-    nonPriorityKept++;
-  }
-  return files.filter((file) => keep.has(file));
-}
-
-const BLOCKER_NAMED_PATH_RE_V1 = /`([\w./-]+\.[\w]+)(?::\d+(?:-\d+)?)?`/g;
-
-/**
- * File-path-shaped tokens named inside the single most recent
- * `reviewScoreHistory` entry's blocker descriptions, across every stage —
- * the `preserveRelPaths` input `updateImplReviewFiles`'s eviction policy
- * needs. Deliberately duplicates `extractBlockerNamedPathsV1`
- * (reviewReadiness.ts)'s matching rule rather than importing it: that
- * function works on freshly-parsed `ReviewBlocker[]` with required fields,
- * while this reads the already-persisted, looser `ReviewBlockerIdentity[]`
- * shape, and this module is deliberately kept free of reviewReadiness.ts's
- * heavier dependency surface (see the module header).
- *
- * Not filtered to one stage: `implReviewFiles` is shared review scope across
- * every impl-review stage a task passes through, so the most recently
- * published review — whichever stage it was — is the one whose named files
- * matter right now.
- */
-export function latestReviewBlockerNamedPathsV1(progress: TaskProgress): Set<string> {
-  const history = progress.reviewScoreHistory ?? [];
-  let latest: ReviewScoreHistoryEntry | undefined;
-  for (const entry of history) {
-    if (!latest || entry.at > latest.at) {
-      latest = entry;
-    }
-  }
-  const paths = new Set<string>();
-  for (const blocker of latest?.blockers ?? []) {
-    if (!blocker.description) {
-      continue;
-    }
-    for (const match of blocker.description.matchAll(BLOCKER_NAMED_PATH_RE_V1)) {
-      const path = match[1];
-      if (path) {
-        paths.add(path.replace(/\\/g, "/"));
-      }
-    }
-  }
-  return paths;
-}
-
-/**
  * Record the workspace-relative paths changed by an AI implementation run,
  * so implementation reviews can use them as the review scope instead of
  * relying on open editors.
@@ -716,16 +800,12 @@ export function latestReviewBlockerNamedPathsV1(progress: TaskProgress): Set<str
  * already reviewed in earlier rounds — files, never on the current round's
  * work the reviewer has not seen yet.
  *
- * `preserveRelPaths` (optional — see `capImplReviewFilesV1`) is applied to
- * the union AFTER it is computed, so a blocker-named file from outside the
- * most-recent window survives eviction even though this call's own `files`
- * had nothing to do with it.
+ * The set is not capped (review1 Step 59, bugs6 item 30). It used to stop at 40
+ * entries, which dropped changed files from the review and trimmed a list the
+ * owner had widened with "Add the missing files". The review input budget now
+ * decides how much code is embedded, and lists every file it leaves out.
  */
-export function updateImplReviewFiles(
-  progress: TaskProgress,
-  files: string[],
-  preserveRelPaths?: ReadonlySet<string>
-): TaskProgress {
+export function updateImplReviewFiles(progress: TaskProgress, files: string[]): TaskProgress {
   const existing = progress.implReviewFiles ?? [];
   // Excludes generated workflow-safety inventories, lockfiles, and minified
   // bundles from ever entering review scope — the same classifier
@@ -738,10 +818,9 @@ export function updateImplReviewFiles(
   // the 2026-08-06 failure this exists to prevent.
   const reviewable = files.filter((file) => !isMachineMaintainedArtifactPathV1(file));
   const union = new Set([...reviewable, ...existing]);
-  const capped = capImplReviewFilesV1([...union], preserveRelPaths ?? new Set());
   return {
     ...progress,
-    implReviewFiles: capped,
+    implReviewFiles: [...union],
     updatedAt: new Date().toISOString(),
   };
 }

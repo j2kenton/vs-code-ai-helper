@@ -93,14 +93,16 @@ void describe("TaskStatusBar — implementation checklist percentage (A3 Part 3 
       bar.update([task], task.canonicalId);
       // Synchronous pass: no percentage yet.
       const itemBeforeFlush = (bar as unknown as { item: vscode.StatusBarItem }).item;
-      assert.ok(!itemBeforeFlush.text?.includes("80%"), "the percentage is not available before the async read resolves");
+      assert.ok(!itemBeforeFlush.text?.includes("verified"), "the percentage is not available before the async read resolves");
 
       await flush();
 
       const item = (bar as unknown as { item: vscode.StatusBarItem }).item;
-      assert.ok(item.text?.includes("80%"), `expected the bar text to include "80%", got "${item.text}"`);
+      // review1 Step 5: the bar shows the gate's count, as the Tasks pane does: eight unverified ticks are
+      // eight provisional items and 0% settled.
+      assert.ok(item.text?.includes("0% (0 verified, 8 provisional)"), `expected the shared count line, got "${item.text}"`);
       const tooltip = (item.tooltip as vscode.MarkdownString).value;
-      assert.ok(tooltip.includes("80%"), "the tooltip also carries the percentage");
+      assert.ok(tooltip.includes("0% (0 verified, 8 provisional)"), "the tooltip also carries the percentage");
     } finally {
       restore();
       bar.dispose();

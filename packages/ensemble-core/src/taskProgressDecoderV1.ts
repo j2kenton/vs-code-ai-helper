@@ -39,6 +39,13 @@ import {
   MAX_PLAN_ITEM_EVIDENCE_ENTRIES,
   MAX_PLAN_ITEM_OWNER_DECISIONS,
   MAX_PLAN_ITEM_OWNER_TEST_RUNS,
+  MAX_PLAN_ITEM_SETTLEMENT_SNAPSHOT_ITEMS_V1,
+  MAX_PROGRESS_WATCH_ENDINGS_V1,
+  PROGRESS_WATCH_ENDING_KINDS_V1,
+  ProgressWatchV1,
+  PlanItemSettlementSnapshotV1,
+  REPORT_CONTRACT_REJECTION_KINDS_V1,
+  ReportContractRejectionV1,
   MAX_REVIEW_BLOCKER_IDENTITIES,
   MAX_REVIEW_REJECTIONS,
   MAX_REVIEW_SCORE_HISTORY,
@@ -163,6 +170,9 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "planItemEvidence",
   "planItemOwnerDecisions",
   "planItemOwnerTestRuns",
+  "lastPlanItemSettlement",
+  "reportContractRejections",
+  "progressWatch",
   "blockerSupersessions",
   "checklistChangeProposals",
   "planRevision",
@@ -1369,6 +1379,93 @@ function validatePlanItemOwnerDecisions(value: unknown): string | undefined {
         !boundedString(record["formId"], 200) ||
         (record["decision"] !== "tick" && record["decision"] !== "exclude")) {
       return "planItemOwnerDecisions entry has an invalid field";
+    }
+  }
+  return undefined;
+}
+
+/** review1 Step 21: the bounded list of rejected-report records (mirror of the extension's decoder). */
+function validateReportContractRejections(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > 50) return "reportContractRejections must be a bounded array";
+  for (const entry of value as unknown[]) {
+    if (!isPlainObject(entry) || Object.keys(entry).some((key) => !["at", "kind", "reason", "roundId", "stage"].includes(key)) ||
+        !boundedString(entry["at"], 64) || !(REPORT_CONTRACT_REJECTION_KINDS_V1 as readonly string[]).includes(String(entry["kind"])) ||
+        typeof entry["reason"] !== "string" || entry["reason"].length > 500 ||
+        (entry["roundId"] !== undefined && !boundedString(entry["roundId"], MAX_ID_LENGTH)) ||
+        (entry["stage"] !== undefined && typeof entry["stage"] !== "string")) {
+      return "reportContractRejections entry has an invalid field";
+    }
+  }
+  return undefined;
+}
+
+/** review1 Step 23: the bounded progress-watch record (mirror of the extension's decoder). */
+function validateProgressWatch(value: unknown): string | undefined {
+  if (!isPlainObject(value)) return "progressWatch must be an object";
+  const allowed = ["lastProgressAt", "lastProgressWhat", "autoRoundsSinceProgress", "consecutiveFailedAutoRounds", "endings", "best", "bestStage", "signalsSeenAt", "heldAt", "heldFor"];
+  if (Object.keys(value).some((key) => !allowed.includes(key)) || !boundedString(value["lastProgressAt"], 64) ||
+      typeof value["lastProgressWhat"] !== "string" || value["lastProgressWhat"].length > 300) {
+    return "progressWatch has an invalid field";
+  }
+  const counter = (v: unknown): boolean => typeof v === "number" && Number.isInteger(v) && v >= 0 && v <= 1_000_000;
+  if (!counter(value["autoRoundsSinceProgress"]) || !counter(value["consecutiveFailedAutoRounds"])) {
+    return "progressWatch counters must be non-negative integers";
+  }
+  if (value["heldAt"] !== undefined && !boundedString(value["heldAt"], 64)) return "progressWatch.heldAt is invalid";
+  if ((value["bestStage"] !== undefined && typeof value["bestStage"] !== "string") ||
+      (value["signalsSeenAt"] !== undefined && !boundedString(value["signalsSeenAt"], 64))) {
+    return "progressWatch review markers are invalid";
+  }
+  if (value["heldFor"] !== undefined && value["heldFor"] !== "rounds" && value["heldFor"] !== "failed") {
+    return "progressWatch.heldFor is invalid";
+  }
+  const best = value["best"];
+  if (best !== undefined) {
+    if (!isPlainObject(best) || Object.keys(best).some((key) => !["score", "settled", "taskFixable"].includes(key)) ||
+        Object.values(best).some((v) => typeof v !== "number" || !Number.isFinite(v))) {
+      return "progressWatch.best is invalid";
+    }
+  }
+  const endings = value["endings"];
+  if (!Array.isArray(endings) || endings.length > MAX_PROGRESS_WATCH_ENDINGS_V1) return "progressWatch.endings must be a bounded array";
+  for (const ending of endings as unknown[]) {
+    if (!isPlainObject(ending) ||
+        Object.keys(ending).some((key) => !["at", "kind", "automatic", "roundId", "stage", "model", "quotaResetAt"].includes(key)) ||
+        !boundedString(ending["at"], 64) || !(PROGRESS_WATCH_ENDING_KINDS_V1 as readonly string[]).includes(String(ending["kind"])) ||
+        typeof ending["automatic"] !== "boolean" ||
+        (ending["roundId"] !== undefined && !boundedString(ending["roundId"], MAX_ID_LENGTH)) ||
+        (ending["stage"] !== undefined && typeof ending["stage"] !== "string") ||
+        (ending["model"] !== undefined && !boundedString(ending["model"], 300)) ||
+        (ending["quotaResetAt"] !== undefined && !boundedString(ending["quotaResetAt"], 64))) {
+      return "progressWatch.endings entry has an invalid field";
+    }
+  }
+  return undefined;
+}
+
+/** review1 Step 8: the bounded plan-item settlement snapshot (mirror of the extension's decoder). */
+function validateLastPlanItemSettlement(value: unknown): string | undefined {
+  if (!isPlainObject(value)) return "lastPlanItemSettlement must be an object";
+  if (Object.keys(value).some((key) => !["at", "items", "lost"].includes(key)) || !boundedString(value["at"], 64)) {
+    return "lastPlanItemSettlement has an invalid field";
+  }
+  const items = value["items"];
+  if (!Array.isArray(items) || items.length > MAX_PLAN_ITEM_SETTLEMENT_SNAPSHOT_ITEMS_V1) {
+    return "lastPlanItemSettlement.items must be a bounded array";
+  }
+  for (const item of items as unknown[]) {
+    if (!isPlainObject(item) || Object.keys(item).some((key) => !["hash", "settled", "label"].includes(key)) ||
+        !boundedString(item["hash"], 128) || typeof item["settled"] !== "boolean" || typeof item["label"] !== "string" ||
+        item["label"].length > 200) {
+      return "lastPlanItemSettlement item has an invalid field";
+    }
+  }
+  const lost = value["lost"];
+  if (lost !== undefined) {
+    if (!isPlainObject(lost) || Object.keys(lost).some((key) => !["at", "labels"].includes(key)) ||
+        !boundedString(lost["at"], 64) || !Array.isArray(lost["labels"]) || lost["labels"].length > 100 ||
+        lost["labels"].some((label) => typeof label !== "string" || label.length > 200)) {
+      return "lastPlanItemSettlement.lost is invalid";
     }
   }
   return undefined;
@@ -2708,6 +2805,24 @@ export function decodeTaskProgressTextV1(
         const error = validatePlanItemOwnerTestRuns(value);
         if (error !== undefined) return recovery("invalidFieldValue", error);
         draft.planItemOwnerTestRuns = value as PlanItemOwnerTestRunV1[];
+        break;
+      }
+      case "lastPlanItemSettlement": {
+        const error = validateLastPlanItemSettlement(value);
+        if (error !== undefined) return recovery("invalidFieldValue", error);
+        draft.lastPlanItemSettlement = value as PlanItemSettlementSnapshotV1;
+        break;
+      }
+      case "progressWatch": {
+        const error = validateProgressWatch(value);
+        if (error !== undefined) return recovery("invalidFieldValue", error);
+        draft.progressWatch = value as ProgressWatchV1;
+        break;
+      }
+      case "reportContractRejections": {
+        const error = validateReportContractRejections(value);
+        if (error !== undefined) return recovery("invalidFieldValue", error);
+        draft.reportContractRejections = value as ReportContractRejectionV1[];
         break;
       }
       case "blockerSupersessions": {

@@ -4,6 +4,9 @@
  * the message (they go to `details`, for a log or a details toggle).
  */
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 
 import { WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1 } from "../state/workAdmissionV1";
@@ -98,6 +101,25 @@ void describe("plain busy refusal (bugs3 Step 12)", () => {
     const stale = describePlainBusyRefusalV1(busy({ ageMs: 6 * WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1 }), undefined, NOW);
     assert.match(stale.message, /looks stuck rather than busy/);
     assert.doesNotMatch(stale.message, /Cancel: stop it/);
+  });
+
+  void it("review1 Step 41: names the task by its display name from its progress file when the caller passes none", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "busy-name-"));
+    try {
+      const taskFolder = path.join(root, ".ensemble", "2026-11-02_task_3");
+      fs.mkdirSync(path.join(taskFolder, "admission-v1"), { recursive: true });
+      fs.writeFileSync(path.join(taskFolder, "task-progress.json"), JSON.stringify({ displayName: "chat1" }));
+      setLiveTaskOperationLookupV1(() => ({ label: "Publish Checks", startedAt: NOW - 60_000 }));
+      const markerPath = path.join(taskFolder, "admission-v1", "admission.hw4.g2.abc");
+      const named = describePlainBusyRefusalV1(busy({ markerPath }), undefined, NOW).message;
+      assert.match(named, /^"chat1" already has a stage action in progress/);
+      assert.doesNotMatch(named, /Task 3 \(2026-11-02\)/);
+      // An explicit name still wins, and an unreadable progress file falls back to the neutral wording.
+      assert.match(describePlainBusyRefusalV1(busy({ markerPath }), "other", NOW).message, /^"other" already/);
+      assert.match(describePlainBusyRefusalV1(busy(), undefined, NOW).message, /^This task already has/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   void it("the notification string is the plain message; a write failure keeps its own wording", () => {

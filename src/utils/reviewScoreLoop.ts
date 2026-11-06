@@ -167,13 +167,37 @@ export interface ImproveReviewScoreResult {
    * raised a decision. Never set together with `stalled`.
    */
   held?: FastForwardHoldV1;
+  /**
+   * review1 Step 26: set with `stalled` when the run ended on its last attempt with an unchanged review while the
+   * work had still moved; the text says what moved, so the stop message never claims nothing happened.
+   */
+  stalledWhileWorkMoved?: string;
 }
 
 /** Why Fast Forward stopped dispatching rounds without being paused or stalled. */
 export interface FastForwardHoldV1 {
-  kind: "pending-decision" | "clean-review" | "no-change-decision" | "test-evidence-unproducible";
+  kind:
+    | "pending-decision"
+    | "clean-review"
+    | "no-change-decision"
+    | "test-evidence-unproducible"
+    | "progress-gate"
+    | "evidence-gap"
+    | "standing-blockers"
+    | "partial-scope";
   detail: string;
 }
+
+/**
+ * review1 Step 34: what the one automatic Publish Checks attempt for an evidence-only gap left behind.
+ * `not-applicable` means the gap is not the whole story, so the normal path stands; `closed` means every
+ * remaining item was settled from the passing output; `stopped` means the gap remains (or the checks failed or
+ * could not run) and the hook has already raised the card.
+ */
+export type EvidenceGapOutcomeV1 =
+  | { readonly kind: "not-applicable" }
+  | { readonly kind: "closed" }
+  | { readonly kind: "stopped"; readonly detail: string };
 
 /**
  * Runs exactly one apply followed by one re-review per attempt, up to
@@ -243,6 +267,17 @@ export async function improveReviewScore(options: {
    */
   pendingBlockingDecision?: () => Promise<string | undefined> | string | undefined;
   /**
+   * review1 Step 24: the "is this working?" gate, asked before EVERY dispatch (also after an escalation was ridden
+   * through, unlike `pendingBlockingDecision`). A string means the task's progress watch tripped: the run stops
+   * there and the "This isn't moving" card is the owner's way on.
+   */
+  admitDispatch?: () => Promise<string | undefined> | string | undefined;
+  /**
+   * review1 Step 26: asked when a review round produced nothing comparable (the review text did not change or had
+   * no score). A string says what moved since the previous round, and the run carries on instead of stalling.
+   */
+  workMovedSinceLastRound?: () => Promise<string | undefined> | string | undefined;
+  /**
    * bugs4 item 25: asked right after an apply() returned, before the re-review.
    * A string means the round changed nothing and a decision is now pending, so
    * re-reviewing the same tree can only repeat the card; the run stops there.
@@ -261,6 +296,27 @@ export async function improveReviewScore(options: {
    * produce, so the run stops instead of dispatching an Apply Review that changes nothing.
    */
   buildMandateCannotProgress?: () => Promise<string | undefined> | string | undefined;
+  /**
+   * review1 Step 39: asked before each dispatch after the first review of the run. A string means every blocker
+   * left is one another round cannot clear (it needs the owner, no code change resolves it, it has stood across
+   * reviews, or earlier rounds declined it); the hook has already put the question to the owner once, on the
+   * owner card, and the run stops instead of spending a round on them alone.
+   */
+  standingBlockersHold?: () => Promise<string | undefined> | string | undefined;
+  /**
+   * review1 Step 59: asked before the run's success shortcut, before the evidence-gap run, before every dispatch and
+   * again before any success return that follows a review made inside the run. A string means the latest
+   * review was not shown the whole change and the owner has not accepted the gap, so its result says nothing
+   * about the missing files; another round and review of the same list would repeat it. The partial-scope card is
+   * already waiting, and the run stops for it instead of ending as a success or spending a round.
+   */
+  partialScopeHold?: () => Promise<string | undefined> | string | undefined;
+  /**
+   * review1 Step 34: asked at most once per run, before any Apply Review, when a clean review's open items are
+   * all provisional test-dependent ones. The hook runs Publish Checks once (never a model round), records what
+   * the passing output proves, and raises the card for the rest.
+   */
+  closeEvidenceGap?: (context: { readonly score: number | null }) => Promise<EvidenceGapOutcomeV1>;
   token?: vscode.CancellationToken;
   /** Maximum apply/review cycles for this run. */
   maxAttempts?: number;
@@ -360,6 +416,20 @@ export async function improveReviewScore(options: {
     options.preLoopEvidence?.zeroFixableEvidence === true &&
     options.preLoopEvidence.planIncomplete === false
   ) {
+    // review1 Step 59: a baseline that was not shown the whole change is not a finished task, whatever its score.
+    const partialScopeAtStart = await options.partialScopeHold?.();
+    if (partialScopeAtStart !== undefined) {
+      return {
+        score: options.baselineScore,
+        attempts: 0,
+        improved: false,
+        stalled: false,
+        paused: false,
+        escalationDeferred: false,
+        zeroFixableSuccess: false,
+        held: { kind: "partial-scope", detail: partialScopeAtStart },
+      };
+    }
     return {
       score: options.baselineScore,
       attempts: 0,
@@ -378,9 +448,51 @@ export async function improveReviewScore(options: {
   // them. Only a clean review with a COMPLETE plan takes the clean-review hold.
   let lastReviewPlanIncomplete = options.preLoopEvidence?.planIncomplete === true;
   let lastScore: number | null = options.baselineScore;
+  // review1 Step 34: the evidence-only gap is tried once per run; a second automatic attempt never follows.
+  let evidenceGapTried = false;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     if (options.token?.isCancellationRequested) {
       throw new vscode.CancellationError();
+    }
+    // review1 Step 59: whatever the latest review found, neither the evidence-gap run (Publish Checks) nor another
+    // round may answer for files that review never saw. The owner adds the files or accepts the gap first.
+    const partialScope = await options.partialScopeHold?.();
+    if (partialScope !== undefined) {
+      return {
+        score: best ?? lastScore,
+        attempts: attempt - 1,
+        improved: false,
+        stalled: false,
+        paused: false,
+        escalationDeferred,
+        zeroFixableSuccess: false,
+        held: { kind: "partial-scope", detail: partialScope },
+      };
+    }
+    if (
+      options.cleanReviewNeverApplies === true &&
+      lastReviewWasClean &&
+      lastReviewPlanIncomplete &&
+      options.closeEvidenceGap !== undefined &&
+      !evidenceGapTried
+    ) {
+      evidenceGapTried = true;
+      const gap = await options.closeEvidenceGap({ score: lastScore });
+      if (gap.kind === "closed") {
+        // Every remaining item was settled from the passing output: the review is clean and the plan complete.
+        lastReviewPlanIncomplete = false;
+      } else if (gap.kind === "stopped") {
+        return {
+          score: best ?? lastScore,
+          attempts: attempt - 1,
+          improved: false,
+          stalled: false,
+          paused: false,
+          escalationDeferred,
+          zeroFixableSuccess: false,
+          held: { kind: "evidence-gap", detail: gap.detail },
+        };
+      }
     }
     if (options.cleanReviewNeverApplies === true && lastReviewWasClean && !lastReviewPlanIncomplete) {
       return {
@@ -412,6 +524,21 @@ export async function improveReviewScore(options: {
         };
       }
     }
+    if (attempt > 1) {
+      const standing = await options.standingBlockersHold?.();
+      if (standing !== undefined) {
+        return {
+          score: best ?? lastScore,
+          attempts: attempt - 1,
+          improved: false,
+          stalled: false,
+          paused: false,
+          escalationDeferred,
+          zeroFixableSuccess: false,
+          held: { kind: "standing-blockers", detail: standing },
+        };
+      }
+    }
     if (!escalationDeferred) {
       const waitingOn = await options.pendingBlockingDecision?.();
       if (waitingOn !== undefined) {
@@ -426,6 +553,19 @@ export async function improveReviewScore(options: {
           held: { kind: "pending-decision", detail: waitingOn },
         };
       }
+    }
+    const gateRefusal = await options.admitDispatch?.();
+    if (gateRefusal !== undefined) {
+      return {
+        score: best,
+        attempts: attempt - 1,
+        improved: false,
+        stalled: false,
+        paused: false,
+        escalationDeferred,
+        zeroFixableSuccess: false,
+        held: { kind: "progress-gate", detail: gateRefusal },
+      };
     }
     await options.apply();
     if (options.token?.isCancellationRequested) {
@@ -469,7 +609,17 @@ export async function improveReviewScore(options: {
       return { score: best, attempts: attempt, improved: false, stalled: false, paused: true, escalationDeferred, zeroFixableSuccess: false };
     }
     if (round === null || score === null) {
-      return { score: best, attempts: attempt, improved: false, stalled: true, paused: false, escalationDeferred, zeroFixableSuccess: false };
+      // review1 Step 26: an unchanged review is not evidence of an unchanging task. When the work moved since the
+      // previous round (plan items settled, a blocker closed, the owner acted), the run carries on to its next
+      // attempt; only a review that did not change AND no movement anywhere is a stall.
+      const movedWhat = await options.workMovedSinceLastRound?.();
+      if (movedWhat === undefined || attempt >= maxAttempts) {
+        return {
+          score: best, attempts: attempt, improved: false, stalled: true, paused: false, escalationDeferred, zeroFixableSuccess: false,
+          ...(movedWhat !== undefined ? { stalledWhileWorkMoved: movedWhat } : {}),
+        };
+      }
+      continue;
     }
     // Plan-progress tracking (see ReviewRoundOutcome.progress). A round that
     // reports no marker leaves all of this null/untouched, so every decision
@@ -540,6 +690,23 @@ export async function improveReviewScore(options: {
       referenceScore = score;
       referenceTaskFixableCount = round.taskFixableCount;
     }
+    // review1 Step 59: a review completed inside this run can be partial too. Each success return below would
+    // report a finished task for files it never saw, so the hold is asked again before any of them.
+    const partialScopeAfterReview = async (): Promise<ImproveReviewScoreResult | undefined> => {
+      const detail = await options.partialScopeHold?.();
+      return detail === undefined
+        ? undefined
+        : {
+            score: best,
+            attempts: attempt,
+            improved: false,
+            stalled: false,
+            paused: false,
+            escalationDeferred,
+            zeroFixableSuccess: false,
+            held: { kind: "partial-scope", detail },
+          };
+    };
     // Fast Forward is only successful after it has made measurable progress
     // from the score it started with.  A configured target may require more,
     // but must not let a task at (or above) that target stop without improving.
@@ -551,6 +718,10 @@ export async function improveReviewScore(options: {
     // Returning success there would advance the stage and strand every
     // remaining step. A review with no progress marker is unaffected.
     if (improved && (stopAtScore === 0 || score >= stopAtScore) && !planIncomplete) {
+      const heldAfterReview = await partialScopeAfterReview();
+      if (heldAfterReview !== undefined) {
+        return heldAfterReview;
+      }
       return { score, attempts: attempt, improved: true, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: false };
     }
 
@@ -570,6 +741,10 @@ export async function improveReviewScore(options: {
       round.zeroFixableEvidence &&
       !planIncomplete
     ) {
+      const heldAfterReview = await partialScopeAfterReview();
+      if (heldAfterReview !== undefined) {
+        return heldAfterReview;
+      }
       return { score, attempts: attempt, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: true };
     }
 
@@ -582,6 +757,10 @@ export async function improveReviewScore(options: {
       // strands the remaining 17. Keep going instead, so the next round
       // implements the next steps.
       if (!planIncomplete) {
+        const heldAfterReview = await partialScopeAfterReview();
+        if (heldAfterReview !== undefined) {
+          return heldAfterReview;
+        }
         return { score, attempts: attempt, improved: false, stalled: false, paused: false, escalationDeferred, zeroFixableSuccess: true };
       }
       // ...unless implementation has stopped actually landing steps, in which

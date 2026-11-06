@@ -153,7 +153,9 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const resultGuard = resultGuardMatch.index;
     const countReport = source.indexOf("options.parentOperation?.reportActivity(", resultGuard);
     assert.ok(countReport >= 0, "expected a changed-file-count reportActivity call after result is known");
-    assert.ok(countReport - resultGuard < 1600, "the count report must sit near the result boundary, after failure settlement");
+    // review1 Step 49 put the diagnostic round's own completion (an early return with its own settlement) between
+    // the failure guard and the count report, so "near" now allows for that branch.
+    assert.ok(countReport - resultGuard < 6000, "the count report must sit near the result boundary, after failure settlement");
 
     const guardedBlock = source.slice(resultGuard, countReport + 400);
     assert.match(

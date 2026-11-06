@@ -26,8 +26,9 @@ import { resolveEffectiveProvider } from "../runners/runnerRegistry";
 import { checkPublishChecksFreshnessV1 } from "./publishChecksFreshness";
 import { resolvePublishScopeFolder } from "./completionLint";
 import { PUBLISH_STAGE_ACTIONS_V1, publishNextStepFromActionsV1, type PublishStepV1 } from "./publishStageActionsV1";
-import { countChecklistEvidenceProgressV1 } from "./implementationChecklist";
+import { computePlanItemCountsV1 } from "./effectiveReviewProgress";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { findContinuableLostEditingRoundV1, type LostEditingRoundV1 } from "./lostRoundNextStepV1";
 
 /**
  * What a "Resume and ..." button should do for a paused task, decided from the
@@ -107,6 +108,13 @@ export interface ResumeActionFactsV1 {
     readonly review?: true;
     readonly apply?: true;
   };
+  /**
+   * review1 Step 32: the newest terminal round is a lost editing round (Implementation, Apply Review or a
+   * continuation that failed, was cut off or was rejected) and the stage has a review on record. The review is
+   * then still the latest one to act on, and Resume continues that round from the working tree instead of
+   * sending the task back through a fresh review.
+   */
+  readonly lostEditingRound?: LostEditingRoundV1;
   /** Provider that would run each candidate action (display label), when resolvable. */
   readonly providers: {
     readonly review?: string;
@@ -215,8 +223,9 @@ export function planResumeActionV1(facts: ResumeActionFactsV1): ResumeActionPlan
       return { kind: "blocked", precondition: noModelPrecondition("applying the review") };
     }
     const blockers = parseReviewBlockers(review).length;
-    const what =
-      blockers === 0
+    const what = facts.lostEditingRound
+      ? "Continue the Apply Review from the working tree (its edits are kept)"
+      : blockers === 0
         ? "Resume and apply the review"
         : `Resume and fix the review's ${blockers} blocker${blockers === 1 ? "" : "s"}`;
     return { kind: "apply-review", label: withProvider(what, facts.providers.apply) };
@@ -286,6 +295,8 @@ export async function loadResumeActionPlanV1(
     isReview || stage === "publish" ? undefined : firstUnmetStagePrerequisiteV1(stage, taskFolderUri),
   ]);
   const unusableSummary = await loadUnusableSummaryFactV1(taskFolderUri, stage);
+  // review1 Step 32: a lost editing round does not make the review it was working from stale.
+  const lostEditingRound = isReview ? findContinuableLostEditingRoundV1(progress, stage) : undefined;
   const publishChecksFresh =
     stage === "publish" ? await loadPublishChecksFreshFactV1(taskFolderUri, progress) : undefined;
   const applyStage: TaskStage = stage.startsWith("plan") ? "plan" : "impl";
@@ -309,9 +320,10 @@ export async function loadResumeActionPlanV1(
       ? {
           reviewPassCurrent:
             isReviewPassCurrentV1(reviewContent, progress.stageReviewPasses, stage) &&
-            !reviewPredatesLatestImplementationRoundV1(progress, stage),
+            !reviewPredatesLatestImplementationRoundV1(progress, stage, { ignoreLostEditingRounds: lostEditingRound !== undefined }),
         }
       : {}),
+    ...(lostEditingRound ? { lostEditingRound } : {}),
     unmet: {
       review: unmetReview?.missingMessage,
       apply: unmetApply?.missingMessage,
@@ -354,7 +366,7 @@ async function loadUnusableSummaryFactV1(
   const plan = await readPlanOfRecordV1(taskFolderUri);
   const progress = await readTaskProgressStrictV1(taskFolderUri);
   const settled = plan.hasChecklist && plan.text !== undefined && progress.ok &&
-    countChecklistEvidenceProgressV1(plan.text, progress.decoded.progress.planItemEvidence ?? [], progress.decoded.progress.planItemOwnerDecisions ?? [])?.gate.remaining === 0;
+    computePlanItemCountsV1({ planText: plan.text, progress: progress.decoded.progress })?.gate.remaining === 0;
   return { remedy: describeUnusableSummaryRemedyV1(canRestore, settled), canRestore };
 }
 
@@ -435,7 +447,9 @@ export async function preflightFixedDispatchV1(
     if (
       passes !== undefined &&
       REVIEWED_COMMIT_STAGES.has(stage) &&
-      reviewPredatesLatestImplementationRoundV1(passes, stage)
+      reviewPredatesLatestImplementationRoundV1(passes, stage, {
+        ignoreLostEditingRounds: findContinuableLostEditingRoundV1(passes, stage) !== undefined,
+      })
     ) {
       return {
         precondition:

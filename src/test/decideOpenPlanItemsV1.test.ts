@@ -21,6 +21,7 @@ import * as vscode from "vscode";
 import {
   applyOpenPlanItemsFormSubmissionV1,
   decideOpenPlanItemsV1,
+  settleRestItemByItemV1,
   dismissOpenPlanItemsFormV1,
   buildOpenPlanItemsNeedDecisionCardInputV1,
   tickAllVerifiedOpenPlanItemsV1,
@@ -504,6 +505,56 @@ void describe("decideOpenPlanItemsV1 command flow", () => {
     const stored = (await readOpenPlanItemsFormsV1(folder, folder))[0]!;
     assert.equal(stored.state, "stale");
     assert.equal(stored.closedReason, CARD_RETIRED_BY_TASK_MOVING_ON_REASON_V1);
+  });
+
+  void it("review1 Step 10: 'settle the rest' posts one form of every other open item, leaving out the ones the card ticks", async () => {
+    const folder = makeTaskFolder(
+      "settle-rest",
+      "<!-- ensemble:implementation-checklist -->\n- [x] Done already\n- [ ] Verified by the reviewer\n- [ ] Still open A\n- [ ] Still open B\n"
+    );
+    const restore = forbidPopups();
+    try {
+      const result = await settleRestItemByItemV1({
+        taskFolderPath: folder,
+        stage: "impl",
+        exceptItems: ["Verified by the reviewer"],
+      });
+      assert.deepEqual(result, { outcome: "done" });
+    } finally {
+      restore();
+    }
+    const form = (await readOpenPlanItemsFormsV1(folder, folder, "impl")).filter((f) => f.state === "open").pop();
+    assert.ok(form);
+    // The ticked item no review or owner has settled still counts open for the gate, so it is on the form too.
+    assert.deepEqual(form.items.map((item) => item.itemText), ["Still open A", "Still open B", "Done already"]);
+    assert.match(form.items[2]!.reason, /not yet checked by a review/);
+  });
+
+  void it("review1 Step 10: confirming a ticked-but-unchecked item on the form records an owner tick and leaves the line alone", async () => {
+    const folder = makeTaskFolder(
+      "settle-rest-confirm",
+      "<!-- ensemble:implementation-checklist -->\n- [x] Done already\n- [ ] Still open A\n"
+    );
+    const restore = forbidPopups();
+    try {
+      await settleRestItemByItemV1({ taskFolderPath: folder, stage: "impl" });
+    } finally {
+      restore();
+    }
+    const form = (await readOpenPlanItemsFormsV1(folder, folder, "impl")).filter((f) => f.state === "open").pop();
+    assert.ok(form);
+    const before = readPlan(folder);
+    const result = await submit(folder, form, [{ itemId: idOf(form, "Done already"), choice: "tick" }]);
+    assert.equal(result.kind, "applied", result.message);
+    assert.match(result.message, /confirmed 1 existing tick/);
+    assert.equal(readPlan(folder), before, "the plan line is not rewritten");
+    const progress = JSON.parse(nodeFs.readFileSync(nodePath.join(folder, "task-progress.json"), "utf8")) as {
+      planItemOwnerDecisions?: { itemKey: string; decision: string }[];
+    };
+    assert.ok(
+      (progress.planItemOwnerDecisions ?? []).some((row) => row.decision === "tick" && /done already/i.test(row.itemKey)),
+      "an owner tick row is recorded for the confirmed item"
+    );
   });
 
   void it("dismisses a form with actor and time, and refuses its later answers", async () => {

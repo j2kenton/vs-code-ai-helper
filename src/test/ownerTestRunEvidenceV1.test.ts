@@ -67,18 +67,21 @@ void describe("owner-recorded test runs (bugs4 item 21, Step 19)", () => {
     assert.equal(progress.planItemOwnerTestRuns, undefined);
   });
 
-  void it("counts only a passing run for the current plan revision as evidence for the item", () => {
+  void it("counts only a passing run for the same item as evidence for it, whatever the plan revision (review1 Step 2)", () => {
     const key = normalizeChecklistItemTextV1(ITEM);
     const passing = [row()] as unknown as import("../types/taskProgress").PlanItemOwnerTestRunV1[];
-    assert.equal(ownerRecordedPassingRunCoversItemV1(passing, REVISION, key), true);
+    assert.equal(ownerRecordedPassingRunCoversItemV1(passing, key), true);
     // A failing run is recorded but settles nothing.
     const failing = [row({ exitCode: 1 })] as unknown as typeof passing;
-    assert.equal(ownerRecordedPassingRunCoversItemV1(failing, REVISION, key), false);
-    // A run for another plan revision, or for another item, does not apply.
-    assert.equal(ownerRecordedPassingRunCoversItemV1(passing, "b".repeat(64), key), false);
-    assert.equal(ownerRecordedPassingRunCoversItemV1(passing, REVISION, "some other item"), false);
+    assert.equal(ownerRecordedPassingRunCoversItemV1(failing, key), false);
+    // A run for another item does not apply.
+    assert.equal(ownerRecordedPassingRunCoversItemV1(passing, "some other item"), false);
+    // A run recorded against an item's content hash applies only while that hash is unchanged.
+    const hashed = [row({ itemContentHashes: { [key]: "h1" } })] as unknown as typeof passing;
+    assert.equal(ownerRecordedPassingRunCoversItemV1(hashed, key, "h1"), true);
+    assert.equal(ownerRecordedPassingRunCoversItemV1(hashed, key, "h2"), false);
     // No runs at all: a test-dependent model claim stays unverified (control).
-    assert.equal(ownerRecordedPassingRunCoversItemV1([], REVISION, key), false);
+    assert.equal(ownerRecordedPassingRunCoversItemV1([], key), false);
   });
 
   void it("round-trips through the task-progress decoder and rejects malformed records", () => {

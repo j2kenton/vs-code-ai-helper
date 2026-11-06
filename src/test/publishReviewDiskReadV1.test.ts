@@ -138,9 +138,14 @@ void describe("Fast Forward source wiring", () => {
   const nextExport = source.indexOf("\nexport async function ", start + 1);
   const ffSource = source.slice(start, nextExport === -1 ? undefined : nextExport);
 
-  void it("the four decision reads in fastForwardReviewWithAI use the disk reader", () => {
+  void it("the decision reads in fastForwardReviewWithAI use the disk reader", () => {
     const diskReads = ffSource.match(/readReviewArtifactFromDiskV1\(reviewUri\)/g) ?? [];
-    assert.equal(diskReads.length, 4, "pre-dispatch, post-dispatch, Publish re-read and apply-loop");
+    assert.equal(
+      diskReads.length,
+      6,
+      "pre-dispatch, post-dispatch, Publish re-read, the partial-scope hold (review1 Step 59), " +
+        "the standing-blockers hold (review1 Step 39) and apply-loop"
+    );
     assert.doesNotMatch(ffSource, /readNonEmptyText\(reviewUri\)/);
     assert.doesNotMatch(ffSource, /readTextIfExists\(reviewUri\)/);
   });

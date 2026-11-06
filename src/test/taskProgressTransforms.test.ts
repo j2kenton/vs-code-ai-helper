@@ -1,6 +1,6 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
-import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, capImplReviewFilesV1, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, handBackToHumanAfterCompletedRoundV1, handBackToHumanAfterPublishChecksV1, IMPL_REVIEW_FILES_MAX_ENTRIES_V1, latestReviewBlockerNamedPathsV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordPlanItemClaimEvidenceV1, recordPlanItemReviewerVerificationV1, recordPlanItemTestReportV1, invalidatePlanItemEvidenceForChangedFilesV1, invalidatePlanItemEvidenceForPlanRevisionV1, invalidatePlanItemEvidenceContradictedByFailuresV1, updateLintPayload, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, shouldRecordHumanNextActorAfterAdvanceRefusalV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
+import { appendBlockerSupersession, appendChecklistChangeProposal, appendReviewRejection, appendReviewScoreHistory, appendRoundOutcome, clearEscalation, clearImplementationTypeCheckFailure, clearReviewInvalidatedByRound, clearStageFallbackReservation, handBackToHumanAfterCompletedRoundV1, handBackToHumanAfterPublishChecksV1, markChecklistChangeProposalAdoptedV1, pauseTaskWithReasonForClaimV1, promotePendingImplReviewFiles, quarantinePendingImplReviewFiles, recordEscalation, recordImplementationTypeCheckFailure, recordPlanItemClaimEvidenceV1, recordPlanItemReviewerVerificationV1, recordPlanItemTestReportV1, invalidatePlanItemEvidenceForChangedFilesV1, prunePlanItemEvidenceForPlanV1, invalidatePlanItemEvidenceContradictedByFailuresV1, updateLintPayload, recordReviewInvalidatedByRound, recordTaskMdSizeBandAnnouncedV1, reserveStageReviewPassV1, setIncompleteRoundContinuations, setNextActorV1, shouldRecordHumanNextActorAfterAdvanceRefusalV1, setZeroChangeImplRounds, updateImplReviewFiles, clearImplReviewFiles, updateTaskProgressStage, updateTaskStatus } from "../utils/taskProgressTransforms";
 import { BlockerSupersessionRecordV1, ChecklistChangeProposalV1, MAX_BLOCKER_SUPERSESSIONS, MAX_CHECKLIST_CHANGE_PROPOSALS, MAX_REVIEW_REJECTIONS, MAX_REVIEW_SCORE_HISTORY, MAX_ROUND_OUTCOMES, ReviewRejectionEntry, ReviewScoreHistoryEntry, RoundLedgerEntryV1, RoundOutcomeEntryV1, type TaskProgress, type TaskStage } from "../types/taskProgress";
 import { isReviewPassCurrentV1, parseReviewPass } from "../utils/reviewReadiness";
 import { getPlanRevisionV1 } from "../utils/implementationChecklist";
@@ -124,25 +124,21 @@ void test("a truncated tested-source list conservatively invalidates on any late
   assert.deepEqual(updated.planItemEvidence?.[0]?.testReports, []);
 });
 
-void test("plan acceptance revision changes clear stale reports and verifications but retain claims", () => {
+void test("a plan change drops only the evidence of items that changed (review1 Step 3)", () => {
   const revision = "f".repeat(64);
-  const evidence = recordPlanItemReviewerVerificationV1(
-    recordPlanItemTestReportV1(
-      recordPlanItemClaimEvidenceV1(makeProgress(), {
-        planRevision: revision, itemText: "Step 6: Original acceptance", source: "implementation",
-        at: "2026-10-26T00:00:00.000Z", roundId: "edit-6",
-      }),
-      { planRevision: revision, itemText: "Step 6: Original acceptance", report: {
-        at: "2026-10-26T00:00:01.000Z", roundId: "edit-6", testIdentity: "step.test.ts",
-        command: "node step.test.ts", passed: 1, failed: 0, sourceState: "post-edit",
-      } }
-    ),
-    { planRevision: revision, itemText: "Step 6: Original acceptance", at: "2026-10-26T00:01:00.000Z", evidence: "review accepted" }
-  );
-  const revised = invalidatePlanItemEvidenceForPlanRevisionV1(evidence, "0".repeat(64));
-  assert.equal(revised.planItemEvidence?.[0]?.claims.length, 1);
-  assert.deepEqual(revised.planItemEvidence?.[0]?.testReports, []);
-  assert.deepEqual(revised.planItemEvidence?.[0]?.verifications, []);
+  const plan = ["- [x] Step 6: Original acceptance", "- [x] Step 7: Untouched item"].join("\n");
+  const record = (itemText: string, next: ReturnType<typeof makeProgress>) =>
+    recordPlanItemReviewerVerificationV1(next, {
+      planRevision: revision, planText: plan, itemText, at: "2026-10-26T00:01:00.000Z", evidence: "review accepted",
+    });
+  const evidence = record("Step 7: Untouched item", record("Step 6: Original acceptance", makeProgress()));
+  assert.equal(evidence.planItemEvidence?.length, 2);
+
+  const withOwnerNote = prunePlanItemEvidenceForPlanV1(evidence, `${plan}\n\n## Owner Decisions\n\n- Owner decision 2026-11-03: Approve (owner-decision-1)\n`);
+  assert.equal(withOwnerNote.planItemEvidence?.length, 2, "a note elsewhere in the plan drops nothing");
+
+  const reworded = prunePlanItemEvidenceForPlanV1(evidence, plan.replace("Original acceptance", "Revised acceptance"));
+  assert.deepEqual(reworded.planItemEvidence?.map((row) => row.itemText), ["Step 7: Untouched item"]);
 });
 
 void test("Publish evidence invalidation requires an exact failing acceptance-test identity", () => {
@@ -271,127 +267,26 @@ void test("machine-maintained paths already in the prior tracked set are not ret
 });
 
 // ---------------------------------------------------------------------------
-// capImplReviewFilesV1 / updateImplReviewFiles eviction (item 9, Part 16 step
-// 42): the persisted set is soft-capped, but a path a standing review
-// blocker names survives eviction even outside the most-recent window.
+// updateImplReviewFiles keeps the whole list (review1 Step 59, bugs6 item 30):
+// no 40-entry cap, so "Add the missing files" really adds them and a later
+// Apply Review does not trim them.
 // ---------------------------------------------------------------------------
 
-void test("capImplReviewFilesV1 is a no-op under the cap", () => {
-  const files = ["a.ts", "b.ts", "c.ts"];
-  assert.deepEqual(capImplReviewFilesV1(files, new Set(), 40), files);
+void test("updateImplReviewFiles keeps every file when the set grows past the old 40-entry cap", () => {
+  const existing = Array.from({ length: 40 }, (_, i) => `f${i}.ts`);
+  const added = Array.from({ length: 60 }, (_, i) => `added${i}.ts`);
+  const widened = updateImplReviewFiles(makeProgress(existing), added);
+  assert.equal(widened.implReviewFiles?.length, 100);
+  assert.equal(widened.implReviewFiles?.[0], "added0.ts");
+  assert.ok(widened.implReviewFiles?.includes("f39.ts"));
 });
 
-void test("capImplReviewFilesV1 keeps only the newest N files over the cap", () => {
-  const files = Array.from({ length: 45 }, (_, i) => `f${i}.ts`);
-  const capped = capImplReviewFilesV1(files, new Set(), 40);
-  assert.equal(capped.length, 40);
-  assert.deepEqual(capped, files.slice(0, 40));
-});
-
-void test("capImplReviewFilesV1 preserves a blocker-named path outside the recency window without exceeding the cap", () => {
-  const files = Array.from({ length: 45 }, (_, i) => `f${i}.ts`);
-  const capped = capImplReviewFilesV1(files, new Set(["f44.ts"]), 40);
-  // f44.ts is the OLDEST file (last in the most-recent-first list) and would
-  // normally be evicted — it survives because a blocker names it, DISPLACING
-  // a recency-only entry rather than growing the result past the cap
-  // (2026-08-29 review, completion blocker: "eviction can exceed 40
-  // entries").
-  assert.equal(capped.length, 40);
-  assert.ok(capped.includes("f44.ts"));
-  // f44 takes one of the 40 slots as a preserved path, so only 39 of the
-  // remaining 44 recency-only entries (f0..f38) survive — f39 is the first
-  // one displaced to make room.
-  assert.ok(!capped.includes("f39.ts"));
-});
-
-void test("capImplReviewFilesV1 preserves original most-recent-first order for kept entries", () => {
-  const files = Array.from({ length: 45 }, (_, i) => `f${i}.ts`);
-  const capped = capImplReviewFilesV1(files, new Set(["f44.ts", "f10.ts"]), 40);
-  assert.equal(capped.length, 40);
-  // f10.ts (preserved, mid-list) still appears BEFORE f44.ts (preserved,
-  // last) — preservation must not reorder the recency-first list.
-  assert.ok(capped.indexOf("f10.ts") < capped.indexOf("f44.ts"));
-});
-
-void test("capImplReviewFilesV1 hard-caps even when preserved paths alone exceed maxEntries", () => {
-  const files = Array.from({ length: 50 }, (_, i) => `f${i}.ts`);
-  const allPreserved = new Set(files);
-  const capped = capImplReviewFilesV1(files, allPreserved, 40);
-  assert.equal(capped.length, 40);
-});
-
-void test("updateImplReviewFiles caps the accumulated set at IMPL_REVIEW_FILES_MAX_ENTRIES_V1", () => {
-  const existing = Array.from({ length: IMPL_REVIEW_FILES_MAX_ENTRIES_V1 }, (_, i) => `f${i}.ts`);
-  const progress = makeProgress(existing);
-  const updated = updateImplReviewFiles(progress, ["new.ts"]);
-  assert.equal(updated.implReviewFiles?.length, IMPL_REVIEW_FILES_MAX_ENTRIES_V1);
-  assert.equal(updated.implReviewFiles?.[0], "new.ts");
-  // The single oldest file is the one evicted to make room for the new one.
-  assert.ok(!updated.implReviewFiles?.includes(`f${IMPL_REVIEW_FILES_MAX_ENTRIES_V1 - 1}.ts`));
-});
-
-void test("updateImplReviewFiles preserves a blocker-named path when eviction would otherwise drop it", () => {
-  const existing = Array.from({ length: IMPL_REVIEW_FILES_MAX_ENTRIES_V1 }, (_, i) => `f${i}.ts`);
-  const oldestPath = `f${IMPL_REVIEW_FILES_MAX_ENTRIES_V1 - 1}.ts`;
-  const progress = makeProgress(existing);
-  const updated = updateImplReviewFiles(progress, ["new.ts"], new Set([oldestPath]));
-  assert.ok(updated.implReviewFiles?.includes(oldestPath));
-});
-
-// ---------------------------------------------------------------------------
-// latestReviewBlockerNamedPathsV1 (item 9, Part 16 step 42)
-// ---------------------------------------------------------------------------
-
-void test("latestReviewBlockerNamedPathsV1 returns an empty set with no review history", () => {
-  const progress = makeProgress(undefined);
-  assert.deepEqual(latestReviewBlockerNamedPathsV1(progress), new Set());
-});
-
-void test("latestReviewBlockerNamedPathsV1 extracts backtick-quoted paths from the most recent entry's blockers", () => {
-  const progress: TaskProgress = {
-    ...makeProgress(undefined),
-    reviewScoreHistory: [
-      {
-        stage: "impl-high-review",
-        score: 6,
-        attemptId: "a1",
-        at: "2026-08-20T00:00:00.000Z",
-        blockerCount: 1,
-        taskFixableCount: 1,
-        blockers: [
-          {
-            category: "completion",
-            resolver: "task-fixable",
-            subject: "old.ts",
-            description: "the guard in `src/old.ts` is wrong",
-          },
-        ],
-      },
-      {
-        stage: "impl-high-review",
-        score: 6,
-        attemptId: "a2",
-        at: "2026-08-21T00:00:00.000Z",
-        blockerCount: 2,
-        taskFixableCount: 2,
-        blockers: [
-          {
-            category: "completion",
-            resolver: "task-fixable",
-            subject: "new.ts",
-            description: "see `src/new.ts:42` for the missing guard",
-          },
-          {
-            category: "completion",
-            resolver: "task-fixable",
-            subject: "prose-only",
-            description: "no path named here at all",
-          },
-        ],
-      },
-    ],
-  };
-  assert.deepEqual(latestReviewBlockerNamedPathsV1(progress), new Set(["src/new.ts"]));
+void test("a widened list survives the next Apply Review's update", () => {
+  const widened = updateImplReviewFiles(makeProgress([]), Array.from({ length: 75 }, (_, i) => `src/w${i}.ts`));
+  const afterApplyReview = updateImplReviewFiles(widened, ["src/new-edit.ts"]);
+  assert.equal(afterApplyReview.implReviewFiles?.length, 76);
+  assert.equal(afterApplyReview.implReviewFiles?.[0], "src/new-edit.ts");
+  assert.ok(Array.from({ length: 75 }, (_, i) => `src/w${i}.ts`).every((f) => afterApplyReview.implReviewFiles?.includes(f)));
 });
 
 // ---------------------------------------------------------------------------

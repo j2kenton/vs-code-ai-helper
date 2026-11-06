@@ -80,12 +80,13 @@ void describe("listProvisionalTickedItemsV1", () => {
 });
 
 void describe("formatProvisionalTickedItemsForReviewerV1", () => {
-  void it("asks the reviewer to name confirmed items verbatim and flags the ones needing a test report", () => {
+  void it("asks the reviewer to name confirmed items by their id and flags the ones needing a test report", () => {
     const text = formatProvisionalTickedItemsForReviewerV1(PLAN, EVIDENCE, OWNER);
     assert.match(text, /3 ticked items are still provisional/);
     assert.match(text, /## Verified Complete/);
-    assert.match(text, /- Add a test for the Publish stale-verdict guard \[needs a passing test report\]/);
-    assert.match(text, /- Wire the completeness gate$/m);
+    assert.match(text, /\[item:<id>\]/);
+    assert.match(text, /- \[item:[0-9a-f]{16}\] Add a test for the Publish stale-verdict guard \[needs a passing test report\]/);
+    assert.match(text, /- \[item:[0-9a-f]{16}\] Wire the completeness gate$/m);
     assert.doesNotMatch(text, /Already verified by a reviewer/);
     assert.doesNotMatch(text, /Settled by the owner/);
     assert.match(text, /pnpm run test:unit -- /, "it names the command that would satisfy the test-evidence rule");
@@ -94,7 +95,7 @@ void describe("formatProvisionalTickedItemsForReviewerV1", () => {
   void it("covers the oldest first and says how many more come up later when over the limit", () => {
     const text = formatProvisionalTickedItemsForReviewerV1(PLAN, EVIDENCE, OWNER, { maxItems: 1, maxChars: 8000 });
     assert.match(text, /Parse links in gitIndexLockV1\.test\.ts reports/);
-    assert.doesNotMatch(text, /- Wire the completeness gate/);
+    assert.doesNotMatch(text, /Wire the completeness gate/);
     assert.match(text, /1 shown, 2 more come up in later reviews/);
   });
 

@@ -135,6 +135,23 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
       "re-runs the review through resumeAndRerunReviewV1, which resumes under admission and dispatches runReviewWithAI " +
       "with admissionHandoffTokenV1",
   },
+  runOwnerEvidenceCommandV1: {
+    kind: "delegatesTo",
+    to: "runReviewWithAI",
+    evidence:
+      "src/commands/runOwnerEvidenceCommandV1.ts — runs an allowlisted read-only command (no provider call, no task " +
+      "write beyond task.md's Owner evidence), then re-runs the review through resumeAndRerunReviewV1, which resumes " +
+      "under admission and dispatches runReviewWithAI with admissionHandoffTokenV1",
+  },
+  runPublishChecksNowV1: { kind: "notWatchdogSusceptible", reason: "deterministic checks run for the owner; no provider dispatch" },
+  recordOwnerRunCommandV1: {
+    kind: "delegatesTo",
+    to: "runReviewWithAI",
+    evidence:
+      "src/commands/recordOwnerRunCommandV1.ts — records the command the owner ran under Owner evidence in task.md (no " +
+      "provider call), then re-runs the review through resumeAndRerunReviewV1, which resumes under admission and " +
+      "dispatches runReviewWithAI with admissionHandoffTokenV1",
+  },
   applyHighLevelReviewChanges: {
     kind: "delegatesTo",
     to: "applyReviewEditWithAI",

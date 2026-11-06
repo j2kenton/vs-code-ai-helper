@@ -32,6 +32,7 @@ import {
   hasNarrowingPrefixV1,
   findNarrowingBlockerV1,
   findPlanStageNarrowingBlockerV1,
+  narrowingReasonIsCheckedV1,
 } from "./planItemNarrowingV1";
 import { taskFixableAreAllUnbuiltWorkV1, isUnbuiltWorkBlockerV1 } from "./reviewRouting";
 import {
@@ -53,13 +54,11 @@ import {
   type ScopedItemListV1,
 } from "./deferredPlanScopeV1";
 import {
-  countChecklistEvidenceProgressV1,
-  describeChecklistGateGapV1,
-  describeOpenAndHandOffsV1,
   listProvisionalTickedItemsV1,
   normalizeChecklistItemTextV1,
   resolveBlockerPlanReferencesV1,
   resolveExcludedOwnerHandoffV1,
+  resolveVerifiedCompleteEntryTextsV1,
 } from "./implementationChecklist";
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -67,13 +66,19 @@ import * as path from "path";
 import {
   AGENT_CAN_GATHER_RE,
   BlockerResolver,
+  isEnvironmentalResolverV1,
   parseOwnerDecisionsNeededV1,
   parseReviewVerifiedCompleteV1,
   ReviewBlocker,
 } from "./reviewReadiness";
 import { KEEP_ITERATING_SEQUENCE_NOTE_V1 } from "./plateauFixCycleV1";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
-import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "./effectiveReviewProgress";
+import {
+  computePlanItemCountsV1,
+  describeOpenAndHandOffsFromCountsV1,
+  effectiveReviewProgressV1,
+  readPlanItemCountsV1,
+} from "./effectiveReviewProgress";
 import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
 import {
   WorkflowDecisionOptionEffectV1,
@@ -84,6 +89,32 @@ import { QuestionOptionV1, StructuredQuestionV1 } from "../types/structuredQuest
 import { LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 } from "./chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "./ownerEvidenceV1";
+import {
+  findAllowlistedCommandInTextV1,
+  RECORD_OWNER_RUN_COMMAND_V1,
+  RUN_OWNER_EVIDENCE_COMMAND_V1,
+} from "./ownerEvidenceCommandAllowlistV1";
+import {
+  buildOwnerEvidenceUpFrontQuestionsV1,
+  listUnansweredOwnerEvidenceStepsAfterV1,
+  listUnansweredOwnerEvidenceStepsV1,
+  ownerEvidenceFormStepsV1,
+  ownerEvidenceStepsKeyV1,
+} from "./ownerEvidenceUpFrontV1";
+import { getExtensionContextV1 } from "./extensionContextV1";
+import { openPlanStageArgV1, optionAppliesAtStageV1, planFileNameForStageV1 } from "./optionAppliesAtStageV1";
+import { blockerOwnerIdentityV1, hasPendingOwnerDecisionCardV1 } from "./ownerCardCoverageV1";
+import {
+  EnvironmentalEvidenceBlockerV1,
+  EnvironmentalFailureEvidenceV1,
+  extractEnvironmentalFailureEvidenceV1,
+  formatEnvironmentReportV1,
+  formatFailureReportV1,
+} from "./environmentalFailureEvidenceV1";
+import { resolveReadOnlyDiagnosisAvailabilityV1 } from "./readOnlyDiagnosisAvailabilityV1";
+import { parseRecordedCompletionChecksEvidenceV1 } from "./completionLint";
+import { reviewInputsChangedSinceV1 } from "./reviewInputsChangedV1";
+import { advanceNeedsOpenItemsConfirmationV1, advanceOverOpenItemsLabelV1 } from "./advanceOverOpenItemsV1";
 
 /** Minimal shape this module needs from ChatViewProvider — avoids importing
  * the view layer from a utils module (chatView.ts pulls in webview/vscode UI
@@ -453,7 +484,23 @@ function describeOpenPlanItemsNoteV1(planItemsOpen: number | undefined, nextStag
   return ` ${planItemsOpen} plan ${plural} still open and will not be built at ${nextStageName}.`;
 }
 
-function buildAdvanceOptionV1(
+/**
+ * review1 Step 57: the "accept it as environmental" move keeps the labelled override ("Move on, leaving N plan items
+ * open") when it leaves High-Level Code Review with plan items open; otherwise it keeps its own label. The
+ * environmental acceptance is still named in the consequence text.
+ */
+function withEnvironmentalAcceptLabelV1(
+  option: WorkflowDecisionOptionV1,
+  nextStage: TaskStage,
+  planItemsOpen: number | undefined
+): WorkflowDecisionOptionV1 {
+  const isOverride = option.label !== `Advance to ${STAGE_DISPLAY_NAMES[nextStage]}`;
+  return isOverride && planItemsOpen !== undefined && planItemsOpen > 0
+    ? { ...option, consequence: `Accepts the environmental failure as well. ${option.consequence}` }
+    : { ...option, label: "Accept it as environmental and continue" };
+}
+
+export function buildAdvanceOptionV1(
   nextStage: TaskStage,
   taskFolderPath: string,
   consequence: string,
@@ -490,7 +537,14 @@ function buildAdvanceOptionV1(
   const openItemsNote = describeOpenPlanItemsNoteV1(planItemsOpen, nextStageName);
   return {
     optionId: "advance",
-    label: `Advance to ${nextStageName}`,
+    // review1 Step 57: while plan items are open, the move out of High-Level Code Review is offered only as the
+    // labelled override, and choosing it asks the same pop-up as Complete Stage & Move On.
+    label:
+      planItemsOpen !== undefined &&
+      planItemsOpen > 0 &&
+      advanceNeedsOpenItemsConfirmationV1(expectedSourceStage, nextStage)
+        ? advanceOverOpenItemsLabelV1(planItemsOpen)
+        : `Advance to ${nextStageName}`,
     consequence:
       (resumeFastForward
         ? `${consequence} Continues fast-forwarding at ${nextStageName}.`
@@ -564,18 +618,21 @@ function buildBuildRemainingOptionV1(
  */
 function buildReconsiderRequirementOptionV1(
   taskFolderPath: string,
-  consequence: string
+  consequence: string,
+  stage?: TaskStage
 ): WorkflowDecisionOptionV1 {
+  // review1 Step 38: at a plan stage plan-final.md does not exist; the plan the owner edits is plan.md.
+  const planFile = planFileNameForStageV1(stage);
   return {
     optionId: "reconsiderRequirement",
     label: "Change the plan instead",
-    consequence,
+    consequence: planFile === "plan.md" ? consequence.replace(/plan-final\.md/g, "plan.md") : consequence,
     // The user edits Accepted Non-Goals themselves; Ensemble dispatches nothing.
     resumeKind: "unpause",
     effect: {
       kind: "command",
       command: "vs-code-ai-helper.openPlanNonGoals",
-      args: [{ taskFolderPath }],
+      args: [{ taskFolderPath, ...openPlanStageArgV1(stage) }],
     },
   };
 }
@@ -614,9 +671,11 @@ function buildPlateauKeepIteratingOptionV1(
         `Keep iterating: resume Fast Forward (iteration ${fastForwardState.attemptNumber} of ` +
         `${fastForwardState.maxAttempts}) from Apply Review`,
       consequence:
-        `Resumes the task and continues Fast Forward from Apply Review (a round that ${fixClause}), at iteration ` +
-        `${fastForwardState.attemptNumber} of ${fastForwardState.maxAttempts} — it keeps iterating through the ` +
-        `remaining attempt budget this run already committed to, rather than running just one more round. ${KEEP_ITERATING_SEQUENCE_NOTE_V1}`,
+        `Resumes the task and continues Fast Forward from Apply Review (a round that ${fixClause}) against the ` +
+        `${taskFixableCount} task-fixable ${taskFixableCount === 1 ? "blocker" : "blockers"}, then re-reviews ${stageName} ` +
+        `after each round, at iteration ${fastForwardState.attemptNumber} of ${fastForwardState.maxAttempts} — it keeps ` +
+        `iterating through the remaining attempt budget this run already committed to, rather than running just one ` +
+        `more round. ${KEEP_ITERATING_SEQUENCE_NOTE_V1}`,
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
@@ -689,6 +748,22 @@ export interface EscalationPlateauContextV1 {
    * the requirement calls for. Empty when `blockersCount === 0`.
    */
   readonly allBlockerDescriptions: readonly string[];
+  /**
+   * review1 Step 50: the descriptions of the `needs-toolchain` blockers: commands the stage cannot run and the
+   * owner runs outside the task. Each gets an "I ran it — record the result" option.
+   */
+  readonly needsToolchainBlockers?: readonly string[];
+  /**
+   * review1 Step 50: the stable identity (`blockerOwnerIdentityV1`, the lineage id when the review declared one) of
+   * each entry of `needsToolchainBlockers`, same order. The owner's record is bound to it, so a reworded re-raise
+   * still finds the record.
+   */
+  readonly needsToolchainBlockerIdentities?: readonly string[];
+  /**
+   * review1 Step 58: true when task.md, plan.md or plan-final.md changed since the review (Step 27's digest). The
+   * card then offers "I've made changes — re-check" beside Keep iterating.
+   */
+  readonly reviewInputsChanged?: boolean;
   /** Appended immediately after the quoted blocker description; empty string when not narrowed. */
   readonly narrowedNote: string;
   readonly progressNote: string;
@@ -815,10 +890,19 @@ export function describeFixableSplitV1(fixable: number, total: number): string {
  * assertion that the work is built, so it is the only thing that lets a card say "nothing left
  * to build".
  */
-export function reviewNamesAllItemsBuiltV1(reviewContent: string, itemTexts: readonly string[]): boolean {
+export function reviewNamesAllItemsBuiltV1(
+  reviewContent: string,
+  itemTexts: readonly string[],
+  planText?: string
+): boolean {
   if (itemTexts.length === 0) return false;
+  // review1 (owner decision 2026-11-05): an entry citing an issued `[item:<id>]` (or a `Step N` naming one item)
+  // names that item; with the plan text available it is read as the item's own text.
+  const entries = parseReviewVerifiedCompleteV1(reviewContent).entries;
   const named = new Set(
-    parseReviewVerifiedCompleteV1(reviewContent).items.map((text) => normalizeChecklistItemTextV1(text))
+    (planText ? resolveVerifiedCompleteEntryTextsV1(planText, entries).entries : entries).map((entry) =>
+      normalizeChecklistItemTextV1(entry.text)
+    )
   );
   return itemTexts.every((text) => named.has(normalizeChecklistItemTextV1(text)));
 }
@@ -895,6 +979,168 @@ function buildBreakerVerifiedTicksOptionV1(taskFolderPath: string): WorkflowDeci
 }
 
 /**
+ * review1 Step 48: reads the recorded Verified Checks (the stage's review file, then publish-review.md) for the
+ * failing check and the environment, and builds the environmental-failure card. Undefined when the latest review
+ * recorded no environmental blocker, so an environmental stop with no blocker behind it keeps the generic card.
+ */
+async function buildEnvironmentalFailureCardForStageV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  reason: string,
+  taskName: string | undefined,
+  blockers: readonly EnvironmentalEvidenceBlockerV1[],
+  planItemsOpen: number
+): Promise<PostWorkflowDecisionInputV1 | undefined> {
+  try {
+    if (!blockers.some((b) => b.resolver === "environmental" || b.resolver === "environmental-fixable")) {
+      return undefined;
+    }
+    let recorded: ReturnType<typeof parseRecordedCompletionChecksEvidenceV1>;
+    for (const fileName of [STAGE_ARTIFACT_FILENAMES[stage], STAGE_ARTIFACT_FILENAMES.publish]) {
+      if (!fileName) continue;
+      const content = await readTextIfExists(vscode.Uri.joinPath(folderUri, fileName));
+      const parsed = content ? parseRecordedCompletionChecksEvidenceV1(content) : undefined;
+      if (parsed && (parsed.failedChecks?.length ?? 0) > 0) {
+        recorded = parsed;
+        break;
+      }
+      recorded ??= parsed?.verificationEnvironment ? parsed : undefined;
+    }
+    const evidence = extractEnvironmentalFailureEvidenceV1({
+      blockers,
+      failedChecks: recorded?.failedChecks?.map((check) => ({
+        command: check.command,
+        exitCode: check.exitCode,
+        output: check.output,
+      })),
+      environment: recorded?.verificationEnvironment,
+    });
+    const readOnly = resolveReadOnlyDiagnosisAvailabilityV1();
+    return buildEnvironmentalFailureDecisionV1({
+      stage,
+      reason,
+      target: { canonicalId: normalizePath(folderUri.fsPath), taskFolderPath: folderUri.fsPath, taskName },
+      evidence,
+      planItemsOpen,
+      ...(readOnly.available ? {} : { investigateUnavailableReason: readOnly.reason }),
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * review1 Step 48: the card for the first review whose only blockers are ones no in-plan round can clear
+ * (`environmental` / `environmental-fixable`). It names the broken check and shows Ensemble's own environment for
+ * the run, and offers: "Investigate it for me" (a read-only diagnostic round, Step 49; recommended when a bounded
+ * code change may resolve it), "I'll look at it myself", and "Accept it as environmental and continue".
+ */
+export function buildEnvironmentalFailureDecisionV1(input: {
+  readonly stage: TaskStage;
+  readonly reason: string;
+  readonly target: { canonicalId: string; taskFolderPath: string; taskName?: string };
+  readonly evidence: EnvironmentalFailureEvidenceV1;
+  readonly planItemsOpen?: number;
+  /**
+   * Set when no model in Implementation's chain can run in the provider's enforced read-only mode (owner decision
+   * 2026-11-05). "Investigate it for me" is then shown disabled with this reason, and never recommended.
+   */
+  readonly investigateUnavailableReason?: string;
+}): PostWorkflowDecisionInputV1 {
+  const { stage, reason, target, evidence } = input;
+  const investigateBlockedBy = input.investigateUnavailableReason;
+  const stageName = STAGE_DISPLAY_NAMES[stage];
+  const nextStage = nextStageInOrderV1(stage);
+  const failureReport = formatFailureReportV1(evidence);
+  const environmentReport = formatEnvironmentReportV1(evidence.environment);
+  const canInvestigate = IMPL_REVIEW_STAGES.includes(stage);
+
+  const investigate: WorkflowDecisionOptionV1 = {
+    optionId: "investigateFailure",
+    label: "Investigate it for me",
+    resumeKind: "continue",
+    consequence:
+      investigateBlockedBy !== undefined
+        ? `Not available: ${investigateBlockedBy}.`
+        : "Resumes the task and runs one diagnostic round that reads the failure and the code and explains it. It runs " +
+          "in the provider's enforced read-only mode, so it cannot change any of your files, and it cannot run tests " +
+          "itself: it works from the failure output above. Ensemble saves its findings to evidence/diagnosis-<n>.md. " +
+          "You then choose whether a separate round applies the fix it suggests.",
+    ...(investigateBlockedBy !== undefined ? { disabled: true } : {}),
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
+      args: [{ taskFolderPath: target.taskFolderPath, investigate: { failure: failureReport, environmentReport } }],
+      recordedNext: "A diagnostic round is investigating the failure; it runs read-only and Ensemble saves its diagnosis.",
+    },
+  };
+  const lookMyself: WorkflowDecisionOptionV1 = {
+    optionId: "lookMyself",
+    label: "I'll look at it myself",
+    resumeKind: "unpause",
+    consequence:
+      "Leaves the task paused and dispatches nothing. Resume it, or choose Keep iterating, once you've dealt with the failure.",
+    effect: { kind: "doNothing", recordedNext: "The task stays paused while you look at the failure." },
+  };
+  const accept: WorkflowDecisionOptionV1 | undefined = nextStage
+    ? withEnvironmentalAcceptLabelV1(
+        buildAdvanceOptionV1(
+          nextStage,
+          target.taskFolderPath,
+          `Accepts that this failure is environmental and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}. ` +
+            "It stays on record and will gate Publish until it is fixed or you publish over it.",
+          stage,
+          input.planItemsOpen
+        ),
+        nextStage,
+        input.planItemsOpen
+      )
+    : undefined;
+
+  const options: WorkflowDecisionOptionV1[] = [
+    ...(canInvestigate ? [investigate] : []),
+    lookMyself,
+    ...(accept ? [accept] : []),
+  ];
+  const recommendation: WorkflowDecisionRecommendationV1 =
+    canInvestigate && evidence.fixable && investigateBlockedBy === undefined
+      ? {
+          kind: "option",
+          optionId: "investigateFailure",
+          reasoning:
+            "The reviewer marked this fixable by a bounded code change outside the plan, and a diagnosis is the " +
+            "smallest step that finds out which. It runs read-only, so it changes none of your files.",
+        }
+      : {
+          kind: "none",
+          reasoning:
+            "This is marked as something no code change resolves, so whether to look at it, accept it or investigate " +
+            "anyway is your judgement.",
+        };
+
+  return {
+    decisionKey: "reviewEscalation:environmental",
+    taskCanonicalId: target.canonicalId,
+    stage,
+    whatHappened: `${stageName} found a failing check that no implementation round can clear: ${reason}`,
+    whyUserNeeded:
+      "Automation has nothing it can dispatch against this, so another round would only repeat the stall. " +
+      "It needs your decision on how to proceed.",
+    options,
+    recommendation,
+    evidence: [
+      { label: "The failing check", detail: failureReport },
+      { label: "Ensemble's own environment for that run", detail: environmentReport },
+    ],
+    gating: {
+      holdsTaskPaused: true,
+      unblocksProgress: true,
+      detail: "This decision is holding the task paused until you choose how to proceed.",
+    },
+  };
+}
+
+/**
  * The bounded, durable escalation shape every `EscalationKind` posts through
  * — the plain generic card (no `plateauContext`) for implementation-side and
  * environmental escalations, and the same rich, evidence-led
@@ -931,6 +1177,9 @@ export function buildEscalationDecisionV1(
       blockersCount,
       primaryBlockerDescription,
       allBlockerDescriptions,
+      needsToolchainBlockers = [],
+      needsToolchainBlockerIdentities,
+      reviewInputsChanged,
       narrowedNote,
       progressNote,
       taskFixableCount,
@@ -997,6 +1246,26 @@ export function buildEscalationDecisionV1(
       // Advance the requirement calls for.
       ...(planItemsOpen > 0 ? [buildBuildRemainingOptionV1(target.taskFolderPath, planItemsOpen, stage)] : []),
       buildPlateauKeepIteratingOptionV1(target.taskFolderPath, stageName, taskFixableCount, blockersCount, stage),
+      // review1 Step 58: offered only when the review's inputs (task.md, plan.md, plan-final.md) changed since the
+      // review, i.e. the owner made a change the review has not seen.
+      ...(reviewInputsChanged === true
+        ? [
+            {
+              optionId: "recheckAfterMyChanges",
+              label: "I've made changes — re-check",
+              resumeKind: "continue" as const,
+              consequence:
+                `Resumes the task and re-runs ${stageName}'s review only, because task.md, plan.md or plan-final.md ` +
+                "changed after the last review. It runs no Apply Review and edits no code; the new verdict says whether " +
+                "your change settled the blockers.",
+              effect: {
+                kind: "command" as const,
+                command: "vs-code-ai-helper.resumeAndRerunReview",
+                args: [{ taskFolderPath: target.taskFolderPath }],
+              },
+            },
+          ]
+        : []),
       {
         optionId: "handleMyself",
         label: "Leave it paused — I'll fix it",
@@ -1018,7 +1287,8 @@ export function buildEscalationDecisionV1(
             "dispatched. No remaining blocker this round is classified spec-defect, so there is no specific " +
             "evidence the requirement itself is unsound in this instance — pick this only if you have reason to " +
             "believe otherwise despite that. Once you've updated the plan, resume the task (or choose Keep " +
-            "Iterating) to continue."
+            "Iterating) to continue.",
+        stage
       ),
       ...(ownerChecksOwed.length > 0
         ? [{
@@ -1041,7 +1311,9 @@ export function buildEscalationDecisionV1(
       // is the exact same kind that will gate Publish later — leaving the
       // owner to discover the override for the first time in a modal at
       // publish time. Only offered when such a blocker is actually present.
-      ...(hasNonFixableBlocker ? [buildPublishAnywayOptionV1(target.taskFolderPath)] : []),
+      ...(hasNonFixableBlocker && optionAppliesAtStageV1("publishAnyway", stage)
+        ? [buildPublishAnywayOptionV1(target.taskFolderPath)]
+        : []),
       ...(narrowing
         ? [
             {
@@ -1077,6 +1349,35 @@ export function buildEscalationDecisionV1(
             },
           ]
         : []),
+      // review1 Step 50: a command the stage cannot run is run by the owner; recording the result is how the
+      // blocker can ever be met on the record.
+      ...needsToolchainBlockers.slice(0, 2).map((desc, index): WorkflowDecisionOptionV1 => {
+        const shortName = desc.replace(/\s+/g, " ").trim().slice(0, 48);
+        return {
+          optionId: index === 0 ? "recordOwnerRun" : `recordOwnerRun${index + 1}`,
+          label:
+            needsToolchainBlockers.length > 1
+              ? `I ran it — record the result: ${shortName}${desc.length > shortName.length ? "…" : ""}`
+              : "I ran it — record the result",
+          resumeKind: "continue",
+          consequence:
+            `Asks for the command you ran, its exit code and the end of its output for "${shortName}${desc.length > shortName.length ? "…" : ""}", ` +
+            "saves them under Owner evidence in task.md as your own run bound to this blocker, then resumes the task and re-runs the review. " +
+            "The review may still disagree, but it has to cite your record.",
+          effect: {
+            kind: "command",
+            command: RECORD_OWNER_RUN_COMMAND_V1,
+            args: [
+              {
+                taskFolderPath: target.taskFolderPath,
+                stage,
+                blocker: desc,
+                blockerLineageId: needsToolchainBlockerIdentities?.[index] ?? blockerOwnerIdentityV1({ description: desc }),
+              },
+            ],
+          },
+        };
+      }),
       ...(() => {
         const gatherable = allBlockerDescriptions?.filter((desc) => AGENT_CAN_GATHER_RE.test(desc)) ?? [];
         return gatherable.map((desc, index) => {
@@ -1155,10 +1456,31 @@ export function buildEscalationDecisionV1(
           allBlockersNeedOwnerDecision
         ? {
             kind: "option",
-            optionId: narrowing ? "acceptNarrowing" : "handleMyself",
+            // review1 Step 38: "Leave it paused" does nothing, so it is never recommended while an option that
+            // records the decision exists. "Change the plan instead" opens the file the decision is written in
+            // (Accepted Non-Goals); a narrowing the owner can accept in one click comes first.
+            //
+            // review1 Step 38 (owner, 2026-11-05; bugs6 item 19): "Accept this narrowing" is recommended only when
+            // the narrowing's reason is checked (a reason on file with evidence). A narrowing the round left no
+            // reason for is a request nobody has backed, so the plan is kept and the work goes on, matching the
+            // owner-decision card for the same blocker.
+            optionId:
+              narrowing && narrowingReasonIsCheckedV1(narrowing)
+                ? "acceptNarrowing"
+                : // At a plan stage "Keep iterating" would dispatch an implementation round; the plan-stage way on is
+                  // changing the plan (which opens plan.md), so that is what is recommended there.
+                  narrowing &&
+                  !isPlanReviewStage(stage) &&
+                  options.some((option) => option.optionId === "keepIterating")
+                ? "keepIterating"
+                : "reconsiderRequirement",
             reasoning:
-              "Every remaining blocker clears only through an owner decision, so advancing would skip the " +
-              "decision and the same blocker would block Publish later.",
+              narrowing && !narrowingReasonIsCheckedV1(narrowing)
+                ? "The narrowing has no reason or evidence on file, so there is nothing to accept yet. Keep the plan " +
+                  "as written and let the next round either build the item or file the reason and evidence for " +
+                  "leaving part of it out."
+                : "Every remaining blocker clears only through an owner decision, so advancing would skip the " +
+                  "decision and the same blocker would block Publish later.",
           }
         : // RC7 item 3: open plan items and only unbuilt-work completion
           // blockers — another review-driven round cannot build them.
@@ -1264,8 +1586,13 @@ export function buildEscalationDecisionV1(
           : `Automation has done what it can here — ${progressNote} ${taskFixableCount} of the ` +
             `${blockersCount} remaining blocker(s) are task-fixable.`) +
         (hasNonFixableBlocker
-          ? " A remaining blocker here is outside automation's control — the same issue will also block Publish " +
-            "later, until it clears or you choose \"I'll publish over it\" below to override it there."
+          ? narrowing
+            ? // A narrowing is the owner's to settle on this card, which is different from a blocker no one can
+              // act on, so it is not described as outside automation's control.
+              " A remaining blocker here is a narrowing only you can approve — the same issue will also block " +
+              "Publish later until you accept it or the item is built."
+            : " A remaining blocker here is outside automation's control — the same issue will also block Publish " +
+              "later, until it clears or you choose \"I'll publish over it\" below to override it there."
           : "") +
         (hasDeclinedBlocker
           ? " The last implementation round already declined this same removal as needing a human decision — " +
@@ -1394,17 +1721,18 @@ export function buildEscalationDecisionV1(
       optionId: "handleMyself",
       label: "Leave it paused — I'll fix it",
       resumeKind: "unpause",
-      consequence: "Leaves the task paused and opens plan-final.md so you can review the plan and make the needed change yourself.",
+      consequence: `Leaves the task paused and opens ${planFileNameForStageV1(stage)} so you can review the plan and make the needed change yourself.`,
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.openPlanFinal",
-        args: [{ taskFolderPath: target.taskFolderPath }],
+        args: [{ taskFolderPath: target.taskFolderPath, ...openPlanStageArgV1(stage) }],
       },
     },
     buildReconsiderRequirementOptionV1(
       target.taskFolderPath,
       "Opens plan-final.md's Accepted Non-Goals section. The task stays paused while you review it — " +
-        "resume it (or choose Keep Iterating) once you've made the change."
+        "resume it (or choose Keep Iterating) once you've made the change.",
+      stage
     ),
   ];
   const recommendation: WorkflowDecisionRecommendationV1 = breakerContext
@@ -1561,7 +1889,7 @@ export async function postEnvironmentalAdvanceNoticeV1(
     ? 0
     : Math.max(
         0,
-        ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0) -
+        ((await readPlanItemCountsV1(folderUri, { mode: "display" }))?.gate.remaining ?? 0) -
           (await readDeferredOpenPlanItemCountV1(folderUri))
       );
   // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: quote every
@@ -1625,14 +1953,15 @@ export async function postEnvironmentalAdvanceNoticeV1(
       optionId: "handleMyself",
       label: "Fix it yourself first",
       resumeKind: "unpause",
-      consequence: "Opens plan-final.md so you can address the blocker before it reaches Publish.",
+      consequence: `Opens ${planFileNameForStageV1(stage)} so you can address the blocker before it reaches Publish.`,
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.openPlanFinal",
-        args: [{ taskFolderPath: target.taskFolderPath }],
+        args: [{ taskFolderPath: target.taskFolderPath, ...openPlanStageArgV1(stage) }],
       },
     },
-    buildPublishAnywayOptionV1(target.taskFolderPath),
+    // review1 Step 38: "publish over it" only exists once there is code to publish.
+    ...(optionAppliesAtStageV1("publishAnyway", stage) ? [buildPublishAnywayOptionV1(target.taskFolderPath)] : []),
   ];
 
   // Review fix (2026-09-23, narrowed blocker c2453680-fe42-461b-9652-1f87445cb9d3-0):
@@ -1712,11 +2041,17 @@ export async function postEnvironmentalAdvanceNoticeV1(
   });
   if (posted) {
     const ownerEvidenceBlocker = nonFixable.find(({ description, resolver }) =>
-      (resolver === "environmental" || resolver === "needs-toolchain") &&
+      (isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") &&
       OWNER_EVIDENCE_PREFIX_RE.test(description)
-    )?.description;
+    );
     if (ownerEvidenceBlocker) {
-      await postOwnerEvidenceQuestionV1(folderUri, stage, ownerEvidenceBlocker, target.taskName);
+      await postOwnerEvidenceQuestionV1(
+        folderUri,
+        stage,
+        ownerEvidenceBlocker.description,
+        target.taskName,
+        blockerOwnerIdentityV1(ownerEvidenceBlocker)
+      );
     }
   }
   return posted !== undefined;
@@ -2051,7 +2386,7 @@ export function resolveDeferrableOwnerChecksV1(
     handoff: resolveExcludedOwnerHandoffV1(description, planOfRecord),
   }));
   if (!matches.every(({ description, resolver, handoff }) =>
-    (resolver === "environmental" || resolver === "needs-toolchain") &&
+    (isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") &&
     classifyEnvironmentalBlockerV1(description) === "owner-evidence" &&
     handoff !== undefined && !handoff.isPrerequisite
   )) {
@@ -2084,20 +2419,20 @@ function describeResolverClearingActionV1(
   // RC4 item 3: a narrowing is an owner decision answered on the card itself.
   // RC7 item 1: only when the card really offers the two options; otherwise
   // say how to record the decision instead of naming options that are absent.
-  if ((resolver === "environmental" || resolver === "task-fixable") && hasNarrowingPrefixV1(description)) {
+  if ((isEnvironmentalResolverV1(resolver) || resolver === "task-fixable") && hasNarrowingPrefixV1(description)) {
     return narrowingOffered
       ? 'an owner decision on the plan item named above — choose "Accept this narrowing" or ' +
           '"Keep the item open" on this card'
-      : "an owner decision on the plan item this blocker names — write the decision under `## Accepted " +
-          "Non-Goals` in plan.md (or plan-final.md once Implementation has started), quoting the blocker, " +
-          `then choose "Keep iterating" to have ${stageName} re-review`;
+      : "an owner decision on the plan item this blocker names — answer it on the owner-decision card in this " +
+          "chat; the answer is recorded in task.md under Owner decisions and in the plan's Accepted Non-Goals, " +
+          `and ${stageName} re-reviews it`;
   }
   // RC4 item 4: a blocker filed with the literal "Owner evidence needed"
   // prefix names evidence rounds cannot gather. It is an owner decision
   // whichever resolver the reviewer used (needs-toolchain is the defensive
   // case), and the record goes in task.md directly — never the stage chat,
   // whose file write is confirmed by a modal.
-  if ((resolver === "environmental" || resolver === "needs-toolchain") && classifyEnvironmentalBlockerV1(description) === "owner-evidence") {
+  if ((isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") && classifyEnvironmentalBlockerV1(description) === "owner-evidence") {
     // Owner evidence is typically a live provider CLI probe (`claude --model …`),
     // which the generic command-prefix list does not recognise, so the first
     // backtick-quoted span in the blocker is offered instead.
@@ -2110,6 +2445,7 @@ function describeResolverClearingActionV1(
     );
   }
   switch (resolver) {
+    case "environmental-fixable":
     case "environmental": {
       const kind = classifyEnvironmentalBlockerV1(description);
       if (kind === "external-status") {
@@ -2493,12 +2829,8 @@ async function postReviewPlateauDecisionV1(
         ownerDecisions: motion.planItemOwnerDecisions,
       });
       if (planOfRecordText !== undefined) {
-        provisionalTicks =
-          countChecklistEvidenceProgressV1(
-            planOfRecordText,
-            motion.planItemEvidence ?? [],
-            motion.planItemOwnerDecisions ?? []
-          )?.provisional ?? 0;
+        // review1 Step 5: the shared plan-item counts.
+        provisionalTicks = computePlanItemCountsV1({ planText: planOfRecordText, progress: motion })?.provisional ?? 0;
         // bugs4 item 53: only the reviewer's own Verified Complete block can say "built".
         const provisionalItems = listProvisionalTickedItemsV1(
           planOfRecordText,
@@ -2507,7 +2839,8 @@ async function postReviewPlateauDecisionV1(
         );
         reviewAffirmsOpenItemsBuilt = reviewNamesAllItemsBuiltV1(
           evidence.content,
-          provisionalItems.map((item) => item.text)
+          provisionalItems.map((item) => item.text),
+          planOfRecordText
         );
       }
     }
@@ -2581,11 +2914,36 @@ async function postReviewPlateauDecisionV1(
   // `buildEscalationDecisionV1` (review blocker, 2026-08-30) — this function's
   // remaining job is exactly the async evidence-gathering above, which the
   // synchronous builder cannot do itself (it has no `folderUri`).
+  // review1 Step 37: one card per owner-only blocker. When the owner-decision card for this stage is already
+  // waiting and every blocker is an owner decision, it IS the question; a second plateau card would ask the same
+  // thing with different options.
+  if (
+    allBlockersNeedOwnerDecision &&
+    hasPendingOwnerDecisionCardV1(target.canonicalId, stage, normalized.blockers.map(blockerOwnerIdentityV1))
+  ) {
+    return true;
+  }
+  // review1 Step 58: has the owner changed the review's inputs since it ran? Only then is "I've made changes —
+  // re-check" an honest option.
+  const plateauReviewArtifactName = STAGE_ARTIFACT_FILENAMES[stage];
+  const reviewInputsChanged = plateauReviewArtifactName
+    ? (
+        await reviewInputsChangedSinceV1(folderUri.fsPath, path.join(folderUri.fsPath, plateauReviewArtifactName)).catch(() => ({
+          changed: false,
+        }))
+      ).changed
+    : false;
   const decision = await postWorkflowDecisionV1(
-    buildEscalationDecisionV1("plateau", stage, reason, target, {
+    {
+    ...buildEscalationDecisionV1("plateau", stage, reason, target, {
       blockersCount: normalized.blockers.length,
       primaryBlockerDescription: primaryBlocker?.description,
       allBlockerDescriptions: normalized.blockers.map((b) => b.description),
+      needsToolchainBlockers: normalized.blockers.filter((b) => b.resolver === "needs-toolchain").map((b) => b.description),
+      needsToolchainBlockerIdentities: normalized.blockers
+        .filter((b) => b.resolver === "needs-toolchain")
+        .map((b) => blockerOwnerIdentityV1(b)),
+      reviewInputsChanged,
       narrowedNote,
       progressNote,
       taskFixableCount: evidence.taskFixableCount,
@@ -2609,6 +2967,9 @@ async function postReviewPlateauDecisionV1(
       ownerChecksOwed,
       ...(narrowing ? { narrowing } : {}),
     }),
+    // review1 Step 37: which blockers this card asks about, so the Fast Forward stop card can tell it covers them.
+    blockerIdentities: normalized.blockers.map(blockerOwnerIdentityV1),
+    },
     target
   );
   return decision !== undefined;
@@ -2764,11 +3125,17 @@ export async function escalateReviewToHuman(
       );
       if (posted) {
         const ownerEvidenceBlocker = reviewPlateauEvidence.blockers.find(({ description, resolver }) =>
-          (resolver === "environmental" || resolver === "needs-toolchain") &&
+          (isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") &&
           OWNER_EVIDENCE_PREFIX_RE.test(description)
-        )?.description;
+        );
         if (ownerEvidenceBlocker) {
-          await postOwnerEvidenceQuestionV1(folderUri, stage, ownerEvidenceBlocker, progressHint?.displayName);
+          await postOwnerEvidenceQuestionV1(
+            folderUri,
+            stage,
+            ownerEvidenceBlocker.description,
+            progressHint?.displayName,
+            blockerOwnerIdentityV1(ownerEvidenceBlocker)
+          );
         }
         return true;
       }
@@ -2791,7 +3158,7 @@ export async function escalateReviewToHuman(
     const genericPlanItemsOpen = !isPlanReviewStage(stage)
       ? Math.max(
           0,
-          ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0) -
+          ((await readPlanItemCountsV1(folderUri, { mode: "display" }))?.gate.remaining ?? 0) -
             (await readDeferredOpenPlanItemCountV1(folderUri))
         )
       : 0;
@@ -2799,6 +3166,47 @@ export async function escalateReviewToHuman(
       breakerZeroChangeRounds !== undefined
         ? await readBreakerCardContextV1(folderUri, stage, breakerZeroChangeRounds, genericPlanItemsOpen)
         : undefined;
+    // review1 Step 37: an environmental stop for a stage whose owner-decision card is already waiting is the same
+    // question; the owner-decision card is the one to answer.
+    // Only when that card asks about every blocker the latest review for this stage recorded: a card about one
+    // blocker never hides the environmental stop for a different one.
+    if (kind === "environmental") {
+      const recordedProgress = await readTaskProgressStrictV1(folderUri, {
+        expectedTaskFolder: path.basename(folderUri.fsPath),
+      });
+      const recordedHistory = recordedProgress.ok ? recordedProgress.decoded.progress.reviewScoreHistory ?? [] : [];
+      const latestForStage = recordedHistory
+        .filter((entry) => entry.stage === stage)
+        .reduce<(typeof recordedHistory)[number] | undefined>(
+          (latest, entry) => (!latest || entry.at > latest.at ? entry : latest),
+          undefined
+        );
+      const recordedIdentities = (latestForStage?.blockers ?? []).map(blockerOwnerIdentityV1);
+      if (hasPendingOwnerDecisionCardV1(normalizePath(folderUri.fsPath), stage, recordedIdentities)) {
+        return true;
+      }
+      // review1 Step 48: a stop on blockers no in-plan round can clear names the broken check and Ensemble's own
+      // environment for that run, and offers to investigate it. It replaces the generic four-option card.
+      const environmentalCard = await buildEnvironmentalFailureCardForStageV1(
+        folderUri,
+        stage,
+        reason,
+        progressHint?.displayName,
+        (latestForStage?.blockers ?? []) as readonly EnvironmentalEvidenceBlockerV1[],
+        genericPlanItemsOpen
+      );
+      if (environmentalCard !== undefined) {
+        const posted = await postWorkflowDecisionV1(environmentalCard, {
+          canonicalId: normalizePath(folderUri.fsPath),
+          taskFolderPath: folderUri.fsPath,
+          stage,
+          taskName: progressHint?.displayName,
+        });
+        if (posted !== undefined) {
+          return true;
+        }
+      }
+    }
     const genericDecisionInput = buildEscalationDecisionV1(
       kind,
       stage,
@@ -2961,14 +3369,15 @@ async function readBreakerCardContextV1(
     const read = await readTaskProgressStrictV1(folderUri, { expectedTaskFolder: path.basename(folderUri.fsPath) });
     if (planText !== undefined && read.ok) {
       const motion = read.decoded.progress;
-      const gate = countChecklistEvidenceProgressV1(
-        planText,
-        motion.planItemEvidence ?? [],
-        motion.planItemOwnerDecisions ?? []
-      );
-      provisional = gate?.provisional ?? 0;
-      if (gate) {
-        gateCountNote = `${describeOpenAndHandOffsV1(planText) ?? `${planItemsOpen} open`}; ${describeChecklistGateGapV1(gate)}.`;
+      const counts = computePlanItemCountsV1({ planText, progress: motion });
+      provisional = counts?.provisional ?? 0;
+      if (counts) {
+        // review1 Step 5: the wording of the gap is unchanged; the figures come from the shared counts.
+        const ticked = counts.verified + counts.provisional + counts.ownerSettled;
+        const gapParts = [`${ticked} ticked`, `${counts.verified} verified by review`];
+        if (counts.ownerSettled > 0) gapParts.push(`${counts.ownerSettled} settled by you`);
+        if (counts.provisional > 0) gapParts.push(`${counts.provisional} awaiting review verification`);
+        gateCountNote = `${describeOpenAndHandOffsFromCountsV1(counts) ?? `${planItemsOpen} open`}; ${gapParts.join(", ")}.`;
       }
       const filename = STAGE_ARTIFACT_FILENAMES[stage];
       const reviewText = filename ? await readTextIfExists(vscode.Uri.joinPath(folderUri, filename)) : undefined;
@@ -2977,7 +3386,8 @@ async function readBreakerCardContextV1(
           reviewText,
           listProvisionalTickedItemsV1(planText, motion.planItemEvidence ?? [], motion.planItemOwnerDecisions ?? []).map(
             (item) => item.text
-          )
+          ),
+          planText
         );
       }
     }
@@ -2994,7 +3404,243 @@ async function readBreakerCardContextV1(
   };
 }
 
+const OWNER_EVIDENCE_UP_FRONT_ASKED_KEY_V1 = "ensemble.ownerEvidenceUpFrontAsked.v1";
+
+/**
+ * review1 Step 44: before Implementation, one chat question listing the plan's "Owner evidence:" steps the owner
+ * has not answered in task.md. Never blocks the round (Implementation goes on), asks each distinct set of steps
+ * once per task, and posts nothing when every step is answered or the chat is not available. Returns whether a
+ * question was posted.
+ */
+export async function postOwnerEvidenceUpFrontQuestionV1(options: {
+  readonly folderUri: vscode.Uri;
+  readonly stage: TaskStage;
+  readonly planText: string;
+  readonly taskMd: string;
+  readonly taskName?: string;
+  /**
+   * Set when continuing a form that had no room for every step: only the unanswered steps after this one (the
+   * last field the previous form showed) are asked.
+   */
+  readonly afterEvidence?: string;
+  /** Test seam: where the asked-once record lives; defaults to the extension's workspace state. */
+  readonly memento?: { get<T>(key: string): T | undefined; update(key: string, value: unknown): Thenable<void> | Promise<void> };
+}): Promise<boolean> {
+  const unanswered =
+    options.afterEvidence === undefined
+      ? listUnansweredOwnerEvidenceStepsV1(options.planText, options.taskMd)
+      : listUnansweredOwnerEvidenceStepsAfterV1(options.planText, options.taskMd, options.afterEvidence);
+  const steps = ownerEvidenceFormStepsV1(unanswered);
+  if (steps.length === 0 || !chatTarget) {
+    return false;
+  }
+  const canonicalId = normalizePath(options.folderUri.fsPath);
+  const memento = options.memento ?? getExtensionContextV1()?.workspaceState;
+  const asked = memento?.get<Record<string, string>>(OWNER_EVIDENCE_UP_FRONT_ASKED_KEY_V1) ?? {};
+  const key = ownerEvidenceStepsKeyV1(steps);
+  if (asked[canonicalId] === key) {
+    return false;
+  }
+  // Owner decision 2026-11-04: one field for each step. The chat settles this form by writing every answered
+  // field under `## Owner evidence` in task.md (chatView.ts); no coordinator operation sits behind it.
+  await chatTarget.askInteraction(
+    {
+      canonicalId,
+      taskFolderPath: options.folderUri.fsPath,
+      stage: options.stage,
+      taskName: options.taskName,
+      interactionId: allocateHex128IdV1(),
+      operationId: allocateHex128IdV1(),
+      actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+      sourceAttemptId: allocateHex128IdV1(),
+      questions: buildOwnerEvidenceUpFrontQuestionsV1(steps),
+    },
+    false,
+    { blocking: false }
+  );
+  await memento?.update(OWNER_EVIDENCE_UP_FRONT_ASKED_KEY_V1, { ...asked, [canonicalId]: key });
+  return true;
+}
+
+/**
+ * review1 Step 44: a form holds at most 16 fields, so after one is submitted, the steps it had no room for are
+ * asked in the next form. `lastShownEvidence` is the evidence text of the last field the submitted form showed.
+ * Reads the plan and task.md fresh, so answers just saved are taken into account. Returns whether a further form
+ * was posted.
+ */
+export async function postRemainingOwnerEvidenceStepsV1(options: {
+  readonly folderUri: vscode.Uri;
+  readonly stage: TaskStage;
+  readonly lastShownEvidence: string;
+  readonly taskName?: string;
+}): Promise<boolean> {
+  const planText = await readTextIfExists(getCanonicalImplementationUri(options.folderUri));
+  if (!planText) {
+    return false;
+  }
+  const taskMd = (await readTextIfExists(vscode.Uri.joinPath(options.folderUri, "task.md"))) ?? "";
+  return postOwnerEvidenceUpFrontQuestionV1({
+    folderUri: options.folderUri,
+    stage: options.stage,
+    planText,
+    taskMd,
+    taskName: options.taskName,
+    afterEvidence: options.lastShownEvidence,
+  });
+}
+
+/**
+ * review1 Step 45: when an owner-evidence request quotes a command on the read-only allowlist, the offer to run it.
+ * The prompt shows the exact command; choosing "Run it for me" is the owner's confirmation, in the chat, and is
+ * the only thing that runs it. A request that quotes nothing on the allowlist gets no offer.
+ */
+export function buildRunItForMeOfferV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  blocker: string
+): { readonly question: StructuredQuestionV1; readonly optionEffects: Record<string, WorkflowDecisionOptionEffectV1> } | undefined {
+  const command = findAllowlistedCommandInTextV1(blocker);
+  if (!command) {
+    return undefined;
+  }
+  const runId = allocateHex128IdV1();
+  const pasteId = allocateHex128IdV1();
+  return {
+    question: {
+      questionId: allocateHex128IdV1(),
+      kind: "singleChoice",
+      prompt:
+        `Ensemble can run this read-only command for you: \`${command.display}\`\n\n` +
+        "It runs in your workspace with a 60 second limit, and nothing runs until you choose below. Anything that " +
+        "looks like a secret is removed from the output before it is saved under `## Owner evidence`.",
+      required: true,
+      options: [
+        {
+          optionId: runId,
+          label: `Run it for me: ${command.display}`,
+          description: "Runs this one command, saves its exit status and output as your evidence, and re-runs the review.",
+        },
+        {
+          optionId: pasteId,
+          label: "I'll paste it myself",
+          description: "Runs nothing. Answer the question above with what you find.",
+        },
+      ],
+    },
+    optionEffects: {
+      [runId]: {
+        kind: "command",
+        command: RUN_OWNER_EVIDENCE_COMMAND_V1,
+        args: [{ taskFolderPath, stage, blocker, commandLine: command.display }],
+        recordedNext: `runs \`${command.display}\`, saves the result under Owner evidence and re-runs the review`,
+      },
+      [pasteId]: { kind: "doNothing", recordedNext: "runs nothing; paste the evidence into the question above" },
+    },
+  };
+}
+
+/**
+ * review1 Step 50: the "I ran it — record the result" choice for a blocker whose evidence is a command the owner
+ * runs outside the task. The effect opens the record prompts (command, exit code, output tail), writes the run under
+ * `## Owner evidence` bound to the blocker's lineage id, and re-runs the review.
+ */
+export function buildRecordOwnerRunOptionV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  blocker: string,
+  /** The blocker's stable lineage identity (`blockerOwnerIdentityV1`); absent only when the caller has the text alone. */
+  blockerLineageId?: string
+): { readonly option: QuestionOptionV1; readonly effect: WorkflowDecisionOptionEffectV1 } {
+  const optionId = allocateHex128IdV1();
+  return {
+    option: {
+      optionId,
+      label: "I ran it — record the result",
+      description:
+        "Asks for the command, its exit code and the end of its output, saves them under Owner evidence as your own " +
+        "run, bound to this blocker, and re-runs the review. A review may still disagree, but it has to cite your record.",
+    },
+    effect: {
+      kind: "command",
+      command: RECORD_OWNER_RUN_COMMAND_V1,
+      args: [{ taskFolderPath, stage, blocker, blockerLineageId: blockerLineageId ?? blockerOwnerIdentityV1({ description: blocker }) }],
+      recordedNext: "asks what you ran and how it ended, saves it under Owner evidence and re-runs the review",
+    },
+  };
+}
+
+/**
+ * The offer an owner-evidence request carries: "Run it for me" when it quotes an allowlisted command, and always
+ * "I ran it — record the result" (review1 Step 50). Never undefined.
+ */
+export function buildOwnerEvidenceActionsOfferV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  blocker: string,
+  blockerLineageId?: string
+): { readonly question: StructuredQuestionV1; readonly optionEffects: Record<string, WorkflowDecisionOptionEffectV1> } {
+  const record = buildRecordOwnerRunOptionV1(taskFolderPath, stage, blocker, blockerLineageId);
+  const run = buildRunItForMeOfferV1(taskFolderPath, stage, blocker);
+  if (run && run.question.kind === "singleChoice") {
+    // Between "Run it for me" and "I'll paste it myself".
+    const options = [...run.question.options];
+    options.splice(options.length - 1, 0, record.option);
+    return {
+      question: { ...run.question, options },
+      optionEffects: { ...run.optionEffects, [record.option.optionId]: record.effect },
+    };
+  }
+  const pasteId = allocateHex128IdV1();
+  return {
+    question: {
+      questionId: allocateHex128IdV1(),
+      kind: "singleChoice",
+      prompt:
+        "If you ran the command this blocker asks for outside the task, you can record the result here instead of " +
+        "pasting it into the question above.",
+      required: true,
+      options: [
+        record.option,
+        { optionId: pasteId, label: "I'll paste it myself", description: "Records nothing. Answer the question above with what you find." },
+      ],
+    },
+    optionEffects: {
+      [record.option.optionId]: record.effect,
+      [pasteId]: { kind: "doNothing", recordedNext: "records nothing; paste the evidence into the question above" },
+    },
+  };
+}
+
 async function postOwnerEvidenceQuestionV1(
+  folderUri: vscode.Uri,
+  stage: TaskStage,
+  blocker: string,
+  taskName?: string,
+  blockerLineageId?: string
+): Promise<void> {
+  await postOwnerEvidenceQuestionTextV1(folderUri, stage, blocker, taskName);
+  const offer = buildOwnerEvidenceActionsOfferV1(folderUri.fsPath, stage, blocker, blockerLineageId);
+  if (offer && chatTarget) {
+    await chatTarget.askInteraction(
+      {
+        canonicalId: normalizePath(folderUri.fsPath),
+        taskFolderPath: folderUri.fsPath,
+        stage,
+        taskName,
+        interactionId: allocateHex128IdV1(),
+        operationId: allocateHex128IdV1(),
+        actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
+        sourceAttemptId: allocateHex128IdV1(),
+        questions: [offer.question],
+        optionEffects: offer.optionEffects,
+      },
+      false,
+      { blocking: false }
+    );
+  }
+}
+
+async function postOwnerEvidenceQuestionTextV1(
   folderUri: vscode.Uri,
   stage: TaskStage,
   blocker: string,

@@ -15,9 +15,11 @@ import {
 } from "../utils/reviewReadiness";
 import {
   executeOwnerPlanDecisionLockedV1,
+  findAmbiguousRewordTargetV1,
   postOwnerOnlyBlockersCardV1,
   postOwnerPlanDecisionCardV1,
   RECORD_OWNER_PLAN_DECISION_COMMAND_V1,
+  startReReviewAfterOwnerDecisionV1,
 } from "../commands/ownerPlanDecisionCommandV1";
 import { buildEscalationDecisionV1, classifyEnvironmentalBlockerV1, isOwnerDecisionBlockerV1 } from "../utils/reviewEscalation";
 import { decideReviewRoute } from "../utils/reviewRouting";
@@ -207,7 +209,9 @@ void describe("bugs5 Step 23: Owner decisions needed parser and card generator",
     assert.strictEqual(card.decisionKey, "ownerPlanDecision:step-6-admission");
     assert.strictEqual(card.whatHappened, "Simpler design built instead of token hand-off.");
     assert.strictEqual(card.whyUserNeeded, "Token hand-off during form submission.");
-    assert.strictEqual(card.options.length, 2);
+    // The block's two options, plus review1 Step 40's "Answer in my own words…".
+    assert.strictEqual(card.options.length, 3);
+    assert.deepEqual(card.options.map((o) => o.optionId).slice(-1), ["ownWords"]);
     const recommendation = card.recommendation;
     assert.strictEqual(recommendation.kind, "option");
     if (recommendation.kind === "option") {
@@ -301,6 +305,53 @@ void describe("bugs5 Step 23: the owner-decision command records the answer with
     assert.ok(shown.includes('the owner chose "Approve the simpler design"'), "the reviewer sees the owner's answer");
   });
 
+  void it("review1 Step 4: a reword rewrites the occurrence asked for, and refuses to guess between identical items", async () => {
+    patchReadFile();
+    const twins = ["# Plan", "- [ ] Do the thing", "- [ ] Do the thing", "- [ ] Final verification"].join("\n");
+    const base = {
+      stage: "impl" as const,
+      blockerId: "twin-item",
+      optionId: "reword",
+      optionLabel: "Reword it",
+    };
+
+    // The second of two identical items, named by occurrence: only that line changes.
+    const second = makeTask("exec-reword-occurrence", twins);
+    await executeOwnerPlanDecisionLockedV1({
+      ...base,
+      taskFolderPath: second,
+      planAction: { kind: "reword", itemText: "Do the thing", newText: "Do the new thing", itemOccurrence: 2 },
+    });
+    const lines = readPlan(second).split("\n");
+    assert.strictEqual(lines[1], "- [ ] Do the thing", "the first twin is untouched");
+    assert.match(lines[2] ?? "", /^- \[ \] Do the new thing — Owner decision/);
+
+    // No occurrence: the command refuses before recording anything, and the plan is not edited.
+    const ambiguous = makeTask("exec-reword-ambiguous", twins);
+    const arg = {
+      ...base,
+      taskFolderPath: ambiguous,
+      planAction: { kind: "reword" as const, itemText: "Do the thing", newText: "Do the new thing" },
+    };
+    const found = await findAmbiguousRewordTargetV1(arg);
+    assert.deepStrictEqual(found, { itemText: "Do the thing", count: 2 });
+    await executeOwnerPlanDecisionLockedV1(arg);
+    const after = readPlan(ambiguous);
+    assert.ok(!after.includes("Do the new thing"), "neither twin was reworded");
+    assert.strictEqual(after.match(/- \[ \] Do the thing/g)?.length, 2);
+
+    // A single match needs no occurrence.
+    const single = makeTask("exec-reword-single", PLAN);
+    assert.strictEqual(
+      await findAmbiguousRewordTargetV1({
+        ...base,
+        taskFolderPath: single,
+        planAction: { kind: "reword", itemText: "Final verification", newText: "Final checks" },
+      }),
+      undefined
+    );
+  });
+
   void it("writes an Owner Decisions note when no item is named, once", async () => {
     patchReadFile();
     const folder = makeTask("exec-note", PLAN);
@@ -320,6 +371,125 @@ void describe("bugs5 Step 23: the owner-decision command records the answer with
     assert.strictEqual(plan.match(/plan-deviation-ab12cd34/g)?.length, 1, "the same note is not written twice");
     assert.ok(plan.includes("- [ ] Final verification"), "the checklist is untouched");
     assert.strictEqual(readProgress(folder).blockerSupersessions?.length, 1);
+  });
+
+  void it("review1 Step 40: an answer is written to task.md under Owner decisions, once, with the blocker and the answer", async () => {
+    patchReadFile();
+    const folder = makeTask("exec-task-md", PLAN);
+    nodeFs.writeFileSync(nodePath.join(folder, "task.md"), "# Task\n\n## Task Description\n\nBuild it.\n", "utf8");
+    const arg = {
+      taskFolderPath: folder,
+      stage: "impl-high-review" as const,
+      blockerId: "step-6-admission",
+      optionId: "approve",
+      optionLabel: "Approve the simpler design",
+      planAction: { kind: "note" as const },
+      blockerText: "Step 6:  token hand-off\nversus the simpler design",
+    };
+    await executeOwnerPlanDecisionLockedV1(arg);
+    await executeOwnerPlanDecisionLockedV1(arg);
+
+    const task = nodeFs.readFileSync(nodePath.join(folder, "task.md"), "utf8");
+    assert.strictEqual(task.match(/## Owner decisions/g)?.length, 1);
+    assert.strictEqual(task.match(/### \d{4}-\d{2}-\d{2} — step-6-admission/g)?.length, 1, "the same answer is not written twice");
+    assert.ok(task.includes("> Step 6: token hand-off versus the simpler design"));
+    assert.ok(task.includes("Owner's answer: Approve the simpler design"));
+    assert.ok(task.startsWith("# Task\n\n## Task Description"), "the owner's own text is untouched");
+  });
+
+  void it("review1 Step 40: at a plan stage the answer also becomes an Accepted Non-Goals entry in plan.md that cites task.md", async () => {
+    patchReadFile();
+    const folder = nodePath.join(ROOT, ".ensemble", "exec-plan-stage");
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "plan.md"), "# Plan\n\n## Goal\n\nShip it.\n", "utf8");
+    nodeFs.writeFileSync(nodePath.join(folder, "task.md"), "# Task\n\n## Task Description\n\nBuild it.\n", "utf8");
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "task-progress.json"),
+      JSON.stringify({
+        taskFolder: "exec-plan-stage", currentStage: "plan-low-review", status: "active",
+        createdAt: "2026-11-01T00:00:00.000Z", updatedAt: "2026-11-01T00:00:00.000Z",
+      }),
+      "utf8"
+    );
+    const arg = {
+      taskFolderPath: folder,
+      stage: "plan-low-review" as const,
+      blockerId: "popups-owner-rule",
+      optionId: "accept",
+      optionLabel: "Keep the six pop-up categories as pop-ups",
+      planAction: { kind: "note" as const },
+      blockerText: "The no-pop-ups owner rule is only partially delivered",
+    };
+    await executeOwnerPlanDecisionLockedV1(arg);
+    await executeOwnerPlanDecisionLockedV1(arg);
+
+    const plan = nodeFs.readFileSync(nodePath.join(folder, "plan.md"), "utf8");
+    assert.strictEqual(plan.match(/## Accepted Non-Goals/g)?.length, 1);
+    assert.ok(plan.includes("The no-pop-ups owner rule is only partially delivered"));
+    assert.ok(plan.includes("(task.md → Owner decisions, popups-owner-rule)"));
+    assert.strictEqual(plan.match(/task\.md → Owner decisions, popups-owner-rule/g)?.length, 1, "written once");
+    const task = nodeFs.readFileSync(nodePath.join(folder, "task.md"), "utf8");
+    assert.ok(task.includes("Owner's answer: Keep the six pop-up categories as pop-ups"));
+
+    // review1 Step 46 (item 5 replay): the review prompt treats exactly this pair as settled. Every review prompt
+    // that scores a stage (plan and code) carries the shared rubric, and the rubric names the citation the answer
+    // just wrote, so the next review does not call the plan's non-goal a fabricated owner decision.
+    const promptsDir = nodePath.resolve(__dirname, "..", "..", "resources", "prompts");
+    const rubric = nodeFs.readFileSync(nodePath.join(promptsDir, "review-scoring-rubric.md"), "utf8");
+    assert.match(rubric, /an `## Accepted Non-Goals` entry that cites `task\.md → Owner decisions, <id>` is settled by it/);
+    assert.match(rubric, /A plan line that says "owner decision" with no such task\.md entry proves nothing/);
+    for (const prompt of ["review-plan-high.md", "review-plan-low.md", "review-impl-high.md", "review-impl-low.md"]) {
+      assert.match(nodeFs.readFileSync(nodePath.join(promptsDir, prompt), "utf8"), /\{\{reviewScoringRubric\}\}/, prompt);
+    }
+  });
+
+  void it("review1 Step 40: at a code stage the answer also becomes an Accepted Non-Goals entry in plan-final.md, once, without touching the checklist", async () => {
+    patchReadFile();
+    const folder = makeTask("exec-code-stage-nongoal", PLAN);
+    nodeFs.writeFileSync(nodePath.join(folder, "task.md"), "# Task\n\n## Task Description\n\nBuild it.\n", "utf8");
+    const before = readPlan(folder);
+    const checklistLines = (text: string): string[] => text.split("\n").filter((line) => /^\s*- \[[ xX]\]/.test(line));
+    const arg = {
+      taskFolderPath: folder,
+      stage: "impl-high-review" as const,
+      blockerId: "step-6-admission",
+      optionId: "approve",
+      optionLabel: "Approve the simpler design",
+      planAction: { kind: "note" as const },
+      blockerText: "Step 6: token hand-off versus the simpler design",
+    };
+    await executeOwnerPlanDecisionLockedV1(arg);
+    await executeOwnerPlanDecisionLockedV1(arg);
+
+    const plan = readPlan(folder);
+    assert.strictEqual(plan.match(/## Accepted Non-Goals/g)?.length, 1);
+    assert.ok(plan.includes("Step 6: token hand-off versus the simpler design"));
+    assert.strictEqual(plan.match(/task\.md → Owner decisions, step-6-admission/g)?.length, 1, "written once");
+    assert.deepStrictEqual(checklistLines(plan), checklistLines(before), "no checklist line changed");
+    assert.notStrictEqual(plan, before, "the file did change");
+  });
+
+  void it("review1 Step 40: a plan-deviation approval and a rejecting option add no Accepted Non-Goals entry at a code stage", async () => {
+    patchReadFile();
+    const folder = makeTask("exec-code-stage-no-nongoal", PLAN);
+    await executeOwnerPlanDecisionLockedV1({
+      taskFolderPath: folder,
+      stage: "impl-high-review",
+      blockerId: "plan-deviation-ab12cd34",
+      optionId: "approve-deviation",
+      optionLabel: "Approve plan deviation",
+      planAction: { kind: "approveDeviation" },
+    });
+    await executeOwnerPlanDecisionLockedV1({
+      taskFolderPath: folder,
+      stage: "impl-high-review",
+      blockerId: "step-7-keep",
+      optionId: "reject",
+      optionLabel: "Keep the plan",
+      planAction: { kind: "note" },
+      rejects: true,
+    });
+    assert.doesNotMatch(readPlan(folder), /## Accepted Non-Goals/);
   });
 
   void it("a rejecting option notes the decision but neither excludes items nor sets the blocker aside", async () => {
@@ -543,5 +713,106 @@ void describe("bugs5 Step 24: Agent-gatherable evidence routing", () => {
   void it("isOwnerEvidenceBlockerV1 returns false for agent-gatherable blocker", () => {
     assert.strictEqual(isOwnerEvidenceBlockerV1({ description: "Agent can gather (cost: $0.10): stream test" }), false);
     assert.strictEqual(isOwnerEvidenceBlockerV1({ description: "Owner evidence needed: laptop file" }), true);
+  });
+});
+
+void describe("review1 Step 40: an owner-decision answer re-runs the review, and the card takes free text", () => {
+  afterEach(() => {
+    __extensionContextV1TestOnly.reset();
+  });
+
+  const baseArg = {
+    taskFolderPath: nodePath.join(ROOT, ".ensemble", "rerun-task"),
+    stage: "impl-high-review" as const,
+    blockerId: "step-6-admission",
+    optionId: "buildToken",
+    optionLabel: "Require token hand-off",
+  };
+
+  void it("an answer that settles the blocker starts the stage review through the single resume-and-review command", async () => {
+    const calls: { id: string; args: unknown[] }[] = [];
+    const started = await startReReviewAfterOwnerDecisionV1(baseArg, (id, ...args) => {
+      calls.push({ id, args });
+      return Promise.resolve(true);
+    });
+    assert.equal(started, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0]!.id, "vs-code-ai-helper.resumeAndRerunReview");
+    assert.deepEqual(calls[0]!.args[0], { taskFolderPath: baseArg.taskFolderPath });
+    // Only task.md and the plan changed, so the unchanged-tree guard must not refuse the review.
+    assert.equal((calls[0]!.args[1] as { skipUnchangedTreeGuardV1?: boolean }).skipUnchangedTreeGuardV1, true);
+    assert.equal(typeof (calls[0]!.args[1] as { onDispatchingV1?: unknown }).onDispatchingV1, "function");
+  });
+
+  void it("keeping the plan as written, or approving a deviation, starts no review", async () => {
+    let calls = 0;
+    const run = (): Promise<boolean> => {
+      calls++;
+      return Promise.resolve(true);
+    };
+    assert.equal(await startReReviewAfterOwnerDecisionV1({ ...baseArg, rejects: true }, run), false);
+    assert.equal(
+      await startReReviewAfterOwnerDecisionV1({ ...baseArg, planAction: { kind: "approveDeviation" } }, run),
+      false
+    );
+    assert.equal(calls, 0);
+  });
+
+  void it("an own-words answer, which keeps the plan untouched, does start the review", async () => {
+    let calls = 0;
+    const started = await startReReviewAfterOwnerDecisionV1({ ...baseArg, rejects: true, ownWords: true }, () => {
+      calls++;
+      return Promise.resolve(true);
+    });
+    assert.equal(started, true);
+    assert.equal(calls, 1);
+  });
+
+  void it("a failing start is reported as not started, never thrown into the answer", async () => {
+    const started = await startReReviewAfterOwnerDecisionV1(baseArg, () => Promise.reject(new Error("boom")));
+    assert.equal(started, false);
+  });
+
+  void it("the card offers 'Answer in my own words…', and only the options that settle the blocker are 'continue'", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folder = nodePath.join(ROOT, ".ensemble", "own-words-task");
+    const block = parseOwnerDecisionsNeededV1(STEP_6_REVIEW)[0]!;
+    const card = await postOwnerPlanDecisionCardV1({ taskFolderPath: folder, stage: "impl-high-review", block });
+    assert.ok(card);
+    const ownWords = card.options.find((o) => o.optionId === "ownWords");
+    assert.ok(ownWords, "the free-text option is on the card");
+    assert.equal(ownWords.resumeKind, "continue");
+    assert.equal(ownWords.effect.kind, "command");
+    const ownWordsArgs = (ownWords.effect as { args?: readonly { ownWords?: boolean }[] }).args;
+    assert.equal(ownWordsArgs?.[0]?.ownWords, true);
+    for (const option of card.options) {
+      if (option.optionId === "ownWords") continue;
+      const rejects = (option.effect as { args?: readonly { rejects?: boolean }[] }).args?.[0]?.rejects === true;
+      assert.equal(option.resumeKind, rejects ? "unpause" : "continue", `${option.optionId} resume kind`);
+    }
+  });
+
+  void it("own words are recorded in task.md and leave the plan's checklist alone", async () => {
+    const folder = nodePath.join(ROOT, ".ensemble", "own-words-record");
+    nodeFs.mkdirSync(folder, { recursive: true });
+    nodeFs.writeFileSync(nodePath.join(folder, "task.md"), "# Task\n\n## Task Description\n\nX\n");
+    nodeFs.writeFileSync(nodePath.join(folder, "plan-final.md"), "# Plan\n\n- [ ] Step 6: Build it\n");
+    await executeOwnerPlanDecisionLockedV1({
+      ...baseArg,
+      taskFolderPath: folder,
+      optionId: "ownWords",
+      optionLabel: "Keep the pop-ups for these six",
+      rejects: true,
+      ownWords: true,
+      blockerText: "Pop-up categories",
+    });
+    const taskMd = nodeFs.readFileSync(nodePath.join(folder, "task.md"), "utf8");
+    assert.match(taskMd, /Owner's answer: Keep the pop-ups for these six\n/);
+    assert.ok(!taskMd.includes("plan kept as written"), "an own-words answer is not described as keeping the plan");
+    const plan = nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
+    assert.ok(plan.includes("- [ ] Step 6: Build it"), "no checklist line changed");
+    assert.ok(!plan.includes("ensemble:excluded"));
+    assert.ok(!plan.includes("plan kept as written"));
   });
 });

@@ -1,5 +1,6 @@
 import {
   FastForwardRunStateV1,
+  isFastForwardRunActiveV1,
   isFastForwardRunPausedProvenanceCurrentV1,
   stampFastForwardResumeProvenanceV1,
 } from "../utils/activeFastForwardRunsV1";
@@ -12,6 +13,7 @@ import {
   buildHeldTicksAnswerOptionsV1,
   describeKeptDeferredAnswerV1,
   isVerifiedTicksDecisionV1,
+  offeredTickItemsOfV1,
 } from "./verifiedTicksHeldOptionsV1";
 import {
   describeLiveTaskOperationV1,
@@ -75,6 +77,101 @@ export interface FastForwardResumeStateV1 extends FastForwardRunStateV1 {
   readonly fastForwardCapturedAtMsV1?: number;
   /** bugs5 Step 19: the stage the run was paused at when the card captured this state. */
   readonly fastForwardStageV1?: string;
+  /**
+   * review1 Step 32: set only by the lost-round card when the run's in-memory state was gone. It names the lost
+   * round whose ledger row carries the run's counters (`RoundLedgerEntryV1.fastForwardRunV1`); the answer is
+   * checked against the task's own records by `decideLedgerBackedFastForwardResumeV1`.
+   */
+  readonly fastForwardLedgerRoundIdV1?: string;
+  /**
+   * review1 Step 32: set only on the lost-round card's "continue, then keep going with Fast Forward" option, for a
+   * lost round whose row carries no run stamp (it was opened before Ensemble recorded one, so the records cannot
+   * say whether Fast Forward was running). The owner's own choice of this option stands in for the missing stamp;
+   * every other check of `decideLedgerBackedFastForwardResumeV1` still applies.
+   */
+  readonly fastForwardOwnerStartedV1?: true;
+}
+
+/** What `decideLedgerBackedFastForwardResumeV1` reads from the task's own records at the moment of choosing. */
+export interface LedgerBackedFastForwardResumeFactsV1 {
+  readonly status: string | undefined;
+  readonly currentStage: string | undefined;
+  /** An operation is running for the task right now. */
+  readonly hasLiveOperation: boolean;
+  /** A Fast Forward run is live in this window for the task right now. */
+  readonly fastForwardRunLive: boolean;
+  /** The lost round's ledger row, if it still exists. */
+  readonly lostRound: { readonly startedAtMs: number; readonly hasFastForwardStamp: boolean } | undefined;
+  /** Start time (ms) of the newest round-ledger row, if any. */
+  readonly latestRoundStartedAtMs: number | undefined;
+}
+
+/**
+ * review1 Step 32: the lost-round card resumes Fast Forward from the round ledger instead of from the window's
+ * memory. Trusted only when the task's own records show the lost round carried a Fast Forward stamp, it is still
+ * the newest round, and the task is still paused at the captured stage with nothing running.
+ */
+export function decideLedgerBackedFastForwardResumeV1(
+  state: FastForwardResumeStateV1,
+  facts: LedgerBackedFastForwardResumeFactsV1
+): DurableFastForwardResumeDecisionV1 {
+  if (state.fastForwardLedgerRoundIdV1 === undefined) {
+    return { trusted: false, reason: "the card did not name the round it continues" };
+  }
+  if (!facts.lostRound) {
+    return { trusted: false, reason: "the lost round's record is no longer in the task's history" };
+  }
+  if (!facts.lostRound.hasFastForwardStamp && state.fastForwardOwnerStartedV1 !== true) {
+    return { trusted: false, reason: "the lost round's record no longer shows it was part of a Fast Forward run" };
+  }
+  if (facts.fastForwardRunLive || facts.hasLiveOperation) {
+    return { trusted: false, reason: "something else is running for this task now" };
+  }
+  if (facts.status !== "paused") {
+    return { trusted: false, reason: "the task is no longer paused for this card" };
+  }
+  if (state.fastForwardStageV1 !== undefined && facts.currentStage !== state.fastForwardStageV1) {
+    return { trusted: false, reason: "the task has moved to another stage since the card was raised" };
+  }
+  if (facts.latestRoundStartedAtMs !== undefined && facts.latestRoundStartedAtMs > facts.lostRound.startedAtMs) {
+    return { trusted: false, reason: "a round started after the lost one" };
+  }
+  return { trusted: true };
+}
+
+/** The resume payload the lost-round card carries when the run's counters come from the lost round's ledger row. */
+export function buildLedgerBackedFastForwardResumeV1(input: {
+  readonly stage: string;
+  readonly lostRoundId: string;
+  readonly run: { readonly attemptNumber: number; readonly maxAttempts: number };
+}): FastForwardResumeStateV1 {
+  return {
+    attemptNumber: input.run.attemptNumber,
+    maxAttempts: input.run.maxAttempts,
+    fastForwardLedgerRoundIdV1: input.lostRoundId,
+    fastForwardCapturedAtMsV1: Date.now(),
+    fastForwardStageV1: input.stage,
+  };
+}
+
+/**
+ * review1 Step 32: the resume payload for a lost round whose row has no Fast Forward stamp (opened before stamps
+ * existed). Choosing the option that carries it starts a Fast Forward run at the first attempt of the configured
+ * budget, from the working tree; the owner's choice is recorded on the payload instead of a stamp.
+ */
+export function buildOwnerStartedFastForwardResumeV1(input: {
+  readonly stage: string;
+  readonly lostRoundId: string;
+  readonly maxAttempts: number;
+}): FastForwardResumeStateV1 {
+  return {
+    attemptNumber: 1,
+    maxAttempts: input.maxAttempts,
+    fastForwardLedgerRoundIdV1: input.lostRoundId,
+    fastForwardOwnerStartedV1: true,
+    fastForwardCapturedAtMsV1: Date.now(),
+    fastForwardStageV1: input.stage,
+  };
 }
 
 /** What `decideDurableFastForwardResumeV1` reads from the task's own records at the moment of choosing. */
@@ -371,6 +468,57 @@ export function liveOperationBlockingOptionV1(
     return undefined;
   }
   return getLiveTaskOperationV1(findTaskFolderPathInArgsV1(option.effect.args) ?? record.taskCanonicalId);
+}
+
+/**
+ * review1 Step 33 (bugs6 item 8): the reviewer-verified-ticks card says only what is true of the task NOW. The
+ * tick-only option ("dispatches nothing, so Fast Forward keeps running") is persisted at post time, when a Fast
+ * Forward run was live; once that run ended the card still carried it, recommended, next to an option saying the
+ * card "was not raised by an active Fast Forward run". This render-time view reconciles the two:
+ *
+ * - Fast Forward is active: the tick-only option reads "Apply the N ticks now (Fast Forward continues)".
+ * - It is not: the tick-only option is not offered (its claim is false), and the recommendation is the option that
+ *   applies the ticks AND continues, either resuming the captured run or running the stage's next action once; the
+ *   recommendation says which.
+ *
+ * Never both texts on one card. A view only: nothing is persisted.
+ */
+export function adaptVerifiedTicksCardToFastForwardStateV1(record: WorkflowDecisionV1): WorkflowDecisionV1 {
+  if (record.state !== "pending" || !isVerifiedTicksDecisionV1(record)) {
+    return record;
+  }
+  const apply = record.options.find((option) => option.optionId === APPLY_OPTION_ID_V1);
+  const tickNow = record.options.find((option) => option.optionId === APPLY_TICKS_NOW_OPTION_ID_V1);
+  if (!apply || !tickNow) {
+    return record;
+  }
+  const folder = findTaskFolderPathInArgsV1(apply.effect.kind === "command" ? apply.effect.args : undefined) ?? record.taskCanonicalId;
+  const count = offeredTickItemsOfV1(record).length;
+  if (isFastForwardRunActiveV1(folder)) {
+    const label = `Apply the ${count > 0 ? `${count} ` : ""}${count === 1 ? "tick" : "ticks"} now (Fast Forward continues)`;
+    return tickNow.label === label
+      ? record
+      : { ...record, options: record.options.map((option) => (option === tickNow ? { ...option, label } : option)) };
+  }
+  const resumesRun = apply.label.endsWith(trustedResumeLabelSuffixForAnyV1(apply.label));
+  const reasoning = resumesRun
+    ? "The reviewer already verified these items. Apply ticks them and then resumes the Fast Forward run this card was raised in."
+    : "The reviewer already verified these items. Apply ticks them and then runs the stage's next action once; no Fast Forward run is active, so it does not start one.";
+  const recommendsTickNow = record.recommendation.kind === "option" && record.recommendation.optionId === tickNow.optionId;
+  return {
+    ...record,
+    options: record.options.filter((option) => option !== tickNow),
+    recommendation:
+      recommendsTickNow || record.recommendation.kind === "none"
+        ? { kind: "option", optionId: apply.optionId, reasoning }
+        : record.recommendation,
+  };
+}
+
+/** The "and resume Fast Forward (iteration N of M)" tail of a trusted option label, or a string that never matches. */
+function trustedResumeLabelSuffixForAnyV1(label: string): string {
+  const match = / and resume Fast Forward \(iteration \d+ of \d+\)$/.exec(label);
+  return match ? match[0] : "\u0000";
 }
 
 /**

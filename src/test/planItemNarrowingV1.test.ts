@@ -31,7 +31,7 @@ function proposal(overrides: Partial<ChecklistChangeProposalV1> = {}): Checklist
 
 const SUMMARY = [
   "Intro paragraph with nothing relevant.",
-  "`stageMutatorSourceScanV1.test.ts` never mentions Clear (checked with one search), so nothing to update.",
+  "`stageMutatorSourceScanV1.test.ts` never mentions Clear (checked with one search of src/test/stageMutatorSourceScanV1.test.ts:41), so nothing to update.",
 ].join("\n\n");
 
 const PREFIX_BLOCKER = {

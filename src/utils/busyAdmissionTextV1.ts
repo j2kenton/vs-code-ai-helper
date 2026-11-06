@@ -12,6 +12,7 @@
  * A claim that has stopped renewing is a different situation (nothing is running); that
  * wording stays with `describeWorkAdmissionRefusalV1`, which this defers to.
  */
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1, describeWorkAdmissionRefusalV1 } from "../state/workAdmissionV1";
@@ -75,12 +76,29 @@ function elapsedWordsV1(startedAtMs: number, now: number): string {
   return minutes < 1 ? "under a minute so far" : `${minutes} min so far`;
 }
 
+/**
+ * review1 Step 41: the task's own display name, read best effort from its progress file next to the claim marker.
+ * Flows that refuse before they have resolved the task (lint, rename, chat-with-stage, Publish Checks, Commit & Push)
+ * pass no name; this lets every refusal name the task the owner sees in the Tasks pane instead of "This task".
+ */
+function readTaskDisplayNameForRefusalV1(markerPath: string): string | undefined {
+  try {
+    const taskFolder = path.dirname(path.dirname(markerPath));
+    const parsed: unknown = JSON.parse(fs.readFileSync(path.join(taskFolder, "task-progress.json"), "utf8"));
+    const name = (parsed as { displayName?: unknown } | null)?.displayName;
+    return typeof name === "string" && name.trim().length > 0 ? name.trim() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function describePlainBusyRefusalV1(
   outcome: WorkAdmissionBusyV1,
   taskDisplayName?: string,
   now: number = Date.now()
 ): PlainBusyRefusalV1 {
-  const subject = taskDisplayName ? `"${taskDisplayName}"` : "This task";
+  const resolvedName = taskDisplayName ?? readTaskDisplayNameForRefusalV1(outcome.markerPath);
+  const subject = resolvedName ? `"${resolvedName}"` : "This task";
   const owner = outcome.owner;
   const details = owner
     ? `held by ${owner.commandId} (pid ${owner.pid} on ${owner.hostId}), claim marker ${outcome.markerPath}`
@@ -88,7 +106,7 @@ export function describePlainBusyRefusalV1(
 
   // The claim stopped renewing: nothing is running, so "Cancel / Wait" would mislead.
   if (Number.isFinite(outcome.ageMs) && outcome.ageMs > 5 * WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1) {
-    return { message: describeWorkAdmissionRefusalV1(outcome, taskDisplayName), details };
+    return { message: describeWorkAdmissionRefusalV1(outcome, resolvedName), details };
   }
 
   // Prefer the live operations state (what the owner sees in Notifications) over the claim.

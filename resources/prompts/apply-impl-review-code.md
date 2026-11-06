@@ -6,11 +6,15 @@ Use the file inspection and editing capabilities available in your execution env
 - If you are running as a CLI coding agent, use your native shell, patch, and file-editing tools to inspect and modify files directly in the current repository.
 - If a named tool is unavailable, use an equivalent available mechanism. Do not stop or switch to a notes-only answer just because the exact tool name is absent.
 
+Report shape, stated once: your final response is Markdown with these sections, in any order — `## Files Changed`, `## Plan Item Checklist` (one entry per item you completed: `<exact item text or its [item:<id>]> — done — <evidence>`), `## Plan deviations`, and `## Verification` (each test command in backticks with its passed and failed counts, and a plain statement that the tests ran on the working tree after your edits). Section order does not matter: each section counts wherever it appears in your own text, but not inside a reproduction of the plan's checklist.
+
+{{suggestionsGuidance}}
+
 Read the approved plan, implementation notes, and review below, then:
 
 1. Inspect the current code before touching anything
 2. Fix every unresolved or partially resolved blocker the review identifies, including architectural, defect, completion, and previous-review blockers
-3. Do not substitute smaller non-blocking changes while **fixable** blockers remain. This rule exists to stop a round doing easy work while dodging a hard defect — it does not apply to a blocker this round cannot clear at all. A blocker classified `environmental` or `needs-toolchain`, or one whose own text says it awaits a human decision or another task, does not gate the rest of the plan: state plainly that it is unaddressable and why, then continue under rule 8 with the round's remaining capacity. Stopping with unbuilt plan steps because of a blocker nobody in this round can fix starves the task; doing the available work is strictly better than doing nothing. Before recording "owner evidence needed", first try what can be safely done yourself: run a CLI against a throwaway folder outside the workspace, read files you have access to, or run a read-only command. Save any gathered evidence under the task's `evidence/` folder and record what was tried. "Owner evidence needed" is reserved for what truly requires the owner (their machine, account, payment, or judgement) — state which of these is required and why an agent cannot obtain it.
+3. Work in this one order, using the sorted blocker list below the review: (1) **Fix first** — the task-fixable defects in work that is already built; (2) **Build to clear** — build the plan steps named under each blocker that is really unbuilt plan work, because building them is the fix (do not patch around "Part 4 remains unbuilt"; build Part 4's steps); (3) with the round's remaining capacity, **build the next unbuilt plan steps in the plan's own order** (rule 8). A blocker under **Not this round** (an owner decision, `environmental`, `needs-toolchain`, one that has stood unchanged across several reviews, or one earlier rounds declined with recorded reasons) does not gate the rest of the plan: state plainly that it is unaddressable this round and why, and spend nothing else on it. When every blocker left is under **Not this round**, and no plan step remains to build, do not report "nothing to fix": say "nothing I can fix", then name the failing check first and why no code change in this plan clears it. Two rules go with this order. Never build on top of an unfixed defect in work the next steps depend on: that multiplies the defect, and a score that falls after such a round is the result. And always leave the round with something finished: if a blocker is too large, land its largest coherent prerequisite slice and say what remains. A round must not end waiting for background work: finish every run you started, or report it as not run. Before recording "owner evidence needed", first try what can be safely done yourself: run a CLI against a throwaway folder outside the workspace, read files you have access to, or run a read-only command. Save any gathered evidence under the task's `evidence/` folder and record what was tried. "Owner evidence needed" is reserved for what truly requires the owner (their machine, account, payment, or judgement) — state which of these is required and why an agent cannot obtain it.
 4. Treat review-confidence blockers as an instruction to inspect the workspace directly or improve the missing evidence, not as proof of a code defect
 5. Address non-blocking suggestions where they are clearly correct and in scope
 6. Edit files directly in the workspace, and remove anything obsolete. As you finish each plan item this round, append one `- [x] …` line to `round-progress.md` in the task folder ({{roundProgressPath}}), quoting that item's exact text. This file is best-effort, in-round bookkeeping only — it is read by the Tasks tree to move the percentage while the round is still running, never by any gate, and it is not part of the plan of record; do not treat it as a substitute for the checklist echo, or the evidenced `## Plan Item Checklist` entries, described below.
@@ -81,6 +85,12 @@ Output ONLY the summary document as your final text response after you are done 
 {{openPlanItems}}
 
 When claiming completion of an item whose acceptance depends on tests, identify the exact test file or test name in that item's `## Plan Item Checklist` evidence. In `## Verification`, report the exact command that ran that test, passed and failed counts, and the post-edit source state tested. The item-specific test identifier must appear in the reported command. A test-dependent item listed as `[PROVISIONAL — evidence missing]` remains unresolved until the matching passing report is present; do not treat its existing checkbox as proof.
+
+## Blockers, sorted for this round
+
+{{blockerWorkList}}
+
+{{testFailures}}
 
 ## Implementation Review
 

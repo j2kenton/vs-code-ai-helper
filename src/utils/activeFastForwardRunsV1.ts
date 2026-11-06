@@ -60,6 +60,14 @@ let fastForwardSessionId = crypto.randomUUID();
 const runEpochs = new Map<string, number>();
 
 /**
+ * review1 Step 54 (review fix): an "and keep going" answer belongs to a run CHAIN, not to one run start. A chain is a
+ * run plus the runs that explicitly continue it (a resume from a pause card). A chain ends when a run ends for any
+ * reason other than a pause for a card, when the owner cancels, or when an automation-stopped card is posted. Ending a
+ * chain bumps its id, so an answer bound to it never matches again and a later, independent action starts clean.
+ */
+const runChains = new Map<string, number>();
+
+/**
  * RC3 item 4, Step 3 completion fix round 2 (review-flagged 2026-09-30,
  * narrowed blocker `62a487ef-0d12-4476-a39f-abc4016bf4d4-0`): session id and
  * run epoch alone cannot tell "this run paused to raise the very card now
@@ -95,9 +103,20 @@ const pausedRunProvenance = new Map<string, { readonly sessionId: string; readon
 
 export function markFastForwardRunActiveV1(
   taskFolderPath: string,
-  state: FastForwardRunStateV1 = { attemptNumber: 0, maxAttempts: 0 }
+  state: FastForwardRunStateV1 = { attemptNumber: 0, maxAttempts: 0 },
+  options: { readonly continuesPausedRun?: boolean } = {}
 ): void {
   const key = normalizePath(taskFolderPath);
+  // A resume from a pause card continues the run that paused (same session, no other run since): same chain.
+  const paused = pausedRunProvenance.get(key);
+  const continuesChain =
+    options.continuesPausedRun === true &&
+    paused !== undefined &&
+    paused.sessionId === fastForwardSessionId &&
+    paused.epoch === (runEpochs.get(key) ?? 0);
+  if (!continuesChain) {
+    runChains.set(key, (runChains.get(key) ?? 0) + 1);
+  }
   runEpochs.set(key, (runEpochs.get(key) ?? 0) + 1);
   activeFastForwardRuns.set(key, state);
   // A new run starting always supersedes any pause a PRIOR run for this same
@@ -215,12 +234,24 @@ export function getFastForwardRunEpochV1(taskFolderPath: string): number {
   return runEpochs.get(normalizePath(taskFolderPath)) ?? 0;
 }
 
+/** The id of the run chain that is current for this task folder (`0` if none has started in this session). */
+export function getFastForwardRunChainV1(taskFolderPath: string): number {
+  return runChains.get(normalizePath(taskFolderPath)) ?? 0;
+}
+
+/** Ends the task's current run chain: "and keep going" answers bound to it stop matching. */
+export function endFastForwardRunChainV1(taskFolderPath: string): void {
+  const key = normalizePath(taskFolderPath);
+  runChains.set(key, (runChains.get(key) ?? 0) + 1);
+}
+
 /** Test-only: simulates a window/extension-host restart — a fresh session id
  * and cleared epoch/active-run state, exactly what a real restart produces
  * (this module being freshly re-loaded). */
 export function __resetFastForwardRunsForTestV1(): void {
   activeFastForwardRuns.clear();
   runEpochs.clear();
+  runChains.clear();
   pausedRunProvenance.clear();
   fastForwardSessionId = crypto.randomUUID();
 }
@@ -236,6 +267,29 @@ export function updateFastForwardRunStateV1(taskFolderPath: string, state: FastF
   if (activeFastForwardRuns.has(key)) {
     activeFastForwardRuns.set(key, state);
   }
+}
+
+/**
+ * review1 Step 32: the field a round's ledger row carries when it opens during a live Fast Forward run, so the
+ * lost-round card can still resume that run after the in-memory state is gone. Empty when no run is live.
+ */
+export function fastForwardRoundStampV1(taskFolderPath: string): {
+  readonly fastForwardRunV1?: { attemptNumber: number; maxAttempts: number };
+} {
+  const state = activeFastForwardRuns.get(normalizePath(taskFolderPath));
+  return state ? { fastForwardRunV1: { attemptNumber: state.attemptNumber, maxAttempts: state.maxAttempts } } : {};
+}
+
+/**
+ * review1 Step 32: the fields every round opened by this Ensemble carries about Fast Forward. `fastForwardStampedV1`
+ * says the row's writer recorded the answer, so a row without `fastForwardRunV1` was NOT part of a Fast Forward run.
+ * A row from before this existed has neither field, and its record cannot say.
+ */
+export function fastForwardRoundFieldsV1(taskFolderPath: string): {
+  readonly fastForwardStampedV1: true;
+  readonly fastForwardRunV1?: { attemptNumber: number; maxAttempts: number };
+} {
+  return { fastForwardStampedV1: true, ...fastForwardRoundStampV1(taskFolderPath) };
 }
 
 export function clearFastForwardRunActiveV1(taskFolderPath: string): void {

@@ -673,10 +673,64 @@ void describe("claimImplRecoveryDispatchV1 — continuation row linkage (Part 4 
       assert.equal(continuationRow?.mode, "continuation");
       assert.equal(continuationRow?.continuationOf, "source-round-1");
       assert.equal(continuationRow?.state, "open");
+      // review1 Step 32: the source row predates run stamps, so its continuation claims nothing about Fast Forward.
+      assert.equal(continuationRow?.fastForwardStampedV1, undefined);
 
       // The source row's own terminal state must survive unchanged.
       const sourceRow = raw.roundLedger?.find((r) => r.roundId === "source-round-1");
       assert.equal(sourceRow?.state, "rejected");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("a continuation of a stamped source is itself stamped, and carries the source's Fast Forward run", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    try {
+      for (const [name, sourceFields, expectRun] of [
+        ["claim_stamped_ff", { fastForwardStampedV1: true as const, fastForwardRunV1: { attemptNumber: 3, maxAttempts: 10 } }, true],
+        ["claim_stamped_plain", { fastForwardStampedV1: true as const }, false],
+      ] as const) {
+        const { folderUri, folderPath } = makeTaskFolder(name, [
+          {
+            roundId: "source-round-1",
+            attemptIds: [],
+            stage: "impl",
+            mode: "implementation",
+            startedAt: "2026-01-01T00:00:00.000Z",
+            endedAt: "2026-01-01T00:05:00.000Z",
+            state: "rejected",
+            outcome: { rejectionReason: "unusable summary", continuationOwed: true },
+            ...sourceFields,
+          },
+        ]);
+        fs.writeFileSync(
+          path.join(folderPath, "task-progress.json"),
+          JSON.stringify(
+            {
+              ...readProgress(folderPath),
+              implRecovery: {
+                sourceAttemptId: "impl-recovery-1",
+                sourceRoundId: "source-round-1",
+                reason: "unusable summary",
+                trigger: "summaryRejected",
+                mode: "unconstrained",
+                dispatch: "pending",
+                at: "2026-01-01T00:05:00.000Z",
+              },
+            },
+            null,
+            2
+          ),
+          "utf8"
+        );
+        const claimed = await claimImplRecoveryDispatchV1(folderUri);
+        const row = readProgress(folderPath).roundLedger?.find((r) => r.roundId === (claimed.record?.attemptId as string));
+        assert.equal(row?.fastForwardStampedV1, true, name);
+        assert.deepEqual(row?.fastForwardRunV1, expectRun ? { attemptNumber: 3, maxAttempts: 10 } : undefined, name);
+      }
     } finally {
       wsStub.restore();
       fsBridge.restore();

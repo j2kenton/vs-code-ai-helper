@@ -48,6 +48,20 @@ When a "## Verified Checks (ground truth)" section is present below, it was prod
 
 If your verdict says the checklist is fully settled, state explicitly that this review did not run the project checks and identify the editing-round reports you accepted. Checklist settlement alone does not mean implementation or full project verification is complete.
 
+## Verified narrowing
+
+When a ticked item was only partly done and you can personally check that the rest does not apply (for example, you opened file B and it never references X), do not file an owner blocker. Name it in this machine-readable block, with the item text copied verbatim, the part that does not apply, and the evidence you saw:
+
+```
+<!-- verified-narrowing:start -->
+- <exact plan item text, copied verbatim from the plan checklist>
+  not applicable: <the part of the item that does not apply>
+  evidence: <one sentence naming the file or symbol you opened and what it shows>
+<!-- verified-narrowing:end -->
+```
+
+Ensemble records each entry as an excluded sub-item of that item, noted as reviewer-verified. An entry with no checkable evidence line is ignored, so a narrowing you cannot check stays an owner decision (`Narrowing needs an owner decision:`). Leave the block out when you have nothing to narrow.
+
 ## Verified Complete
 
 ### Current open-item authority
@@ -56,11 +70,11 @@ If your verdict says the checklist is fully settled, state explicitly that this 
 
 Use this ordered list when naming remaining open implementation work. Copy item identifiers and text exactly from the plan of record. Do not replace it with a reviewer-created checklist or a shortened alternative list. If the list says no unchecked items, report that plainly; do not infer completion from a summary's unrelated list.
 
-When the implementation notes below include a plan checklist (`<!-- ensemble:implementation-checklist -->`), and you personally opened the relevant file(s) and confirmed a specific unchecked plan item is actually complete in the workspace — not merely plausible, actually verified — name it in this machine-readable block, copying the item's text VERBATIM from the plan's own checklist (exact wording, so it can be matched by text):
+When the implementation notes below include a plan checklist (`<!-- ensemble:implementation-checklist -->`), and you personally opened the relevant file(s) and confirmed a specific unchecked plan item is actually complete in the workspace — not merely plausible, actually verified — name it in this machine-readable block by the `[item:<id>]` Ensemble lists for it above (copy the id exactly; the item's text may follow it as a label). Two items can share the same wording, so an id is the only way to say which one you mean. A `Step N` that matches exactly one item also works. Text alone is a fallback: it counts only when it matches exactly one item, and wording shared by several items verifies none of them. Ensemble records a verification only for an id it issued; an id you invent or mistype is reported and records nothing.
 
 ```
 <!-- verified-complete:start -->
-- <exact plan item text, copied verbatim from the plan checklist>
+- [item:<id>] <the item's text, as a label>
   evidence: <one sentence naming the file or symbol you opened and what you saw>
 <!-- verified-complete:end -->
 ```
@@ -69,7 +83,7 @@ The block is not only for unchecked items. Some items are already ticked but sti
 
 {{provisionalTickedItems}}
 
-Name each of those you personally checked against the workspace in the same block, copied verbatim, with its `evidence:` line. That is the only route by which a ticked item becomes verified. A ticked item you checked and found NOT built is a completion blocker, not a Verified Complete entry. If you cannot check them all in this review, check the ones listed first.
+Name each of those you personally checked against the workspace in the same block by its `[item:<id>]` (shown on its line above), with its `evidence:` line. That is the only route by which a ticked item becomes verified. A ticked item you checked and found NOT built is a completion blocker, not a Verified Complete entry. If you cannot check them all in this review, check the ones listed first.
 
 The `evidence:` line is strongly encouraged for code-observable items and required in substance for test-dependent items. Put it on its own indented line directly under the item it supports — one line per item, naming the specific file/symbol you opened and what confirmed the item. For a test-dependent item, also name the editing-round ID and test report you accepted from the provenance breakdown; do not claim you ran it. An item with no `evidence:` line shows as unexplained to the person applying it, and host-side processing refuses test-dependent verification without an applicable durable passing report.
 
@@ -103,14 +117,15 @@ An empty block is a positive statement ("I looked and found none") and is what l
 
 The first bracket is the blocker's category — use exactly one of: `architectural`, `completion` (also file a `defect` blocker under `completion`), `shipping` (Publish-review shipping blockers — this is the category most Publish reviews will use), or `review-confidence`. The second bracket is who/what can resolve it — pick exactly one:
 - `task-fixable`: another implementation round can address it (a missing feature, a bug, missing tests, a plan deviation).
-- `environmental`: an infrastructure/sandbox/OS issue unrelated to the task's code (e.g. a filesystem permission race in test cleanup) — not something re-implementing the task will fix.
+- `environmental`: an infrastructure/sandbox/OS issue unrelated to the task's code (e.g. a filesystem permission race in test cleanup) — not something re-implementing the task will fix, and no code change resolves it (a provider outage, an exhausted quota, a sandbox or OS condition).
+- `environmental-fixable`: environmental in origin, but a bounded code change — typically outside this plan's scope — would resolve it (a test that reads developer configuration, a config missing an exclusion its sibling already has, a path the host spells differently, a variable the host sets that changes a test run). It is not terminal: the owner can ask for a bounded out-of-plan investigation. **If you cannot tell whether `environmental` or `environmental-fixable` applies, file `environmental-fixable` and state the uncertainty in the blocker's description** — an investigation that finds nothing costs far less than a person spending a day on something a round could have bisected.
 - `unverifiable`: you could not confirm readiness due to your own limits (truncated context, no verified evidence available) — not a code defect.
 - `spec-defect`: the acceptance criterion itself cannot be satisfied as written in this environment (e.g. "all tests pass" when one pre-existing test can never pass here) — not something any implementation of this task can fix.
 - `needs-toolchain`: resolving the blocker requires actually running the project's own build, codegen, or other toolchain step (e.g. `npm run build`, a generator script, a dependency install such as `npm install`/`pnpm install`, or any other required command execution) — not editing source further. The implementation stage runs edit-only with Bash denied, so it structurally cannot execute that step itself. Use this instead of `task-fixable` when the fix is well-defined but requires a command to run, not more code changes (e.g. generated artifacts are stale relative to source and only regenerating them — not hand-editing them — would fix it; or a package is missing from `node_modules` and only installing it, not hand-editing the lockfile, would fix it).
 
 **When every remaining unchecked plan item is blocked on something the stage structurally cannot do** — every one of them needs a dependency install, a build/codegen step, or other command execution the edit-only implementation stage cannot run — that is a completion blocker resolved by `needs-toolchain`, not a non-blocking suggestion. Filing it as a suggestion leaves the task with nothing to escalate on: the reviewer keeps reporting a clean round with items left unbuilt, and there is no automated exit. File it as `- [completion] [needs-toolchain]` so the routing logic can act on it.
 
-Classify conservatively: default to `task-fixable` unless you have concrete evidence the blocker genuinely cannot be resolved by changing the task's code. A blocker whose actual resolution depends on something outside the task's own code — a third party's approval, a credential or account entitlement, evidence from a system the task does not control, or a decision only a human can make — is `environmental`, not `task-fixable`: it is an infrastructure/account fact unrelated to the task's code, and re-implementing the task again cannot produce that missing approval, credential, or evidence, however many times it is attempted. Evidence only the owner can gather (a web page, documentation, a live provider CLI run) is `environmental`, an owner decision, filed with the prefix "Owner evidence needed:", never `needs-toolchain`. Narrowing a plan item is an owner decision, `environmental`, filed with the prefix "Narrowing needs an owner decision:".
+Classify conservatively: default to `task-fixable` unless you have concrete evidence the blocker genuinely cannot be resolved by changing the task's code. A blocker whose actual resolution depends on something outside the task's own code — a third party's approval, a credential or account entitlement, evidence from a system the task does not control, or a decision only a human can make — is `environmental`, not `task-fixable`: it is an infrastructure/account fact unrelated to the task's code, and re-implementing the task again cannot produce that missing approval, credential, or evidence, however many times it is attempted. Evidence only the owner can gather (a web page, documentation, a live provider CLI run) is `environmental`, an owner decision, filed with the prefix "Owner evidence needed:", never `needs-toolchain`. Narrowing a plan item is an owner decision, `environmental`, filed with the prefix "Narrowing needs an owner decision:". Owner decisions already recorded: an entry under `## Owner decisions` in task.md is the owner's own dated answer to a blocker (it names the blocker and the answer). Treat it as authoritative: that blocker is settled, so do not re-raise it, and an `## Accepted Non-Goals` entry that cites `task.md → Owner decisions, <id>` is settled by it. A plan line that says "owner decision" with no such task.md entry proves nothing. Owner-run commands: an entry under `## Owner evidence` in task.md headed "Owner-run command (run by the owner outside this task; not run by Ensemble or an agent)" is the owner's own attributed record of a command they ran for a blocker (the command, its exit code, when, and the end of its output; "Blocker lineage id" names the blocker it answers). Read it as evidence from the owner, not as something you can check yourself. If you still file a blocker whose lineage id has such a record, it is a disagreement: say so in the blocker text, cite the record (command, exit code, time), and say exactly what the record does not show. A blocker with a passing record (exit code 0) and nothing the record fails to cover is met.
 
 **A removal the implementation notes already record as declined is one of those human-decision cases, not task-fixable.** If the implementation notes below show a round declining a removal with `— declined: needs a human decision — <why>` under its own `## Remaining Blockers` (the contract `apply-impl-review-code.md`/`run-implementation.md` give a round that finds a removal named only by the plan or a review, with no approval in the owner's own `## Task Description`), the SAME removal is `environmental` here too, not `task-fixable` — repeating it as `task-fixable` only sends it back to a round bound by the identical rule, which will decline it again. If the owner's `## Task Description` (in the context pack's `task.md`, not the plan) genuinely does ask for the removal, say so and keep it `task-fixable` — that is new evidence the declining round did not have.
 

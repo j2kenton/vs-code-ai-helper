@@ -105,10 +105,14 @@ void describe("readPlanOfRecordForDisplayV1", () => {
     assert.equal(plan.counts, undefined);
   });
 
-  void it("the effective display read returns the disk counts when nothing stands the checklist down", async () => {
+  void it("the effective display read returns the shared counts when nothing stands the checklist down", async () => {
     stubReadFile(new Map([[planPath, PLAN_FOUR_OF_TEN]]));
     const counted = await readEffectivePlanChecklistProgressForDisplayV1(folder);
-    assert.equal(counted?.settled, 4);
+    // review1 Step 5: the header reads the gate's count, like the Tasks pane. Four ticked boxes that no reviewer
+    // or owner has verified are four provisional items, not four settled ones.
+    assert.equal(counted?.ticked, 4);
+    assert.equal(counted?.settled, 0);
+    assert.equal(counted?.provisional, 4);
     assert.equal(counted?.total, 10);
   });
 
@@ -125,14 +129,16 @@ void describe("readPlanOfRecordForDisplayV1", () => {
         : {}),
     });
 
-  void it("the effective display read honours the checklistProgressUnreliable latch", async () => {
-    // Control: the same progress document without the latch still yields counts,
-    // so the stand-down below is the latch and not a decode failure.
+  void it("the effective display read keeps a latched checklist's figure and marks it latched (review1 Step 10)", async () => {
     stubReadFile(new Map([[planPath, PLAN_FOUR_OF_TEN], [progressPath, progressJson(false)]]));
-    assert.equal((await readEffectivePlanChecklistProgressForDisplayV1(folder))?.settled, 4);
+    const unlatched = await readEffectivePlanChecklistProgressForDisplayV1(folder);
+    assert.equal(unlatched?.ticked, 4);
+    assert.equal(unlatched?.latched, false);
 
     stubReadFile(new Map([[planPath, PLAN_FOUR_OF_TEN], [progressPath, progressJson(true)]]));
-    assert.equal(await readEffectivePlanChecklistProgressForDisplayV1(folder), undefined);
+    const latched = await readEffectivePlanChecklistProgressForDisplayV1(folder);
+    assert.equal(latched?.ticked, 4, "the number is no longer hidden while latched");
+    assert.equal(latched?.latched, true);
   });
 
   void it("the effective display read stands down for an unreadable task-progress file", async () => {
@@ -145,12 +151,13 @@ void describe("display call sites use the no-save reader", () => {
   const read = (relative: string): string => fs.readFileSync(path.join(__dirname, "..", "..", "src", relative), "utf8");
 
   void it("the tree, status bar and chat header read through the ForDisplay variant", () => {
-    // The tree reads through `readDisplayPlanChecklistProgressV1`, which also
-    // resolves the plan via `readPlanOfRecordForDisplayV1` (no editor save) and
-    // additionally reports a latched count flagged `unverified`
-    // (merge of `ui 12` into `v1 f2`, 2026-09-21).
-    assert.match(read("views/taskTreeProvider.ts"), /readDisplayPlanChecklistProgressV1\(task\.folderUri\)/);
-    assert.match(read("utils/effectiveReviewProgress.ts"), /readDisplayPlanChecklistProgressV1[\s\S]{0,400}?readPlanOfRecordForDisplayV1\(folderUri\)/);
+    // review1 Step 5: the tree reads the shared counts in display mode, which resolves the plan via
+    // `readPlanOfRecordForDisplayV1` (no editor save) and reports a latched count qualified rather than hidden.
+    assert.match(read("views/taskTreeProvider.ts"), /readPlanItemCountsV1\(task\.folderUri, \{ policy: "lenient", mode: "display" \}\)/);
+    // review1 Step 5: both display readers delegate to the shared counts read, whose display mode reads the plan
+    // through the no-save variant.
+    assert.match(read("utils/effectiveReviewProgress.ts"), /readDisplayPlanChecklistProgressV1[\s\S]{0,600}?readPlanItemCountsV1\(folderUri, \{ policy, mode: "display" \}\)/);
+    assert.match(read("utils/effectiveReviewProgress.ts"), /options\.mode === "display" \? await readPlanOfRecordForDisplayV1\(folderUri\)/);
     assert.match(read("views/taskStatusBar.ts"), /readEffectivePlanChecklistProgressForDisplayV1\(task\.folderUri\)/);
     assert.match(read("views/chatView.ts"), /readEffectivePlanChecklistProgressForDisplayV1\(\s*vscode\.Uri\.file\(target\.taskFolderPath\)/);
   });

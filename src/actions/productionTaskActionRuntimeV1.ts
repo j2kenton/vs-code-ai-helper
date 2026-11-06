@@ -456,6 +456,8 @@ export function createProductionTaskActionCoordinatorV1(options: {
    * and must not narrow their provider chain by it now.
    */
   readonly requireSummaryOnlyCapableText?: boolean;
+  /** review1 Step 49: only candidates whose text mode vendor-enforces read-only (the diagnostic round). */
+  readonly requireReadOnlyText?: boolean;
   /** Restrict a report correction to the exact model used by the edit round. */
   readonly restrictToPrimaryModel?: boolean;
   /**
@@ -480,6 +482,7 @@ export function createProductionTaskActionCoordinatorV1(options: {
       workspaceCwd: options.workspaceCwd,
       resolveStagePrimaryModel: options.resolveStagePrimaryModel,
       requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
+      requireReadOnlyText: options.requireReadOnlyText,
       restrictToPrimaryModel: options.restrictToPrimaryModel,
     }),
     // Make a passed-over model visible. Until this existed, a candidate the

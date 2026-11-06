@@ -22,6 +22,13 @@ const source = fs.readFileSync(
   "utf8"
 ).replace(/\r\n/g, "\n");
 
+/**
+ * review1 Step 26: the generic fallback no longer says "the review did not produce a new, comparable result" and
+ * no longer sends the owner to check the run log for a provider failure; it names what moved and what did not
+ * (`describeUnchangedReviewStallV1`). It is still the LAST alternative, reached only when no failure was named.
+ */
+const UNCHANGED_REVIEW_FALLBACK_V1 = "await describeUnchangedReviewStallV1({";
+
 void describe("reviewActions.ts Fast Forward stalled-stop notification wording", () => {
   void it("renders the count of stalled build rounds from outcome.buildRoundsWithoutProgress instead of a blanket claim", () => {
     // RC2 item 13, Step 50: the branch condition grew a second clause
@@ -107,7 +114,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
       "`${ffFailedStepV1} failed: ${describeTaskActionFailureV1(ffCoordinatorOutcomeForAdmissionV1)}`"
     );
     const genericFallbackIndex = branchSlice.indexOf(
-      '"the review did not produce a new, comparable result"'
+      UNCHANGED_REVIEW_FALLBACK_V1
     );
     assert.ok(namedCauseIndex >= 0, "the branch must interpolate describeTaskActionFailureV1's actual cause");
     assert.ok(genericFallbackIndex >= 0, "the branch must still keep the generic fallback for a true stall with no dispatch-failure outcome");
@@ -142,7 +149,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
     const runnerIndex = branchSlice.indexOf(
       "`${ffFailedStepV1} failed: ${ffRunnerFailureV1.providerLabel}: ${ffRunnerFailureV1.message}`"
     );
-    const genericIndex = branchSlice.indexOf('"the review did not produce a new, comparable result"');
+    const genericIndex = branchSlice.indexOf(UNCHANGED_REVIEW_FALLBACK_V1);
     assert.ok(runnerIndex >= 0, "the stalled branch must render the provider label and message");
     assert.ok(genericIndex >= 0, "the generic fallback must remain for a true stall");
     assert.ok(runnerIndex < genericIndex, "the runner-failure wording must win over the generic fallback");
@@ -167,7 +174,7 @@ void describe("reviewActions.ts Fast Forward stalled-stop notification wording",
   void it("returns the stage-left hand-over before the stalled branch can say no comparable result", () => {
     const stageLeft = source.indexOf("if (ffStageLeftForV1) {");
     const stalledBranch = source.indexOf("stalled: outcome.stalled === true");
-    const generic = source.indexOf('"the review did not produce a new, comparable result"');
+    const generic = source.indexOf(UNCHANGED_REVIEW_FALLBACK_V1);
     assert.ok(stageLeft >= 0, "the post-loop stage-left exit must exist");
     assert.ok(stageLeft < stalledBranch, "the stage-left return must precede the stalled branch");
     assert.ok(stageLeft < generic, "the stage-left return must precede the generic stall wording");

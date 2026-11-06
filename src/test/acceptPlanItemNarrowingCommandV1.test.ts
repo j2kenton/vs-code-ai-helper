@@ -356,7 +356,10 @@ void describe("acceptPlanItemNarrowingV1", () => {
       blockersCount: 4,
       allBlockersNeedOwnerDecision: true,
     });
-    assert.equal(boxC.recommendation.kind === "option" && boxC.recommendation.optionId, "handleMyself");
+    // review1 Step 38: "Leave it paused" does nothing, so it is not recommended while "Change the plan instead"
+    // (a forward option) exists; and an owner decision still never recommends Advance.
+    assert.equal(boxC.recommendation.kind === "option" && boxC.recommendation.optionId, "reconsiderRequirement");
+    assert.ok(boxC.options.some((o) => o.optionId === "handleMyself"));
     assert.equal(boxC.options.some((o) => o.optionId === "acceptNarrowing"), false);
     // Unbuilt work with open plan items.
     const build = buildEscalationDecisionV1("plateau", "impl-high-review", "plateau", target, {

@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
+import { installOwnerOriginCommandRegistrationV1 } from "./state/ownerCommandRegistrationV1";
+import { runWithOwnerOriginV1 } from "./state/automationDispatchContextV1";
 import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
 import type { TaskActionOutcomeV1 } from "./types/taskActionOutcomeV1";
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
@@ -98,11 +100,20 @@ import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { registerOpenRetainedPromptCommand } from "./commands/openRetainedPromptV1";
 import { registerOpenPlanNonGoalsCommand } from "./commands/openPlanNonGoalsV1";
 import { registerDecideOpenPlanItemsCommandV1 } from "./commands/decideOpenPlanItemsV1";
+import { observeDisplayedPlanItemCountsV1 } from "./commands/planItemSettlementNoticeV1";
+import { setPlanItemCountsObserverV1 } from "./utils/effectiveReviewProgress";
 import { registerOwnerTestRunCommandsV1 } from "./commands/ownerTestRunCardV1";
+import { registerTickEvidenceGapItemsCommandV1 } from "./commands/evidenceGapChecksV1";
+import { registerWithheldTestEvidenceCommandsV1 } from "./commands/withheldTestEvidenceCommandsV1";
 import { registerOwnerPlanDecisionCommandV1 } from "./commands/ownerPlanDecisionCommandV1";
+import { registerAutomaticDispatchGateV1 } from "./commands/automaticDispatchGateV1";
+import { startAutoContinueSweepV1 } from "./commands/autoContinueSweepWiringV1";
 import { registerPartialScopeDecisionCommandV1 } from "./commands/partialScopeDecisionV1";
 import { registerEnablePublishBackupCommandV1 } from "./commands/enablePublishBackupV1";
 import { registerAcceptPlanItemNarrowingCommandV1 } from "./commands/acceptPlanItemNarrowingV1";
+import { registerRunOwnerEvidenceCommandV1 } from "./commands/runOwnerEvidenceCommandV1";
+import { registerRecordOwnerRunCommandV1 } from "./commands/recordOwnerRunCommandV1";
+import { registerRunPublishChecksNowCommandV1 } from "./commands/runPublishChecksNowV1";
 import {
   registerDraftTaskWithAICommand,
   resumeDraftInteractionV1,
@@ -133,6 +144,7 @@ import {
   rearmAcceptedTicksV1,
   registerApplyReviewerVerifiedTicksCommands,
 } from "./commands/applyReviewerVerifiedTicks";
+import { registerApplyReviewerVerifiedNarrowingsCommandV1 } from "./commands/applyReviewerVerifiedNarrowingsV1";
 import { registerPlanRevisionCommandsV1 } from "./commands/planRevisionV1";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
@@ -286,6 +298,8 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log("Ensemble is now active!");
+  // Before any command is registered: every command a person runs is an owner-origin call tree (review1 Step 24).
+  installOwnerOriginCommandRegistrationV1(vscode.commands);
   setExtensionContextV1(context);
   // The last readable major of each CLI (devpass-code 1.x vs 2.x) survives a
   // window reload, so a failed `--version` probe keeps the contract in use.
@@ -436,6 +450,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, 3_000);
     rearmTimer.unref?.();
     context.subscriptions.push({ dispose: () => clearTimeout(rearmTimer) });
+  }
+  // review1 Step 53: a safe card's countdown ends in its recommended option running by itself. The deadline is on
+  // the decision record, so this also covers a card armed before a reload.
+  // A viewer window never runs it: the runner that owns the decisions does.
+  if (!viewerHost) {
+    context.subscriptions.push(startAutoContinueSweepV1(chatViewProvider.workflowDecisionStore, chatViewProvider));
   }
   // With no stage conversation selected, the Chat With AI panel defaults to
   // the global assistant instead of a "select a task first" blocked state.
@@ -847,11 +867,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (task === undefined) {
         return { ok: false, reason: "the runner does not know this task" };
       }
-      const admission = await acquireWorkAdmissionV1({
-        taskFolderPath: task.taskFolderPath,
-        purpose: "admission",
-        commandId: "relayResumeInteractionV1",
-      });
+      // A relayed answer is the owner's click on the viewer, so its claim is owner-origin.
+      const admission = await runWithOwnerOriginV1(() =>
+        acquireWorkAdmissionV1({
+          taskFolderPath: task.taskFolderPath,
+          purpose: "admission",
+          commandId: "relayResumeInteractionV1",
+        })
+      );
       if (admission.outcome !== "acquired") {
         return {
           ok: false,
@@ -1453,11 +1476,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerOpenRetainedPromptCommand(context);
   registerOpenPlanNonGoalsCommand(context);
   registerDecideOpenPlanItemsCommandV1(context);
+  // review1 Step 8: a count a surface displays also refreshes the settlement snapshot (names items a plan change
+  // sent back, keeps the tooltip note current). The read itself stays pure.
+  setPlanItemCountsObserverV1((folderUri) => {
+    void observeDisplayedPlanItemCountsV1(folderUri);
+  });
+  context.subscriptions.push({ dispose: () => setPlanItemCountsObserverV1(undefined) });
   registerOwnerTestRunCommandsV1(context);
+  registerTickEvidenceGapItemsCommandV1(context);
+  registerWithheldTestEvidenceCommandsV1(context);
   registerOwnerPlanDecisionCommandV1(context);
+  registerAutomaticDispatchGateV1(context);
   registerPartialScopeDecisionCommandV1(context);
   registerEnablePublishBackupCommandV1(context);
   registerAcceptPlanItemNarrowingCommandV1(context, inventory, currentTaskStore);
+  registerRunOwnerEvidenceCommandV1(context, inventory, currentTaskStore);
+  registerRecordOwnerRunCommandV1(context, inventory, currentTaskStore, chatViewProvider);
+  registerRunPublishChecksNowCommandV1(context);
   registerHeldAdmissionMarkerCommandsV1(context);
   registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
@@ -1477,6 +1512,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerHandoffChecksCommandsV1(context, inventory);
   registerSettleChecklistItemCommandV1(context, inventory, currentTaskStore);
   registerApplyReviewerVerifiedTicksCommands(context, inventory, currentTaskStore);
+  registerApplyReviewerVerifiedNarrowingsCommandV1(context);
   registerPlanRevisionCommandsV1(context, inventory, currentTaskStore);
   registerTaskCreationRecoveryCommands(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);

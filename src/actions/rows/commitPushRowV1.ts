@@ -610,7 +610,11 @@ export async function executeCommitPushV1(
         lockKey
       );
       if (!checksResult.ok) {
-        result = { kind: "notCompleted", reason: checksResult.reason };
+        result = {
+          kind: "notCompleted",
+          reason: checksResult.reason,
+          ...(checksResult.detail !== undefined ? { detail: checksResult.detail } : {}),
+        };
       } else {
         // §10.2's "staging-scope decisions" step, run directly by this
         // coordinator, before any of the remaining steps below.

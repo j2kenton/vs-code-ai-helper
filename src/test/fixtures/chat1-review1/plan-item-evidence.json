@@ -1,0 +1,1040 @@
+[
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "step 1: confirm by reading the code that each bugs5 piece listed under “starting point” is present, and record the result in `impl-summary.md`. change no code. if a piece is missing, report it as a blocker instead of re-implementing it.",
+      "itemText": "Step 1: Confirm by reading the code that each bugs5 piece listed under “Starting point” is present, and record the result in `impl-summary.md`. Change no code. If a piece is missing, report it as a blocker instead of re-implementing it.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "step 2: add `src/views/chattranscriptfilterv1.ts` with a pure function `isconversationentryv1(entry)`.",
+      "itemText": "Step 2: Add `src/views/chatTranscriptFilterV1.ts` with a pure function `isConversationEntryV1(entry)`.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "step 3: tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "itemText": "Step 3: Tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "step 4: stop writing per-tick `progress:` lines in `tracedecisionoperationv1` (chatview ~3880). the live strip and the running-operation row in notifications show the latest progress instead.",
+      "itemText": "Step 4: Stop writing per-tick `Progress:` lines in `traceDecisionOperationV1` (chatView ~3880). The live strip and the running-operation row in Notifications show the latest progress instead.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "step 6: add the live run strip.",
+      "itemText": "Step 6: Add the live run strip.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "the host builds the transcript through `isconversationentryv1`. `activity`, `outcome` and the listed old status formats are excluded. user messages, questions, untyped replies and unknown kinds are included.",
+      "itemText": "The host builds the transcript through `isConversationEntryV1`. `activity`, `outcome` and the listed old status formats are excluded. User messages, questions, untyped replies and unknown kinds are included.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "every writer listed in step 3 sets `kind`, and `tracedecisionoperationv1` writes no `progress:` line.",
+      "itemText": "Every writer listed in Step 3 sets `kind`, and `traceDecisionOperationV1` writes no `Progress:` line.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "f678756880061d49dbd720199c207a2d3c03c9ef3b0dc77708c4470d3b183b82",
+      "itemKey": "the strip is fed by a `runstrip` message built from `taskoperations`. it shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "itemText": "The strip is fed by a `runStrip` message built from `taskOperations`. It shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 5: give each hidden kind of line a notifications entry that names the task, where none exists today. write one entry per event, and never duplicate the end-of-operation entry (`operationnotificationbridge.ts`).",
+      "itemText": "Step 5: Give each hidden kind of line a Notifications entry that names the task, where none exists today. Write one entry per event, and never duplicate the end-of-operation entry (`operationNotificationBridge.ts`).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 10: add `src/views/chatcardlifecyclev1.ts` (pure functions).",
+      "itemText": "Step 10: Add `src/views/chatCardLifecycleV1.ts` (pure functions).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 16: fix the evidence button “open run log”: change `vscode.postmessage` to `v.postmessage` (chatview ~5195).",
+      "itemText": "Step 16: Fix the evidence button “Open run log”: change `vscode.postMessage` to `v.postMessage` (chatView ~5195).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 18: explain refusals when another action holds the task.",
+      "itemText": "Step 18: Explain refusals when another action holds the task.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 19: post exactly one notification per refusal.",
+      "itemText": "Step 19: Post exactly one notification per refusal.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 20: change `single_cycle_label_suffix_v1` (`src/commands/fastforwardresumesuffixv1.ts` ~173) to “ and try again (one cycle, then stops)”. check that every label built from it reads correctly: `applyreviewerverifiedticks.ts` ~711 and `reconcileplanchecklist.ts` ~2113, 2114, 2138 and 2185.",
+      "itemText": "Step 20: Change `SINGLE_CYCLE_LABEL_SUFFIX_V1` (`src/commands/fastForwardResumeSuffixV1.ts` ~173) to “ and try again (one cycle, then stops)”. Check that every label built from it reads correctly: `applyReviewerVerifiedTicks.ts` ~711 and `reconcilePlanChecklist.ts` ~2113, 2114, 2138 and 2185.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 21: reword the git-change messages.",
+      "itemText": "Step 21: Reword the git-change messages.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "each hidden kind of line has a notifications entry that names the task (step 5), and `terminalentryfor` includes the settle reason for failed and refused operations.",
+      "itemText": "Each hidden kind of line has a Notifications entry that names the task (Step 5), and `terminalEntryFor` includes the settle reason for failed and refused operations.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 8: keep finished decision cards in the timeline.",
+      "itemText": "Step 8: Keep finished decision cards in the timeline.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e",
+          "evidence": "`workflowDecisionStoreV1.ts` `listForTask`; `chatView.ts` `settledDecisionsForTimelineV1`, `trimmedDecisionCards`, `timelineDecisions`. Tests: \"chat1 Step 8: listForTask…\" in `workflowDecisionStoreV1.test.ts`, \"chat1 Step 8: the timeline keeps finished cards…\" in `chatCardLifecycleV1.test.ts`, \"shows a trimmed finished card as one collapsed line…\" in `chatViewWebviewScriptV1.test.ts`."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 11: render a finished card's body read-only.",
+      "itemText": "Step 11: Render a finished card's body read-only.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e",
+          "evidence": "page script `renderDecisions` finished branch. Test: \"keeps a finished decision card read-only and collapsed…\"."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 12: add the collapse control.",
+      "itemText": "Step 12: Add the collapse control.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e",
+          "evidence": "`applyCardChrome`. Tests: \"gives an open card a header button…\", \"wraps a pending question and a settled one in the same header\"."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 13: save each card's expand choice in new `src/views/chatcardexpandstatev1.ts`, modelled on `chatrevealv1.ts` (a key in workspace state holding a bounded list).",
+      "itemText": "Step 13: Save each card's expand choice in new `src/views/chatCardExpandStateV1.ts`, modelled on `chatRevealV1.ts` (a key in workspace state holding a bounded list).",
+      "claims": [
+        {
+          "source": "implementation",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e"
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 14: when a new card arrives (a card id not yet shown for this task), open it expanded. while that task's chat is showing, the webview scrolls it into view (`block: nearest`) and never takes focus. which cards open the chat with ai section stays bugs4's rule (`cardwaitsonownerv1`).",
+      "itemText": "Step 14: When a new card arrives (a card id not yet shown for this task), open it expanded. While that task's chat is showing, the webview scrolls it into view (`block: nearest`) and never takes focus. Which cards open the Chat With AI section stays bugs4's rule (`cardWaitsOnOwnerV1`).",
+      "claims": [
+        {
+          "source": "implementation",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e"
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 15: make dismiss always work. each dismiss handler reports back to the webview:",
+      "itemText": "Step 15: Make Dismiss always work. Each Dismiss handler reports back to the webview:",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e",
+          "evidence": "`reportCardDismissV1` covers `__dismiss__`, `cancelInteraction`, `dismissQuestion` and the open-items form. Page tests: \"a Dismiss that fails enables the card's controls again…\", \"a Dismiss that works…\", \"a cancelled interaction that fails comes back enabled…\". The host side of `reportCardDismissV1` has no direct test."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "each card header is a `<button>` with `aria-expanded`. expand choices are saved per card and per card state, in a bounded list.",
+      "itemText": "Each card header is a `<button>` with `aria-expanded`. Expand choices are saved per card and per card state, in a bounded list.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e",
+          "evidence": "see Steps 12 and 13."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "every dismiss handler reports back to the webview. on failure, the card's controls are enabled again and its reason shows.",
+      "itemText": "Every Dismiss handler reports back to the webview. On failure, the card's controls are enabled again and its reason shows.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T04:44:07.406Z",
+          "roundId": "551bee5a30022c362e9bd18c3a920e6e",
+          "evidence": "see Step 15. The open-items form reports a failure only if the handler throws. A \"no longer open\" result counts as finished, since the card disappears on repaint."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 2: add `src/views/chattranscriptfilterv1.ts` with a pure function `isconversationentryv1(entry)`.",
+      "itemText": "Step 2: Add `src/views/chatTranscriptFilterV1.ts` with a pure function `isConversationEntryV1(entry)`.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 3: tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "itemText": "Step 3: Tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 4: stop writing per-tick `progress:` lines in `tracedecisionoperationv1` (chatview ~3880). the live strip and the running-operation row in notifications show the latest progress instead.",
+      "itemText": "Step 4: Stop writing per-tick `Progress:` lines in `traceDecisionOperationV1` (chatView ~3880). The live strip and the running-operation row in Notifications show the latest progress instead.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 6: add the live run strip.",
+      "itemText": "Step 6: Add the live run strip.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "the host builds the transcript through `isconversationentryv1`. `activity`, `outcome` and the listed old status formats are excluded. user messages, questions, untyped replies and unknown kinds are included.",
+      "itemText": "The host builds the transcript through `isConversationEntryV1`. `activity`, `outcome` and the listed old status formats are excluded. User messages, questions, untyped replies and unknown kinds are included.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "every writer listed in step 3 sets `kind`, and `tracedecisionoperationv1` writes no `progress:` line.",
+      "itemText": "Every writer listed in Step 3 sets `kind`, and `traceDecisionOperationV1` writes no `Progress:` line.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "the strip is fed by a `runstrip` message built from `taskoperations`. it shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "itemText": "The strip is fed by a `runStrip` message built from `taskOperations`. It shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "no string the owner can see contains `duplicaterejected`, `observed-unattributed` or “changed index paths”. the one-cycle option label ends “(one cycle, then stops)”.",
+      "itemText": "No string the owner can see contains `duplicateRejected`, `observed-unattributed` or “changed index paths”. The one-cycle option label ends “(one cycle, then stops)”.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 7: write the tests for part 1 (rounds don't run them; publish checks do).",
+      "itemText": "Step 7: Write the tests for Part 1 (rounds don't run them; Publish Checks do).",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3",
+          "evidence": "`chatTranscriptFilterV1.test.ts`, `chatRunStripV1.test.ts`, `roundOutcomeDetailV1.test.ts`, `operationNotificationBridge.test.ts`, `chatViewWebviewScriptV1.test.ts`, `chatViewWorkflowDecision.test.ts`; 191 passed, 0 failed (command under Verification)."
+        }
+      ],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 9: keep finished question cards too.",
+      "itemText": "Step 9: Keep finished question cards too.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3",
+          "evidence": "`interactionSettlementV1` / `formSettlementV1` in `chatCardLifecycleV1.ts`; the `chatView.ts` render no longer filters to unresolved/open; page `readOnly` branches. Tests: \"chat1 Step 9\" describe in `chatCardLifecycleV1.test.ts`, two Step 9 tests in `chatViewWebviewScriptV1.test.ts`, updated assertions in `chatInteractionUI.test.ts`."
+        }
+      ]
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 17: write the tests for part 2 (rounds don't run them; publish checks do).",
+      "itemText": "Step 17: Write the tests for Part 2 (rounds don't run them; Publish Checks do).",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3",
+          "evidence": "`chatCardLifecycleV1.test.ts`, `chatCardExpandStateV1.test.ts`, `chatViewWebviewScriptV1.test.ts`, `chatInteractionUI.test.ts`, `cardRetirementAndDismissalV1.test.ts`, `sharedDismissButtonV1.test.ts`, `chatRevealV1.test.ts`, `chatCardMetaV1.test.ts`; 87 passed, 0 failed."
+        }
+      ],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 22: write the tests for part 3 (rounds don't run them; publish checks do).",
+      "itemText": "Step 22: Write the tests for Part 3 (rounds don't run them; Publish Checks do).",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3",
+          "evidence": "`markTaskDoneHeldRefusalV1.test.ts` (one notification, no code, no second entry), `taskHeldRefusalV1.test.ts`, plus the one-cycle and git-wording test updates; 139 passed, 0 failed."
+        }
+      ],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 23: move each pop-up below into its task's chat as a card or structured question, using the existing path for cards a command waits on (`awaitworkflowdecisionanswerv1`, with bugs3's orphan handling). each option keeps exactly what it does today.",
+      "itemText": "Step 23: Move each pop-up below into its task's chat as a card or structured question, using the existing path for cards a command waits on (`awaitWorkflowDecisionAnswerV1`, with bugs3's orphan handling). Each option keeps exactly what it does today.",
+      "claims": [
+        {
+          "source": "implementation",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3"
+        }
+      ]
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "step 24: write the tests for part 4 (rounds don't run them; publish checks do).",
+      "itemText": "Step 24: Write the tests for Part 4 (rounds don't run them; Publish Checks do).",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3",
+          "evidence": "`chatChoiceConversionsV1.test.ts` (source scan: no pop-up calls, decision keys present), `taskBoundChatQuestionsV1.test.ts`, `redoCommandIntegration.test.ts` (confirm reverts and redoes; dismissed card changes nothing), `completedTaskResume.test.ts` (reopen answer and dismiss), `taskLifecycleArchivePin.test.ts` (rename answer, dismiss, blank)."
+        }
+      ],
+      "testReports": []
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "settled decisions, answered interactions, settled questions and settled open-items forms render as read-only cards with no inputs. the “answered: … / resuming…” rendering and the separate recorded, dismissed and withdrawn lines are gone from the transcript.",
+      "itemText": "Settled decisions, answered interactions, settled questions and settled open-items forms render as read-only cards with no inputs. The “Answered: … / Resuming…” rendering and the separate Recorded, Dismissed and Withdrawn lines are gone from the transcript.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3",
+          "evidence": "see Step 9 and the earlier Step 8 / 11 / 3 evidence. Tests: \"a settled interaction stays as a collapsed read-only card…\" and \"a settled open-items form stays as a collapsed read-only card…\" in `chatViewWebviewScriptV1.test.ts`."
+        }
+      ]
+    },
+    {
+      "planRevision": "3965a5f3a558a3f7840d173b58b94fd69edf4ee4e64e6fcb3bf97dd80bd89c64",
+      "itemKey": "the commands in step 23 no longer call `showquickpick`, `showinputbox`, or a message with buttons.",
+      "itemText": "The commands in Step 23 no longer call `showQuickPick`, `showInputBox`, or a message with buttons.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T05:20:34.132Z",
+          "roundId": "fafc98e430de58f71f00121dbc6b01d3",
+          "evidence": "`chatChoiceConversionsV1.test.ts` \"chat1 Step 23: task-bound pop-ups are chat cards\"; `setTaskStage.ts` keeps one QuickPick, the \"Select a task\" picker for the case with no task known, which stays a pop-up."
+        }
+      ]
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 1: confirm by reading the code that each bugs5 piece listed under “starting point” is present, and record the result in `impl-summary.md`. change no code. if a piece is missing, report it as a blocker instead of re-implementing it.",
+      "itemText": "Step 1: Confirm by reading the code that each bugs5 piece listed under “Starting point” is present, and record the result in `impl-summary.md`. Change no code. If a piece is missing, report it as a blocker instead of re-implementing it.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 2: add `src/views/chattranscriptfilterv1.ts` with a pure function `isconversationentryv1(entry)`.",
+      "itemText": "Step 2: Add `src/views/chatTranscriptFilterV1.ts` with a pure function `isConversationEntryV1(entry)`.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 3: tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "itemText": "Step 3: Tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 4: stop writing per-tick `progress:` lines in `tracedecisionoperationv1` (chatview ~3880). the live strip and the running-operation row in notifications show the latest progress instead.",
+      "itemText": "Step 4: Stop writing per-tick `Progress:` lines in `traceDecisionOperationV1` (chatView ~3880). The live strip and the running-operation row in Notifications show the latest progress instead.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 5: give each hidden kind of line a notifications entry that names the task, where none exists today. write one entry per event, and never duplicate the end-of-operation entry (`operationnotificationbridge.ts`).",
+      "itemText": "Step 5: Give each hidden kind of line a Notifications entry that names the task, where none exists today. Write one entry per event, and never duplicate the end-of-operation entry (`operationNotificationBridge.ts`).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 6: add the live run strip.",
+      "itemText": "Step 6: Add the live run strip.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 8: keep finished decision cards in the timeline.",
+      "itemText": "Step 8: Keep finished decision cards in the timeline.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 9: keep finished question cards too.",
+      "itemText": "Step 9: Keep finished question cards too.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 10: add `src/views/chatcardlifecyclev1.ts` (pure functions).",
+      "itemText": "Step 10: Add `src/views/chatCardLifecycleV1.ts` (pure functions).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 11: render a finished card's body read-only.",
+      "itemText": "Step 11: Render a finished card's body read-only.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 12: add the collapse control.",
+      "itemText": "Step 12: Add the collapse control.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 13: save each card's expand choice in new `src/views/chatcardexpandstatev1.ts`, modelled on `chatrevealv1.ts` (a key in workspace state holding a bounded list).",
+      "itemText": "Step 13: Save each card's expand choice in new `src/views/chatCardExpandStateV1.ts`, modelled on `chatRevealV1.ts` (a key in workspace state holding a bounded list).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 14: when a new card arrives (a card id not yet shown for this task), open it expanded. while that task's chat is showing, the webview scrolls it into view (`block: nearest`) and never takes focus. which cards open the chat with ai section stays bugs4's rule (`cardwaitsonownerv1`).",
+      "itemText": "Step 14: When a new card arrives (a card id not yet shown for this task), open it expanded. While that task's chat is showing, the webview scrolls it into view (`block: nearest`) and never takes focus. Which cards open the Chat With AI section stays bugs4's rule (`cardWaitsOnOwnerV1`).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 15: make dismiss always work. each dismiss handler reports back to the webview:",
+      "itemText": "Step 15: Make Dismiss always work. Each Dismiss handler reports back to the webview:",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 16: fix the evidence button “open run log”: change `vscode.postmessage` to `v.postmessage` (chatview ~5195).",
+      "itemText": "Step 16: Fix the evidence button “Open run log”: change `vscode.postMessage` to `v.postMessage` (chatView ~5195).",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 18: explain refusals when another action holds the task.",
+      "itemText": "Step 18: Explain refusals when another action holds the task.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 20: change `single_cycle_label_suffix_v1` (`src/commands/fastforwardresumesuffixv1.ts` ~173) to “ and try again (one cycle, then stops)”. check that every label built from it reads correctly: `applyreviewerverifiedticks.ts` ~711 and `reconcileplanchecklist.ts` ~2113, 2114, 2138 and 2185.",
+      "itemText": "Step 20: Change `SINGLE_CYCLE_LABEL_SUFFIX_V1` (`src/commands/fastForwardResumeSuffixV1.ts` ~173) to “ and try again (one cycle, then stops)”. Check that every label built from it reads correctly: `applyReviewerVerifiedTicks.ts` ~711 and `reconcilePlanChecklist.ts` ~2113, 2114, 2138 and 2185.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 21: reword the git-change messages.",
+      "itemText": "Step 21: Reword the git-change messages.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "the host builds the transcript through `isconversationentryv1`. `activity`, `outcome` and the listed old status formats are excluded. user messages, questions, untyped replies and unknown kinds are included.",
+      "itemText": "The host builds the transcript through `isConversationEntryV1`. `activity`, `outcome` and the listed old status formats are excluded. User messages, questions, untyped replies and unknown kinds are included.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "every writer listed in step 3 sets `kind`, and `tracedecisionoperationv1` writes no `progress:` line.",
+      "itemText": "Every writer listed in Step 3 sets `kind`, and `traceDecisionOperationV1` writes no `Progress:` line.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "each hidden kind of line has a notifications entry that names the task (step 5), and `terminalentryfor` includes the settle reason for failed and refused operations.",
+      "itemText": "Each hidden kind of line has a Notifications entry that names the task (Step 5), and `terminalEntryFor` includes the settle reason for failed and refused operations.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "the strip is fed by a `runstrip` message built from `taskoperations`. it shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "itemText": "The strip is fed by a `runStrip` message built from `taskOperations`. It shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "settled decisions, answered interactions, settled questions and settled open-items forms render as read-only cards with no inputs. the “answered: … / resuming…” rendering and the separate recorded, dismissed and withdrawn lines are gone from the transcript.",
+      "itemText": "Settled decisions, answered interactions, settled questions and settled open-items forms render as read-only cards with no inputs. The “Answered: … / Resuming…” rendering and the separate Recorded, Dismissed and Withdrawn lines are gone from the transcript.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "each card header is a `<button>` with `aria-expanded`. expand choices are saved per card and per card state, in a bounded list.",
+      "itemText": "Each card header is a `<button>` with `aria-expanded`. Expand choices are saved per card and per card state, in a bounded list.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "every dismiss handler reports back to the webview. on failure, the card's controls are enabled again and its reason shows.",
+      "itemText": "Every Dismiss handler reports back to the webview. On failure, the card's controls are enabled again and its reason shows.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "no string the owner can see contains `duplicaterejected`, `observed-unattributed` or “changed index paths”. the one-cycle option label ends “(one cycle, then stops)”.",
+      "itemText": "No string the owner can see contains `duplicateRejected`, `observed-unattributed` or “changed index paths”. The one-cycle option label ends “(one cycle, then stops)”.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 23: undo the part 4 move (owner decision, 2026-11-03; task.md, owner evidence): put each of these back as the pop-up it was at `0b14378`, with exactly the same options and effects. keep any other chat1 change in these files (wording, refusal text).",
+      "itemText": "Step 23: Undo the Part 4 move (owner decision, 2026-11-03; task.md, Owner evidence): put each of these back as the pop-up it was at `0b14378`, with exactly the same options and effects. Keep any other chat1 change in these files (wording, refusal text).",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T06:12:10.266Z",
+          "roundId": "a417802d3abe75a9ae28fb3f78b85a7f",
+          "evidence": "`git diff HEAD` is empty for the five fully restored command files. `reopenTask.ts` `pickReopenStage` is the `HEAD` QuickPick. `chatView.ts` Reset is `showWarningMessage` again. The `confirmResetChatHistory`, `chooseReopenStage`, `chooseTaskStage`, `confirmRevertStageChanges`, `confirmRedoStageChanges` and `confirmDeleteStaleAdmissionMarkers` keys appear nowhere outside tests."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 24: restore `src/test/chatchoiceconversionsv1.test.ts` to pin the 2026-10-26 rule as at `0b14378`: its \"pickers, search, filters and confirmations stay pop-ups\" list includes all seven files again. remove the tests that assert they post cards.",
+      "itemText": "Step 24: Restore `src/test/chatChoiceConversionsV1.test.ts` to pin the 2026-10-26 rule as at `0b14378`: its \"pickers, search, filters and confirmations stay pop-ups\" list includes all seven files again. Remove the tests that assert they post cards.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T06:12:10.266Z",
+          "roundId": "a417802d3abe75a9ae28fb3f78b85a7f",
+          "evidence": "the file is byte-identical to `HEAD`, and the card tests are gone."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "the seven commands in step 23 call their pop-ups again, and `chatchoiceconversionsv1.test.ts` pins them as pop-ups.",
+      "itemText": "The seven commands in Step 23 call their pop-ups again, and `chatChoiceConversionsV1.test.ts` pins them as pop-ups.",
+      "claims": [
+        {
+          "source": "retroactive",
+          "at": "2026-11-03T06:12:10.266Z",
+          "roundId": "a417802d3abe75a9ae28fb3f78b85a7f",
+          "evidence": "`chatChoiceConversionsV1.test.ts` \"pickers, search, filters and confirmations stay pop-ups\" passes. `completedTaskResume`, `redoCommandIntegration` and `taskLifecycleArchivePin` pass against the real pop-ups."
+        }
+      ],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "bcdf0d06746b1667173b37d868294bcbfffb58563558c1697ad3fb59b58d2106",
+      "itemKey": "step 19: post exactly one notification per refusal.",
+      "itemText": "Step 19: Post exactly one notification per refusal.",
+      "claims": [],
+      "verifications": [],
+      "testReports": []
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 1: confirm by reading the code that each bugs5 piece listed under “starting point” is present, and record the result in `impl-summary.md`. change no code. if a piece is missing, report it as a blocker instead of re-implementing it.",
+      "itemText": "Step 1: Confirm by reading the code that each bugs5 piece listed under “Starting point” is present, and record the result in `impl-summary.md`. Change no code. If a piece is missing, report it as a blocker instead of re-implementing it.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`runs/006-claude-cli-impl.md` records all six checks, and the corresponding current implementations remain in `chatView.ts`, `sharedButtonStylesV1.ts`, `idleReconcileCardV1.ts`, `idleReconcileGitV1.ts`, `operationModelSegmentV1.ts`, `startupAnnouncerLinesV1.ts` and `chatRevealV1.ts`."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 2: add `src/views/chattranscriptfilterv1.ts` with a pure function `isconversationentryv1(entry)`.",
+      "itemText": "Step 2: Add `src/views/chatTranscriptFilterV1.ts` with a pure function `isConversationEntryV1(entry)`.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatTranscriptFilterV1.ts` implements the required inclusion/exclusion rules and `chatView.ts:4859-4868` applies it to host-built entries and the timeline."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 3: tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "itemText": "Step 3: Tag status lines at their source with the existing kinds, so new lines never depend on the format matcher.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatView.ts:1946-1959`, `3885-3895` and `4043-4102`, plus the listed writers in `workflowDecisionDispatchV1.ts`, `cardLifecycleV1.ts` and `ownerPlanDecisionCommandV1.ts`, stamp `activity` or `outcome`; the orphaned-waiter writer is also tagged."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 4: stop writing per-tick `progress:` lines in `tracedecisionoperationv1` (chatview ~3880). the live strip and the running-operation row in notifications show the latest progress instead.",
+      "itemText": "Step 4: Stop writing per-tick `Progress:` lines in `traceDecisionOperationV1` (chatView ~3880). The live strip and the running-operation row in Notifications show the latest progress instead.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatView.ts:4090-4094` only updates remembered operation state on a progress signature change and writes no Progress transcript entry."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 5: give each hidden kind of line a notifications entry that names the task, where none exists today. write one entry per event, and never duplicate the end-of-operation entry (`operationnotificationbridge.ts`).",
+      "itemText": "Step 5: Give each hidden kind of line a Notifications entry that names the task, where none exists today. Write one entry per event, and never duplicate the end-of-operation entry (`operationNotificationBridge.ts`).",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatStatusLogV1.ts` adds task/stage context; auto-start, plan revision, settlement and round-outcome call sites use it, `roundOutcomeDetailV1.ts` deduplicates/folds round detail, and `terminalEntryFor` includes failed/refused reasons."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 6: add the live run strip.",
+      "itemText": "Step 6: Add the live run strip.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatRunStripV1.ts` builds root-operation strip data; `chatView.ts:1236-1270`, `1427-1445` and `5191-5228` throttle updates, provide both links and replace/hide the strip in place while retaining the Send-disabled reason."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 8: keep finished decision cards in the timeline.",
+      "itemText": "Step 8: Keep finished decision cards in the timeline.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`WorkflowDecisionStoreV1.listForTask`, `settledDecisionsForTimelineV1`, `buildChatTimelineV1`, and `chatView.ts:4620-4712` retain settled/trimmed cards, anchor them and suppress replaced withdrawn copies and duplicate anchors."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 9: keep finished question cards too.",
+      "itemText": "Step 9: Keep finished question cards too.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatView.ts:4713-4766` creates settled interaction, question and form card views; `renderInteractionBody`, `renderOpenPlanItemsForms` and `renderMessage` preserve their contents read-only with the required outcomes."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 10: add `src/views/chatcardlifecyclev1.ts` (pure functions).",
+      "itemText": "Step 10: Add `src/views/chatCardLifecycleV1.ts` (pure functions).",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatCardLifecycleV1.ts` defines `ChatCardViewV1` for all four kinds and implements state mapping, default expansion, outcome wording, times, settlements and trimmed cards."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 11: render a finished card's body read-only.",
+      "itemText": "Step 11: Render a finished card's body read-only.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatView.ts:5337-5363`, `5510-5521` and `5690-5750` preserve settled content and choices without radio buttons, text boxes or Confirm/Dismiss/Answer controls, while retaining copy/time rows."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 12: add the collapse control.",
+      "itemText": "Step 12: Add the collapse control.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`applyCardChrome` in `chatView.ts:5266-5300` wraps every card in a real button with title, outcome, `aria-expanded` and `aria-controls`, toggling the body immediately."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 13: save each card's expand choice in new `src/views/chatcardexpandstatev1.ts`, modelled on `chatrevealv1.ts` (a key in workspace state holding a bounded list).",
+      "itemText": "Step 13: Save each card's expand choice in new `src/views/chatCardExpandStateV1.ts`, modelled on `chatRevealV1.ts` (a key in workspace state holding a bounded list).",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatCardExpandStateV1.ts` stores bounded per-card/per-state choices; `chatView.ts:1448-1467` saves `toggleCard` messages and `4639-4644`, `4869-4877` applies and cleans them on render."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 14: when a new card arrives (a card id not yet shown for this task), open it expanded. while that task's chat is showing, the webview scrolls it into view (`block: nearest`) and never takes focus. which cards open the chat with ai section stays bugs4's rule (`cardwaitsonownerv1`).",
+      "itemText": "Step 14: When a new card arrives (a card id not yet shown for this task), open it expanded. While that task's chat is showing, the webview scrolls it into view (`block: nearest`) and never takes focus. Which cards open the Chat With AI section stays bugs4's rule (`cardWaitsOnOwnerV1`).",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`defaultCardExpandedV1`, `noteNewCards` at `chatView.ts:5313-5326`, and `revealForOwnerCardV1` implement the defaults, nearest-scroll/no-focus behavior and existing `cardWaitsOnOwnerV1` reveal rule."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 15: make dismiss always work. each dismiss handler reports back to the webview:",
+      "itemText": "Step 15: Make Dismiss always work. Each Dismiss handler reports back to the webview:",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "all four message routes call `reportCardDismissV1`; `chatView.ts:2700-2713` posts success/failure and `reportCardActionResult` at `5302-5311` restores controls and shows failure reasons."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 16: fix the evidence button “open run log”: change `vscode.postmessage` to `v.postmessage` (chatview ~5195).",
+      "itemText": "Step 16: Fix the evidence button “Open run log”: change `vscode.postMessage` to `v.postMessage` (chatView ~5195).",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatView.ts:5685` wires Open run log through `v.postMessage({type:'openDecisionEvidence', ...})`."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 18: explain refusals when another action holds the task.",
+      "itemText": "Step 18: Explain refusals when another action holds the task.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`taskActionOutcomeV1.ts` adds holder metadata, `workflowLeaseStoreV1.ts:79-121` populates it, and `taskActionOutcomeTextV1.ts:254-285` renders holder, elapsed start and actionable next steps without the raw code."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 19: post exactly one notification per refusal.",
+      "itemText": "Step 19: Post exactly one notification per refusal.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`taskHeldRefusalNoticeV1.ts` settles refused with `reportedByCommand`, posts one contextual warning, and is used by `markTaskDone.ts`, `reopenTask.ts` and all three `commitAndPushTask.ts` paths; `terminalEntryFor` suppresses the duplicate entry."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 20: change `single_cycle_label_suffix_v1` (`src/commands/fastforwardresumesuffixv1.ts` ~173) to “ and try again (one cycle, then stops)”. check that every label built from it reads correctly: `applyreviewerverifiedticks.ts` ~711 and `reconcileplanchecklist.ts` ~2113, 2114, 2138 and 2185.",
+      "itemText": "Step 20: Change `SINGLE_CYCLE_LABEL_SUFFIX_V1` (`src/commands/fastForwardResumeSuffixV1.ts` ~173) to “ and try again (one cycle, then stops)”. Check that every label built from it reads correctly: `applyReviewerVerifiedTicks.ts` ~711 and `reconcilePlanChecklist.ts` ~2113, 2114, 2138 and 2185.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`fastForwardResumeSuffixV1.ts:173` has the exact suffix, and all five listed label builders compose it without conflicting wording."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 21: reword the git-change messages.",
+      "itemText": "Step 21: Reword the git-change messages.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`taskOperations.ts:26-58` uses the approved plain sentence and retains evidence; `roundGitInterferenceDecisionV1.ts:23-38`, `49-57`, `108-115` removes attribution/internal terms from `whatHappened` and puts operation detail in Details."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 23: undo the part 4 move (owner decision, 2026-11-03; task.md, owner evidence): put each of these back as the pop-up it was at `0b14378`, with exactly the same options and effects. keep any other chat1 change in these files (wording, refusal text).",
+      "itemText": "Step 23: Undo the Part 4 move (owner decision, 2026-11-03; task.md, Owner evidence): put each of these back as the pop-up it was at `0b14378`, with exactly the same options and effects. Keep any other chat1 change in these files (wording, refusal text).",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatView.ts:1703-1734`, `viewStageChanges.ts:125-132`, `reopenTask.ts:41-50`, `setTaskStage.ts:276-295`, `scheduleTaskResume.ts:2866-2880`, `renameTask.ts:159-196` and `releaseStuckAdmissionMarkers.ts:502-515` retain their pop-ups, options and effects; revert/redo adds only the required irreversibility warning."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "step 24: restore `src/test/chatchoiceconversionsv1.test.ts` to pin the 2026-10-26 rule as at `0b14378`: its \"pickers, search, filters and confirmations stay pop-ups\" list includes all seven files again. remove the tests that assert they post cards.",
+      "itemText": "Step 24: Restore `src/test/chatChoiceConversionsV1.test.ts` to pin the 2026-10-26 rule as at `0b14378`: its \"pickers, search, filters and confirmations stay pop-ups\" list includes all seven files again. Remove the tests that assert they post cards.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatChoiceConversionsV1.test.ts:92-120` includes all seven files in the pop-up list and checks they do not use chat-choice/free-text helpers; no countervailing card-posting test remains."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "the host builds the transcript through `isconversationentryv1`. `activity`, `outcome` and the listed old status formats are excluded. user messages, questions, untyped replies and unknown kinds are included.",
+      "itemText": "The host builds the transcript through `isConversationEntryV1`. `activity`, `outcome` and the listed old status formats are excluded. User messages, questions, untyped replies and unknown kinds are included.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatTranscriptFilterV1.ts:29-74` implements each rule and `chatView.ts:4859-4868` uses it for host transcript construction."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "every writer listed in step 3 sets `kind`, and `tracedecisionoperationv1` writes no `progress:` line.",
+      "itemText": "Every writer listed in Step 3 sets `kind`, and `traceDecisionOperationV1` writes no `Progress:` line.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "the shared `appendStatusLineV1`, startup announcer, operation tracer and external status writers all stamp kinds; the tracer's signature-change branch contains no Progress write."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "each hidden kind of line has a notifications entry that names the task (step 5), and `terminalentryfor` includes the settle reason for failed and refused operations.",
+      "itemText": "Each hidden kind of line has a Notifications entry that names the task (Step 5), and `terminalEntryFor` includes the settle reason for failed and refused operations.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`chatStatusLogV1.ts`, `schedulingIntentV1.ts:961-979`, `implementationArtifactResolver.ts:2094-2119`, `roundLedgerV1.ts:966-994` and `operationNotificationBridge.ts:81-103` provide task-named entries and terminal reasons without duplicate terminal projection."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "the strip is fed by a `runstrip` message built from `taskoperations`. it shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "itemText": "The strip is fed by a `runStrip` message built from `taskOperations`. It shows the label, model, start time and latest activity, and is hidden when nothing runs.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`currentRunStripV1` reads `taskOperations`; `buildRunStripV1` supplies all fields and undefined when idle; `scheduleRunStripPostV1` posts the dedicated message and `renderStrip` hides the indicator for null without waiting."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "settled decisions, answered interactions, settled questions and settled open-items forms render as read-only cards with no inputs. the “answered: … / resuming…” rendering and the separate recorded, dismissed and withdrawn lines are gone from the transcript.",
+      "itemText": "Settled decisions, answered interactions, settled questions and settled open-items forms render as read-only cards with no inputs. The “Answered: … / Resuming…” rendering and the separate Recorded, Dismissed and Withdrawn lines are gone from the transcript.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "settled card creation and read-only render branches in `chatView.ts` cover all four kinds, while `appendStatusLineV1` tags separate status lines `outcome` and `isConversationEntryV1` removes them from display."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "each card header is a `<button>` with `aria-expanded`. expand choices are saved per card and per card state, in a bounded list.",
+      "itemText": "Each card header is a `<button>` with `aria-expanded`. Expand choices are saved per card and per card state, in a bounded list.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "`applyCardChrome` creates the accessible button and `chatCardExpandStateV1.ts` implements the 300-entry state-aware persistence applied by the host."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "every dismiss handler reports back to the webview. on failure, the card's controls are enabled again and its reason shows.",
+      "itemText": "Every Dismiss handler reports back to the webview. On failure, the card's controls are enabled again and its reason shows.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "the four Dismiss routes use `reportCardDismissV1`, and `reportCardActionResult` restores registered controls and inserts the reason into the card body."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "no string the owner can see contains `duplicaterejected`, `observed-unattributed` or “changed index paths”. the one-cycle option label ends “(one cycle, then stops)”.",
+      "itemText": "No string the owner can see contains `duplicateRejected`, `observed-unattributed` or “changed index paths”. The one-cycle option label ends “(one cycle, then stops)”.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "held-refusal call sites use `describeTaskHeldRefusalV1`, Git owner text uses the new plain wording, remaining raw-code occurrences are internal types/branches rather than rendered strings, and the suffix plus composed labels has the required ending."
+        }
+      ]
+    },
+    {
+      "planRevision": "985c02c54e31b2fbf1c2e6932d2ef8484787c4092b67b380c91961d40c52d04c",
+      "itemKey": "the seven commands in step 23 call their pop-ups again, and `chatchoiceconversionsv1.test.ts` pins them as pop-ups.",
+      "itemText": "The seven commands in Step 23 call their pop-ups again, and `chatChoiceConversionsV1.test.ts` pins them as pop-ups.",
+      "claims": [],
+      "verifications": [
+        {
+          "at": "2026-11-03T09:43:56.206Z",
+          "evidence": "all seven current command implementations call `showWarningMessage`, `showQuickPick` or `showInputBox` as appropriate, and the restored source-pinning test lists each file."
+        }
+      ]
+    }
+]

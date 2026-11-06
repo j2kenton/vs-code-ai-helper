@@ -336,6 +336,21 @@
         "category": "Ensemble"
       },
       {
+        "command": "vs-code-ai-helper.runOwnerEvidenceCommandV1",
+        "title": "Run Owner Evidence Command",
+        "category": "Ensemble"
+      },
+      {
+        "command": "vs-code-ai-helper.recordOwnerRunCommandV1",
+        "title": "Record a Command You Ran",
+        "category": "Ensemble"
+      },
+      {
+        "command": "vs-code-ai-helper.runPublishChecksNowV1",
+        "title": "Run Publish Checks and Keep the Failing Tests",
+        "category": "Ensemble"
+      },
+      {
         "command": "vs-code-ai-helper.viewDisclaimer",
         "title": "View Disclaimer",
         "category": "Ensemble"
@@ -648,6 +663,18 @@
         },
         {
           "command": "vs-code-ai-helper.acceptPlanItemNarrowingV1",
+          "when": "false"
+        },
+        {
+          "command": "vs-code-ai-helper.runOwnerEvidenceCommandV1",
+          "when": "false"
+        },
+        {
+          "command": "vs-code-ai-helper.recordOwnerRunCommandV1",
+          "when": "false"
+        },
+        {
+          "command": "vs-code-ai-helper.runPublishChecksNowV1",
           "when": "false"
         }
       ],
@@ -1147,6 +1174,12 @@
           "scope": "window",
           "description": "Use the review acceptance threshold for Fast Forward."
         },
+        "ensemble.fastForwardActOnSuggestions": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "Under Fast Forward, keep acting on a review's non-blocking suggestions after its score meets the stop level. Off by default: once the score is good enough, Apply Review leaves suggestions alone instead of making polish edits that send test evidence back to provisional."
+        },
         "ensemble.autoReviewAfterPlan": {
           "type": [
             "string",
@@ -1335,6 +1368,30 @@
           "maximum": 720,
           "scope": "window",
           "description": "When a quota/rate-limit or model-entitlement failure carries a provider-reported reset time within this many hours, remedy messages say to rerun after that local time; beyond it, messages advise switching the stage's model instead of waiting. When no reset time is known at all, messages keep offering both options (rerun or switch), unchanged from before this setting existed."
+        },
+        "ensemble.resilience.askOwnerAfterRounds": {
+          "type": "integer",
+          "default": 8,
+          "minimum": 0,
+          "maximum": 99,
+          "scope": "window",
+          "description": "Stop all automation for a task and ask you what to do after this many automatic rounds (Fast Forward, auto-continue, recovery continuations, scheduled and backup retries) since the last sign of progress: plan items settled, task-fixable blockers down, a higher review score, or something you did. One check in front of every automatic dispatch. 0 turns it off."
+        },
+        "ensemble.resilience.askOwnerAfterFailedRounds": {
+          "type": "integer",
+          "default": 3,
+          "minimum": 0,
+          "maximum": 99,
+          "scope": "window",
+          "description": "Stop all automation for a task and ask you what to do after this many automatic rounds in a row that failed, were refused or were cut off (a quota, a time limit, a provider error). 0 turns it off."
+        },
+        "ensemble.decisions.autoContinueMinutes": {
+          "type": "integer",
+          "default": 15,
+          "minimum": 0,
+          "maximum": 1440,
+          "scope": "window",
+          "description": "A card whose recommended option is safe to run unattended (applying reviewer-verified ticks, or moving to the next review after a clean review) runs that option by itself after this many minutes if you have not answered, dismissed it or pressed Wait for me. The card shows the countdown. If the task changes during the wait, the countdown is cancelled and the card is offered again. Publish Anyway, Commit & Push, exclusions, deviations and owner judgements never continue by themselves. 0 turns it off."
         },
         "ensemble.resilience.inactivityTimeoutMinutes": {
           "type": "integer",

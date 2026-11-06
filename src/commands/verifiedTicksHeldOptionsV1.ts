@@ -22,6 +22,9 @@ export const APPLY_WHEN_PAUSED_OPTION_ID_V1 = "applyWhenFastForwardPauses";
 export const APPLY_TICKS_NOW_COMMAND_V1 = "vs-code-ai-helper.applyReviewerVerifiedTicksNow";
 export const APPLY_TICKS_DECISION_KEY_V1 = "applyReviewerVerifiedTicks";
 
+/** review1 Step 10: the checklist card's "settle the rest item by item" command (registered by decideOpenPlanItemsV1). */
+export const SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1 = "vs-code-ai-helper.settleRestItemByItem";
+
 /** What the card says while its Apply is held and the answer can be given now for later (Step 3). */
 export const HELD_CARD_STAYS_OPEN_NOTE_V1 =
   "This card stays open. Its Apply button comes back when Fast Forward ends. A newer review's card would " +
@@ -29,6 +32,7 @@ export const HELD_CARD_STAYS_OPEN_NOTE_V1 =
 
 interface ApplyArgsV1 {
   readonly offeredItems?: readonly string[];
+  readonly offeredItemIds?: readonly (string | null)[];
   readonly [key: string]: unknown;
 }
 
@@ -47,6 +51,11 @@ function applyArgsOfV1(option: WorkflowDecisionOptionV1 | undefined): ApplyArgsV
 /** The item texts the card offers to tick (the Apply option's `offeredItems`), or `[]`. */
 export function offeredTickItemsOfV1(record: Pick<WorkflowDecisionV1, "options">): readonly string[] {
   return applyArgsOfV1(applyOptionOfV1(record))?.offeredItems ?? [];
+}
+
+/** The issued item id of each offered item (same index as {@link offeredTickItemsOfV1}; `null` for a text-only entry), if the card recorded them. */
+export function offeredTickItemIdsOfV1(record: Pick<WorkflowDecisionV1, "options">): readonly (string | null)[] | undefined {
+  return applyArgsOfV1(applyOptionOfV1(record))?.offeredItemIds;
 }
 
 export function isVerifiedTicksDecisionV1(record: Pick<WorkflowDecisionV1, "decisionKey">): boolean {
@@ -78,7 +87,7 @@ export function buildHeldTicksAnswerOptionsV1(
       label: `Apply the ${count} ${noun} now`,
       resumeKind: "unpause",
       consequence:
-        `Ticks the ${count} item(s) in plan-final.md and dispatches nothing, so Fast Forward keeps running and its ` +
+        `Ticks the ${count} item(s) in plan-final.md and dispatches nothing; the running work continues and its ` +
         "next round counts them. If a round is open, the ticks are applied as soon as it ends, before Fast " +
         "Forward's next decision. An item that is already ticked is reported, never ticked twice.",
       recordedNext: `ticking the ${count} ${noun} in plan-final.md without starting anything`,

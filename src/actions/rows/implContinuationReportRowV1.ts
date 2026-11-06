@@ -157,6 +157,10 @@ export function createImplContinuationReportRowV1(): ProviderTaskActionRowV1 {
     validateInput: validateImplContinuationReportInputV1,
     loggingPolicy: { channel: "action.implContinuationReport", includeResultMetrics: true },
     providerMode: "text",
+    // The read-only diagnosis round (review1 Step 49) runs through this row and has to open the files a failure
+    // points at. A CLI provider reads the workspace itself; Copilot has no file access without the read-only
+    // session this attaches (the same one reviews get), so it is attached only for a provider that needs it.
+    readsWorkspaceFiles: true,
     maxResponseBytes: maxResponseBytesCeilingForModeV1("text"),
     permittedResultKinds: ["completed", "questions", "cancelled", "failed"],
     completedContentType: "markdown-artifact.v1",

@@ -115,3 +115,27 @@ export function shouldContinueAsApplyReviewV1(
   }
   return undefined;
 }
+
+/**
+ * review1 Step 18: the review stage whose review the next round carries — one dispatch after a review. A claimed
+ * continuation follows its source round's review (`shouldContinueAsApplyReviewV1`); any other round carries the
+ * newest review of the implementation review stages. `undefined` before a stage's first review, when the
+ * checklist-driven `run-implementation.md` is still the right prompt.
+ */
+export function selectPostReviewDispatchStageV1(input: {
+  readonly recoveryRecord: Pick<ImplRecoveryV1, "sourceDispatchMode" | "sourceReviewStage"> | undefined;
+  readonly history: readonly { readonly stage: TaskStage; readonly at: string }[] | undefined;
+  readonly stages: readonly TaskStage[];
+}): TaskStage | undefined {
+  const fromContinuation = shouldContinueAsApplyReviewV1(input.recoveryRecord);
+  if (fromContinuation !== undefined) {
+    return fromContinuation;
+  }
+  let newest: { readonly stage: TaskStage; readonly at: string } | undefined;
+  for (const entry of input.history ?? []) {
+    if (!input.stages.includes(entry.stage)) continue;
+    // `at` is an ISO-8601 UTC timestamp, so lexicographic order is chronological; ties keep the later entry.
+    if (newest === undefined || entry.at >= newest.at) newest = entry;
+  }
+  return newest?.stage;
+}

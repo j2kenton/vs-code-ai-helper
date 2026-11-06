@@ -23,7 +23,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { countNestedChecklistItemsV1 } from "./implementationChecklist";
+import { countNestedChecklistItemsV1, stripPlanItemAnnotationsV1 } from "./implementationChecklist";
 
 /**
  * `plan-final.md` is the plan of record: its substantive text (items, their
@@ -51,7 +51,18 @@ const LATEST_ROUND_SUMMARY_HEADING_V1 = "\n---\n\n## Latest implementation round
 export function normalizePlanOfRecordForDigestV1(text: string): string {
   const summaryAt = text.indexOf(LATEST_ROUND_SUMMARY_HEADING_V1);
   const body = summaryAt >= 0 ? text.slice(0, summaryAt) : text;
-  return body.replace(/^(\s*(?:[-*]|\d+\.)\s+)\[[xX ]\]/gm, "$1[ ]").replace(/\r\n/g, "\n");
+  // review1 Step 31: Ensemble's own settle notes (`— Checked: …`, `— Excluded by you: …`, owner-decision and
+  // narrowing notes) and the exclusion marker are written when the owner ticks or excludes an item. They are not
+  // an edit to the plan's wording, so they must not make the review on record look stale (an owner tick with a
+  // note would otherwise suppress the "stage is done" card). Item lines only; the strip is per line.
+  return body
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => {
+      const item = /^(\s*(?:[-*]|\d+\.)\s+)\[[xX ]\](.*)$/.exec(line);
+      return item ? `${item[1]}[ ]${stripPlanItemAnnotationsV1(item[2] ?? "")}` : line;
+    })
+    .join("\n");
 }
 
 /**

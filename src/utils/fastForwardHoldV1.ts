@@ -136,6 +136,29 @@ export function describeFastForwardHoldV1(hold: FastForwardHoldV1, stageName: st
         `Another Apply Review would change nothing, so none was dispatched (${rounds}). ` +
         "The open items and the ways on are in the decision card that follows."
       );
+    case "evidence-gap":
+      return (
+        `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
+        `No Apply Review was dispatched for it, because another round cannot produce a test report that counts (${rounds}). ` +
+        "The items and the ways on are in the decision card that follows."
+      );
+    case "standing-blockers":
+      return (
+        `Fast Forward (${stageName}) stopped: every remaining blocker is one another round cannot clear ` +
+        `(${hold.detail}). Spending a round on them alone would repeat the same result (${rounds}). ` +
+        "The question is on the decision card that follows."
+      );
+    case "partial-scope":
+      return (
+        `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
+        `Reviewing the same list again would repeat that, so no round was dispatched (${rounds}). ` +
+        "The way on is the decision card that follows: add the missing files, or accept the gap."
+      );
+    case "progress-gate":
+      return (
+        `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
+        `Nothing more is dispatched until you answer the "This isn't moving" card (${rounds}).`
+      );
     case "clean-review":
       return (
         `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +

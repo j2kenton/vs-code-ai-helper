@@ -114,6 +114,13 @@ export interface WorkflowDecisionOptionV1 {
    */
   readonly runsWhenTaskFree?: boolean;
   /**
+   * review1 Step 53: safe to run with nobody answering. Set ONLY on options that cannot lose work, change anything
+   * outside the task, or need the owner's judgement, and that are monotonic or undoable: applying reviewer-verified
+   * ticks, and moving to the next review after a clean review. Publish Anyway, Commit & Push, exclusions, deviations
+   * and owner judgements never set it. `isAutoContinueOptionV1` additionally refuses a destructive or disabled option.
+   */
+  readonly unattendedSafe?: boolean;
+  /**
    * bugs5 Step 7: what choosing this option does next, in the owner's words. The chat writes
    * `Recorded: "<label>" — <recordedNext>.` from it instead of the generic effect-based line.
    */
@@ -237,10 +244,37 @@ export interface WorkflowDecisionV1 {
   readonly awaited?: WorkflowDecisionAwaitedOriginV1;
   /** Present only on a card whose options refer to one live operation. */
   readonly liveReference?: WorkflowDecisionLiveReferenceV1;
+  /**
+   * review1 Step 37: the identities (lineage id, else a hash of the text) of the owner-only blockers this card
+   * asks about, so another path that would ask about the same blockers sees the card is already there.
+   */
+  readonly blockerIdentities?: readonly string[];
   /** How an awaited decision ended, when it did not end by being answered in the chat. */
   readonly completionReason?: WorkflowDecisionCompletionReasonV1;
   /** bugs5 Steps 2-3: an answer accepted while an operation runs, carried out when it ends. */
   readonly deferredAnswer?: WorkflowDecisionDeferredAnswerV1;
+  /** review1 Step 53: the countdown after which the card's recommended unattended-safe option runs by itself. */
+  readonly autoContinue?: WorkflowDecisionAutoContinueV1;
+}
+
+/**
+ * review1 Step 53: stored on the decision record, so the deadline survives a reload and the periodic sweep can find
+ * it. The task's `progressVersion` and round-ledger length at arming time are how the sweep notices that something
+ * else happened during the wait (another round, a new review), which cancels the countdown instead of running a
+ * stale answer.
+ */
+export interface WorkflowDecisionAutoContinueV1 {
+  readonly optionId: string;
+  /** ISO time at which the option runs unless the owner answered, dismissed or pressed "Wait for me". */
+  readonly deadline: string;
+  readonly minutes: number;
+  readonly armedProgressVersion?: number;
+  readonly armedRoundCount?: number;
+  /** Set when the owner chose "and keep going" earlier in the run, so this card runs at once with no wait. */
+  readonly keepGoing?: boolean;
+  /** Set when the countdown was cancelled (answer, Wait for me, or a state change); it is never re-armed silently. */
+  readonly cancelledAt?: string;
+  readonly cancelledReason?: string;
 }
 
 /**
@@ -260,6 +294,11 @@ export interface WorkflowDecisionDeferredAnswerV1 {
   readonly acceptedAt: string;
   /** The offered items the answer covers (the item texts, which are the merge's own keys). */
   readonly itemKeys: readonly string[];
+  /**
+   * The issued item id of each entry in `itemKeys` (same index; `null` where the review named the item by its text),
+   * so two same-worded items stay two items when the answer is carried out.
+   */
+  readonly itemIds?: readonly (string | null)[];
   /** Set once the ticks were merged (ticksOnly) so a second sweep does not repeat the line. */
   readonly carriedOutAt?: string;
 }
@@ -314,6 +353,8 @@ export interface CreateWorkflowDecisionInputV1 {
   readonly awaited?: WorkflowDecisionAwaitedOriginV1;
   /** The live operation a running-only card refers to (bugs3 Step 19). */
   readonly liveReference?: WorkflowDecisionLiveReferenceV1;
+  /** review1 Step 37: see {@link WorkflowDecisionV1.blockerIdentities}. */
+  readonly blockerIdentities?: readonly string[];
   readonly createdAt: string;
 }
 
@@ -531,6 +572,9 @@ export function createWorkflowDecisionV1(input: CreateWorkflowDecisionInputV1): 
       ...(input.gating !== undefined ? { gating: input.gating } : {}),
       ...(input.awaited !== undefined ? { awaited: input.awaited } : {}),
       ...(input.liveReference !== undefined ? { liveReference: input.liveReference } : {}),
+      ...(input.blockerIdentities !== undefined && input.blockerIdentities.length > 0
+        ? { blockerIdentities: [...input.blockerIdentities] }
+        : {}),
       ...(input.suppressWhileAnswered !== undefined
         ? {
             identity: workflowDecisionIdentityV1(

@@ -3,6 +3,8 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { ADMISSION_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
 import { resolveHostIdentityV1 } from "./hostIdentityV1";
+import { hasAutomaticOriginV1, hasOwnerOriginV1, hasPassedAutomaticGateV1 } from "./automationDispatchContextV1";
+import { evaluateProgressWatchV1, readAutomaticGateLimitsV1 } from "./progressWatchGateV1";
 import { readOtherProcessStartEpochMsV1, isProcessStartTimeMismatchV1 } from "./processStartTimeProbeV1";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
@@ -116,6 +118,13 @@ export interface WorkAdmissionClaimInfoV1 {
   readonly hostId: string;
   readonly commandId: string;
   readonly startedAt: string;
+  /**
+   * review1 Step 24: who started the work this claim admits. `"automatic"` for anything the owner did not click
+   * (an automation chain, Fast Forward's own rounds, the recovery sweep, a scheduled or backup retry), and for any
+   * path that cannot be classified; `"owner"` only for a call tree marked as owner-started with no automatic origin. Absent on claims
+   * written before this field existed.
+   */
+  readonly origin?: "owner" | "automatic";
 }
 
 export interface WorkAdmissionHandleV1 {
@@ -2649,6 +2658,59 @@ function markerBlocksAcquisitionV1(
   return true;
 }
 
+/** review1 Step 24: the error an automatic claim is refused with while the task's progress gate says to ask the owner. */
+export class AutomaticDispatchRefusedErrorV1 extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AutomaticDispatchRefusedErrorV1";
+  }
+}
+
+/**
+ * Internal markers that use an `admission` claim but start no work, so they never pass through the gate:
+ * `resolutionInFlight` is held while an owner's decision answer is being resolved.
+ */
+const GATE_EXEMPT_COMMAND_IDS_V1: ReadonlySet<string> = new Set(["resolutionInFlight"]);
+
+/**
+ * review1 Step 24: the admission layer's own backstop. The caller has already established that the claim is
+ * automatic (not owner-started, or started by a path nobody marked) and did not go through
+ * `admitAutomaticDispatchV1`, so the claim is refused, whatever the task's progress watch says: a new automatic path
+ * that forgets the gate is stopped here instead of slipping through while the task is still under its limits. The
+ * message tells a task the gate has stopped (the owner's card is waiting) from a path that skipped the gate.
+ *
+ * The one case that admits is no registered limits: the extension registers them at activation, and unit tests that
+ * exercise admission alone (or a host without the extension's settings) run without the gate installed.
+ */
+export function automaticDispatchRefusalV1(
+  taskFolderPath: string,
+  commandId?: string
+): AutomaticDispatchRefusedErrorV1 | undefined {
+  const limits = readAutomaticGateLimitsV1();
+  if (!limits) return undefined;
+  if (commandId !== undefined && GATE_EXEMPT_COMMAND_IDS_V1.has(commandId)) return undefined;
+  try {
+    const text = fs.readFileSync(path.join(taskFolderPath, TASK_PROGRESS_FILENAME), "utf8");
+    const decoded = decodeTaskProgressTextV1(text, { expectedTaskFolder: path.basename(taskFolderPath) });
+    if (decoded.ok) {
+      const decision = evaluateProgressWatchV1(decoded.decoded.progress.progressWatch, limits);
+      if (decision.trip) {
+        return new AutomaticDispatchRefusedErrorV1(
+          decision.reason === "failed"
+            ? "Automatic work was not started: the last automatic rounds in a row failed, so Ensemble is waiting for your decision (see the card in Chat With AI)."
+            : "Automatic work was not started: automation has run many rounds with no sign of progress, so Ensemble is waiting for your decision (see the card in Chat With AI)."
+        );
+      }
+    }
+  } catch {
+    // An unreadable progress file does not excuse a claim that skipped the gate.
+  }
+  return new AutomaticDispatchRefusedErrorV1(
+    `Automatic work was not started: it did not go through the "is this working?" check (${commandId ?? "unnamed claim"}). ` +
+      "This is an Ensemble fault, not something to fix in the task; start the work yourself from the task."
+  );
+}
+
 /**
  * Acquire durable work admission for `taskFolderPath`, running the genesis
  * flow described in the module doc comment. Never throws — filesystem
@@ -2686,6 +2748,16 @@ async function acquireWorkAdmissionCoreV1(
 ): Promise<WorkAdmissionResultV1> {
   const { taskFolderPath, purpose, commandId } = params;
   const dir = admissionDirV1(taskFolderPath);
+
+  // review1 Step 24: record who started this work, and refuse an automatic claim for work-starting purposes that
+  // did not pass the "is this working?" gate when the task's progress watch says it must stop and ask the owner.
+  // A path that cannot be classified as the owner's counts as automatic: "owner" needs an explicit owner marker
+  // (`asOwnerEntryPointV1` on commands and webview handlers) and no automatic origin inside it.
+  const origin: "owner" | "automatic" = hasOwnerOriginV1() && !hasAutomaticOriginV1() ? "owner" : "automatic";
+  if (purpose === "admission" && origin === "automatic" && !hasPassedAutomaticGateV1()) {
+    const refusal = automaticDispatchRefusalV1(taskFolderPath, commandId);
+    if (refusal) return { outcome: "writeFailed", error: refusal };
+  }
 
   // Part 1b step 12 ("Require every later claimant to complete the barrier
   // ... before publishing admission or starting another pause"): fully
@@ -2762,6 +2834,7 @@ async function acquireWorkAdmissionCoreV1(
     hostId,
     commandId,
     startedAt: new Date().toISOString(),
+    origin,
   };
   const claimPath = path.join(dir, CLAIM_FILENAME_V1);
 

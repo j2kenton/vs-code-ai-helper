@@ -23,6 +23,7 @@ import {
   cliProviderSupportsV1StdoutCapture,
   ConfiguredCheckCommandV1,
   createCliTextTransportV1,
+  isCliTextModeGuaranteedReadOnlyV1,
   isCliTextModeSummaryOnlyCapableV1,
   runImplementationWithCli,
 } from "./cliAgentRunner";
@@ -2472,10 +2473,19 @@ export function openV1RunnerSelection(options: {
    * of ever reserving an unqualified provider under a summary-only mandate.
    */
   requireSummaryOnlyCapableText?: boolean;
+  /**
+   * `text` mode only (review1 Step 49): reject every candidate whose text mode does not vendor-enforce read-only
+   * (`isCliTextModeGuaranteedReadOnlyV1`: Claude plan mode, Codex read-only sandbox, ...), but, unlike
+   * `requireSummaryOnlyCapableText`, accept one that repurposes an interactive flow, because the caller reads the
+   * answer as free text. Used by the diagnostic round, which must not be able to edit the shared working tree. A
+   * rejected candidate is an explicit settled attempt, so the ranked selection moves on to the next model in the
+   * chain that can enforce it, and settles `providerModeUnavailable` when none can.
+   */
+  requireReadOnlyText?: boolean;
   /** Do not fall back to another configured model for a same-model report correction. */
   restrictToPrimaryModel?: boolean;
 }): V1RunnerSelectionV1 {
-  const { session, mode, workspaceCwd, requireSummaryOnlyCapableText = false } = options;
+  const { session, mode, workspaceCwd, requireSummaryOnlyCapableText = false, requireReadOnlyText = false } = options;
 
   type RankedEntryV1 =
     | { readonly supported: true; readonly candidate: V1CandidateV1 }
@@ -2545,7 +2555,8 @@ export function openV1RunnerSelection(options: {
     if (
       mode !== "text" ||
       !cliProviderSupportsV1StdoutCapture(effective.def) ||
-      (requireSummaryOnlyCapableText && !isCliTextModeSummaryOnlyCapableV1(effective.def))
+      (requireSummaryOnlyCapableText && !isCliTextModeSummaryOnlyCapableV1(effective.def)) ||
+      (requireReadOnlyText && !isCliTextModeGuaranteedReadOnlyV1(effective.def))
     ) {
       // CLI providers are unsupported for preflight/edit (plan product
       // decisions), and a last-message-file CLI cannot satisfy AC-RUNNER-02
@@ -2748,6 +2759,8 @@ export function createV1RunnerSelectionOpener(options: {
   };
   /** Forwarded verbatim to every `openV1RunnerSelection` call — see its doc comment. */
   requireSummaryOnlyCapableText?: boolean;
+  /** Forwarded verbatim to every `openV1RunnerSelection` call — see its doc comment. */
+  requireReadOnlyText?: boolean;
   /** Do not use a backup candidate; used when correction must use the original model. */
   restrictToPrimaryModel?: boolean;
 }): (request: {
@@ -2764,6 +2777,7 @@ export function createV1RunnerSelectionOpener(options: {
       stage: resolved.stage,
       workspaceCwd: options.workspaceCwd,
       requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
+      requireReadOnlyText: options.requireReadOnlyText,
       restrictToPrimaryModel: options.restrictToPrimaryModel,
     });
   };

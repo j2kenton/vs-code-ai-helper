@@ -102,6 +102,7 @@ import {
   TerminalizeRoundResultV1,
 } from "../utils/roundLedgerV1";
 import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
+import { fastForwardRoundFieldsV1, fastForwardRoundStampV1 } from "../utils/activeFastForwardRunsV1";
 
 /**
  * How long the transition's own lease on the pending dispatch lasts. Short by
@@ -1122,9 +1123,21 @@ export async function claimImplRecoveryDispatchV1(
       // could never find this row (review fix, 2026-08-27: "recovery linkage
       // selects the first task-wide live row rather than resolving the
       // actual source identity" — the id a caller holds must always resolve).
+      // review1 Step 32: a continuation belongs to the Fast Forward run its source round belonged to.
+      // A source row from before stamps existed has no answer to hand on, so its continuation stays unstamped
+      // (unless a run is live now) rather than claiming it was not part of a run.
+      const sourceRow = resolveRoundV1(current, continuationOf);
+      const sourceFastForwardRun = sourceRow?.fastForwardRunV1;
+      const sourceUnstamped = sourceRow !== undefined && sourceRow.fastForwardStampedV1 !== true && !sourceFastForwardRun;
+      const fastForwardField = sourceFastForwardRun
+        ? { fastForwardStampedV1: true as const, fastForwardRunV1: sourceFastForwardRun }
+        : sourceUnstamped
+          ? fastForwardRoundStampV1(folderUri.fsPath)
+          : fastForwardRoundFieldsV1(folderUri.fsPath);
       const continuationRow: RoundLedgerEntryV1 = openRow
         ? {
             ...openRow,
+            ...fastForwardField,
             attemptIds: openRow.attemptIds.includes(continuationAttemptId)
               ? openRow.attemptIds
               : [...openRow.attemptIds, continuationAttemptId],
@@ -1139,6 +1152,7 @@ export async function claimImplRecoveryDispatchV1(
             mode: "continuation",
             startedAt: new Date().toISOString(),
             state: "open",
+            ...fastForwardField,
           };
         openedContinuationRoundId = continuationRow.roundId;
         next = upsertRoundLedgerEntryV1(next, continuationRow);

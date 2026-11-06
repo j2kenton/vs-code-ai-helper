@@ -457,6 +457,51 @@ void describe("improveReviewScore — unproducible test evidence (bugs4 item 11)
   });
 });
 
+void describe("improveReviewScore — standing blockers (review1 Step 39)", () => {
+  const STILL_BLOCKED: ReviewRoundOutcome = { score: 6, taskFixableCount: 1, zeroFixableEvidence: false };
+
+  void it("spends no further round once the review left only blockers a round cannot clear", async () => {
+    let applies = 0;
+    const result = await improveReviewScore({
+      context: fakeContext(),
+      stage: "impl-high-review",
+      baselineScore: 6,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(STILL_BLOCKED),
+      // The first dispatch happens (the start-of-run check covers it); after that review the blocker stands.
+      standingBlockersHold: () => "the same blocker has stood across 4 reviews",
+      maxAttempts: 5,
+    });
+    assert.equal(applies, 1);
+    assert.equal(result.held?.kind, "standing-blockers");
+    assert.equal(result.attempts, 1);
+    assert.equal(result.stalled, false);
+    const line = describeFastForwardHoldV1(result.held, "High-Level Code Review", result.attempts);
+    assert.match(line, /stood across 4 reviews/);
+    assert.match(line, /decision card/);
+  });
+
+  void it("is not asked before the first dispatch, which the start-of-run check already covered", async () => {
+    let asked = 0;
+    await improveReviewScore({
+      context: fakeContext(),
+      stage: "impl-high-review",
+      baselineScore: 6,
+      apply: () => Promise.resolve(),
+      review: () => Promise.resolve(STILL_BLOCKED),
+      standingBlockersHold: () => {
+        asked += 1;
+        return undefined;
+      },
+      maxAttempts: 1,
+    });
+    assert.equal(asked, 0);
+  });
+});
+
 void describe("describeFastForwardHoldV1 for unproducible test evidence (bugs4 item 46)", () => {
   void it("says why the run stopped and points at the decision card that carries the way on", () => {
     const line = describeFastForwardHoldV1(

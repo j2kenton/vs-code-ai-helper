@@ -22,6 +22,10 @@ import {
 import { isWorkflowPrivatePathV1 } from "../services/workflowPrivacyClassifierV1";
 import { resolveGitRepo, runGitCommand } from "./gitRepoInfo";
 import { USER_REQUEST_SOURCE_LABEL_V1 } from "./userRequestLabelV1";
+import { buildEnsembleFactsSectionV1 } from "./ensembleFactsV1";
+
+/** In compact mode, a long list (rejected paths) keeps this many entries and says how many more there were. */
+const COMPACT_LIST_MAX_ENTRIES_V1 = 10;
 
 /**
  * Resolve the real, symlink-free path of the nearest existing ancestor of
@@ -329,6 +333,7 @@ export async function generateContextPack(
   lines.push("");
   lines.push(taskContent ?? "_No task.md content found._");
   lines.push("");
+  lines.push(...buildEnsembleFactsSectionV1(workspaceUri));
   lines.push("## Open Editors");
   lines.push("");
   if (orderedDocs.length > 0) {
@@ -654,9 +659,20 @@ export async function generateImplReviewContextPack(
    * the transport's canonical byte limit and, when it is still over,
    * rebuilds the pack with a smaller value here rather than dispatching a
    * prompt the transaction store will reject. Defaults to
-   * `IMPL_REVIEW_MAX_TOTAL_CHARS` when omitted.
+   * the share code is guaranteed (`guaranteedImplReviewCodeBudgetCharsV1`) when omitted.
    */
-  maxTotalChars?: number
+  maxTotalChars?: number,
+  /**
+   * review1 Step 59: a smaller limit for the bounded task description, tried before any code is cut when the
+   * non-code input leaves the code less than half of the transport limit. Defaults to
+   * `REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1`.
+   */
+  taskDescriptionMaxChars?: number,
+  /**
+   * review1 Step 59: compact the pack's own non-code sections (the tracked-file list that the contents section
+   * repeats, and a long rejected-path list) before any code is cut. Files that are missing on disk stay listed.
+   */
+  nonCodeCompact?: boolean
 ): Promise<{
   content: string;
   isFallback: boolean;
@@ -675,12 +691,15 @@ export async function generateImplReviewContextPack(
   const fullTaskContent = await readTextFileIfExists(taskFileUri);
   // Once a plan exists it is the contract: the review gets a bounded task
   // description (requirements), not the whole accumulated task.md.
+  const taskDescriptionLimit = taskDescriptionMaxChars ?? REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1;
   const planExists =
     fullTaskContent !== undefined &&
-    fullTaskContent.length > REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1 &&
+    fullTaskContent.length > taskDescriptionLimit &&
     ((await readTextFileIfExists(vscode.Uri.joinPath(taskFolderUri, PLAN_FILENAME)))?.trim().length ?? 0) > 0;
   const taskContent =
-    fullTaskContent === undefined ? undefined : boundTaskDescriptionForReviewV1(fullTaskContent, planExists);
+    fullTaskContent === undefined
+      ? undefined
+      : boundTaskDescriptionForReviewV1(fullTaskContent, planExists, taskDescriptionLimit);
 
   // Resolved once and shared by both the tracked and fallback branches below
   // — undefined when the workspace isn't a git repo, in which case every
@@ -703,6 +722,7 @@ export async function generateImplReviewContextPack(
   lines.push("");
   lines.push(taskContent ?? "_No task.md content found._");
   lines.push("");
+  lines.push(...buildEnsembleFactsSectionV1(workspaceUri));
 
   // isTracked distinguishes an AI run (even one that changed zero files)
   // from a manually-implemented task or a pre-tracking task.
@@ -862,18 +882,38 @@ export async function generateImplReviewContextPack(
         `⚠ ${rejectedPaths.length} tracked path(s) rejected (unsafe, denylisted, private/control, or outside workspace):`
       );
       lines.push("");
-      for (const p of rejectedPaths) {
+      const shownRejected = nonCodeCompact === true ? rejectedPaths.slice(0, COMPACT_LIST_MAX_ENTRIES_V1) : rejectedPaths;
+      for (const p of shownRejected) {
         lines.push(`- \`${p}\``);
+      }
+      if (shownRejected.length < rejectedPaths.length) {
+        lines.push(`- … and ${rejectedPaths.length - shownRejected.length} more`);
       }
       lines.push("");
     }
 
-    for (const { relPath, content } of fileInputs) {
-      const note = content === undefined ? " ⚠ (missing on disk)" : "";
-      lines.push(`- ${relPath}${note}`);
-    }
-    for (const relPath of machineMaintainedPaths) {
-      lines.push(`- ${relPath} (machine-maintained — contents not embedded)`);
+    if (nonCodeCompact === true) {
+      // The contents section below names every embedded file under its own heading and lists every omitted one, so
+      // the full name list is the duplicate part. A file missing on disk has no heading there, so it stays listed.
+      const missingOnDisk = fileInputs.filter((entry) => entry.content === undefined);
+      lines.push(
+        `_${fileInputs.length} tracked file(s) (named with their contents below; files left out of the size budget are ` +
+          `listed at the end)${missingOnDisk.length > 0 ? ", missing on disk:" : "."}_`
+      );
+      for (const { relPath } of missingOnDisk) {
+        lines.push(`- ${relPath} ⚠ (missing on disk)`);
+      }
+      if (machineMaintainedPaths.length > 0) {
+        lines.push(`_${machineMaintainedPaths.length} machine-maintained artifact(s) are listed at the end._`);
+      }
+    } else {
+      for (const { relPath, content } of fileInputs) {
+        const note = content === undefined ? " ⚠ (missing on disk)" : "";
+        lines.push(`- ${relPath}${note}`);
+      }
+      for (const relPath of machineMaintainedPaths) {
+        lines.push(`- ${relPath} (machine-maintained — contents not embedded)`);
+      }
     }
     lines.push("");
 
@@ -1111,7 +1151,11 @@ export async function writeImplReviewContextPack(
   priorityRelPaths?: ReadonlySet<string>,
   baselineSha?: string,
   /** See `generateImplReviewContextPack`'s matching parameter. */
-  maxTotalChars?: number
+  maxTotalChars?: number,
+  /** See `generateImplReviewContextPack`'s matching parameter. */
+  taskDescriptionMaxChars?: number,
+  /** See `generateImplReviewContextPack`'s matching parameter. */
+  nonCodeCompact?: boolean
 ): Promise<{
   contextPackUri: vscode.Uri;
   isFallback: boolean;
@@ -1126,7 +1170,9 @@ export async function writeImplReviewContextPack(
       implReviewFiles,
       priorityRelPaths,
       baselineSha,
-      maxTotalChars
+      maxTotalChars,
+      taskDescriptionMaxChars,
+      nonCodeCompact
     );
   const contextPackUri = await writeContextPackContent(taskFolderUri, content);
   return { contextPackUri, isFallback, embeddedContentBytes, omittedRelPaths };

@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
 import { isViewerHostV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "../state/hostRoleV1";
 import { TaskInventory } from "../state/taskInventory";
-import { runWithAutomaticOriginV1 } from "../state/automationDispatchContextV1";
+import { runWithAdmittedAutomaticDispatchV1, runWithAutomaticOriginV1 } from "../state/automationDispatchContextV1";
+import { admitAutomaticDispatchV1 } from "./automaticDispatchGateV1";
+import { getFastForwardMaxIterations } from "../config/settings";
 import {
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
   RUNS_DIRNAME,
@@ -113,6 +115,15 @@ import {
   withdrawWorkflowDecisionsByKeyV1,
 } from "../utils/workflowDecisionDispatchV1";
 import { describeResumeOptionV1, loadResumeActionPlanV1, ResumeActionPlanV1 } from "../utils/resumeActionPlanV1";
+import { buildLostEditingRoundCardPartsV1, findContinuableLostEditingRoundV1 } from "../utils/lostRoundNextStepV1";
+import { FastForwardRunStateV1, getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
+import {
+  buildLedgerBackedFastForwardResumeV1,
+  buildOwnerStartedFastForwardResumeV1,
+  fastForwardResumeSuffixV1,
+} from "./fastForwardResumeSuffixV1";
+import { readReviewCleanFactsV1 } from "./automationStoppedCardV1";
+import { resolveEffectiveStageChainV1 } from "../utils/modelSelection";
 import { ChatTarget } from "../views/chatView";
 import {
   WorkflowDecisionCommandResultV1,
@@ -172,7 +183,15 @@ export function buildStalledTaskEscalationDecisionV1(
   stuckRecovery: boolean,
   target: ChatTarget,
   resumePlan?: ResumeActionPlanV1,
-  progress?: TaskProgress
+  progress?: TaskProgress,
+  lostRoundContext?: {
+    /** The latest review is clean (0 blockers): Apply Review is never recommended, whatever the plan gate says. */
+    readonly reviewClean?: boolean;
+    /** Step 5's gate is complete (nothing open or provisional). With a clean review, Apply Review is not offered at all. */
+    readonly gateComplete?: boolean;
+    /** The Fast Forward run live for the task when the card is built, so Continue resumes that run (`resumeFromAttemptV1`). */
+    readonly fastForwardState?: FastForwardRunStateV1;
+  }
 ): PostWorkflowDecisionInputV1 {
   const displayName = notificationTaskDisplayNameV1(target.taskName, target.taskFolderPath);
   // RC1 item 9: read the round ledger so the card says whether the last round
@@ -187,6 +206,68 @@ export function buildStalledTaskEscalationDecisionV1(
       );
   if (resumePlan?.kind === "blocked") {
     return buildBlockedStalledTaskDecisionV1(target, whatHappened, resumePlan);
+  }
+  // review1 Step 32 (review1 item 2): when the round that was lost is an editing round and its review is still the
+  // latest, the card recommends continuing it from the working tree, names the failure, offers other enabled
+  // models when the failure will repeat, and still offers a fresh review and leaving it paused.
+  const lostEditingRound =
+    progress && resumePlan?.kind === "apply-review" ? findContinuableLostEditingRoundV1(progress, target.stage) : undefined;
+  if (lostEditingRound && resumePlan?.kind === "apply-review") {
+    const chain = resolveEffectiveStageChainV1(target.stage);
+    const lostModel = (progress?.roundOutcomes ?? []).filter((entry) => entry.stage === target.stage).at(-1)?.modelId;
+    // A live run's state is the best source. Once it is gone (the run ended, or the window reloaded), the lost
+    // round's own ledger row still records the run it opened in, and the answer is checked against that row.
+    const ffResume = lostRoundContext?.fastForwardState
+      ? fastForwardResumeSuffixV1(target.taskFolderPath, lostRoundContext.fastForwardState).extraArgs.resumeFastForwardV1
+      : lostEditingRound.fastForwardRun
+        ? buildLedgerBackedFastForwardResumeV1({
+            stage: target.stage,
+            lostRoundId: lostEditingRound.roundId,
+            run: lostEditingRound.fastForwardRun,
+          })
+        : undefined;
+    const parts = buildLostEditingRoundCardPartsV1({
+      taskFolderPath: target.taskFolderPath,
+      stage: target.stage,
+      lost: lostEditingRound,
+      ...(lostRoundContext?.reviewClean === true ? { reviewClean: true } : {}),
+      ...(lostRoundContext?.gateComplete === true ? { gateComplete: true } : {}),
+      ...(ffResume !== undefined ? { resumeFastForward: ffResume } : {}),
+      // A round opened before stamps existed: the records cannot say whether Fast Forward was running, so the card
+      // offers an owner-chosen Fast Forward continue (recommended, as it keeps a run if there was one) next to the
+      // one-cycle one. A round that carries the stamp but no run was not part of a run: one cycle is then exact.
+      ...(ffResume === undefined && !lostEditingRound.fastForwardKnown
+        ? {
+            offerFastForwardStart: buildOwnerStartedFastForwardResumeV1({
+              stage: target.stage,
+              lostRoundId: lostEditingRound.roundId,
+              maxAttempts: getFastForwardMaxIterations(),
+            }),
+          }
+        : {}),
+      continueLabel: describeResumeOptionV1(resumePlan, target.stage).label,
+      chainModels: [...(chain.primary ? [chain.primary] : []), ...chain.backups],
+      ...(lostModel !== undefined ? { lostModel } : {}),
+    });
+    return {
+      decisionKey: "watchdogStalledEscalation",
+      taskCanonicalId: target.canonicalId,
+      stage: target.stage,
+      whatHappened: `${whatHappened} ${parts.sentence}`,
+      whyUserNeeded:
+        "Automation paused this task rather than leaving it silently active with nothing running, and cannot decide on " +
+        "your behalf whether to continue the lost round, switch models or review first.",
+      options: [...parts.options],
+      recommendation: parts.recommendation,
+      gating: {
+        holdsTaskPaused: true,
+        unblocksProgress: true,
+        detail:
+          lostRoundContext?.reviewClean === true && lostRoundContext?.gateComplete === true
+            ? "Running a fresh review resumes the task and re-reviews the working tree; Leave it paused dispatches nothing."
+            : "Choosing Continue resumes the task and runs Apply Review from the working tree; Leave it paused dispatches nothing.",
+      },
+    };
   }
   // v1 fixes 2, items 14 + 25: the button names the action it will run.
   const resumeOption = describeResumeOptionV1(resumePlan, target.stage);
@@ -855,7 +936,7 @@ export class TaskActionScheduler implements vscode.Disposable {
         const firing = runWithNotificationTaskContextV1(
           this.taskNames.get(taskFolderPath),
           taskFolderPath,
-          () => runWithAutomaticOriginV1(() => this.fire(taskFolderPath, canonicalId, run.runAt, run.stage)),
+          () => runWithAutomaticOriginV1(() => this.fireBehindProgressGateV1(taskFolderPath, canonicalId, run.runAt, run.stage)),
           run.stage
         );
         this.inFlightFiresForTestV1.add(firing);
@@ -1107,6 +1188,21 @@ export class TaskActionScheduler implements vscode.Disposable {
    * sweep (on activation, or the periodic 5-minute timer) sees it still
    * present and retries, rather than the run silently vanishing forever.
    */
+  /**
+   * review1 Step 24: a scheduled quota rerun is an automatic dispatch like any other, so it passes the task's
+   * "is this working?" gate first. A refused run is dropped (no retry timer); the card the gate raised is the
+   * owner's way on, and answering it re-arms the schedule through the normal sweep.
+   */
+  private async fireBehindProgressGateV1(taskFolderPath: string, canonicalId: string | undefined, expectedRunAt: string, expectedStage: TaskProgress["currentStage"]): Promise<"dispatched" | "refused" | "skipped"> {
+    const admission = await admitAutomaticDispatchV1({ taskFolderPath, kind: "scheduled-rerun", stage: expectedStage });
+    if (!admission.admitted) {
+      this.timers.delete(taskFolderPath);
+      this.armedRuns.delete(taskFolderPath);
+      return "skipped";
+    }
+    return runWithAdmittedAutomaticDispatchV1(() => this.fire(taskFolderPath, canonicalId, expectedRunAt, expectedStage));
+  }
+
   private async fire(taskFolderPath: string, canonicalId: string | undefined, expectedRunAt: string, expectedStage: TaskProgress["currentStage"]): Promise<"dispatched" | "refused" | "skipped"> {
     this.timers.delete(taskFolderPath);
     this.armedRuns.delete(taskFolderPath);
@@ -2060,7 +2156,17 @@ export class TaskActionScheduler implements vscode.Disposable {
         continue;
       }
       this.chainGuardSkipNotified.delete(task.taskFolderPath);
-      await this.claimAndDispatchOwedContinuationV1(task.taskFolderPath);
+      // review1 Step 24: the recovery sweep re-arms a continuation by itself, so it passes the task's "is this
+      // working?" gate first (bugs6 item 7: 57 failed re-arms in 40 minutes). Run now is the owner's click and is
+      // not gated.
+      const sweepAdmission = await admitAutomaticDispatchV1({
+        taskFolderPath: task.taskFolderPath,
+        kind: "recovery-sweep",
+        stage: task.progress.currentStage,
+        displayName: task.progress.displayName,
+      });
+      if (!sweepAdmission.admitted) continue;
+      await runWithAdmittedAutomaticDispatchV1(() => this.claimAndDispatchOwedContinuationV1(task.taskFolderPath));
     }
   }
 
@@ -2759,7 +2865,14 @@ export class TaskActionScheduler implements vscode.Disposable {
           () => undefined
         );
         const posted = await postWorkflowDecisionV1(
-          buildStalledTaskEscalationDecisionV1(stuckRecovery, target, resumePlan, task.progress),
+          buildStalledTaskEscalationDecisionV1(stuckRecovery, target, resumePlan, task.progress, {
+            ...(await readReviewCleanFactsV1(vscode.Uri.file(task.taskFolderPath), task.progress.currentStage).catch(
+              () => ({ reviewClean: false, gateComplete: false })
+            )),
+            ...(getFastForwardRunStateV1(task.taskFolderPath)
+              ? { fastForwardState: getFastForwardRunStateV1(task.taskFolderPath) as FastForwardRunStateV1 }
+              : {}),
+          }),
           target
         );
         if (!posted) {

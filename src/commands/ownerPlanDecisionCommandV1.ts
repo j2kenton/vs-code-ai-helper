@@ -3,10 +3,14 @@ import { createHash } from "crypto";
 import {
   BlockerSupersessionRecordV1,
   IMPL_REVIEW_STAGES,
+  STAGE_ARTIFACT_FILENAMES,
+  STAGE_DISPLAY_NAMES,
   TaskProgress,
   TaskStage,
+  isPlanReviewStage,
   isReviewStage,
 } from "../types/taskProgress";
+import { appendOwnerDecisionV1 } from "../utils/ownerEvidenceV1";
 import type { WorkflowDecisionCommandResultV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { normalizePath } from "../utils/taskRoot";
 import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
@@ -15,16 +19,37 @@ import { taskOperations } from "../utils/taskOperations";
 import { withTaskLock } from "../state/taskStateStore";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { recordPlanItemOwnerDecisionV1 } from "../utils/taskProgressTransforms";
-import { getPlanRevisionV1, settleChecklistItemV1 } from "../utils/implementationChecklist";
+import {
+  appendAcceptedNonGoalV1,
+  countTopLevelPlanItemsNamedV1,
+  getPlanRevisionV1,
+  rewordChecklistItemV1,
+  settleChecklistItemV1,
+} from "../utils/implementationChecklist";
+import { refreshPlanItemSettlementSnapshotV1 } from "./planItemSettlementNoticeV1";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 import { logChatStatusToNotificationsV1 } from "../utils/chatStatusLogV1";
-import { postWorkflowDecisionV1, PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
+import {
+  listPendingWorkflowDecisionsForTaskV1,
+  postWorkflowDecisionV1,
+  PostWorkflowDecisionInputV1,
+  withdrawWorkflowDecisionsByKeyV1,
+} from "../utils/workflowDecisionDispatchV1";
+import { optionAppliesAtStageV1, planFileNameForStageV1 } from "../utils/optionAppliesAtStageV1";
+import {
+  blockerOwnerIdentityV1,
+  findCardCoveringOwnerOnlyBlockersV1,
+  ownerBlockerIdentityV1,
+} from "../utils/ownerCardCoverageV1";
 import {
   ParsedOwnerDecisionBlockV1,
   parseOwnerDecisionsNeededV1,
   parsePlanDeviationsV1,
+  parseReviewBlockersDetailed,
+  type ReviewBlocker,
+  type PlanDeviationContextV1,
 } from "../utils/reviewReadiness";
 
 export const RECORD_OWNER_PLAN_DECISION_COMMAND_V1 = "vs-code-ai-helper.recordOwnerPlanDecisionV1";
@@ -44,18 +69,39 @@ export interface RecordOwnerPlanDecisionArgV1 {
     readonly itemText?: string;
     readonly items?: readonly string[];
     readonly newText?: string;
+    /**
+     * review1 Step 4: which of several identically worded top-level items a `reword` is about (1-based, plan order).
+     * Required when `itemText` names more than one item; a text-only target that is ambiguous is refused.
+     */
+    readonly itemOccurrence?: number;
   };
   /** The chosen option keeps the plan as written: record the decision, but do not set the blocker aside. */
   readonly rejects?: boolean;
   readonly rawContentHash?: string;
   readonly note?: string;
+  /** review1 Step 40: the blocker's own words, recorded with the answer in task.md. */
+  readonly blockerText?: string;
+  /**
+   * review1 Step 40: the owner answers in their own words. The command asks for the text (a clicked-here input), records
+   * it in task.md for the review to read, and changes neither the plan nor the blocker's standing: only the review can
+   * say whether those words settle it.
+   */
+  readonly ownWords?: true;
 }
+
+const OWN_WORDS_OPTION_ID_V1 = "ownWords";
+const MAX_OWN_WORDS_LENGTH_V1 = 1000;
 
 export interface OwnerPlanDecisionPlanChangeV1 {
   /** The plan text after the change (unchanged when the plan could not be read). */
   readonly planText: string | undefined;
-  /** Checklist items the decision excluded or reworded, as they now read. */
+  /** Checklist items the decision excluded, as they now read. */
   readonly settledItems: readonly string[];
+  /**
+   * review1 Step 4: items the decision reworded (the old text and the new line as it now reads). A reword settles
+   * nothing: the new wording is a new item for the review to check.
+   */
+  readonly rewordedItems: readonly { readonly previous: string; readonly current: string }[];
 }
 
 /** The review stages an owner decision is shown to: a round's own stage maps to both implementation reviews. */
@@ -65,7 +111,7 @@ function stagesForOwnerDecisionV1(stage: TaskStage): readonly TaskStage[] {
 
 /** The line a decision adds under `## Owner Decisions` when it names no checklist item. */
 function ownerDecisionSectionLineV1(arg: RecordOwnerPlanDecisionArgV1, decisionNote: string): string {
-  return `- ${decisionNote} (${arg.blockerId}${arg.rejects ? "; plan kept as written" : ""})`;
+  return `- ${decisionNote} (${arg.blockerId}${arg.rejects && !arg.ownWords ? "; plan kept as written" : ""})`;
 }
 
 function addOwnerDecisionSectionLineV1(planText: string, line: string): string {
@@ -101,16 +147,24 @@ export async function applyOwnerPlanDecisionToPlanV1(
   for (let attempt = 0; attempt < PLAN_WRITE_ATTEMPTS; attempt++) {
     const plan = await readTextIfExists(planUri);
     if (plan === undefined) {
-      return { planText: undefined, settledItems: [] };
+      return { planText: undefined, settledItems: [], rewordedItems: [] };
     }
     let next = plan;
     const settledItems: string[] = [];
+    const rewordedItems: { previous: string; current: string }[] = [];
     for (const itemText of targetItems) {
       if (arg.planAction?.kind === "reword" && arg.planAction.newText) {
-        if (next.includes(itemText)) {
-          const reworded = `${arg.planAction.newText} — ${decisionNote}`;
-          next = next.replace(itemText, () => reworded);
-          settledItems.push(arg.planAction.newText);
+        // review1 Step 4: the checklist line of the latest rendering the owner meant: its occurrence when given. A
+        // text that names several items and no occurrence is ambiguous, so no line is guessed at (the decision is
+        // still noted under `## Owner Decisions`, which changes no item).
+        const occurrence = arg.planAction.itemOccurrence;
+        if (occurrence === undefined && countTopLevelPlanItemsNamedV1(next, itemText) > 1) {
+          continue;
+        }
+        const reworded = rewordChecklistItemV1(next, itemText, arg.planAction.newText, decisionNote, occurrence ?? 1);
+        if (reworded.previousItemText !== undefined) {
+          next = reworded.content;
+          rewordedItems.push({ previous: reworded.previousItemText, current: `${arg.planAction.newText} — ${decisionNote}` });
         }
         continue;
       }
@@ -120,14 +174,49 @@ export async function applyOwnerPlanDecisionToPlanV1(
         settledItems.push(settled.settledItemText);
       }
     }
-    if (settledItems.length === 0) {
+    if (settledItems.length === 0 && rewordedItems.length === 0) {
       next = addOwnerDecisionSectionLineV1(next, ownerDecisionSectionLineV1(arg, decisionNote));
     }
     if (next === plan || (await writeTextFileIfUnchangedV1(planUri, plan, next))) {
-      return { planText: next, settledItems };
+      return { planText: next, settledItems, rewordedItems };
     }
   }
   throw new Error("plan-final.md kept changing while the owner decision was being recorded; choose the option again.");
+}
+
+/**
+ * review1 Step 40: at a plan-review stage the plan of record is plan.md, which has no checklist for the decision
+ * to settle. The decision is written there as an Accepted Non-Goals entry citing the task.md record, so a review
+ * that reads both sees one owner decision, not an unsupported claim.
+ */
+async function recordPlanStageNonGoalV1(arg: RecordOwnerPlanDecisionArgV1, date: string): Promise<void> {
+  const planUri = vscode.Uri.joinPath(vscode.Uri.file(arg.taskFolderPath), STAGE_ARTIFACT_FILENAMES.plan ?? "plan.md");
+  await recordNonGoalInPlanFileV1(planUri, arg, date);
+}
+
+/**
+ * review1 Step 40: at a code stage the plan of record is plan-final.md. The answer is cited there as an Accepted
+ * Non-Goals entry too (appending under that heading changes no checklist item, so no verification is lost).
+ * Deviation approvals are not blockers' non-goals, so they get none.
+ */
+async function recordCodeStageNonGoalV1(arg: RecordOwnerPlanDecisionArgV1, date: string): Promise<void> {
+  await recordNonGoalInPlanFileV1(getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath)), arg, date);
+}
+
+async function recordNonGoalInPlanFileV1(planUri: vscode.Uri, arg: RecordOwnerPlanDecisionArgV1, date: string): Promise<void> {
+  const citation = `task.md → Owner decisions, ${arg.blockerId}`;
+  for (let attempt = 0; attempt < PLAN_WRITE_ATTEMPTS; attempt++) {
+    const plan = await readTextIfExists(planUri);
+    if (plan === undefined || plan.includes(`(${citation})`)) return;
+    const itemText = (arg.blockerText ?? arg.blockerId).replace(/\s+/g, " ").trim().slice(0, 300);
+    const next = appendAcceptedNonGoalV1(
+      plan,
+      [{ itemText, reason: `owner decision ${date}: ${arg.optionLabel} (${citation})` }],
+      date,
+      `Owner decision (${date})`
+    );
+    if (next === plan || (await writeTextFileIfUnchangedV1(planUri, plan, next))) return;
+  }
 }
 
 /** Execute the plan-final.md and task-progress updates for an owner decision under the task lock. */
@@ -137,7 +226,25 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
   const decisionNote = arg.note ?? `Owner decision ${today}: ${arg.optionLabel}`;
   const nowIso = new Date().toISOString();
 
+  // review1 Step 40: the answer goes where reviews look for the owner's own words (task.md) before the plan cites it.
+  const recordedInTask = await appendOwnerDecisionV1(
+    arg.taskFolderPath,
+    {
+      blockerId: arg.blockerId,
+      blockerText: arg.blockerText ?? arg.blockerId,
+      answer: arg.rejects && !arg.ownWords ? `${arg.optionLabel} (plan kept as written)` : arg.optionLabel,
+    },
+    today
+  ).catch(() => false);
+  if (isPlanReviewStage(arg.stage) && !arg.rejects) {
+    await recordPlanStageNonGoalV1(arg, today).catch(() => undefined);
+  }
+
   const change = await applyOwnerPlanDecisionToPlanV1(getCanonicalImplementationUri(folderUri), arg, decisionNote);
+
+  if (!isPlanReviewStage(arg.stage) && !arg.rejects && arg.planAction?.kind !== "approveDeviation") {
+    await recordCodeStageNonGoalV1(arg, today).catch(() => undefined);
+  }
 
   if (!arg.rejects) {
     // What the reviewer reads in `{{ownerDecisions}}`: the owner's answer, not only the blocker's id.
@@ -151,10 +258,23 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
           for (const item of change.settledItems) {
             next = recordPlanItemOwnerDecisionV1(next, {
               planRevision: revision,
+              planText: change.planText,
               itemText: item,
               at: nowIso,
               formId: `owner-decision:${arg.blockerId}`,
               decision: "exclude",
+            });
+          }
+          // review1 Step 4: a reword is its own decision kind; it settles nothing, so the new wording is
+          // checked afresh while every other item keeps its verification.
+          for (const item of change.rewordedItems) {
+            next = recordPlanItemOwnerDecisionV1(next, {
+              planRevision: revision,
+              planText: change.planText,
+              itemText: item.current,
+              at: nowIso,
+              formId: `owner-decision:${arg.blockerId}`,
+              decision: "reword",
             });
           }
         }
@@ -178,11 +298,22 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
     );
   }
 
-  const outcome = arg.rejects
+  // review1 Step 8: if the plan write changed an item (a reword), say which item goes back to the review.
+  await refreshPlanItemSettlementSnapshotV1(folderUri, arg.stage);
+
+  const taskRecordNote = recordedInTask ? " It is also recorded in task.md under Owner decisions." : "";
+  const outcome = `${arg.ownWords
+    ? `Recorded your answer for ${arg.blockerId}${recordedInTask ? " in task.md under Owner decisions" : ""}. The plan is unchanged; the review reads your words and decides whether they settle the blocker.`
+    : arg.rejects
     ? `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. The plan stays as written, and the next round builds it that way.`
-    : change.settledItems.length > 0
-      ? `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. Excluded ${change.settledItems.length} plan item(s) in plan-final.md with your decision noted; the next review will not carry this blocker.`
-      : `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. Your decision is noted in plan-final.md; the next review will not carry this blocker.`;
+    : change.settledItems.length > 0 || change.rewordedItems.length > 0
+      ? `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. ${[
+          change.settledItems.length > 0 ? `Excluded ${change.settledItems.length} plan item(s)` : "",
+          change.rewordedItems.length > 0
+            ? `Reworded ${change.rewordedItems.length} plan item(s) (the review has to re-check ${change.rewordedItems.length === 1 ? "it" : "them"})`
+            : "",
+        ].filter(Boolean).join("; ")} in plan-final.md with your decision noted; the next review will not carry this blocker.`
+      : `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. Your decision is noted in plan-final.md; the next review will not carry this blocker.`}${taskRecordNote}`;
   await appendChatMessageV1(arg.taskFolderPath, {
     role: "assistant",
     text: outcome,
@@ -195,6 +326,109 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
 
 /** Command handler for recording an owner plan decision. */
 export async function recordOwnerPlanDecisionV1(
+  originalArg: RecordOwnerPlanDecisionArgV1
+): Promise<WorkflowDecisionCommandResultV1> {
+  let arg = originalArg;
+  if (arg.ownWords === true) {
+    // A clicked-here input: the owner types the answer. No text means nothing is recorded and the card comes back.
+    const typed = await vscode.window.showInputBox({
+      title: "Your answer",
+      prompt: `Answer in your own words. The review reads it from task.md. (${arg.blockerId})`,
+      ignoreFocusOut: true,
+    });
+    const text = typed?.replace(/\s+/g, " ").trim().slice(0, MAX_OWN_WORDS_LENGTH_V1);
+    if (!text) {
+      return { outcome: "refused", message: "No answer was entered, so nothing was recorded. The question is open again.", reopenCard: true };
+    }
+    // Recorded as the owner's words; the blocker's standing and the plan are left to the review.
+    arg = { ...arg, optionLabel: text, rejects: true };
+  }
+  // review1 Step 4: a reword whose text names several identical items, with no occurrence, is refused before anything
+  // is recorded, so the answer cannot land on the wrong item (and cost that item's verification).
+  const ambiguous = await findAmbiguousRewordTargetV1(arg);
+  if (ambiguous !== undefined) {
+    return {
+      outcome: "refused",
+      message:
+        `${ambiguous.count} plan items read “${ambiguous.itemText.slice(0, 100)}”, so this answer can't tell which one to reword. ` +
+        "Nothing was recorded. The question is open again.",
+      reopenCard: true,
+    };
+  }
+  // A round is live: the answer is written, and the review started, when that round ends (see the deferred run below).
+  const deferred = hasLiveWorkAdmissionBestEffortV1(arg.taskFolderPath);
+  const result = await recordOwnerPlanDecisionRecordOnlyV1(arg);
+  if (result.outcome === "done" && !deferred) {
+    await startReReviewAfterOwnerDecisionV1(arg);
+  }
+  return result;
+}
+
+/** The reword target `arg` names when it matches several top-level items and gives no occurrence; otherwise undefined. */
+export async function findAmbiguousRewordTargetV1(
+  arg: RecordOwnerPlanDecisionArgV1
+): Promise<{ readonly itemText: string; readonly count: number } | undefined> {
+  const action = arg.planAction;
+  if (arg.rejects || action?.kind !== "reword" || !action.newText || action.itemOccurrence !== undefined) {
+    return undefined;
+  }
+  const targets = action.items && action.items.length > 0 ? action.items : action.itemText ? [action.itemText] : [];
+  if (targets.length === 0) {
+    return undefined;
+  }
+  const plan = await readTextIfExists(getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath)));
+  if (plan === undefined) {
+    return undefined;
+  }
+  for (const itemText of targets) {
+    const count = countTopLevelPlanItemsNamedV1(plan, itemText);
+    if (count > 1) {
+      return { itemText, count };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * review1 Step 40: after an answer that settles or explains a blocker, the stage's review runs again through the
+ * single resume-and-review path (Step 41), so the owner does not have to find and press "Keep iterating". An answer
+ * that keeps the plan as written (a rejection) and a plan-deviation approval start nothing: the next round builds, or
+ * the work continues, as it was. Best effort: a refused start is reported by that command itself.
+ */
+export async function startReReviewAfterOwnerDecisionV1(
+  arg: RecordOwnerPlanDecisionArgV1,
+  executeCommand: (command: string, ...args: unknown[]) => PromiseLike<unknown> = (command, ...args) =>
+    vscode.commands.executeCommand(command, ...args)
+): Promise<boolean> {
+  if ((arg.rejects === true && arg.ownWords !== true) || arg.planAction?.kind === "approveDeviation") {
+    return false;
+  }
+  try {
+    const started = await executeCommand(
+      "vs-code-ai-helper.resumeAndRerunReview",
+      { taskFolderPath: arg.taskFolderPath },
+      {
+        // Only task.md and the plan changed, not the code, so the unchanged-tree guard would refuse the review.
+        skipUnchangedTreeGuardV1: true,
+        onDispatchingV1: () => {
+          const text = `Saved; re-running ${STAGE_DISPLAY_NAMES[arg.stage]} now.`;
+          void appendChatMessageV1(arg.taskFolderPath, {
+            role: "assistant",
+            text,
+            stage: arg.stage,
+            at: new Date().toISOString(),
+            kind: "outcome",
+          }).catch(() => undefined);
+        },
+      }
+    );
+    return started === true;
+  } catch {
+    return false;
+  }
+}
+
+async function recordOwnerPlanDecisionRecordOnlyV1(
   arg: RecordOwnerPlanDecisionArgV1
 ): Promise<WorkflowDecisionCommandResultV1> {
   if (hasLiveWorkAdmissionBestEffortV1(arg.taskFolderPath)) {
@@ -206,6 +440,7 @@ export async function recordOwnerPlanDecisionV1(
       subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
       carryOut: async () => {
         await withTaskLock(arg.taskFolderPath, () => executeOwnerPlanDecisionLockedV1(arg));
+        await startReReviewAfterOwnerDecisionV1(arg);
         return { kind: "done" };
       },
       report: () => Promise.resolve(),
@@ -247,54 +482,95 @@ export async function postOwnerPlanDecisionCardV1(options: {
   stage: TaskStage;
   block: ParsedOwnerDecisionBlockV1;
   taskDisplayName?: string;
+  /** review1 Step 37: identities of the blockers this card asks about (see `attributeBlockersToDecisionBlocksV1`). */
+  blockerIdentities?: readonly string[];
 }): Promise<WorkflowDecisionV1 | undefined> {
   const { taskFolderPath, stage, block } = options;
   const canonicalId = normalizePath(taskFolderPath);
 
-  const recommended = block.recommendation ?? {
-    optionId: block.options[0]?.id ?? "approve",
-    reason: "Recommended option.",
-  };
+  // review1 Step 42: a block can carry no recommendation on purpose (a deviation the review has not checked).
+  const recommended =
+    block.recommendation ??
+    (block.noRecommendationReason !== undefined
+      ? undefined
+      : { optionId: block.options[0]?.id ?? "approve", reason: "Recommended option." });
 
   const cardInput: PostWorkflowDecisionInputV1 = {
     decisionKey: `ownerPlanDecision:${block.id}`,
     taskCanonicalId: canonicalId,
     stage,
+    ...(options.blockerIdentities !== undefined && options.blockerIdentities.length > 0
+      ? { blockerIdentities: options.blockerIdentities }
+      : {}),
     whatHappened: block.problem,
     whyUserNeeded: block.planPurpose,
     suppressWhileAnswered: {
       conditionFingerprint: block.rawContentHash,
-      answeredOptionIds: block.options.map((o) => o.id),
+      answeredOptionIds: [...block.options.map((o) => o.id), OWN_WORDS_OPTION_ID_V1],
     },
     // Technical detail is labelled "Details", which the chat card renders behind a collapsed toggle.
     evidence: block.technicalDetails ? [{ label: "Details", detail: block.technicalDetails }] : [],
-    options: block.options.map((opt) => ({
-      optionId: opt.id,
-      label: opt.label,
-      consequence: opt.consequence,
-      resumeKind: "unpause",
-      effect: {
-        kind: "command",
-        command: RECORD_OWNER_PLAN_DECISION_COMMAND_V1,
-        args: [
-          {
-            taskFolderPath,
-            stage,
-            blockerId: block.id,
-            optionId: opt.id,
-            optionLabel: opt.label,
-            planAction: opt.planAction,
-            ...(opt.rejects ? { rejects: true } : {}),
-            rawContentHash: block.rawContentHash,
-          } satisfies RecordOwnerPlanDecisionArgV1,
-        ],
+    options: [
+      ...block.options.map((opt) => ({
+        optionId: opt.id,
+        label: opt.label,
+        // review1 Step 8: a reword changes the item's wording, so the review has to check the new text; say which
+        // item that sends back before the owner chooses.
+        consequence:
+          opt.planAction?.kind === "reword" && opt.planAction.itemText
+            ? `${opt.consequence} This rewords “${opt.planAction.itemText.slice(0, 100)}”${
+                opt.planAction.itemOccurrence !== undefined ? ` (occurrence ${opt.planAction.itemOccurrence})` : ""
+              }, so the review has to re-check that 1 item; every other item keeps its verification.`
+            : opt.consequence,
+        // review1 Step 40: an answer that settles the blocker re-runs the stage's review (the command starts it);
+        // keeping the plan as written, or approving a deviation, starts nothing.
+        resumeKind: opt.rejects || opt.planAction?.kind === "approveDeviation" ? ("unpause" as const) : ("continue" as const),
+        effect: {
+          kind: "command" as const,
+          command: RECORD_OWNER_PLAN_DECISION_COMMAND_V1,
+          args: [
+            {
+              taskFolderPath,
+              stage,
+              blockerId: block.id,
+              optionId: opt.id,
+              optionLabel: opt.label,
+              planAction: opt.planAction,
+              ...(opt.rejects ? { rejects: true } : {}),
+              rawContentHash: block.rawContentHash,
+              blockerText: block.problem,
+            } satisfies RecordOwnerPlanDecisionArgV1,
+          ],
+        },
+      })),
+      {
+        optionId: OWN_WORDS_OPTION_ID_V1,
+        label: "Answer in my own words…",
+        consequence:
+          "Asks for your answer here in the chat window, records it in task.md under Owner decisions, and re-runs the review " +
+          "to read it. The plan is not changed and the blocker is not set aside; the review decides whether your words settle it.",
+        resumeKind: "continue" as const,
+        effect: {
+          kind: "command" as const,
+          command: RECORD_OWNER_PLAN_DECISION_COMMAND_V1,
+          args: [
+            {
+              taskFolderPath,
+              stage,
+              blockerId: block.id,
+              optionId: OWN_WORDS_OPTION_ID_V1,
+              optionLabel: "Answer in my own words",
+              ownWords: true,
+              rawContentHash: block.rawContentHash,
+              blockerText: block.problem,
+            } satisfies RecordOwnerPlanDecisionArgV1,
+          ],
+        },
       },
-    })),
-    recommendation: {
-      kind: "option",
-      optionId: recommended.optionId,
-      reasoning: recommended.reason,
-    },
+    ],
+    recommendation: recommended
+      ? { kind: "option", optionId: recommended.optionId, reasoning: recommended.reason }
+      : { kind: "none", reasoning: block.noRecommendationReason ?? "The choice is yours." },
     gating: {
       holdsTaskPaused: true,
       unblocksProgress: true,
@@ -315,38 +591,77 @@ export async function postOwnerOnlyBlockersCardV1(options: {
   taskFolderPath: string;
   stage: TaskStage;
   blockerDescriptions: readonly string[];
+  /** Lineage ids (or undefined) for each description, in the same order; identities fall back to the text hash. */
+  blockerLineageIds?: readonly (string | undefined)[];
+  /**
+   * review1 Step 39: true when other blockers still have work a round can do, so Fast Forward carries on with those
+   * and this card only takes the standing ones off its hands (the wording must not say Fast Forward stopped).
+   */
+  continuesWithOtherWork?: boolean;
 }): Promise<WorkflowDecisionV1 | undefined> {
   const { taskFolderPath, stage, blockerDescriptions } = options;
   if (blockerDescriptions.length === 0) {
     return undefined;
   }
   const canonicalId = normalizePath(taskFolderPath);
+  // review1 Step 37: one card per owner-only blocker. An owner-decision card or the plateau card for this stage
+  // already asks the owner; say so in the chat stop line instead of posting a second, different question.
+  const blockerIdentities = blockerDescriptions.map((description, index) =>
+    ownerBlockerIdentityV1(description, options.blockerLineageIds?.[index])
+  );
+  const covering = findCardCoveringOwnerOnlyBlockersV1(canonicalId, stage, blockerIdentities);
+  if (covering) {
+    return covering;
+  }
   const fingerprint = createHash("sha256").update(blockerDescriptions.join("\n")).digest("hex").slice(0, 16);
+  // review1 Step 38: "Tick or Exclude…" acts on plan-final.md's checklist, which does not exist at a plan stage.
+  // There the way on is to record the decision in plan.md, so that is what the card offers and recommends.
+  const canSettleItem = optionAppliesAtStageV1("settleChecklistItem", stage);
+  const planFile = planFileNameForStageV1(stage);
+  const forwardOptionId = canSettleItem ? "settleItem" : "changePlan";
   const cardInput: PostWorkflowDecisionInputV1 = {
     decisionKey: `ownerOnlyBlockers:${fingerprint}`,
     taskCanonicalId: canonicalId,
     stage,
-    whatHappened:
-      `Fast Forward stopped. ${blockerDescriptions.length === 1 ? "The one thing" : `All ${blockerDescriptions.length} things`} ` +
-      "holding this review's score can only be settled by you, so another Apply Review round would not help.",
+    blockerIdentities,
+    whatHappened: options.continuesWithOtherWork
+      ? `${blockerDescriptions.length === 1 ? "One blocker" : `${blockerDescriptions.length} blockers`} ` +
+        "can only be settled by you, or have stood unchanged across reviews, so another Apply Review round on " +
+        `${blockerDescriptions.length === 1 ? "it" : "them"} alone would not help. Fast Forward carries on with the blockers a round can still work on.`
+      : `Fast Forward stopped. ${blockerDescriptions.length === 1 ? "The one thing" : `All ${blockerDescriptions.length} things`} ` +
+        "holding this review's score can only be settled by you, so another Apply Review round would not help.",
     whyUserNeeded:
       "These are decisions or evidence that only you can give: " +
       blockerDescriptions.map((d) => `“${d}”`).join("; "),
     evidence: [],
     options: [
-      {
-        optionId: "settleItem",
-        label: "Tick or Exclude a Checklist Item…",
-        consequence:
-          "Opens the form to tick an item you have checked yourself, or exclude one you have decided not to build, " +
-          "with a dated note the next review can read. Fast Forward does not restart by itself; run the review again afterwards.",
-        resumeKind: "unpause",
-        effect: {
-          kind: "command",
-          command: "vs-code-ai-helper.settleChecklistItem",
-          args: [{ canonicalId, taskFolderPath }],
-        },
-      },
+      canSettleItem
+        ? {
+            optionId: "settleItem",
+            label: "Tick or Exclude a Checklist Item…",
+            consequence:
+              "Opens the form to tick an item you have checked yourself, or exclude one you have decided not to build, " +
+              "with a dated note the next review can read. Fast Forward does not restart by itself; run the review again afterwards.",
+            resumeKind: "unpause" as const,
+            effect: {
+              kind: "command" as const,
+              command: "vs-code-ai-helper.settleChecklistItem",
+              args: [{ canonicalId, taskFolderPath }],
+            },
+          }
+        : {
+            optionId: "changePlan",
+            label: "Change the plan instead",
+            consequence:
+              `Opens ${planFile} at its Accepted Non-Goals section so you can record your decision there. ` +
+              "Fast Forward does not restart by itself; run the review again afterwards.",
+            resumeKind: "unpause" as const,
+            effect: {
+              kind: "command" as const,
+              command: "vs-code-ai-helper.openPlanNonGoals",
+              args: [{ taskFolderPath, stage }],
+            },
+          },
       {
         optionId: "notNow",
         label: "Not now",
@@ -357,7 +672,7 @@ export async function postOwnerOnlyBlockersCardV1(options: {
     ],
     recommendation: {
       kind: "option",
-      optionId: "settleItem",
+      optionId: forwardOptionId,
       reasoning: "Only your answer changes the score; running another Apply Review against these would repeat the same result.",
     },
     gating: {
@@ -369,30 +684,163 @@ export async function postOwnerOnlyBlockersCardV1(options: {
   return postWorkflowDecisionV1(cardInput, { canonicalId, taskFolderPath, stage });
 }
 
-/** bugs5 Step 23: Parse `## Owner decisions needed` blocks from review content and raise a card for each. */
+const OWNER_PLAN_DECISION_KEY_PREFIX_V1 = "ownerPlanDecision:";
+const PLAN_DEVIATION_KEY_PREFIX_V1 = `${OWNER_PLAN_DECISION_KEY_PREFIX_V1}plan-deviation-`;
+
+/** The step numbers a piece of card text names ("Step 34", "Steps 19/22" names 19). */
+function stepNumbersNamedV1(text: string): ReadonlySet<number> {
+  const steps = new Set<number>();
+  for (const match of text.matchAll(/\bsteps?\s+(\d+)(?!\d)/gi)) {
+    steps.add(Number(match[1]));
+  }
+  return steps;
+}
+
+function pendingOwnerPlanCardsV1(
+  canonicalId: string,
+  stage: TaskStage,
+  kind: "deviation" | "review"
+): readonly WorkflowDecisionV1[] {
+  return listPendingWorkflowDecisionsForTaskV1(canonicalId).filter(
+    (card) =>
+      card.stage === stage &&
+      card.decisionKey.startsWith(OWNER_PLAN_DECISION_KEY_PREFIX_V1) &&
+      card.decisionKey.startsWith(PLAN_DEVIATION_KEY_PREFIX_V1) === (kind === "deviation")
+  );
+}
+
+function cardNamesAnyStepV1(card: WorkflowDecisionV1, steps: ReadonlySet<number>): boolean {
+  if (steps.size === 0) return false;
+  for (const step of stepNumbersNamedV1(`${card.whatHappened}\n${card.whyUserNeeded}`)) {
+    if (steps.has(step)) return true;
+  }
+  return false;
+}
+
+/** review1 Step 42: withdraw pending cards of one kind whose key the latest report no longer contains. */
+async function withdrawOwnerPlanCardsNoLongerReportedV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  kind: "deviation" | "review",
+  currentKeys: ReadonlySet<string>,
+  reason: string
+): Promise<void> {
+  const canonicalId = normalizePath(taskFolderPath);
+  for (const card of pendingOwnerPlanCardsV1(canonicalId, stage, kind)) {
+    if (!currentKeys.has(card.decisionKey)) {
+      await withdrawWorkflowDecisionsByKeyV1({ taskFolderPath, canonicalId }, card.decisionKey, reason);
+    }
+  }
+}
+
+/**
+ * bugs5 Step 23: Parse `## Owner decisions needed` blocks from review content and raise a card for each.
+ * review1 Step 42: cards for blocks the review no longer reports are withdrawn, and a round's plan-deviation
+ * card that this review raises a decision about is folded into that one card.
+ */
+/**
+ * review1 Step 37: which blockers each owner-decision card asks about. A blocker whose text names the block's id
+ * or plan purpose belongs to that block. A blocker that no block names (a reviewer rarely repeats the id) is
+ * paired with a block that no blocker names, in order; extra blockers stay unattributed, so a card about one
+ * blocker never hides a different owner-only blocker's own card. Task-fixable blockers are never attributed.
+ */
+export function attributeBlockersToDecisionBlocksV1(
+  blockers: readonly ReviewBlocker[],
+  blocks: readonly ParsedOwnerDecisionBlockV1[]
+): ReadonlyMap<string, readonly string[]> {
+  const result = new Map<string, string[]>(blocks.map((block) => [block.id, []]));
+  const unmatched: ReviewBlocker[] = [];
+  for (const blocker of blockers) {
+    if (blocker.resolver === "task-fixable") continue;
+    const text = blocker.description.toLowerCase();
+    const named = blocks.find(
+      (block) => text.includes(block.id.toLowerCase()) || (block.planPurpose !== "" && text.includes(block.planPurpose.toLowerCase()))
+    );
+    if (named) {
+      result.get(named.id)?.push(blockerOwnerIdentityV1(blocker));
+    } else {
+      unmatched.push(blocker);
+    }
+  }
+  const blocksNamedByNoBlocker = blocks.filter((block) => result.get(block.id)?.length === 0);
+  blocksNamedByNoBlocker.forEach((block, index) => {
+    const blocker = unmatched[index];
+    if (blocker) result.get(block.id)?.push(blockerOwnerIdentityV1(blocker));
+  });
+  return result;
+}
+
 export async function raiseOwnerDecisionCardsFromReviewV1(
   taskFolderPath: string,
   stage: TaskStage,
   reviewContent: string
 ): Promise<readonly WorkflowDecisionV1[]> {
   const posted: WorkflowDecisionV1[] = [];
-  for (const block of parseOwnerDecisionsNeededV1(reviewContent)) {
-    const decision = await postOwnerPlanDecisionCardV1({ taskFolderPath, stage, block });
+  const blocks = parseOwnerDecisionsNeededV1(reviewContent);
+  const identitiesByBlock = attributeBlockersToDecisionBlocksV1(
+    parseReviewBlockersDetailed(reviewContent).blockers,
+    blocks
+  );
+  await withdrawOwnerPlanCardsNoLongerReportedV1(
+    taskFolderPath,
+    stage,
+    "review",
+    new Set(blocks.map((block) => `${OWNER_PLAN_DECISION_KEY_PREFIX_V1}${block.id}`)),
+    "the latest review no longer asks for this decision"
+  ).catch(() => undefined);
+  const canonicalId = normalizePath(taskFolderPath);
+  for (const block of blocks) {
+    const decision = await postOwnerPlanDecisionCardV1({
+      taskFolderPath,
+      stage,
+      block,
+      blockerIdentities: identitiesByBlock.get(block.id) ?? [],
+    });
     if (decision) {
       posted.push(decision);
+      // The review's card carries the review's options; the round's own card about the same step is folded in.
+      const steps = stepNumbersNamedV1(`${block.problem}\n${block.planPurpose}\n${block.rawContent}`);
+      for (const deviationCard of pendingOwnerPlanCardsV1(canonicalId, stage, "deviation")) {
+        if (cardNamesAnyStepV1(deviationCard, steps)) {
+          await withdrawWorkflowDecisionsByKeyV1(
+            { taskFolderPath, canonicalId },
+            deviationCard.decisionKey,
+            "the review raised a decision about the same step, so this one is answered there"
+          ).catch(() => undefined);
+        }
+      }
     }
   }
   return posted;
 }
 
-/** bugs5 Step 23: Parse the `## Plan deviations` section of a round's summary and raise a card for each. */
+/**
+ * bugs5 Step 23: Parse the `## Plan deviations` section of a round's summary and raise a card for each.
+ * review1 Step 42: one card per top-level deviation; cards for deviations the latest round no longer reports are
+ * withdrawn; a deviation a pending review decision already covers (same step) raises no second card.
+ */
 export async function raisePlanDeviationCardsV1(
   taskFolderPath: string,
   stage: TaskStage,
-  summaryContent: string
+  summaryContent: string,
+  context?: PlanDeviationContextV1
 ): Promise<readonly WorkflowDecisionV1[]> {
   const posted: WorkflowDecisionV1[] = [];
-  for (const deviation of parsePlanDeviationsV1(summaryContent)) {
+  const deviations = parsePlanDeviationsV1(summaryContent, context);
+  await withdrawOwnerPlanCardsNoLongerReportedV1(
+    taskFolderPath,
+    stage,
+    "deviation",
+    new Set(deviations.map((deviation) => `${OWNER_PLAN_DECISION_KEY_PREFIX_V1}${deviation.id}`)),
+    "the latest round no longer reports this plan deviation"
+  ).catch(() => undefined);
+  const canonicalId = normalizePath(taskFolderPath);
+  const reviewCards = pendingOwnerPlanCardsV1(canonicalId, stage, "review");
+  for (const deviation of deviations) {
+    const steps = stepNumbersNamedV1(`${deviation.planPurpose}\n${deviation.rawContent}`);
+    if (reviewCards.some((card) => cardNamesAnyStepV1(card, steps))) {
+      continue;
+    }
     const decision = await postOwnerPlanDecisionCardV1({ taskFolderPath, stage, block: deviation });
     if (decision) {
       posted.push(decision);

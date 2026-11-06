@@ -1309,7 +1309,7 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
   // (Step 35) every `resumeKind: "continue"` option's label must say it
   // resumes the task, including this relabelled one, which the previous
   // revision left without that wording.
-  void it("relabels applyVerifiedTicks to point at an already-pending applyReviewerVerifiedTicks card, and still says it resumes the task", async () => {
+  void it("posts no second checklist card while the reviewer-verified ticks card is pending (review1 Step 10)", async () => {
     const name = "evidence-pending-apply-ticks-card";
     const folder = nodePath.join(ROOT, ".ensemble", name);
     const canonicalId = `canonical-${name}`;
@@ -1368,30 +1368,13 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
       const decision = store
         .listPending(canonicalId)
         .find((d) => d.decisionKey === "reconcilePlanChecklist");
-      assert.ok(decision, "a decision must be posted");
-      const applyOption = decision.options.find((o) => o.optionId === "applyVerifiedTicks");
-      assert.ok(applyOption, "an Apply Reviewer-Verified Tick(s) option must still be offered");
+      // review1 Step 10: one checklist card per task. The pending reviewer-verified ticks card IS that card, so
+      // no second reconcile card is posted beside it, and the original card is left pending.
+      assert.equal(decision, undefined, "no second checklist card is posted beside the pending ticks card");
       assert.equal(
-        applyOption.label,
-        "Same as the reviewer-verified ticks card above — apply and try again (one cycle, then stops)"
+        store.listPending(canonicalId).filter((d) => d.decisionKey === "applyReviewerVerifiedTicks").length,
+        1
       );
-      assert.match(
-        applyOption.label,
-        /and try again \(one cycle, then stops\)/,
-        "every resumeKind: 'continue' option's label must say what it does next, even when relabelled"
-      );
-      assert.match(
-        applyOption.consequence,
-        /same action offered on the pending reviewer-verified-ticks card above/
-      );
-      // The real, idempotent command effect must be unchanged by the relabel.
-      assert.equal(applyOption.effect.kind, "command");
-      if (applyOption.effect.kind === "command") {
-        assert.equal(
-          applyOption.effect.command,
-          "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed"
-        );
-      }
     } finally {
       win.restore();
       fs.restore();
@@ -1442,6 +1425,17 @@ void describe("reconcilePlanChecklist — evidence for the case-4 judgement", ()
         assert.equal(decision.recommendation.optionId, "notYet");
         assert.match(decision.recommendation.reasoning, /no basis to recommend Mark reconciled/i);
         assert.match(decision.recommendation.reasoning, /safe choice/);
+      }
+      // review1 Step 10: the reconcile card is the task's one checklist card, so it offers the same item-by-item
+      // settlement as the reviewer-verified ticks card.
+      const settleRest = decision.options.find((o) => o.optionId === "settleRest");
+      assert.ok(settleRest, "the reconcile card offers 'settle the open items one by one'");
+      assert.equal(settleRest.effect.kind, "command");
+      if (settleRest.effect.kind === "command") {
+        assert.equal(settleRest.effect.command, "vs-code-ai-helper.settleRestItemByItem");
+        const args = settleRest.effect.args?.[0] as { taskFolderPath?: string; stage?: string } | undefined;
+        assert.equal(args?.taskFolderPath, folder);
+        assert.equal(args?.stage, "impl-high-review");
       }
     } finally {
       win.restore();

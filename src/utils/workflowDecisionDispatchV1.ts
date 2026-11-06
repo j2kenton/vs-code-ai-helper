@@ -1,5 +1,10 @@
 import * as vscode from "vscode";
 import { getExtensionContextV1 } from "./extensionContextV1";
+import { readAutoContinueMinutes } from "../config/settings";
+import { planAutoContinueV1, withWaitForMeOptionV1 } from "./autoContinueV1";
+import { currentRunBindingV1, matchesKeepGoingV1, withKeepGoingOptionV1 } from "./autoContinueKeepGoingV1";
+import { requestAutoContinueSweepNowV1 } from "../state/autoContinueSweepTriggerV1";
+import { readAutoContinueTaskStateV1 } from "./autoContinueTaskStateV1";
 
 /**
  * The Memento the DECISION VIEWS are built over. In a viewer that is not
@@ -285,13 +290,63 @@ export async function postWorkflowDecisionV1(
   }
   const preconditioned = await applyRecommendationPreconditionsV1(input, target);
   const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
+  // review1 Step 53: a card whose recommended option is safe to run unattended carries a countdown and a
+  // "Wait for me" choice. The plan is made from the card as it will be stored.
+  const autoContinueMinutes = readAutoContinueMinutes();
+  const plannedCountdown =
+    autoContinueMinutes > 0
+      ? planAutoContinueV1(
+          { options: preconditioned.options, recommendation: preconditioned.recommendation, state: "pending" },
+          autoContinueMinutes,
+          Date.now(),
+          await readAutoContinueTaskStateV1(target.taskFolderPath)
+        )
+      : undefined;
+  // review1 Step 54: the owner already chose "and keep going" for this kind of card in this run, so it runs at once.
+  const keepGoingApplies =
+    plannedCountdown !== undefined &&
+    matchesKeepGoingV1(
+      {
+        taskCanonicalId: target.canonicalId,
+        decisionKey: input.decisionKey,
+        options: preconditioned.options,
+        recommendation: preconditioned.recommendation,
+        state: "pending",
+      },
+      store.listKeepGoing(),
+      Date.now(),
+      currentRunBindingV1(target.taskFolderPath)
+    );
+  const autoContinuePlan =
+    plannedCountdown !== undefined && keepGoingApplies
+      ? { ...plannedCountdown, deadline: new Date().toISOString(), keepGoing: true }
+      : plannedCountdown;
+  const autoContinueOption =
+    autoContinuePlan !== undefined
+      ? preconditioned.options.find((candidate) => candidate.optionId === autoContinuePlan.optionId)
+      : undefined;
+  const storedInput =
+    autoContinuePlan !== undefined && autoContinueOption !== undefined
+      ? {
+          ...preconditioned,
+          // The countdown sentence is not stored: the chat draws it from the deadline each time (describeAutoContinueNoteV1).
+          options: withKeepGoingOptionV1(withWaitForMeOptionV1(preconditioned.options), autoContinuePlan.optionId),
+        }
+      : preconditioned;
   const result = await store.post({
-    ...preconditioned,
-    decisionId: preconditioned.decisionId ?? crypto.randomUUID(),
+    ...storedInput,
+    decisionId: storedInput.decisionId ?? crypto.randomUUID(),
     createdAt: new Date().toISOString(),
   });
   if (!result.ok) {
     throw new Error(`workflow decision "${input.decisionKey}" failed validation: ${result.reason}`);
+  }
+  if (!result.suppressed && autoContinuePlan !== undefined && autoContinueOption !== undefined) {
+    // The deadline lives on the stored record, so the periodic sweep finds it again after a reload.
+    await store.armAutoContinue(result.decision.decisionId, autoContinuePlan);
+    if (autoContinuePlan.keepGoing === true) {
+      requestAutoContinueSweepNowV1();
+    }
   }
   if (result.suppressed) {
     // Already answered with the same condition and answers (item 7): no new

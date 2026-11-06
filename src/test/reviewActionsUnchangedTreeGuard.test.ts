@@ -57,6 +57,7 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { safeRemoveDir } from "./testFsUtils";
+import { recordReviewInputsV1 } from "../utils/reviewInputsChangedV1";
 import { computePublishScopeId, renderPublishChecksFreshnessStamp } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
@@ -119,6 +120,9 @@ async function makeUnchangedTreeTaskFolder(name: string): Promise<{ folderPath: 
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
+    // The review's scope preflight (resolved before the unchanged-tree guard) needs a tracked change list; without
+    // one it refuses for a missing scope and the guard is never reached.
+    implReviewFiles: ["src/a.ts"],
     ownership: {
       metaRoot: path.dirname(folderPath),
       projectRoot: path.dirname(folderPath),
@@ -140,6 +144,11 @@ async function makeUnchangedTreeTaskFolder(name: string): Promise<{ folderPath: 
   // artifact itself (about to be written below) is excluded, mirroring the
   // production guard's own exclusion of its self-referential output.
   const reviewPath = path.join(folderPath, "impl-high-review.md");
+  // review1 Step 27: a review is only "unchanged" while its other inputs (task.md, plan.md, plan-final.md) are too, so
+  // the fixture records them the way a dispatched review does. The record is a file in the tree, so it is written
+  // before the fingerprint is taken, and the review after both.
+  await recordReviewInputsV1(folderPath, reviewPath);
+  await new Promise((resolve) => setTimeout(resolve, 25));
   const fingerprint =
     (await computeWorkingTreeFingerprintV1(REAL_ROOT, {
       excludeAbsolutePaths: [

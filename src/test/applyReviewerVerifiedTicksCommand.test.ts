@@ -33,11 +33,17 @@ import {
   applyReviewerVerifiedTicks,
   applyReviewerVerifiedTicksConfirmedV1,
   recordReviewerVerificationOfTickedItemsV1,
+  writeVerifiedTicksToPlanV1,
 } from "../commands/applyReviewerVerifiedTicks";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskProgress } from "../types/taskProgress";
-import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
+import {
+  countChecklistEvidenceProgressV1,
+  getPlanRevisionV1,
+  normalizeChecklistItemTextV1,
+} from "../utils/implementationChecklist";
+import { recordPlanItemReviewerVerificationV1 } from "../utils/taskProgressTransforms";
 import {
   StatusSurface,
   deactivateNotificationRouter,
@@ -363,7 +369,8 @@ async function run(
     }
     // bugs4 item 32: the withheld-for-test-evidence outcome is a chat card now, not a pop-up.
     for (const offer of [...store.listPending(folder), ...store.listPending(canonicalId)].filter(
-      (d) => d.decisionKey === "chatActionOffer:resumeAndApplyCurrentStageAction"
+      // review1 Step 34/53: the card offers Publish Checks, a recorded run and the owner's tick, never a model round.
+      (d) => d.decisionKey === "withheldTestEvidence"
     )) {
       win.captured.push({ method: "chat", message: offer.whatHappened });
     }
@@ -963,7 +970,7 @@ void describe("applyReviewerVerifiedTicks — editing-round test evidence", () =
     const result = await run("test-evidence-missing", { plan, review }, { confirm: true });
     assert.equal(result.decision, undefined);
     const chat = result.captured.find((entry) => entry.method === "chat")?.message ?? "";
-    assert.match(chat, /waits? for a passing test report/);
+    assert.match(chat, /no passing test report counts/);
     assert.match(chat, /\n {2}- Add regression cases in dispatch\.test\.ts/, "the item is listed as a bullet, not joined into one paragraph");
     assert.match(chat, /pnpm run test:unit -- /, "the card names the command that would satisfy the rule");
     assert.match(chat, /Add regression cases in dispatch\.test\.ts — no test report is recorded for this item/, "bugs4 Step 20: each withheld item carries its own reason");
@@ -1054,7 +1061,7 @@ void describe("applyReviewerVerifiedTicks — editing-round test evidence", () =
     );
     assert.equal(result.decision, undefined);
     const staleChat = result.captured.find((entry) => entry.method === "chat")?.message ?? "";
-    assert.match(staleChat, /waits? for a passing test report/);
+    assert.match(staleChat, /no passing test report counts/);
     assert.match(staleChat, /its test report predates later edits to the tested files/, "bugs4 Step 20: a stale report is named as stale, not as missing");
     assert.match(readPlan(result.folder), /- \[ \] Add regression cases/);
   });
@@ -1192,6 +1199,145 @@ void describe("recordReviewerVerificationOfTickedItemsV1 — verifying items an 
         .map((record) => record.itemText)
         .sort();
       assert.deepEqual(verified, [filenameItem, searchItem].sort());
+    } finally {
+      realFs.restore();
+    }
+  });
+});
+
+// review1 (owner decision 2026-11-05): the reviewer names an item by text. When that text fits more than one
+// checked plan item (a top-level item and a child, or two copies at one level) it verifies none of them.
+void describe("recordReviewerVerificationOfTickedItemsV1 — a top-level item and an identically worded child", () => {
+  const plan = [
+    "<!-- ensemble:implementation-checklist -->",
+    "",
+    "- [x] Step 1: Parent",
+    "  - [x] Shared wording",
+    "- [x] Shared wording",
+    "",
+  ].join("\n");
+  const reviewNaming = (...names: string[]): string =>
+    ["Readiness: 9/10", "", "<!-- verified-complete:start -->", ...names.map((name) => `- ${name}`), "<!-- verified-complete:end -->", ""].join("\n");
+  const readEvidence = (folder: string) =>
+    (JSON.parse(nodeFs.readFileSync(nodePath.join(folder, "task-progress.json"), "utf8")) as TaskProgress).planItemEvidence ?? [];
+
+  void it("verifies neither the child nor the same-worded leaf, even when one of them is already verified", async () => {
+    const leafVerified = recordPlanItemReviewerVerificationV1({} as TaskProgress, {
+      planRevision: getPlanRevisionV1(plan),
+      planText: plan,
+      itemText: "Shared wording",
+      at: "2026-11-05T00:00:00.000Z",
+      evidence: "leaf checked earlier",
+    }).planItemEvidence;
+    const { folder } = makeTask("verify-ticked-twin-leaf-first", {
+      plan,
+      review: reviewNaming("Shared wording"),
+      planItemEvidence: leafVerified,
+    });
+    const realFs = installRealFs();
+    try {
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(vscode.Uri.file(folder), "impl-high-review"), 0);
+      const rows = readEvidence(folder);
+      assert.equal(rows.length, 1, "no row was added for the child");
+      assert.equal(rows[0]?.verifications?.length, 1, "the leaf keeps only its earlier verification");
+    } finally {
+      realFs.restore();
+    }
+  });
+
+  void it("verifies the unambiguous entries and none of the ambiguous one, so the parent does not settle by it", async () => {
+    const { folder } = makeTask("verify-ticked-twin-both", { plan, review: reviewNaming("Step 1: Parent", "Shared wording") });
+    const realFs = installRealFs();
+    try {
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(vscode.Uri.file(folder), "impl-high-review"), 1);
+      const rows = readEvidence(folder);
+      assert.deepEqual(rows.map((row) => row.itemKey), ["step 1: parent"], "only the unambiguous entry is verified");
+      assert.equal(rows.filter((row) => row.itemKey === "shared wording").length, 0, "neither twin is verified");
+      assert.equal(countChecklistEvidenceProgressV1(plan, rows, [])?.gate.settled, 0, "the parent still needs its child");
+    } finally {
+      realFs.restore();
+    }
+  });
+
+  void it("two same-level copies of one wording are ambiguous too, and record no verification", async () => {
+    const twoCopies = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Step 1: Rename the helper",
+      "- [x] Rename the helper",
+      "- [x] Rename the helper",
+      "",
+    ].join("\n");
+    const { folder } = makeTask("verify-ticked-two-copies", { plan: twoCopies, review: reviewNaming("Rename the helper") });
+    const realFs = installRealFs();
+    try {
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(vscode.Uri.file(folder), "impl-high-review"), 0);
+      assert.equal(readEvidence(folder).length, 0);
+    } finally {
+      realFs.restore();
+    }
+  });
+
+  void it("an entry that names the step number is unambiguous even when a child shares the rest of the wording", async () => {
+    const byStep = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [x] Step 2: Shared wording",
+      "  - [x] Shared wording",
+      "",
+    ].join("\n");
+    const { folder } = makeTask("verify-ticked-by-step", { plan: byStep, review: reviewNaming("Step 2: Shared wording") });
+    const realFs = installRealFs();
+    try {
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(vscode.Uri.file(folder), "impl-high-review"), 1);
+      const rows = readEvidence(folder);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]?.itemNested, false);
+    } finally {
+      realFs.restore();
+    }
+  });
+
+  void it("an unticked child is not verified by naming its top-level twin, only the ticked leaf is", async () => {
+    const unticked = plan.replace("  - [x] Shared wording", "  - [ ] Shared wording");
+    const { folder } = makeTask("verify-ticked-twin-unticked-child", { plan: unticked, review: reviewNaming("Shared wording") });
+    const realFs = installRealFs();
+    try {
+      assert.equal(await recordReviewerVerificationOfTickedItemsV1(vscode.Uri.file(folder), "impl-high-review"), 1);
+      const rows = readEvidence(folder);
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]?.itemNested, false);
+    } finally {
+      realFs.restore();
+    }
+  });
+
+  void it("applying a verified tick records the verification on the item the merge ticked, at that item's level", async () => {
+    // Both items of the shared wording are open; the merge ticks the first one in plan order, which is the child.
+    const bothOpen = plan.replace(/\[x\]/g, "[ ]");
+    const { folder } = makeTask("verify-ticked-twin-merge", {
+      plan: bothOpen,
+      review: reviewNaming("Shared wording"),
+    });
+    const realFs = installRealFs();
+    try {
+      const result = await writeVerifiedTicksToPlanV1(vscode.Uri.file(folder), {
+        reviewStage: "impl-high-review",
+        reviewFilename: "impl-high-review.md",
+        applicable: ["Shared wording"],
+        applicableEvidence: ["child checked"],
+        applicableTestReportRoundIds: [[]],
+        withheldTestItems: [],
+        withheldReasons: new Map(),
+      });
+      assert.equal(result.kind, "applied");
+      const after = readPlan(folder);
+      assert.match(after, /^ {2}- \[x\] Shared wording/m, "the merge ticked the child");
+      assert.match(after, /^- \[ \] Shared wording/m, "and left the top-level leaf open");
+      const rows = readEvidence(folder);
+      assert.equal(rows.length, 1, "one verification, for the one item that was ticked");
+      assert.equal(rows[0]?.itemNested, true, "recorded at the child's level, not on the top-level twin");
+      assert.equal(rows[0]?.verifications?.[0]?.evidence, "child checked");
     } finally {
       realFs.restore();
     }

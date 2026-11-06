@@ -6,6 +6,8 @@ Use the file inspection and editing capabilities available in your execution env
 - If you are running as a CLI coding agent, use your native shell, patch, and file-editing tools to inspect and modify files directly in the current repository.
 - If a named tool is unavailable, use an equivalent available mechanism. Do not stop or switch to a notes-only answer just because the exact tool name is absent.
 
+Report shape, stated once: your final response is Markdown with these sections, in any order — `## Files Changed`, `## Plan Item Checklist` (one entry per item you completed: `<exact item text or its [item:<id>]> — done — <evidence>`), `## Plan deviations`, and `## Verification` (each test command in backticks with its passed and failed counts, and a plain statement that the tests ran on the working tree after your edits). Section order does not matter: each section counts wherever it appears in your own text, but not inside a reproduction of the plan's checklist.
+
 Work through the final plan step by step:
 
 1. Inspect the existing code before touching anything

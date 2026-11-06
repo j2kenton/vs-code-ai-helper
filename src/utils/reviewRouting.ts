@@ -230,8 +230,8 @@ function restrictToTrailingSameReviewerRun<T extends ReviewScoreHistoryEntry>(
  * checklist, so it structurally cannot move a task-fixable blocker count no
  * matter how many rounds run. That is a DISPATCH plateau (the loop kept
  * choosing an action that cannot help), not a WORK plateau (the problem
- * resists every action tried) — `chooseAutomaticImplementationDispatchV1`
- * (this file) exists to prevent the dispatch plateau at the source; a caller
+ * resists every action tried) — review1 Step 18's single post-review dispatch
+ * (`selectPostReviewDispatchStageV1`) prevents the dispatch plateau at the source; a caller
  * diagnosing a churn-ceiling escalation should still check the dispatch mode
  * of the stagnant window's rounds before concluding the problem itself is
  * hard.
@@ -1182,7 +1182,7 @@ export function decideReviewRoute(input: {
     blockers.filter((b) => b.resolver === resolver).length;
   const taskFixable = countByResolver("task-fixable");
   const specDefect = countByResolver("spec-defect");
-  const environmental = countByResolver("environmental");
+  const environmental = countByResolver("environmental") + countByResolver("environmental-fixable");
   const onlyEnvironmentalRemain = blockers.length > 0 && environmental === blockers.length;
   const onlyNonFixableRemain = blockers.length > 0 && taskFixable === 0;
 
@@ -1554,60 +1554,6 @@ export function decideHandoffOnlyStopV1(input: {
   };
 }
 
-/** What an automatic (unattended) Implementation dispatch should actually do,
- * given `decidePostReviewActionV1`'s verdict. */
-export type AutomaticImplementationDispatchV1 =
-  | { readonly kind: "run-implementation" }
-  | {
-      /**
-       * Redirect to Apply Review instead of running a checklist-driven
-       * Implementation round — `decision.action` is `"apply-review"` or
-       * `"both"`, so Implementation is either structurally unable to fix
-       * what the review found, or is one of two valid actions where Apply
-       * Review takes precedence (module doc comment above `decidePostReviewActionV1`).
-       */
-      readonly kind: "redirect-apply-review";
-      readonly reviewStage: TaskStage;
-      readonly reason: string;
-    };
-
-/**
- * wf10 continuation item 17: the manual pre-run routing check
- * (`decidePostReviewActionV1` above) has always been computed on the
- * automatic path too, but automation dispatches only ever POSTED it as a
- * decision card for a human to read — the human path is not there, so the
- * card is skipped, and the round fell through to run Implementation
- * regardless of what the decision said. Observed: ten consecutive automatic
- * `# Implementation Run` rounds against a `[same:…]` blocker frozen at
- * score 6, none of them able to touch it, because Implementation only reads
- * the plan checklist.
- *
- * This is the missing other half: what the AUTOMATIC path should do with the
- * same verdict, with no human to ask. `isAutomationDispatch: false` (a
- * manual run) always runs Implementation here — the decision card handles
- * manual routing on its own, this function must not second-guess a human who
- * already chose to press "Implementation". `continuationOwed: true` also
- * always runs Implementation — draining an owed continuation outranks
- * everything (see `continuationOwed` on `decidePostReviewActionV1`'s input;
- * Review/Apply Review both refuse while a continuation is owed, so a
- * redirect here would just fail).
- */
-export function chooseAutomaticImplementationDispatchV1(input: {
-  readonly decision: PostReviewActionDecisionV1;
-  readonly isAutomationDispatch: boolean;
-  readonly continuationOwed: boolean;
-}): AutomaticImplementationDispatchV1 {
-  if (
-    !input.isAutomationDispatch ||
-    input.continuationOwed ||
-    input.decision.reviewStage === undefined ||
-    (input.decision.action !== "apply-review" && input.decision.action !== "both")
-  ) {
-    return { kind: "run-implementation" };
-  }
-  return {
-    kind: "redirect-apply-review",
-    reviewStage: input.decision.reviewStage,
-    reason: input.decision.reason,
-  };
-}
+// review1 Step 18: `chooseAutomaticImplementationDispatchV1` (the automatic Apply Review redirect) is gone. A
+// stage with a current review renders its next round with that review (`selectPostReviewDispatchStageV1`), so
+// there is no dispatch to choose between.

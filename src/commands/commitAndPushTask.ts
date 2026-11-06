@@ -31,6 +31,7 @@ import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishRead
 import { buildCommitPushUnstagedListV1, describeCommitPushUnstagedListV1 } from "../utils/commitPushUnstagedListV1";
 import { refreshStaleReviewBannersForTaskV1 } from "../utils/reviewFreshness";
 import { runLintingFixes } from "./runLintingFixes";
+import { confirmOpenPlanItemsAtEndV1 } from "./openPlanItemsAtEndV1";
 import { resolveFreshModelForStage } from "../utils/modelSelection";
 import {
   runTrackedOperation,
@@ -1526,8 +1527,13 @@ export async function generatePRDescription(
   // delivered work. That is the identical failure that retired the overview
   // extraction (see the note at the top of this function): a plain
   // "not available" beats a confident lie about what was tested.
+  const planOfRecordForSplit = implementationNotes
+    ? await Promise.resolve(vscode.workspace.fs.readFile(vscode.Uri.joinPath(taskFolderUri, "plan-final.md")))
+        .then((bytes) => new TextDecoder().decode(bytes))
+        .catch(() => undefined)
+    : undefined;
   const runOwnedNotes = implementationNotes
-    ? splitSummaryAtEchoV1(implementationNotes).own
+    ? splitSummaryAtEchoV1(implementationNotes, planOfRecordForSplit).own
     : undefined;
   // NO overview extraction. Three attempts at recovering the run's one-or-two
   // sentence lead-in from the response all failed the same way: filtering
@@ -1997,7 +2003,9 @@ export type CommitPushCompletionChecksResultV1 =
   | { readonly ok: true }
   | {
       readonly ok: false;
-      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "checksDeclined" | "fixWithAiUnavailable">;
+      readonly reason: Extract<CommitAndPushNotCompletedReasonV1, "checksDeclined" | "fixWithAiUnavailable" | "userCancelled">;
+      /** The user-facing text for this stopping point, when the default for the reason does not fit. */
+      readonly detail?: string;
     };
 
 /**
@@ -2235,6 +2243,24 @@ export async function runCommitPushCompletionChecksV1(
   // push), so it's surfaced directly by executeCommitPushV1's own pre-check
   // instead of going through the failing-checks modal below, which is
   // reserved for lint/test failures.
+  // review1 Step 61: plan items still neither ticked nor excluded are listed once before anything runs or is
+  // committed. Stop commits nothing; no card when nothing is open.
+  if (
+    (await confirmOpenPlanItemsAtEndV1({
+      taskFolderUri: vscode.Uri.file(resolvedTask.taskFolderPath),
+      stage: "publish",
+      command: "Commit & Push",
+      token: op.token,
+    })) === "stop"
+  ) {
+    return {
+      ok: false,
+      reason: "userCancelled",
+      detail:
+        "Commit and push stopped: plan items are still open in plan-final.md. Nothing was staged, committed or pushed. " +
+        "Tick or exclude them (Tick or Exclude a Checklist Item…), then choose Commit & Push again.",
+    };
+  }
   let freshChecksRequired = false;
   // Set when the owner answers "Not now" to the run-the-checks card; nothing has run or changed.
   let checksRunDeclined = false;

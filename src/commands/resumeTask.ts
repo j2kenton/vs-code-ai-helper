@@ -3,6 +3,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { recordStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
 import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
+import { acquireWaitingForYoungHolderV1 } from "../utils/youngAdmissionHolderWaitV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import { clearEscalationRecordingPlateauOverrideV1, pauseTaskWithReason, setNextActorV1 } from "../utils/taskProgressTransforms";
@@ -12,7 +13,7 @@ import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { retirePendingQuestionsV1 } from "../utils/cardLifecycleV1";
-import { OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "../utils/ownerEvidenceV1";
+import { appendOwnerDecisionV1, OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "../utils/ownerEvidenceV1";
 import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
@@ -34,19 +35,32 @@ import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
 import { CancelRunningOperationsResultV1, runTrackedOperation, taskKey } from "../utils/taskOperations";
 import { clearApplyReviewFocusV1, setApplyReviewFocusV1 } from "../utils/applyReviewFocusV1";
+import {
+  clearApprovedFixRequestV1,
+  clearInvestigationRequestV1,
+  collectProtectedFilesV1,
+  describeOutOfPlanApprovalV1,
+  InvestigationRequestV1,
+  nextDiagnosisPathV1,
+  sanitizeApprovedFixFilesV1,
+  setApprovedFixRequestV1,
+  setInvestigationRequestV1,
+} from "../utils/investigateFailureV1";
 import { clearPendingEndedLineNoteV1, setPendingEndedLineNoteV1 } from "../utils/operationEndedLineV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
+import { confirmAdvanceOverOpenItemsV1 } from "./confirmAdvanceOverOpenItemsV1";
 import { loadResumeActionPlanV1, preflightFixedDispatchV1 } from "../utils/resumeActionPlanV1";
 import {
   FastForwardResumeStateV1,
   buildFastForwardResumeDispatchV1,
   decideDurableFastForwardResumeV1,
+  decideLedgerBackedFastForwardResumeV1,
   describeKeepIteratingStandInEndedNoteV1,
   isFastForwardResumeStateTrustedV1,
 } from "./fastForwardResumeSuffixV1";
-import { getFastForwardSessionIdV1 } from "../utils/activeFastForwardRunsV1";
+import { getFastForwardSessionIdV1, isFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
 import { getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
 
 /**
@@ -310,11 +324,15 @@ export async function resumePausedTask(
   // (`hasLiveWorkAdmissionBestEffortV1`), so the sweep now finds a task
   // under active protection instead of one that silently went active with
   // nothing running.
-  const admission = await acquireWorkAdmissionV1({
-    taskFolderPath: resolvedTask.taskFolderPath,
-    purpose: "admission",
-    commandId: "resumeTask",
-  });
+  // review1 Step 41: a refusal caused only by the task's own chain having started an operation seconds ago waits
+  // (bounded) for that operation instead of dropping this resume with a busy card.
+  const admission = await acquireWaitingForYoungHolderV1(() =>
+    acquireWorkAdmissionV1({
+      taskFolderPath: resolvedTask.taskFolderPath,
+      purpose: "admission",
+      commandId: "resumeTask",
+    })
+  );
   if (admission.outcome !== "acquired") {
     const busyRefusalWithTaskLabel = describeWorkAdmissionRefusalForUserV1(admission, taskLabel);
     // Recorded so a caller that dispatched this resume (the open-items form's
@@ -1009,6 +1027,17 @@ async function resumeCompletedTask(
   // success entry through operationNotificationBridge.
 }
 
+/** Options for `resumeAndRerunReviewV1`. The command is awaited for the whole review, so progress is signalled by callback. */
+export interface ResumeAndRerunReviewOptionsV1 {
+  /** RC4 item 3: `acceptPlanItemNarrowingV1` and the owner-evidence path pass this (review input changed, tree did not). */
+  readonly skipUnchangedTreeGuardV1?: true;
+  /**
+   * review1 Step 41: called once the resume has completed and the review is about to be dispatched, so a caller can tell
+   * the owner "re-running now" while the review runs, not after it has ended. In-process only.
+   */
+  readonly onDispatchingV1?: () => void;
+}
+
 /**
  * Resume a paused task and immediately re-dispatch its stage review — the
  * `WorkflowDecisionOptionEffectV1` shape only carries one command, and
@@ -1031,8 +1060,7 @@ export async function resumeAndRerunReviewV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ResumeTaskArg,
-  /** RC4 item 3: only `acceptPlanItemNarrowingV1` passes this (review input changed, tree did not). */
-  reviewOptionsV1?: { readonly skipUnchangedTreeGuardV1?: true }
+  reviewOptionsV1?: ResumeAndRerunReviewOptionsV1
 ): Promise<boolean> {
   // Resolved BEFORE the resume, from the same (possibly-cached) `inventory`
   // resumePausedTask itself resolves against — this is the target folder,
@@ -1075,6 +1103,11 @@ export async function resumeAndRerunReviewV1(
     explicitArg,
     target.taskFolderPath,
     async (admissionHandoffToken): Promise<void> => {
+      try {
+        reviewOptionsV1?.onDispatchingV1?.();
+      } catch {
+        // A status-line callback must never block the review dispatch.
+      }
       started =
         (await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
           taskFolderPath: target.taskFolderPath,
@@ -1097,9 +1130,9 @@ export async function resumeAndRerunReviewV1(
  *
  * Deliberately dispatches `runImplementationWithAI` rather than a specific
  * "continuation" vs "fresh implementation" command: that routing decision
- * (owed continuation vs Apply Review vs Implementation) already lives inside
- * `runImplementationWithAI` itself (`chooseAutomaticImplementationDispatchV1`
- * / the manual pre-run decision), so resuming and calling it once is
+ * (owed continuation vs the post-review Apply Review template vs the first-round Implementation template) already
+ * lives inside `runImplementationWithAI` itself (review1 Step 18: one dispatch, chosen by whether the stage has a
+ * current review), so resuming and calling it once is
  * sufficient to reach whichever action the escalation's reason actually
  * names — a second copy of that routing logic here would drift from it.
  *
@@ -1147,6 +1180,31 @@ export async function resumeAndDispatchImplementationV1(
         : {}),
     })
   );
+}
+
+/**
+ * review1 Step 49: the request a diagnostic round is given. The protected list is the task's own banked files
+ * (`implReviewFiles`); the diagnosis path is the next free `evidence/diagnosis-<n>.md`.
+ */
+async function buildInvestigationRequestV1(
+  taskFolderPath: string,
+  input: { failure: string; environmentReport: string }
+): Promise<InvestigationRequestV1> {
+  const folderUri = vscode.Uri.file(taskFolderPath);
+  const progress = await readTaskProgressStrictV1(folderUri);
+  const banked = progress.ok ? progress.decoded.progress.implReviewFiles : undefined;
+  let existing: string[] = [];
+  try {
+    existing = (await vscode.workspace.fs.readDirectory(vscode.Uri.joinPath(folderUri, "evidence"))).map(([name]) => name);
+  } catch {
+    // No evidence folder yet: the first diagnosis is number 1.
+  }
+  return {
+    failure: input.failure,
+    environmentReport: input.environmentReport,
+    protectedFiles: collectProtectedFilesV1(banked),
+    diagnosisPath: nextDiagnosisPathV1(existing),
+  };
 }
 
 /**
@@ -1200,6 +1258,18 @@ export async function resumeAndApplyCurrentStageActionV1(
      * dispatches works on this one blocker (its text) instead of on every task-fixable blocker.
      */
     focusBlocker?: string;
+    /**
+     * review1 Step 49: set ONLY by the environmental-failure card's "Investigate it for me" option. The Apply
+     * Review this dispatches is a diagnostic round (`investigate-failure.md`): it writes
+     * `evidence/diagnosis-<n>.md` and changes nothing else.
+     */
+    investigate?: { failure: string; environmentReport: string };
+    /**
+     * review1 Step 49: set ONLY by the diagnosis card's "Apply the suggested fix" option. The owner's choice is
+     * recorded in task.md as an owner-approved out-of-plan change, and the Apply Review this dispatches may edit
+     * only these files.
+     */
+    applyDiagnosisFix?: { diagnosisPath: string; files: string[]; failure: string };
   }
 ): Promise<void> {
   const resolverArg = normalizeResumeTaskArg(explicitArg);
@@ -1232,13 +1302,31 @@ export async function resumeAndApplyCurrentStageActionV1(
     const ffProgress = freshForFf.ok ? freshForFf.decoded.progress : target.progress;
     // A read of the stage, bound to a local so the one-door stage-write scan does not take it for a write.
     const { currentStage } = ffProgress;
-    const decision = decideDurableFastForwardResumeV1(resumeFastForwardCandidate, {
-      currentSessionId: getFastForwardSessionIdV1(),
-      status: ffProgress.status,
-      currentStage,
-      hasLiveOperation: getLiveTaskOperationV1(target.taskFolderPath) !== undefined,
-      latestRoundStartedAtMs: latestRoundStartedAtMsV1(ffProgress.roundLedger),
-    });
+    // review1 Step 32: the lost-round card names the lost round, whose ledger row carries the run's counters.
+    const lostRoundRow =
+      resumeFastForwardCandidate.fastForwardLedgerRoundIdV1 !== undefined
+        ? (ffProgress.roundLedger ?? []).find((row) => row.roundId === resumeFastForwardCandidate.fastForwardLedgerRoundIdV1)
+        : undefined;
+    const hasLiveOperation = getLiveTaskOperationV1(target.taskFolderPath) !== undefined;
+    const decision =
+      resumeFastForwardCandidate.fastForwardLedgerRoundIdV1 !== undefined
+        ? decideLedgerBackedFastForwardResumeV1(resumeFastForwardCandidate, {
+            status: ffProgress.status,
+            currentStage,
+            hasLiveOperation,
+            fastForwardRunLive: isFastForwardRunActiveV1(target.taskFolderPath),
+            lostRound: lostRoundRow
+              ? { startedAtMs: Date.parse(lostRoundRow.startedAt), hasFastForwardStamp: lostRoundRow.fastForwardRunV1 !== undefined }
+              : undefined,
+            latestRoundStartedAtMs: latestRoundStartedAtMsV1(ffProgress.roundLedger),
+          })
+        : decideDurableFastForwardResumeV1(resumeFastForwardCandidate, {
+            currentSessionId: getFastForwardSessionIdV1(),
+            status: ffProgress.status,
+            currentStage,
+            hasLiveOperation,
+            latestRoundStartedAtMs: latestRoundStartedAtMsV1(ffProgress.roundLedger),
+          });
     if (decision.trusted) {
       resumeFastForwardTrusted = true;
     } else {
@@ -1331,6 +1419,28 @@ export async function resumeAndApplyCurrentStageActionV1(
   if (explicitArg?.focusBlocker && plan.kind !== "run-review") {
     setApplyReviewFocusV1(target.taskFolderPath, explicitArg.focusBlocker);
   }
+  if (explicitArg?.investigate && plan.kind !== "run-review") {
+    setInvestigationRequestV1(
+      target.taskFolderPath,
+      await buildInvestigationRequestV1(target.taskFolderPath, explicitArg.investigate)
+    );
+  }
+  if (explicitArg?.applyDiagnosisFix && plan.kind !== "run-review") {
+    const files = sanitizeApprovedFixFilesV1(explicitArg.applyDiagnosisFix.files ?? []);
+    if (files.length === 0) {
+      NotificationRouter.showWarning(
+        `"${taskName}": the suggested fix names no file inside the workspace, so nothing was approved or run.`
+      );
+      return;
+    }
+    const approved = { diagnosisPath: explicitArg.applyDiagnosisFix.diagnosisPath, files, failure: explicitArg.applyDiagnosisFix.failure };
+    await appendOwnerDecisionV1(target.taskFolderPath, {
+      blockerId: "out-of-plan-fix",
+      blockerText: approved.failure.split("\n")[0] ?? "A failing check",
+      answer: describeOutOfPlanApprovalV1(approved),
+    }).catch(() => false);
+    setApprovedFixRequestV1(target.taskFolderPath, approved);
+  }
   try {
     dispatched = await resumeThenDispatchV1(
       inventory,
@@ -1357,6 +1467,8 @@ export async function resumeAndApplyCurrentStageActionV1(
   } finally {
     clearPendingEndedLineNoteV1(standInTaskKey);
     clearApplyReviewFocusV1(target.taskFolderPath);
+    clearInvestigationRequestV1(target.taskFolderPath);
+    clearApprovedFixRequestV1(target.taskFolderPath);
   }
   // A composed action that did not start its second step must not read as
   // success: both commands report refusal as `false`.
@@ -1458,6 +1570,15 @@ export async function resumeAndSetTaskStageV1(
   const stage = explicitArg.stage;
   const resumeFastForward = explicitArg.resumeFastForward === true;
   const expectedSourceStage = explicitArg.expectedSourceStage;
+  // review1 Step 57: the "Advance to Low-Level Code Review" card option is the same move as Complete Stage & Move
+  // On, so it asks the same question first while plan items are open. Declining changes nothing: the task is not
+  // resumed and the stage stays as it was.
+  if (
+    expectedSourceStage !== undefined &&
+    !(await confirmAdvanceOverOpenItemsV1(vscode.Uri.file(target.taskFolderPath), expectedSourceStage, stage))
+  ) {
+    return;
+  }
   // arrangeStageDispatch: false — this function dispatches setTaskStage
   // itself, below, which is a stage MOVE, not a rerun of the current stage's
   // action; a durably arranged current-stage action would be actively wrong
@@ -1816,7 +1937,7 @@ export function registerResumeTaskCommand(
 
   const resumeAndRerunReview = vscode.commands.registerCommand(
     "vs-code-ai-helper.resumeAndRerunReview",
-    (arg?: ResumeTaskArg, reviewOptionsV1?: { readonly skipUnchangedTreeGuardV1?: true }) =>
+    (arg?: ResumeTaskArg, reviewOptionsV1?: ResumeAndRerunReviewOptionsV1) =>
       resumeAndRerunReviewV1(inventory, currentTaskStore, arg, reviewOptionsV1)
   );
   context.subscriptions.push(resumeAndRerunReview);

@@ -30,7 +30,6 @@ import {
 } from "../services/providerSelectionPolicyV1";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { AgentExecutionModeV1 } from "../types/agentExecutionV1";
-
 function installModelSettings(raw: Record<string, unknown>): { restore: () => void } {
   const original = (vscode.workspace as unknown as Record<string, unknown>).getConfiguration;
   (vscode.workspace as unknown as Record<string, unknown>).getConfiguration = (): {
@@ -63,6 +62,7 @@ function openSelection(options: {
   mode: AgentExecutionModeV1;
   modelId: string | undefined;
   requireSummaryOnlyCapableText?: boolean;
+  requireReadOnlyText?: boolean;
   restrictToPrimaryModel?: boolean;
 }): ReturnType<typeof openV1RunnerSelection> {
   return openV1RunnerSelection({
@@ -72,6 +72,7 @@ function openSelection(options: {
     stage: "impl-high-review",
     workspaceCwd: "/workspace",
     requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
+    requireReadOnlyText: options.requireReadOnlyText,
     restrictToPrimaryModel: options.restrictToPrimaryModel,
   });
 }
@@ -378,6 +379,59 @@ void describe("openV1RunnerSelection", () => {
    * place of a summary-only-capable primary would defeat the guarantee the
    * caller opted into `requireSummaryOnlyCapableText` for.
    */
+  // review1 Step 49 (owner decision 2026-11-05): the diagnostic round needs vendor-enforced read-only only. Claude's plan
+  // mode qualifies (it does not for summary-only, which also needs an honoured response contract); a provider whose
+  // text mode auto-approves tools is skipped for the next model in the chain that can enforce it.
+  void it("requireReadOnlyText accepts Claude plan mode, skips a write-capable provider, and uses the next read-only model", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "cline-cli:pass",
+        backups: ["claude-cli:sonnet"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({ session, mode: "text", modelId: "cline-cli:pass", requireReadOnlyText: true });
+      const first = selection.reserveNext(session.allocateAttempt());
+      assert.equal(first.kind, "candidateUnavailable");
+      if (first.kind === "candidateUnavailable") {
+        assert.equal(first.code, "providerModeUnavailable");
+        assert.equal(first.runnerId, "cline-cli");
+      }
+      const second = selection.reserveNext(session.allocateAttempt());
+      assert.equal(second.kind, "reserved");
+      if (second.kind === "reserved") {
+        assert.equal(second.reserved.handle.runnerId, "claude-cli");
+      }
+    } finally {
+      stub.restore();
+    }
+  });
+
+  void it("requireReadOnlyText with only write-capable models in the chain reserves nothing", () => {
+    const stub = installModelSettings({
+      "impl-high-review": {
+        primary: "cline-cli:pass",
+        backups: ["antigravity-cli:flash"],
+        strategy: "switch-to-backup",
+      },
+    });
+    try {
+      const session = openSession();
+      const selection = openSelection({ session, mode: "text", modelId: "cline-cli:pass", requireReadOnlyText: true });
+      const seen: string[] = [];
+      for (let i = 0; i < 4; i++) {
+        const next = selection.reserveNext(session.allocateAttempt());
+        seen.push(next.kind);
+        if (next.kind === "noneRemaining" || next.kind === "reserved") break;
+      }
+      assert.ok(!seen.includes("reserved"), seen.join(","));
+    } finally {
+      stub.restore();
+    }
+  });
+
   void it("requireSummaryOnlyCapableText skips a write-capable backup and reserves the next summary-only-capable candidate", () => {
     const stub = installModelSettings({
       "impl-high-review": {

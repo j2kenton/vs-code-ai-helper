@@ -26,9 +26,26 @@ export function hasNarrowingPrefixV1(description: string): boolean {
   return NARROWING_PREFIX_RE.test(description.trim());
 }
 
+// A source file named the way a reviewer can open it: a path with an extension, or a file name with a line number.
+const CODE_REFERENCE_RE =
+  /(?:[\w.-]+\/)+[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|json|md|ya?ml|css|html|py|go|rs|java|sh)\b|\b[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|json|py|go|rs|java|sh):\d+/i;
+const CHECKLIST_LINE_RE = /^[ \t]*(?:[-*]|\d+[.)])[ \t]+\[[ xX]\]/m;
+
 const NO_REASON_TEXT = "The round left no reason on file.";
 const NO_EVIDENCE_TEXT = "No evidence on file; the blocker text above is all the reviewer recorded.";
 const EVIDENCE_CAP = 600;
+
+/**
+ * review1 Step 38 (owner, 2026-11-05; bugs6 item 19): a narrowing is checked only when the round left a reason on
+ * file AND there is evidence for it. "The round left no reason on file" with no evidence is a request nobody has
+ * backed, so "Accept this narrowing" is never recommended for it.
+ */
+export function narrowingReasonIsCheckedV1(narrowing: {
+  readonly reasonSource: string;
+  readonly evidenceSource: string;
+}): boolean {
+  return narrowing.reasonSource !== "none" && narrowing.evidenceSource !== "none";
+}
 
 export type NarrowingSourceV1 =
   | "the round's refused checklist rewording"
@@ -148,10 +165,15 @@ export function findNarrowingBlockerV1(
   const itemTicked = checked.has(norm(itemText));
 
   const tokens = [...backtickedSpans(itemText), ...backtickedSpans(blockerText)];
+  // An echoed checklist line is the plan talking, not the round: it is neither a reason nor evidence.
   const paragraphs = (implSummary ?? "")
     .split(/\n\s*\n/)
     .map((p) => p.trim())
-    .filter((p) => p.length > 0 && tokens.some((t) => p.includes(t)));
+    .filter((p) => p.length > 0 && !CHECKLIST_LINE_RE.test(p) && tokens.some((t) => p.includes(t)));
+  // Evidence is a code reference the paragraph adds itself: a path that only appears inside the item's or the
+  // blocker's own wording does not count.
+  const ownText = (p: string): string => p.split(itemText).join(" ").split(blockerText).join(" ");
+  const evidenceParagraphs = paragraphs.filter((p) => CODE_REFERENCE_RE.test(ownText(p)));
 
   let reason = NO_REASON_TEXT;
   let reasonSource: NarrowingSourceV1 = "none";
@@ -169,8 +191,8 @@ export function findNarrowingBlockerV1(
 
   let evidence = NO_EVIDENCE_TEXT;
   let evidenceSource: NarrowingSourceV1 = "none";
-  if (paragraphs.length > 0) {
-    const joined = paragraphs.join("\n\n");
+  if (evidenceParagraphs.length > 0) {
+    const joined = evidenceParagraphs.join("\n\n");
     evidence = joined.length > EVIDENCE_CAP ? `${joined.slice(0, EVIDENCE_CAP - 1)}…` : joined;
     evidenceSource = "impl-summary.md";
   }

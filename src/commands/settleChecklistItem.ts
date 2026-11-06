@@ -10,11 +10,20 @@ import { getCanonicalImplementationUri } from "../utils/implementationArtifactRe
 import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import {
   classifyUncheckedChecklistItemsV1,
+  getPlanRevisionV1,
+  listPlanItemContentHashesV1,
+  listProvisionalTickedItemsV1,
+  normalizeChecklistItemTextV1,
   settleChecklistItemV1,
   truncateChecklistItemTextV1,
 } from "../utils/implementationChecklist";
+import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { recordPlanItemOwnerDecisionV1 } from "../utils/taskProgressTransforms";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
+import { postStageReadyCardIfReadyV1 } from "./automationStoppedCardV1";
+import { refreshPlanItemSettlementSnapshotV1 } from "./planItemSettlementNoticeV1";
 
 /**
  * "Settle a checklist item by hand" (RC1 item 8): tick or exclude ONE item of
@@ -38,11 +47,83 @@ export type SettleChecklistItemArgV1 =
 
 export type SettleChecklistItemOutcomeV1 =
   | { readonly kind: "settled"; readonly itemText: string }
+  /** review1 Step 7: a ticked item awaiting a check was settled by recording the owner's tick (the line is untouched). */
+  | { readonly kind: "ownerTickRecorded"; readonly itemText: string }
+  /** review1 Step 7: the item is ticked and a reviewer or the owner already settled it. */
+  | { readonly kind: "alreadySettled"; readonly itemText: string }
   | { readonly kind: "noPlan" }
   | { readonly kind: "notFound" }
   | { readonly kind: "changedUnderneath" };
 
-/** Re-reads the plan and settles the one item. Everything is re-derived from disk. */
+/** The message for an outcome that settled nothing, saying why (review1 Step 7). */
+export function describeUnsettledOutcomeV1(taskName: string, outcome: SettleChecklistItemOutcomeV1): string {
+  switch (outcome.kind) {
+    case "notFound":
+      return `${taskName}: that item is not in plan-final.md as it was listed (it was settled, reworded or removed since), so nothing was changed.`;
+    case "alreadySettled":
+      return `${taskName}: “${truncateChecklistItemTextV1(outcome.itemText, 100)}” is already settled by a review or by you, so nothing was changed.`;
+    case "noPlan":
+      return `${taskName}: plan-final.md could not be read, so no item was settled.`;
+    case "changedUnderneath":
+      return `${taskName}: plan-final.md changed while this was being applied — nothing was written. Try again.`;
+    default:
+      return `${taskName}: nothing was changed.`;
+  }
+}
+
+/** Records the owner's row for an item, best effort: the plan line is already written when this runs. */
+async function recordOwnerSettlementV1(
+  taskFolderPath: string,
+  plan: string,
+  itemText: string,
+  decision: "tick" | "exclude"
+): Promise<void> {
+  const at = new Date().toISOString();
+  const planRevision = getPlanRevisionV1(plan);
+  await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (progress) =>
+    recordPlanItemOwnerDecisionV1(progress, { planRevision, planText: plan, itemText, at, formId: `settle:${at}`, decision })
+  ).catch(() => undefined);
+  // review1 Step 8: the owner's settlement changed the count, so the stored snapshot (and any "sent back" note on
+  // the Tasks tooltip) follows it.
+  await refreshPlanItemSettlementSnapshotV1(vscode.Uri.file(taskFolderPath));
+}
+
+/**
+ * review1 Step 7: settles a ticked item that only a model has claimed by recording the owner's tick (an owner
+ * decision row with the item's content hash). The plan line is not rewritten: the box is already ticked.
+ */
+export async function applyOwnerTickToProvisionalItemV1(
+  taskFolderPath: string,
+  itemText: string
+): Promise<SettleChecklistItemOutcomeV1> {
+  const folderUri = vscode.Uri.file(taskFolderPath);
+  const plan = await readTextIfExists(getCanonicalImplementationUri(folderUri));
+  if (plan === undefined) {
+    return { kind: "noPlan" };
+  }
+  const read = await readTaskProgressStrictV1(folderUri);
+  const progress = read.ok ? read.decoded.progress : undefined;
+  const key = normalizeChecklistItemTextV1(itemText);
+  const entry = listPlanItemContentHashesV1(plan).find((candidate) => !candidate.nested && candidate.key === key);
+  if (!entry || !entry.checked || entry.excluded) {
+    return { kind: "notFound" };
+  }
+  const provisional = listProvisionalTickedItemsV1(plan, progress?.planItemEvidence ?? [], progress?.planItemOwnerDecisions ?? []);
+  if (!provisional.some((item) => normalizeChecklistItemTextV1(item.text) === key)) {
+    return { kind: "alreadySettled", itemText: entry.text };
+  }
+  await recordOwnerSettlementV1(taskFolderPath, plan, entry.text, "tick");
+  // review1 Step 31: if that was the last open item and the review is clean, say so at once.
+  void postStageReadyCardIfReadyV1(taskFolderPath, "After your tick");
+  return { kind: "ownerTickRecorded", itemText: entry.text };
+}
+
+/**
+ * Re-reads the plan and settles the one item. Everything is re-derived from disk. An unticked item is ticked or
+ * excluded in the plan and the owner's decision is recorded (review1 Step 7: today the command wrote only the
+ * plan, so the gate could not tell an owner tick from a model's); a ticked item awaiting a check records the
+ * owner's tick without rewriting the line.
+ */
 export async function applySettleChecklistItemV1(
   taskFolderPath: string,
   itemText: string,
@@ -56,11 +137,15 @@ export async function applySettleChecklistItemV1(
   }
   const { content, settledItemText } = settleChecklistItemV1(plan, itemText, mode, note);
   if (settledItemText === undefined) {
-    return { kind: "notFound" };
+    // Not an unticked item: a ticked item still awaiting a check is settled by the owner's tick.
+    return mode === "tick" ? applyOwnerTickToProvisionalItemV1(taskFolderPath, itemText) : { kind: "notFound" };
   }
   if (!(await writeTextFileIfUnchangedV1(planUri, plan, content))) {
     return { kind: "changedUnderneath" };
   }
+  // The text as written now carries the settle note; the owner row is keyed to the item's content, not the note.
+  await recordOwnerSettlementV1(taskFolderPath, content, settledItemText, mode);
+  void postStageReadyCardIfReadyV1(taskFolderPath, mode === "tick" ? "After your tick" : "After your exclusion");
   return { kind: "settled", itemText: settledItemText };
 }
 
@@ -96,10 +181,19 @@ export async function settleChecklistItem(
   }
   const classified = classifyUncheckedChecklistItemsV1(plan);
   const unchecked = [...classified.buildable, ...classified.handoff];
-  if (unchecked.length === 0) {
+  // review1 Step 7: ticked items still awaiting a check can be settled by the owner here too.
+  const progressRead = await readTaskProgressStrictV1(vscode.Uri.file(resolved.taskFolderPath));
+  const awaitingCheck = listProvisionalTickedItemsV1(
+    plan,
+    progressRead.ok ? progressRead.decoded.progress.planItemEvidence ?? [] : [],
+    progressRead.ok ? progressRead.decoded.progress.planItemOwnerDecisions ?? [] : []
+  ).map((item) => item.text);
+  if (unchecked.length === 0 && awaitingCheck.length === 0) {
     NotificationRouter.showInformation(`${taskName}: every checklist item is already settled.`);
     return false;
   }
+  const pickable = [...unchecked, ...awaitingCheck];
+  const awaitingKeys = new Set(awaitingCheck.map(normalizeChecklistItemTextV1));
 
   const target = {
     canonicalId: resolved.canonicalId,
@@ -115,18 +209,39 @@ export async function settleChecklistItem(
       target,
       whatHappened: `Settle a checklist item — ${taskName}`,
       whyUserNeeded: "Choose the item to settle by hand.",
-      options: unchecked.map((text, index) => ({
-        optionId: `item-${index}`,
-        label: truncateChecklistItemTextV1(text, 120),
-        consequence: "Selects this checklist item to tick or exclude.",
-      })),
+      options: pickable.map((text, index) => {
+        const awaiting = awaitingKeys.has(normalizeChecklistItemTextV1(text)) && index >= unchecked.length;
+        return {
+          optionId: `item-${index}`,
+          label: awaiting
+            ? `Ticked, awaiting check — ${truncateChecklistItemTextV1(text, 100)}`
+            : truncateChecklistItemTextV1(text, 120),
+          consequence: awaiting
+            ? "Selects this ticked item. Its box is already ticked; you record that you checked it, and the plan line is not changed."
+            : "Selects this checklist item to tick or exclude.",
+        };
+      }),
       detail: "Answering selects the checklist item to settle.",
     });
-    const itemIndex = chosenItem === undefined ? -1 : unchecked.findIndex((_t, i) => `item-${i}` === chosenItem);
+    const itemIndex = chosenItem === undefined ? -1 : pickable.findIndex((_t, i) => `item-${i}` === chosenItem);
     if (itemIndex < 0) {
       return false;
     }
-    itemText = unchecked[itemIndex]!;
+    itemText = pickable[itemIndex]!;
+  }
+
+  // A ticked item awaiting a check has one way to settle: record that the owner checked it.
+  if (awaitingKeys.has(normalizeChecklistItemTextV1(itemText)) && !unchecked.some((text) => normalizeChecklistItemTextV1(text) === normalizeChecklistItemTextV1(itemText))) {
+    const recorded = await applyOwnerTickToProvisionalItemV1(resolved.taskFolderPath, itemText);
+    if (recorded.kind === "ownerTickRecorded") {
+      await inventory.refresh();
+      NotificationRouter.showInformation(
+        `${taskName}: recorded your tick for “${truncateChecklistItemTextV1(recorded.itemText, 100)}”. The plan line is unchanged.`
+      );
+      return true;
+    }
+    NotificationRouter.showInformation(describeUnsettledOutcomeV1(taskName, recorded));
+    return false;
   }
 
   let mode = explicit?.mode;
@@ -179,16 +294,19 @@ export async function settleChecklistItem(
         `${taskName}: ${mode === "tick" ? "ticked" : "excluded"} “${truncateChecklistItemTextV1(outcome.itemText, 100)}” in plan-final.md.`
       );
       return true;
-    case "notFound":
+    case "ownerTickRecorded":
+      await inventory.refresh();
       NotificationRouter.showInformation(
-        `${taskName}: that item is already settled, or plan-final.md has changed since it was listed.`
+        `${taskName}: recorded your tick for “${truncateChecklistItemTextV1(outcome.itemText, 100)}”. The plan line is unchanged.`
       );
-      return false;
+      return true;
     case "noPlan":
-      NotificationRouter.showWarning(`${taskName}: plan-final.md could not be read, so no item was settled.`);
-      return false;
     case "changedUnderneath":
-      NotificationRouter.showWarning(`${taskName}: plan-final.md changed while this was being applied — nothing was written. Try again.`);
+      NotificationRouter.showWarning(describeUnsettledOutcomeV1(taskName, outcome));
+      return false;
+    case "notFound":
+    case "alreadySettled":
+      NotificationRouter.showInformation(describeUnsettledOutcomeV1(taskName, outcome));
       return false;
   }
 }

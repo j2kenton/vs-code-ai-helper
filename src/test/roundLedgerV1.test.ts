@@ -35,6 +35,7 @@ import {
   resolveRoundV1,
   upsertRoundLedgerEntryV1,
 } from "../utils/taskProgressTransforms";
+import { clearFastForwardRunActiveV1, markFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
 import {
   __resetPendingAutomationRoundIntentsForTestV1,
   AttachCoordinatorIdentityErrorV1,
@@ -3003,6 +3004,47 @@ void describe("claimImplementationRoundLedgerV1 (Part 4 architectural fix, 2026-
       assert.equal(raw.roundLedger?.[0]?.roundId, "prompt-round-1");
       assert.equal(raw.roundLedger?.[0]?.state, "open");
       assert.equal(raw.roundLedger?.[0]?.intentId, undefined, "a manual claim has no intentId to attach");
+    } finally {
+      wsStub.restore();
+      fsBridge.restore();
+    }
+  });
+
+  void it("stamps the row with the live Fast Forward run's counters, and only while a run is live (review1 Step 32)", async () => {
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    __resetPendingAutomationRoundIntentsForTestV1();
+    try {
+      const folderPath = path.join(REAL_ROOT, "plans", "claim_impl_round_ff_stamp");
+      fs.mkdirSync(folderPath, { recursive: true });
+      const progress: TaskProgress & { ensembleProgressVersion: 1 } = {
+        ensembleProgressVersion: 1,
+        taskFolder: "claim_impl_round_ff_stamp",
+        currentStage: "impl",
+        status: "active",
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        ownership: {
+          metaRoot: path.join(REAL_ROOT, "plans"),
+          projectRoot: REAL_ROOT,
+          workspaceRoot: REAL_ROOT,
+          boundAt: "2026-01-01T00:00:00.000Z",
+        },
+      };
+      fs.writeFileSync(path.join(folderPath, "task-progress.json"), JSON.stringify(progress, null, 2), "utf8");
+      const folderUri = vscode.Uri.file(folderPath);
+
+      await claimImplementationRoundLedgerV1(folderUri, "plain-round", "impl", "apply-review");
+      markFastForwardRunActiveV1(folderPath, { attemptNumber: 3, maxAttempts: 10 });
+      try {
+        await claimImplementationRoundLedgerV1(folderUri, "ff-round", "impl", "apply-review");
+      } finally {
+        clearFastForwardRunActiveV1(folderPath);
+      }
+
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.find((row) => row.roundId === "plain-round")?.fastForwardRunV1, undefined);
+      assert.deepEqual(raw.roundLedger?.find((row) => row.roundId === "ff-round")?.fastForwardRunV1, { attemptNumber: 3, maxAttempts: 10 });
     } finally {
       wsStub.restore();
       fsBridge.restore();

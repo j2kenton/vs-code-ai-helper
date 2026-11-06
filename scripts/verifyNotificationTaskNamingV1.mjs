@@ -54,10 +54,11 @@ const NOTIFICATION_CALL_TAIL =
  * Identifiers that, inside the call's own text, mean the task is named:
  * either exactly one of these words, or any identifier ending in one of
  * them (a file-local helper like `commitPushTaskLabel(resolvedTask)` still
- * names the task even though the bare word doesn't appear on its own).
+ * names the task even though the bare word doesn't appear on its own), with an
+ * optional version suffix (`earlyRefusalTaskNameV1(folderPath)`).
  */
 const TASK_NAME_PATTERN =
-  /\b[A-Za-z_$]*(?:displayName|taskName|taskLabel|taskTitle|folderName|formatTaskNameForDisplay|notificationTaskDisplayNameV1|taskDisplayName)\b/i;
+  /\b[A-Za-z_$]*(?:displayName|taskName|taskLabel|taskTitle|folderName|formatTaskNameForDisplay|notificationTaskDisplayNameV1|taskDisplayName)(?:V\d+)?\b/i;
 
 const SNIPPET_MAX_CHARS = 160;
 

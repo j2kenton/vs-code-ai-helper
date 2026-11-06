@@ -57,6 +57,24 @@ export function resolveClaimCancelTargetV1(
   return { kind: "operation", operationId };
 }
 
+/** review1 Step 41: a hold that started within this window is not offered as "Cancel is the next step". */
+const RECENT_HOLD_WINDOW_MS_V1 = 60_000;
+
+/** True when the claim holding the task started within the last minute (whoever started it). */
+export function isRecentlyStartedHoldV1(outcome: WorkAdmissionBusyV1, now: number = Date.now()): boolean {
+  const startedAtMs = outcome.owner ? Date.parse(outcome.owner.startedAt) : Number.NaN;
+  return Number.isFinite(startedAtMs) && now - startedAtMs >= 0 && now - startedAtMs <= RECENT_HOLD_WINDOW_MS_V1;
+}
+
+/**
+ * The card's "why you are asked" line for a hold that has only just started. The generic line says the
+ * Cancel action "is the next step", which for an action started seconds ago (often by the owner's own click) sends
+ * the owner to stop the very thing they asked for.
+ */
+export function describeRecentHoldWhyV1(label: string): string {
+  return `${label} only just started, so waiting for it is the usual next step. Cancel it only if you did not mean to run it.`;
+}
+
 /** Test seam: forget the recent-offer memory. */
 export function resetBusyRefusalOffersForTestV1(): void {
   recentBusyOffersV1.clear();
@@ -107,6 +125,7 @@ export async function offerBusyRefusalChoicesInChatV1(
   const pointer = await offerActionInChatV1({
     taskFolderPath,
     actionLabel: `Cancel ${label}`,
+    ...(isRecentlyStartedHoldV1(outcome, now) ? { whyUserNeeded: describeRecentHoldWhyV1(label) } : {}),
     command: "vs-code-ai-helper.cancelOperation",
     args: [cancelArgs],
     actionResumeKind: "unpause",

@@ -76,11 +76,16 @@ void describe("describeOversizedInputRemedyV1", () => {
 
 void describe("review pre-dispatch abort (source wiring)", () => {
   const source = fs.readFileSync(path.join(process.cwd(), "src", "commands", "reviewActions.ts"), "utf8");
-  const start = source.indexOf("if (oversizedAfterShrink) {");
+  const start = source.indexOf("if (oversizedAfterShrink || codeShareRefusedNonCodeBytes !== undefined) {");
   const block = source.slice(start, start + 6500);
 
-  void it("rebuilds the pack at most once before failing", () => {
-    assert.match(source, /maxTotalChars = shrinkFloorChars;/);
+  void it("measures with the code at its floor, builds with the derived budget, retries once scaled, then fails (review1 Step 59)", () => {
+    assert.match(source, /let measured = await buildAndMeasure\(shrinkFloorChars, taskDescriptionMaxChars\);/);
+    assert.match(source, /if \(measured > MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1\) \{\s*oversizedAfterShrink = true;/);
+    assert.match(source, /measured = await buildAndMeasure\(plan\.codeBudgetChars, taskDescriptionMaxChars\);/);
+    assert.match(source, /shrinkImplReviewCodeBudgetV1\(/);
+    assert.match(source, /measured = await buildAndMeasure\(scaled, taskDescriptionMaxChars\);\s*oversizedAfterShrink = /);
+    assert.ok(start >= 0, "the abort block is found");
     assert.ok(!source.includes("maxShrinkAttempts = 64;\n    for (let attempt = 0; ; attempt++) {\n      const written"));
   });
 

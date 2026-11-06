@@ -132,8 +132,11 @@ export function buildPartialScopeDecisionInputV1(options: {
   scope: PartialReviewScopeV1;
   score: number | null;
   threshold: number;
+  /** Whether the score would clear the stage if the whole change had been reviewed. Defaults to true. */
+  scoreClears?: boolean;
 }): PostWorkflowDecisionInputV1 {
   const { taskFolderPath, stage, scope, score, threshold } = options;
+  const scoreClears = options.scoreClears !== false;
   const canonicalId = normalizePath(taskFolderPath);
   const arg = (action: ResolvePartialReviewScopeArgV1["action"]): ResolvePartialReviewScopeArgV1 => ({
     taskFolderPath,
@@ -148,7 +151,10 @@ export function buildPartialScopeDecisionInputV1(options: {
     stage,
     whatHappened:
       `This review scored ${score ?? "unscored"}/10 (threshold ${threshold}), but it was not shown the whole change. ` +
-      `${scope.summary}. The stage was not advanced.`,
+      `${scope.summary}. ` +
+      (scoreClears
+        ? "The stage was not advanced."
+        : "Whatever the score, it says nothing about the files it was not shown, so the stage cannot clear until they are reviewed or accepted."),
     whyUserNeeded:
       `${scope.missingCount} changed file(s) were never part of the review, so a high score says nothing about them. ` +
       "Either they should be reviewed, or you accept that they are not.",
@@ -198,6 +204,7 @@ export async function postPartialScopeDecisionV1(options: {
   scope: PartialReviewScopeV1;
   score: number | null;
   threshold: number;
+  scoreClears?: boolean;
 }): Promise<WorkflowDecisionV1 | undefined> {
   const canonicalId = normalizePath(options.taskFolderPath);
   return postWorkflowDecisionV1(buildPartialScopeDecisionInputV1(options), {

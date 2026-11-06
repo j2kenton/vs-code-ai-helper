@@ -8,7 +8,9 @@
  *   `[completion]` blockers. The grouped unbuilt-steps blocker stays a single blocker
  *   until the last step is built, so this number is the only way to see it narrow.
  */
-import { countChecklistEvidenceProgressV1, listStepNumbersNamedInTextV1 } from "./implementationChecklist";
+import type { TaskProgress } from "../types/taskProgress";
+import { computePlanItemCountsV1 } from "./effectiveReviewProgress";
+import { listStepNumbersNamedInTextV1 } from "./implementationChecklist";
 
 export interface ChurnProgressSignalsV1 {
   readonly settledItemCount?: number;
@@ -17,18 +19,18 @@ export interface ChurnProgressSignalsV1 {
 
 export function computeChurnProgressSignalsV1(input: {
   readonly planOfRecord: string | undefined;
-  readonly planItemEvidence: Parameters<typeof countChecklistEvidenceProgressV1>[1] | undefined;
-  readonly planItemOwnerDecisions: Parameters<typeof countChecklistEvidenceProgressV1>[2] | undefined;
+  readonly planItemEvidence: TaskProgress["planItemEvidence"] | undefined;
+  readonly planItemOwnerDecisions: TaskProgress["planItemOwnerDecisions"] | undefined;
   readonly blockers: readonly { readonly category: string; readonly resolver: string; readonly description: string }[];
 }): ChurnProgressSignalsV1 {
+  // review1 Step 5: the settled count is the shared counter's, not a private copy of the gate.
   const progress =
     input.planOfRecord === undefined
       ? undefined
-      : countChecklistEvidenceProgressV1(
-          input.planOfRecord,
-          input.planItemEvidence ?? [],
-          input.planItemOwnerDecisions ?? []
-        );
+      : computePlanItemCountsV1({
+          planText: input.planOfRecord,
+          progress: { planItemEvidence: input.planItemEvidence, planItemOwnerDecisions: input.planItemOwnerDecisions },
+        });
   const named = new Set<number>();
   for (const blocker of input.blockers) {
     if (blocker.category === "completion" && blocker.resolver === "task-fixable") {
@@ -38,7 +40,7 @@ export function computeChurnProgressSignalsV1(input: {
     }
   }
   return {
-    ...(progress ? { settledItemCount: progress.gate.settled } : {}),
+    ...(progress ? { settledItemCount: progress.settled } : {}),
     ...(named.size > 0 ? { unbuiltStepCount: named.size } : {}),
   };
 }

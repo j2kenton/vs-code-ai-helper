@@ -2367,7 +2367,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     const { decision } = await postNarrowingCard(
       "narrowing-card-prefix",
       `Narrowing needs an owner decision: \`${NARROW_ITEM}\` — b.test.ts was not updated`,
-      { summary: "`b.test.ts` never references the feature, so there was nothing to update.\n\nUnrelated paragraph." }
+      { summary: "`b.test.ts` never references the feature (searched src/test/b.test.ts:1-80), so there was nothing to update.\n\nUnrelated paragraph." }
     );
     assert.ok(decision);
     const labels = decision.evidence?.map((e) => e.label) ?? [];
@@ -2525,7 +2525,9 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     const clears = decision.evidence?.find((e) => e.label === "What clears this")?.detail ?? "";
     assert.doesNotMatch(clears, /Accept this narrowing|Keep the item open/);
     assert.match(clears, /Accepted Non-Goals/);
-    assert.equal(recommended(decision), "handleMyself");
+    // review1 Step 38: "Change the plan instead" opens the file the decision is recorded in; "Leave it paused"
+    // does nothing, so it is not recommended while that option exists.
+    assert.equal(recommended(decision), "reconsiderRequirement");
   });
 
   void it("an unlocatable narrowing plus another environmental blocker never names the narrowing options", async () => {
@@ -2546,7 +2548,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     assert.doesNotMatch(text, /Accept this narrowing|Keep the item open/);
   });
 
-  void it("the Box C shape (owner evidence plus an unlocatable narrowing) recommends leaving it paused, never Advance", async () => {
+  void it("the Box C shape (owner evidence plus an unlocatable narrowing) recommends changing the plan, never Advance", async () => {
     const decision = await postRc7Card(
       "rc7-box-c",
       "plan-high-review",
@@ -2561,7 +2563,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       0
     );
     assert.ok(decision);
-    assert.equal(recommended(decision), "handleMyself");
+    assert.equal(recommended(decision), "reconsiderRequirement");
   });
 
   void it("a mixed plan-review plateau recommends Accept and still names the owner-evidence action", async () => {
@@ -2578,10 +2580,12 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     );
     assert.ok(decision);
     assert.ok(decision.options.some((o) => o.optionId === "acceptNarrowing"));
-    assert.equal(recommended(decision), "acceptNarrowing");
+    // review1 Step 38 (owner, 2026-11-05): this review left no reason or evidence for the narrowing, so accepting it
+    // is not recommended; at a plan stage the way on is changing the plan.
+    assert.equal(recommended(decision), "reconsiderRequirement");
     assert.match(
       (decision.recommendation as { reasoning?: string }).reasoning ?? "",
-      /Every remaining blocker clears only through an owner decision/
+      /no reason or evidence on file/
     );
     const clears = decision.evidence?.find((e) => e.label === "What clears this")?.detail ?? "";
     assert.match(clears, /Accept this narrowing/);
@@ -2709,7 +2713,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     store.set(vscode.Uri.joinPath(folderUri, "plan-final.md").toString(), NARROW_PLAN);
     store.set(
       vscode.Uri.joinPath(folderUri, "impl-summary.md").toString(),
-      "`b.test.ts` never references the feature, so there was nothing to update."
+      "`b.test.ts` never references the feature (searched src/test/b.test.ts:1-80), so there was nothing to update."
     );
     const content = [
       "Readiness: 6/10",
@@ -2764,7 +2768,7 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
     );
     store.set(
       vscode.Uri.joinPath(folderUri, "impl-summary.md").toString(),
-      "`b.test.ts` never references the feature, so there was nothing to update."
+      "`b.test.ts` never references the feature (searched src/test/b.test.ts:1-80), so there was nothing to update."
     );
     const content = [
       "Readiness: 6/10",
@@ -2842,12 +2846,18 @@ void describe("escalateReviewToHuman — reviewPlateauEvidence posts a WorkflowD
       });
       assert.strictEqual(escalated, true, "escalates on the first review when all blockers holding score need owner");
       assert.strictEqual(readProgress(store, folderUri).status, "paused");
-      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
-        .listPending()
-        .find((d) => d.decisionKey === "reviewPlateauEscalation");
-      assert.ok(decision, "plateau escalation card is posted");
+      // review1 Step 37: one card per owner-only blocker. The review wrote a decision block, so the
+      // owner-decision card is the question and no second plateau card asks it again.
+      const pending = new WorkflowDecisionStoreV1(context.workspaceState).listPending();
+      assert.equal(
+        pending.some((d) => d.decisionKey === "reviewPlateauEscalation"),
+        false,
+        "no second plateau card for a blocker the owner-decision card already asks about"
+      );
+      const decision = pending.find((d) => d.decisionKey === "ownerPlanDecision:step-6-admission");
+      assert.ok(decision, "the owner-decision card is posted");
       assert.ok(
-        decision.options.some((o) => o.optionId === "handleMyself" || o.optionId === "changePlan"),
+        decision.options.some((o) => o.optionId === "approve" || o.optionId === "buildToken"),
         "card options include owner resolution"
       );
     } finally {
@@ -2955,8 +2965,8 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
       const optionIds = decision.options.map((option) => option.optionId);
       assert.deepEqual(
         optionIds,
-        ["acknowledgeAdvance", "handleMyself", "publishAnyway"],
-        "must offer all three exits named in Part 4: advance anyway, fix it yourself, Publish Anyway"
+        ["acknowledgeAdvance", "handleMyself"],
+        "review1 Step 38 (owner decision 2026-11-04): the Publish override is not offered before the Publish stage"
       );
       assert.deepEqual(decision.options.find((o) => o.optionId === "acknowledgeAdvance")?.effect, {
         kind: "command",
@@ -2975,6 +2985,26 @@ void describe("postEnvironmentalAdvanceNoticeV1 — B4's advance-with-note notic
         command: "vs-code-ai-helper.openPlanFinal",
         args: [{ taskFolderPath: "/tmp/task1" }],
       });
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("review1 Step 38: at the Publish stage the notice still offers publishAnyway, which opens commitAndPushTask", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      const posted = await postEnvironmentalAdvanceNoticeV1(
+        vscode.Uri.file("/tmp/task1"),
+        "publish",
+        [{ category: "completion", resolver: "environmental", description: "Root test run stays red because workspace-local configuration is loaded" }],
+        { canonicalId: "c1", taskFolderPath: "/tmp/task1", taskName: "jester" }
+      );
+      assert.strictEqual(posted, true);
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending()
+        .find((candidate) => candidate.decisionKey === "environmentalAdvanceNotice");
+      assert.ok(decision);
       assert.deepEqual(decision.options.find((o) => o.optionId === "publishAnyway")?.effect, {
         kind: "command",
         command: "vs-code-ai-helper.commitAndPushTask",

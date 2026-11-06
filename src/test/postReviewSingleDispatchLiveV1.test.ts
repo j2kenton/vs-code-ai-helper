@@ -1,37 +1,15 @@
 /**
- * Live-composition regression for the wf10 continuation review blocker
- * (narrowed `7cb82d57-49cb-456e-97d5-6f7e9fc0fc71-2`, 2026-08-27): "the
- * automatic Apply Review route lacks the required live-composition
- * regression test."
+ * review1 Step 18 (replaces the wf10 live-composition test of the automatic Apply Review redirect, which is gone):
+ * one dispatch after a review.
  *
- * Prior coverage of the automatic Apply Review redirect was either a pure
- * selector test (`reviewRouting.test.ts`'s `chooseAutomaticImplementationDispatchV1`
- * suite — no operation registry involved at all) or a fully
- * `executeCommand`-stubbed test (`goToReviewAndApply.test.ts` — proves
- * `goToReviewAndApplyV1`'s own dispatch-ordering logic, but never touches a
- * real `TaskOperationRegistry`). Neither can catch the actual bug that was
- * fixed: the redirect used to call `goToReviewAndApplyV1` from INSIDE the
- * "Run Implementation" tracked-operation's own callback, so `setTaskStage`'s
- * `cancelRunningOperationsForTask` polled waiting for the very operation it
- * was called from to end — a guaranteed self-wait that always timed out
- * (observed: the redirect announces itself, blocks ~15s, then
- * `goToReviewAndApplyV1` gives up and the redirect never dispatches). The fix
- * (`reviewActions.ts`'s `redirectAfterOperationV1`) defers the actual
- * `goToReviewAndApplyV1` call to run only once `runTrackedOperation` has
- * resolved.
- *
- * This test drives the REAL `runImplementationWithAI` against the REAL
- * `taskOperations` registry (`../utils/taskOperations`, unpatched) and the
- * REAL `vs-code-ai-helper.setTaskStage` command (registered via
- * `registerSetTaskStageCommand` against a real `TaskInventory` and
- * `CurrentTaskStore`, exactly as `extension.ts` wires it) — the same
- * production path that calls `cancelRunningOperationsForTask`, the function
- * whose polling loop the deadlock actually lived in. Only the provider
- * boundary (`runImplementationOrSealedV1`, deliberately made to throw so an
- * accidental Implementation dispatch fails the test loudly instead of
- * silently proving nothing) and the two Apply Review commands themselves
- * (stubbed to just record their invocation — dispatching a real AI review
- * round is a different property, not what this test is about) are faked.
+ * Drives the REAL `runImplementationWithAI` against the REAL `taskOperations` registry and the REAL
+ * `vs-code-ai-helper.setTaskStage` command, with only the provider boundary (`runImplementationOrSealedV1`)
+ * faked so the prompt it receives can be read. A task that has a review on record (an unattended dispatch, the
+ * same shape that used to be redirected) must:
+ *   - send the provider `apply-impl-review-code.md`, with the review's blockers in the prompt;
+ *   - never call an Apply Review command, and never change the task's stage (so no `setTaskStage` and no
+ *     `cancelRunningOperationsForTask` runs inside the live root operation).
+ * A task with no review yet still gets `run-implementation.md`, unchanged.
  */
 import * as assert from "node:assert/strict";
 import * as cp from "node:child_process";
@@ -144,6 +122,7 @@ function writeTaskFolder(): void {
   );
   fs.writeFileSync(path.join(FOLDER_PATH, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
   fs.writeFileSync(path.join(FOLDER_PATH, "plan-final.md"), PLAN_FINAL_FULLY_TICKED, "utf8");
+  fs.writeFileSync(path.join(FOLDER_PATH, "plan.md"), PLAN_FINAL_FULLY_TICKED, "utf8");
   fs.writeFileSync(
     path.join(FOLDER_PATH, "impl-high-review.md"),
     "# Implementation Review\n\nReadiness: 6/10\n\nsrc/foo.ts still leaks the handle.\n",
@@ -240,8 +219,8 @@ function readProgress(): TaskProgress {
   return decoded.decoded.progress;
 }
 
-void describe("automatic Apply Review redirect — live composition (real operation registry + real stage transition)", () => {
-  void it("dispatches the redirect only after the source operation has genuinely ended, without the cancellation poll self-waiting", async () => {
+void describe("one dispatch after a review — live composition (real operation registry + real stage command)", () => {
+  void it("an unattended Implementation dispatch carries the review, calls no Apply Review command and changes no stage", async () => {
     writeTaskFolder();
 
     const provider = new StatusTreeProvider();
@@ -255,6 +234,7 @@ void describe("automatic Apply Review redirect — live composition (real operat
     registerSetTaskStageCommand(context, inventory, currentTaskStore);
 
     const applyCommandCalls: { command: string; arg: unknown }[] = [];
+    const providerPrompts: string[] = [];
     const cancelCallOperationCounts: number[] = [];
     const notifications: string[] = [];
     const providerTarget = provider as unknown as { addEntry: (...args: unknown[]) => unknown };
@@ -283,16 +263,16 @@ void describe("automatic Apply Review redirect — live composition (real operat
     const patches: Patched[] = [
       patch(runEditActionModule, "checkEditActionProviderPathGateV1", () => Promise.resolve({ ok: true })),
       patch(runEditActionModule, "checkEditActionAvailabilityV1", () => Promise.resolve({ ok: true })),
-      // If the redirect fails to fire and Implementation is dispatched
-      // instead, this throws — failing the test loudly rather than silently
-      // proving nothing (the same "provider boundary should never be
-      // reached" pattern used elsewhere in this suite family).
-      patch(runEditActionModule, "runImplementationOrSealedV1", () => {
-        throw new Error(
-          "runImplementationOrSealedV1 must never be invoked: the automatic " +
-            "redirect should have routed to Apply Review before reaching the " +
-            "provider boundary."
-        );
+      // The provider boundary: record the prompt the round is given.
+      patch(runEditActionModule, "runImplementationOrSealedV1", (options: { prompt: string }) => {
+        providerPrompts.push(options.prompt);
+        return Promise.resolve({
+          status: "completed",
+          filesChanged: [],
+          runnerId: "cli-test",
+          providerLabel: "Test CLI",
+          storedModelId: "cli:test-model",
+        });
       }),
       patch(modelSelectionModule, "resolveFreshModelForStage", () =>
         Promise.resolve({ modelId: "cli:test-model", source: "task" })),
@@ -300,12 +280,8 @@ void describe("automatic Apply Review redirect — live composition (real operat
         Promise.resolve({ availability: { available: true }, providerLabel: "Test CLI" })),
       patch(contextPackModule, "generateContextPack", () => Promise.resolve("ctx")),
       patch(settingsModule, "allowsDirtyWorktreeChanges", () => true),
-      // The property under test: at the exact moment the redirect's stage
-      // transition asks the real operation registry to cancel whatever is
-      // running for this task, the "Run Implementation" operation that
-      // triggered the redirect must have ALREADY ended (0 live operations) —
-      // proving the redirect runs after runTrackedOperation resolved, not
-      // from inside its own callback (the fixed self-wait deadlock).
+      // A stage change asks the real registry to cancel what is running for the task; the single dispatch
+      // makes none, so this records any call.
       patch(taskOperationsModule, "cancelRunningOperationsForTask", (...args: unknown[]) => {
         cancelCallOperationCounts.push(taskOperations.getTaskOperations(FOLDER_PATH).length);
         return origCancel(...args);
@@ -320,7 +296,8 @@ void describe("automatic Apply Review redirect — live composition (real operat
     try {
       await inventory.refresh();
       await runImplementationWithAI(
-        vscode.Uri.file(REAL_ROOT),
+        // The extension's own folder: the prompt templates are read from its resources/.
+        vscode.Uri.file(path.resolve(__dirname, "..", "..")),
         context,
         { taskFolderPath: FOLDER_PATH, automationDispatch: true }
       );
@@ -334,50 +311,19 @@ void describe("automatic Apply Review redirect — live composition (real operat
       deactivateNotificationRouter();
     }
     const elapsedMs = Date.now() - start;
+    assert.ok(elapsedMs < 5_000, `the dispatch took ${elapsedMs}ms`);
 
-    // Well under cancelRunningOperationsForTask's 15s poll timeout — proves
-    // no self-wait occurred (a self-wait would have blocked for the full
-    // timeout, since nothing would ever decrement the operation count).
-    assert.ok(
-      elapsedMs < 5_000,
-      `redirect took ${elapsedMs}ms — a self-wait deadlock would block for ~15s`
-    );
+    // One dispatch: the provider got exactly one prompt, and it is the apply template carrying the review.
+    assert.equal(providerPrompts.length, 1, `notifications=${JSON.stringify(notifications)}`);
+    const prompt = providerPrompts[0]!;
+    assert.match(prompt, /You are addressing an implementation review/);
+    assert.match(prompt, /src\/foo\.ts still leaks the handle/);
+    assert.doesNotMatch(prompt, /You are implementing a software development task/);
 
-    // The redirect's cancellation request must see ZERO live operations for
-    // this task, at every call — the "Run Implementation" operation had
-    // already ended before the stage transition asked to cancel anything.
-    assert.ok(
-      cancelCallOperationCounts.length > 0,
-      `setTaskStage must have called cancelRunningOperationsForTask. notifications=${JSON.stringify(notifications)} applyCommandCalls=${JSON.stringify(applyCommandCalls)}`
-    );
-    for (const count of cancelCallOperationCounts) {
-      assert.equal(count, 0, "no live operation may still be registered when the redirect's cancellation request runs");
-    }
-
-    // No operation is left registered for the task once the whole dispatch
-    // has settled, either.
+    // No redirect and no stage change: no Apply Review command, no cancellation request, same stage.
+    assert.deepEqual(applyCommandCalls, []);
+    assert.deepEqual(cancelCallOperationCounts, []);
+    assert.equal(readProgress().currentStage, "impl-low-review");
     assert.equal(taskOperations.getTaskOperations(FOLDER_PATH).length, 0);
-
-    // The redirect actually ran: the task moved to the review stage the
-    // decision named, and the corresponding Apply Review command was
-    // dispatched exactly once.
-    const persisted = readProgress();
-    assert.equal(persisted.currentStage, "impl-high-review");
-    assert.deepEqual(
-      applyCommandCalls.map((c) => c.command),
-      ["vs-code-ai-helper.applyHighLevelReviewChanges"]
-    );
-    // 2026-09-09 review completion blocker, narrowed: the redirect now mints
-    // a single-use admission handoff token (this function's own admission
-    // `handle` is still live across the redirect) and forwards it, so the
-    // downstream `applyReviewWithAI`/`applyReviewEditWithAI` admission
-    // acquisition adopts this call's already-live marker instead of racing a
-    // fresh genesis against it and self-blocking `busy`.
-    const redirectArg = applyCommandCalls[0]?.arg as
-      | { taskFolderPath?: string; admissionHandoffTokenV1?: string }
-      | undefined;
-    assert.equal(redirectArg?.taskFolderPath, FOLDER_PATH);
-    assert.equal(typeof redirectArg?.admissionHandoffTokenV1, "string");
-    assert.ok((redirectArg?.admissionHandoffTokenV1?.length ?? 0) > 0);
   });
 });

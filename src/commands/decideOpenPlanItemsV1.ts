@@ -18,14 +18,16 @@ import {
 } from "../utils/chatHistoryStore";
 import {
   applyOpenPlanItemsFormV1,
-  countChecklistEvidenceProgressV1,
   describeChecklistGateGapV1,
   getPlanRevisionV1,
   listOpenPlanItemRecordsV1,
+  listProvisionalTickedItemsV1,
   normalizeChecklistItemTextV1,
   OpenPlanItemsFormAnswerV1,
   truncateChecklistItemTextV1,
+  unescapeChecklistItemTextV1,
 } from "../utils/implementationChecklist";
+import { computePlanItemCountsV1 } from "../utils/effectiveReviewProgress";
 import {
   classifyOpenPlanItemsV1,
   formatClassifiedOpenPlanItemsV1,
@@ -47,6 +49,9 @@ import { POST_OWNER_TEST_RUN_CARD_COMMAND_V1, partitionItemsByNamedCommandV1 } f
 import { formatTestsRefusedRemedyV1, type TestsRefusedV1 } from "../utils/testsRefusedV1";
 import type { AllowedTestCommandV1 } from "../utils/allowedTestCommandV1";
 import { clearStageActionRefusalReasonV1, takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
+import { postStageReadyCardIfReadyV1 } from "./automationStoppedCardV1";
+import { refreshPlanItemSettlementSnapshotV1 } from "./planItemSettlementNoticeV1";
+import { SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1 } from "./verifiedTicksHeldOptionsV1";
 
 const COMMAND = "vs-code-ai-helper.decideOpenPlanItems";
 const TICK_ALL_COMMAND = "vs-code-ai-helper.tickAllVerifiedOpenPlanItems";
@@ -58,6 +63,11 @@ export const TICK_ALL_VERIFIED_NOTE_V1 = "settled by your decision; no test repo
 export interface OpenPlanItemReasonForDecisionV1 {
   readonly itemText: string;
   readonly reason: string;
+  /**
+   * review1 Step 10: the item is already ticked in plan-final.md but no review or owner has settled it, so the
+   * gate still counts it open. The form lists it and "tick" confirms the existing tick without rewriting the line.
+   */
+  readonly alreadyTicked?: boolean;
 }
 
 export interface DecideOpenPlanItemsArgV1 {
@@ -144,7 +154,10 @@ function resolveOpenFormItemsV1(
   for (const item of items) {
     const key = normalizeChecklistItemTextV1(item.itemText);
     const record = records.find(
-      (r) => !r.settled && !used.has(r.itemId) && normalizeChecklistItemTextV1(r.itemText) === key
+      (r) =>
+        (item.alreadyTicked === true ? r.ticked : !r.settled) &&
+        !used.has(r.itemId) &&
+        normalizeChecklistItemTextV1(r.itemText) === key
     );
     if (!record) {
       continue;
@@ -155,6 +168,7 @@ function resolveOpenFormItemsV1(
       itemText: record.itemText,
       occurrence: record.occurrence,
       reason: item.reason,
+      ...(item.alreadyTicked === true ? { alreadyTicked: true } : {}),
     });
   }
   return formItems;
@@ -266,6 +280,12 @@ export async function applyOpenPlanItemsFormSubmissionV1(input: {
   readonly answers: unknown;
 }): Promise<OpenPlanItemsFormSubmissionResultV1> {
   const result = await withTaskLock(input.taskFolderPath, async () => applyOpenPlanItemsFormLockedV1(input));
+  // review1 Step 8: the form changed the count, so the stored snapshot (and the Tasks tooltip's "sent back" note)
+  // follows it, as the single-item settle command does. Run here, after the task lock is released: the refresh
+  // takes that lock itself, so calling it from inside the locked apply deadlocks.
+  if (result.result.kind === "applied") {
+    await refreshPlanItemSettlementSnapshotV1(vscode.Uri.file(input.taskFolderPath));
+  }
   if (result.continuation) {
     // bugs4 item 6: the follow-up's outcome is part of the ONE chat line the
     // form ends with. It is never a pop-up on its own.
@@ -280,6 +300,8 @@ export async function applyOpenPlanItemsFormSubmissionV1(input: {
     }
     return { ...result.result, message: `${result.result.message} ${followUp}` };
   }
+  // review1 Step 31: the form may have settled the last open items; if the review is clean, say so at once.
+  if (result.result.kind === "applied") void postStageReadyCardIfReadyV1(input.taskFolderPath, "After your answers");
   return result.result;
 }
 
@@ -313,12 +335,15 @@ async function applyOpenPlanItemsFormLockedV1(input: {
     plan,
     new Set(form.items.map((item) => item.itemId)),
     answers,
-    new Date().toISOString().slice(0, 10)
+    new Date().toISOString().slice(0, 10),
+    new Set(form.items.filter((item) => item.alreadyTicked === true).map((item) => item.itemId))
   );
   if (!applied.ok) {
     return { result: { kind: "rejected", message: applied.rejectionReason } };
   }
   const changed = applied.ticked.length + applied.excluded.length > 0;
+  // review1 Step 10: confirming an existing tick writes no plan line but is still an owner decision to record.
+  const decided = changed || applied.confirmedTicked.length > 0;
   if (changed && !(await writeTextFileIfUnchangedV1(planUri, plan, applied.content))) {
     return { result: { kind: "rejected", message: "plan changed, try Apply again." } };
   }
@@ -326,11 +351,15 @@ async function applyOpenPlanItemsFormLockedV1(input: {
     markFormPlanWriteV1(input.taskFolderPath, planUri.fsPath, applied.content);
   }
   let provenanceNote = "";
-  if (changed) {
+  if (decided) {
     // bugs4 item 7: a form tick is an explicit owner decision. Record it with
     // owner provenance so the gate settles the item, apart from any reviewer
     // verification. The task lock is already held by the caller.
-    const recorded = await recordOwnerDecisionsV1(input.taskFolderPath, form.formId, plan, applied);
+    const recorded = await recordOwnerDecisionsV1(input.taskFolderPath, form.formId, {
+      content: applied.content,
+      tickedWritten: [...applied.tickedWritten, ...applied.confirmedTicked],
+      excludedWritten: applied.excludedWritten,
+    });
     provenanceNote = recorded
       ? ` ${recorded}`
       : " The completeness gate could not record these as your decisions, so it may still count them as unverified.";
@@ -344,15 +373,18 @@ async function applyOpenPlanItemsFormLockedV1(input: {
   if (applied.excluded.length > 0) {
     parts.push(`excluded ${applied.excluded.length}`);
   }
+  if (applied.confirmedTicked.length > 0) {
+    parts.push(`confirmed ${applied.confirmedTicked.length} existing tick${applied.confirmedTicked.length === 1 ? "" : "s"}`);
+  }
   const skippedLines = applied.skipped.map(
     (s) => `"${truncateChecklistItemTextV1(textById.get(s.itemId) ?? s.itemText, 60)}" — ${s.reason}`
   );
   const summary =
-    (parts.length > 0 ? `${parts.join(", ")} in plan-final.md.` : "No items were changed. Nothing will run; the items stay open. Fix what blocks them, then use Fast Forward or Apply Review.") +
+    (parts.length > 0 ? `${parts.join(", ")}${changed ? " in plan-final.md" : ""}.` : "No items were changed. Nothing will run; the items stay open. Fix what blocks them, then use Fast Forward or Apply Review.") +
     (skippedLines.length > 0 ? ` ${skippedLines.join("; ")}.` : "") +
     provenanceNote;
   NotificationRouter.showInformation(`${taskName}: ${summary}`);
-  return { result: { kind: "applied", message: summary }, ...(changed ? { continuation: {
+  return { result: { kind: "applied", message: summary }, ...(decided ? { continuation: {
     taskFolderPath: input.taskFolderPath, displayName: input.displayName, items: [], stage: form.stage,
     ...(form.resumeFastForwardV1 ? { resumeFastForwardV1: form.resumeFastForwardV1 } : {}),
   } } : {}) };
@@ -366,7 +398,6 @@ async function applyOpenPlanItemsFormLockedV1(input: {
 async function recordOwnerDecisionsV1(
   taskFolderPath: string,
   formId: string,
-  priorContent: string,
   applied: {
     readonly content: string;
     readonly tickedWritten: readonly string[];
@@ -374,43 +405,29 @@ async function recordOwnerDecisionsV1(
   }
 ): Promise<string | undefined> {
   const planRevision = getPlanRevisionV1(applied.content);
-  const priorRevision = getPlanRevisionV1(priorContent);
   const at = new Date().toISOString();
   try {
     const patched = await patchTaskProgressStrictV1(
       vscode.Uri.file(taskFolderPath),
       (progress) => {
         let next = progress;
-        // The write above can change the plan revision (a note on a tick, an
-        // exclusion), and decisions are only read for the current revision.
-        // Carry the owner's decisions from the revision this write started
-        // from over to the new one so a later form does not undo them. An item
-        // whose own line this write changed no longer matches by key, so it is
-        // simply not counted until it is decided again.
-        if (priorRevision !== planRevision) {
-          for (const record of progress.planItemOwnerDecisions ?? []) {
-            if (record.planRevision !== priorRevision) continue;
-            next = recordPlanItemOwnerDecisionV1(next, {
-              planRevision, itemText: record.itemText, at: record.at, formId: record.formId, decision: record.decision,
-            });
-          }
-        }
-        // Keyed by the text as written: a note appended to a ticked line changes
-        // the key the gate looks the item up by.
+        // review1 Step 2/3: decisions match the item's own content (a note appended to a ticked line does not
+        // change it), so nothing is carried between plan revisions. The hash is taken from the written plan.
+        const planText = applied.content;
         for (const itemText of applied.tickedWritten) {
-          next = recordPlanItemOwnerDecisionV1(next, { planRevision, itemText, at, formId, decision: "tick" });
+          next = recordPlanItemOwnerDecisionV1(next, { planRevision, planText, itemText, at, formId, decision: "tick" });
         }
         for (const itemText of applied.excludedWritten) {
-          next = recordPlanItemOwnerDecisionV1(next, { planRevision, itemText, at, formId, decision: "exclude" });
+          next = recordPlanItemOwnerDecisionV1(next, { planRevision, planText, itemText, at, formId, decision: "exclude" });
         }
         return next;
       },
       { skipLock: true }
     );
     if (!patched) return undefined;
-    const gate = countChecklistEvidenceProgressV1(applied.content, patched.planItemEvidence ?? [], patched.planItemOwnerDecisions ?? []);
+    const gate = computePlanItemCountsV1({ planText: applied.content, progress: patched });
     if (!gate) return undefined;
-    return `Gate: ${describeChecklistGateGapV1(gate)}; ${gate.gate.settled} of ${gate.gate.total} settled.`;
+    return `Gate: ${describeChecklistGateGapV1(gate)}; ${gate.settled} of ${gate.total} settled.`;
   } catch {
     return undefined;
   }
@@ -461,10 +478,9 @@ async function continueAfterOpenPlanItemDecisionsInnerV1(
   if (progressRead.decoded.progress.currentStage !== arg.stage) {
     return `Nothing was started: ${taskName} is no longer on ${STAGE_DISPLAY_NAMES[arg.stage]}, so these decisions do not trigger its current stage.`;
   }
+  // review1 Step 5: the shared plan-item counts.
   const evidenceProgress =
-    freshPlan === undefined
-      ? undefined
-      : countChecklistEvidenceProgressV1(freshPlan, progressRead.decoded.progress.planItemEvidence ?? [], progressRead.decoded.progress.planItemOwnerDecisions ?? []);
+    freshPlan === undefined ? undefined : computePlanItemCountsV1({ planText: freshPlan, progress: progressRead.decoded.progress });
   const remaining = evidenceProgress?.gate.remaining;
   if (evidenceProgress === undefined || remaining === undefined) {
     return (
@@ -573,8 +589,77 @@ async function continueAfterOpenPlanItemDecisionsInnerV1(
     : `Every plan item is now settled. Advance to ${nextStageName} when you are ready.`;
 }
 
+export interface SettleRestItemByItemArgV1 {
+  readonly taskFolderPath: string;
+  readonly displayName?: string;
+  readonly stage: TaskStage;
+  /** Items the card's other option is about to tick; they are left out of the form. */
+  readonly exceptItems?: readonly string[];
+  readonly resumeFastForwardV1?: DecideOpenPlanItemsArgV1["resumeFastForwardV1"];
+}
+
+/**
+ * review1 Step 10: the checklist card's "settle the rest item by item" option. Reads the plan of record now and
+ * posts the open-items form for every top-level item still open (minus those the card's apply option ticks), so
+ * the card does not carry a list that could be stale by the time it is chosen.
+ */
+export async function settleRestItemByItemV1(
+  arg?: SettleRestItemByItemArgV1
+): Promise<WorkflowDecisionCommandResultV1 | boolean> {
+  if (!arg?.taskFolderPath) {
+    return false;
+  }
+  const plan = await readTextIfExists(getCanonicalImplementationUri(vscode.Uri.file(arg.taskFolderPath)));
+  if (plan === undefined) {
+    NotificationRouter.showWarning(
+      `${formatNotificationTaskLabelV1(arg.displayName, arg.taskFolderPath)}: plan-final.md could not be read, so no item-by-item form was posted.`
+    );
+    return false;
+  }
+  const skip = new Set((arg.exceptItems ?? []).map((text) => normalizeChecklistItemTextV1(text)));
+  const openItems: OpenPlanItemReasonForDecisionV1[] = listOpenPlanItemRecordsV1(plan)
+    .filter((record) => !record.settled && !skip.has(normalizeChecklistItemTextV1(record.itemText)))
+    .map((record) => ({ itemText: record.itemText, reason: "Open in plan-final.md." }));
+  // The gate still counts a ticked item open until a review or the owner settles it, so those belong on this
+  // form too (the reviewer-verified items the card's other option ticks are left out).
+  const progress = await readTaskProgressStrictV1(vscode.Uri.file(arg.taskFolderPath));
+  const ticks: OpenPlanItemReasonForDecisionV1[] = progress.ok
+    ? listProvisionalTickedItemsV1(
+        plan,
+        progress.decoded.progress.planItemEvidence ?? [],
+        progress.decoded.progress.planItemOwnerDecisions ?? []
+      )
+        // A ticked child belongs to its parent's line, which the form cannot split; the parent is listed.
+        .filter((item) => !skip.has(normalizeChecklistItemTextV1(item.text)))
+        .map((item) => ({
+          itemText: unescapeChecklistItemTextV1(item.text),
+          alreadyTicked: true,
+          reason:
+            "Ticked in plan-final.md but not yet checked by a review. Choose “I did it — tick it” to confirm the " +
+            "tick yourself; the plan line is not rewritten.",
+        }))
+    : [];
+  const items = [...openItems, ...ticks];
+  if (items.length === 0) {
+    NotificationRouter.showInformation(
+      `${formatNotificationTaskLabelV1(arg.displayName, arg.taskFolderPath)}: no other plan item is open, so there is nothing to settle item by item.`
+    );
+    return { outcome: "done" };
+  }
+  return decideOpenPlanItemsV1({
+    taskFolderPath: arg.taskFolderPath,
+    ...(arg.displayName ? { displayName: arg.displayName } : {}),
+    items,
+    stage: arg.stage,
+    ...(arg.resumeFastForwardV1 ? { resumeFastForwardV1: arg.resumeFastForwardV1 } : {}),
+  });
+}
+
 export function registerDecideOpenPlanItemsCommandV1(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
+    vscode.commands.registerCommand(SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1, (arg?: SettleRestItemByItemArgV1) =>
+      settleRestItemByItemV1(arg)
+    ),
     vscode.commands.registerCommand(COMMAND, (arg?: DecideOpenPlanItemsArgV1) => decideOpenPlanItemsV1(arg)),
     vscode.commands.registerCommand(TICK_ALL_COMMAND, (arg?: DecideOpenPlanItemsArgV1) => tickAllVerifiedOpenPlanItemsV1(arg))
   );
@@ -618,6 +703,8 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
   readonly builtClaimedKeys?: ReadonlySet<string>;
   /** bugs4 item 30: the plan's "N open, of which M are owner hand-offs" line. */
   readonly openSummary?: string;
+  /** review1 Step 6: how many nested sub-items are open (named on the card; the form cannot settle them). */
+  readonly openNestedItems?: number;
   /**
    * bugs4 Step 20: the test commands the last editing round's summary says the provider refused.
    * Another round would be refused the same way, so the card points at the permission or tool setup.
@@ -748,7 +835,13 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
     whatHappened:
       `This round changed no files. The plan checklist still has ${count} open ${plural}` +
       (input.openSummary ? ` (plan-wide: ${input.openSummary})` : "") +
-      `:\n\n${evidenceLines}`,
+      `:\n\n${evidenceLines}` +
+      // review1 Step 6: nested sub-items hold their parent open but cannot be settled from this form.
+      ((input.openNestedItems ?? 0) > 0
+        ? `\n\n${input.openNestedItems} nested sub-item${input.openNestedItems === 1 ? " is" : "s are"} also open under ` +
+          "the items above. They are not listed in the form because the form settles whole items only; the round that " +
+          "discovered them closes them, or you can edit them in plan-final.md."
+        : ""),
     whyUserNeeded: allReviewVerified
       ? "The latest review verified every open item built. They stay open only because the boxes are unticked or " +
         "no passing test report is recorded; ticking them is your decision to make." +

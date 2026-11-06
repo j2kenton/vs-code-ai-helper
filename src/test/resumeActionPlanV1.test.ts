@@ -415,13 +415,26 @@ void describe("preflightFixedDispatchV1 after a failed round (RC4 item 2)", () =
     assert.equal(refusal, undefined);
   });
 
-  void it("still refuses Apply Review after a failed round whose change set is unknown", async () => {
+  // review1 Step 32 (review1 item 2): the failed round IS the lost editing round. Its edits are kept in the working
+  // tree and Apply Review continues against the review it was working from, so it no longer stales that review
+  // even when its change set is unknown. (Before, this was refused and the owner was sent through a fresh review.)
+  void it("continues Apply Review after a lost editing round whose change set is unknown (review1 Step 32)", async () => {
     const refusal = await preflightFixedDispatchV1(
       folderWith(),
       "impl-high-review",
       "apply-review",
       passes({ rejectionReason: "usage limit" })
     );
+    assert.equal(refusal, undefined);
+  });
+
+  void it("still refuses Apply Review after a COMPLETED round whose change set is unknown", async () => {
+    const base = passes({ rejectionReason: "usage limit" });
+    const completed = {
+      ...base,
+      roundLedger: (base.roundLedger ?? []).map((row) => ({ ...row, state: "completed" as const })),
+    };
+    const refusal = await preflightFixedDispatchV1(folderWith(), "impl-high-review", "apply-review", completed);
     assert.match(refusal?.precondition ?? "", /before the latest implementation round/);
   });
 });

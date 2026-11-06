@@ -18,6 +18,12 @@ export interface VerifiedCompleteReviewOutcomeV1 {
   readonly withheldTestItems: number;
   /** Severity of a blocked derivation: "warning" means something is wrong, "info" means nothing to add. */
   readonly blockedSeverity?: "info" | "warning";
+  /**
+   * review1 Step 10: ticked items (nested children included, by the gate's rule) no reviewer or owner has settled,
+   * counted after this review's verifications were recorded. When known, zero is itself reason to clear: the
+   * count is evidence-based, so a checklist with no unchecked tick has nothing left for the flag to doubt.
+   */
+  readonly provisionalItems?: number;
 }
 
 export interface LatchAutoClearDecisionV1 {
@@ -27,6 +33,12 @@ export interface LatchAutoClearDecisionV1 {
 }
 
 export function decideLatchAutoClearAfterReviewV1(outcome: VerifiedCompleteReviewOutcomeV1): LatchAutoClearDecisionV1 {
+  if (outcome.provisionalItems === 0 && outcome.blockedSeverity !== "warning") {
+    return {
+      clear: true,
+      reason: "after this review no ticked item is left unchecked, so every tick now has a reviewer or owner behind it",
+    };
+  }
   if (!outcome.blockPresent) {
     return {
       clear: false,

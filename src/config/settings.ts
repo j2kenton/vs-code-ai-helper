@@ -37,7 +37,7 @@ const ALL_SETTING_KEYS = [
   LARGE_TOKEN_REQUEST_WARNING_KEY, ENABLED_PROVIDERS_KEY,
   FAST_FORWARD_MAX_ITERATIONS_KEY, AUTO_ADVANCE_ENABLED_KEY,
   COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, AUTO_ADVANCE_SCORE_KEY,
-  "fastForwardStopLevel", "fastForwardUseAcceptanceThreshold",
+  "fastForwardStopLevel", "fastForwardUseAcceptanceThreshold", "fastForwardActOnSuggestions",
   "autoReviewAfterPlan", "autoReviewAfterImplementation",
   "maxImplementationIterations",
   "allowDirtyWorktreeChanges", "desktopNotifications",
@@ -502,6 +502,10 @@ export interface ResilienceSettings {
    * stdout/stderr/raw-transport bytes for this many minutes, distinct from
    * the flat RUN_TIMEOUT_MS wall clock (0 disables the watchdog). */
   inactivityTimeoutMinutes: number;
+  /** review1 Step 24: ask the owner after this many automatic rounds since the last progress (0 = off). */
+  askOwnerAfterRounds: number;
+  /** review1 Step 24: ask the owner after this many automatic rounds in a row that failed (0 = off). */
+  askOwnerAfterFailedRounds: number;
 }
 
 const RESILIENCE_FF_SURVIVES_ESCALATION_KEY = "resilience.fastForwardSurvivesEscalation";
@@ -514,6 +518,8 @@ const RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY = "resilience.noProgressBreakerR
 const RESILIENCE_FALLBACK_PROVIDER_BREAKER_ROUNDS_KEY = "resilience.fallbackProviderBreakerRounds";
 const RESILIENCE_QUOTA_RESET_NEAR_THRESHOLD_HOURS_KEY = "resilience.quotaResetNearThresholdHours";
 const RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY = "resilience.inactivityTimeoutMinutes";
+const RESILIENCE_ASK_OWNER_AFTER_ROUNDS_KEY = "resilience.askOwnerAfterRounds";
+const RESILIENCE_ASK_OWNER_AFTER_FAILED_ROUNDS_KEY = "resilience.askOwnerAfterFailedRounds";
 
 /**
  * Fallbacks for the `ensemble.resilience.*` flags, mirroring the defaults
@@ -566,7 +572,19 @@ export const RESILIENCE_DEFAULTS = {
   // default is biased against firing. See the setting's description in
   // package.json, and the note at readInactivityTimeoutMinutes.
   inactivityTimeoutMinutes: 0,
+  askOwnerAfterRounds: 8,
+  askOwnerAfterFailedRounds: 3,
 } as const;
+
+/** review1 Step 53: minutes a safe card waits before its recommended option runs by itself (default 15, 0 = off). */
+export const AUTO_CONTINUE_MINUTES_DEFAULT_V1 = 15;
+
+export function readAutoContinueMinutes(): number {
+  const value = readSetting<unknown>("decisions.autoContinueMinutes", AUTO_CONTINUE_MINUTES_DEFAULT_V1);
+  const numeric =
+    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : AUTO_CONTINUE_MINUTES_DEFAULT_V1;
+  return Math.max(0, Math.min(1440, numeric));
+}
 
 function readResilienceRounds(key: string, fallback: number): number {
   const value = readSetting<unknown>(key, fallback);
@@ -656,6 +674,14 @@ export function getResilienceSettings(): ResilienceSettings {
     inactivityTimeoutMinutes: readInactivityTimeoutMinutes(
       RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY,
       RESILIENCE_DEFAULTS.inactivityTimeoutMinutes
+    ),
+    askOwnerAfterRounds: readResilienceRounds(
+      RESILIENCE_ASK_OWNER_AFTER_ROUNDS_KEY,
+      RESILIENCE_DEFAULTS.askOwnerAfterRounds
+    ),
+    askOwnerAfterFailedRounds: readResilienceRounds(
+      RESILIENCE_ASK_OWNER_AFTER_FAILED_ROUNDS_KEY,
+      RESILIENCE_DEFAULTS.askOwnerAfterFailedRounds
     ),
   };
 }
@@ -1067,6 +1093,14 @@ export function getFastForwardStopLevel(): number {
 
 export function usesAcceptanceThresholdForFastForward(): boolean {
   return readSetting(FAST_FORWARD_USE_ACCEPTANCE_KEY, false);
+}
+
+/**
+ * review1 Step 16: whether Apply Review keeps acting on a review's non-blocking suggestions under Fast Forward
+ * after the score meets the stop level. Default false: once the score is good enough, suggestions are left alone.
+ */
+export function actsOnSuggestionsAfterStopLevelV1(): boolean {
+  return readSetting("fastForwardActOnSuggestions", false);
 }
 
 /** Mode for auto-review after AI drafts a plan. */

@@ -527,6 +527,11 @@ export interface OpenPlanItemsFormItemV1 {
   /** 1-based count of this exact text among the plan's checklist items, in plan order. */
   readonly occurrence: number;
   readonly reason: string;
+  /**
+   * review1 Step 10: the item was already ticked in plan-final.md when the form was posted, but no review or owner
+   * had settled it. "Tick" on it confirms the existing tick as an owner decision and writes no plan line.
+   */
+  readonly alreadyTicked?: boolean;
 }
 
 export type OpenPlanItemsFormStateV1 = "open" | "applied" | "stale" | "dismissed";
@@ -1000,7 +1005,14 @@ export function decodeOpenPlanItemsFormsV1(raw: unknown): OpenPlanItemsFormV1[] 
       ) {
         return undefined;
       }
-      items.push({ itemId: i.itemId, itemText: i.itemText, occurrence: i.occurrence, reason: i.reason });
+      if (i.alreadyTicked !== undefined && typeof i.alreadyTicked !== "boolean") return undefined;
+      items.push({
+        itemId: i.itemId,
+        itemText: i.itemText,
+        occurrence: i.occurrence,
+        reason: i.reason,
+        ...(i.alreadyTicked === true ? { alreadyTicked: true } : {}),
+      });
     }
     let resume: { attemptNumber: number; maxAttempts: number } | undefined;
     if (e.resumeFastForwardV1 !== undefined) {

@@ -3149,8 +3149,13 @@ void test("the timer path runs fire() with automatic origin and Run now does not
   assert.ok(timerAt > 0);
   assert.match(
     source.slice(Math.max(0, timerAt - 400), timerAt),
-    /runWithAutomaticOriginV1\(\(\) => this\.fire\(/,
-    "the timer path wraps fire()"
+    /runWithAutomaticOriginV1\(\(\) => this\.fireBehindProgressGateV1\(/,
+    "the timer path wraps fire() (through the progress gate, review1 Step 24)"
+  );
+  assert.match(
+    source,
+    /fireBehindProgressGateV1[\s\S]{0,900}runWithAdmittedAutomaticDispatchV1\(\(\) => this\.fire\(/,
+    "the gated wrapper runs fire() as an admitted automatic dispatch"
   );
   const runNowAt = source.indexOf("async runNow(");
   assert.ok(runNowAt > 0);

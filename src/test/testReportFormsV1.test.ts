@@ -212,12 +212,22 @@ void describe("a report that does not count says why (bugs4 item 21, never silen
     return diagnosis.kind === "not-applicable" ? diagnosis.reason : "";
   };
 
-  void it("names a missing post-edit statement", () => {
+  void it("a report that does not say either way counts as post-edit (review1 Step 13)", () => {
     const summary = report(
       [`- ${GIT_LOCK_ITEM} — done — test: gitIndexLockV1.test.ts`],
       ["- `pnpm run test:unit -- src/test/gitIndexLockV1.test.ts` — 12 passed, 0 failed."]
     );
-    assert.match(reasonOf(summary), /post-edit tree/);
+    const diagnosis = diagnoseApplicablePassingTestReportForItemV1(PLAN, GIT_LOCK_ITEM, summary);
+    assert.equal(diagnosis.kind, "applicable", "no statement and no 'before the edits' statement: it counts");
+    if (diagnosis.kind === "applicable") assert.match(diagnosis.report.sourceState, /post-edit/);
+  });
+
+  void it("names a report that says the tests ran before the edits", () => {
+    const summary = report(
+      [`- ${GIT_LOCK_ITEM} — done — test: gitIndexLockV1.test.ts`],
+      ["- `pnpm run test:unit -- src/test/gitIndexLockV1.test.ts` — 12 passed, 0 failed; run before the edits."]
+    );
+    assert.match(reasonOf(summary), /ran before this round's edits/);
   });
 
   void it("names an item the round did not claim", () => {
@@ -233,7 +243,7 @@ void describe("a report that does not count says why (bugs4 item 21, never silen
       [`- ${GIT_LOCK_ITEM} — done — test: gitIndexLockV1.test.ts`],
       ["- `pnpm run test:unit -- src/test/gitIndexLockV1.test.ts` — ran; post-edit source state: tree."]
     );
-    assert.match(reasonOf(summary), /did not report “N passed” with 0 failed/);
+    assert.match(reasonOf(summary), /did not report “N passed” and “0 failed”/);
   });
 
   void it("names evidence with no test file or command, and a missing Verification section", () => {

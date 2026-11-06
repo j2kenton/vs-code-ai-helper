@@ -8,6 +8,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { settleChecklistItemV1 } from "../utils/implementationChecklist";
 import { recordReviewInputsV1, reviewInputsChangedSinceV1, reviewWorkspaceChangedSinceV1 } from "../utils/reviewInputsChangedV1";
 
 function setMtime(file: string, secondsFromBase: number): void {
@@ -111,6 +112,46 @@ void describe("reviewInputsChangedSinceV1", () => {
     const reworded = await reviewInputsChangedSinceV1(dir, review);
     assert.equal(reworded.changed, true);
     assert.deepEqual(reworded.changedFiles, ["plan-final.md"]);
+  });
+
+  void it("review1 Step 31: an owner tick or exclusion with a settle note is not a plan edit, so the review stays current", async () => {
+    const { dir, review } = folder();
+    const planFinal = path.join(dir, "plan-final.md");
+    fs.writeFileSync(planFinal, "# Implementation checklist\n\n- [ ] Build the thing\n- [ ] Test the thing\n  - [ ] A nested part\n- [ ] Owner check\n");
+    await recordReviewInputsV1(dir, review);
+    fs.utimesSync(review, Date.now() / 1000 + 60, Date.now() / 1000 + 60);
+    fs.writeFileSync(
+      planFinal,
+      "# Implementation checklist\n\n" +
+        "- [x] Build the thing — Checked: ran it by hand.\n" +
+        "- [ ] Test the thing\n  - [ ] A nested part — Excluded by you: not needed. <!-- ensemble:excluded -->\n" +
+        "- [ ] Owner check — Owner decision 2026-11-05: accepted. <!-- ensemble:excluded -->\n"
+    );
+    assert.equal(
+      (await reviewInputsChangedSinceV1(dir, review)).changed,
+      false,
+      "the notes Ensemble appends when the owner settles an item are not an input change"
+    );
+    fs.writeFileSync(
+      planFinal,
+      "# Implementation checklist\n\n- [x] Build the thing — Checked: ran it by hand.\n- [ ] Test the thing differently\n  - [ ] A nested part\n- [ ] Owner check\n"
+    );
+    assert.equal((await reviewInputsChangedSinceV1(dir, review)).changed, true, "rewording an item is still an input change");
+  });
+
+  void it("review1 Step 31: the plan text the real settle writes (tick with a note, then an exclusion) leaves the review current", async () => {
+    const { dir, review } = folder();
+    const planFinal = path.join(dir, "plan-final.md");
+    const plan = "# Implementation checklist\n\n- [x] Build the thing\n- [ ] Test the thing\n- [ ] Owner check\n";
+    fs.writeFileSync(planFinal, plan);
+    await recordReviewInputsV1(dir, review);
+    fs.utimesSync(review, Date.now() / 1000 + 60, Date.now() / 1000 + 60);
+    const ticked = settleChecklistItemV1(plan, "Test the thing", "tick", "ran it, it passes");
+    assert.match(ticked.content, /\[x\] Test the thing — Checked: ran it, it passes\./, "the settle writes a note");
+    const excluded = settleChecklistItemV1(ticked.content, "Owner check", "exclude", "mine to do");
+    assert.match(excluded.content, /Excluded by you: mine to do\./);
+    fs.writeFileSync(planFinal, excluded.content);
+    assert.equal((await reviewInputsChangedSinceV1(dir, review)).changed, false, "the owner's own settlement is not a stale review");
   });
 
   void it("a record written before plan-final.md was an input cannot show an existing plan of record unchanged", async () => {

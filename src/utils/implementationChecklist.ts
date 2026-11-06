@@ -470,6 +470,449 @@ export function getPlanRevisionV1(planText: string): string {
 }
 
 /**
+ * review1 Step 2: the item's text without Ensemble's own annotations — the exclusion and
+ * closed-before-implementation markers, the `— Checked: …` / `— Excluded by you: …` notes the settle
+ * flow appends, and an `Owner decision YYYY-MM-DD: …` or reviewer-narrowing note — so adding any of
+ * them never changes what the item says.
+ */
+export function stripPlanItemAnnotationsV1(text: string): string {
+  return unescapeChecklistItemTextV1(text)
+    .replace(CLOSED_BEFORE_IMPLEMENTATION_STRIP_RE, "")
+    .replace(EXCLUDED_MARKER_STRIP_RE, "")
+    .replace(/\s+— (?:Checked|Excluded by you): [\s\S]*$/, "")
+    .replace(/\s+— Owner decision \d{4}-\d{2}-\d{2}: [\s\S]*$/, "")
+    .replace(/\s+— narrowed \(reviewer-verified\): [\s\S]*$/, "");
+}
+
+/**
+ * review1 Step 2: a hash of one checklist item's own content — its normalised text plus the normalised
+ * text of each nested child — that ignores the checkbox state and Ensemble's annotations. Evidence about
+ * the item stays valid while this hash is unchanged, whatever else in the plan changes.
+ */
+export function computePlanItemContentHashV1(itemText: string, childTexts: readonly string[] = []): string {
+  const parts = [itemText, ...childTexts].map((text) => normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(text)));
+  return createHash("sha256").update(parts.join("\u0000")).digest("hex").slice(0, 32);
+}
+
+/** One item of the latest rendering with its identity keys and content hash. */
+export interface PlanItemHashEntryV1 {
+  readonly text: string;
+  /** `normalizeChecklistItemTextV1` of the item's text as written (the evidence `itemKey`). */
+  readonly key: string;
+  /** The same key after Ensemble's annotations are removed. */
+  readonly annotationFreeKey: string;
+  /** A top-level item's hash covers its nested children; a nested item's covers only itself. */
+  readonly hash: string;
+  readonly checked: boolean;
+  readonly excluded: boolean;
+  readonly nested: boolean;
+  /** 1-based count of this annotation-free key among the items of the same level, in plan order. */
+  readonly occurrence: number;
+  /** Index (in the returned list) of a nested item's parent. */
+  readonly parentIndex?: number;
+  /**
+   * True when a top-level item and a nested item of the latest rendering share this annotation-free wording.
+   * Such twins hash alike, so a stored row that did not record its level is read as the top-level item's.
+   */
+  readonly sharesKeyAcrossLevels?: boolean;
+}
+
+/**
+ * review1 (review fix): may a stored row apply to this item given the nesting level? A row that recorded its
+ * level (`itemNested`) applies only to an item of that level. A row from before the field existed applies to
+ * either level, except that it never settles a nested child when a top-level item has the same wording.
+ */
+function rowLevelAppliesV1(
+  rowNested: boolean | undefined,
+  current: { readonly nested?: boolean; readonly sharesKeyAcrossLevels?: boolean }
+): boolean {
+  if (current.nested === undefined) return true;
+  if (rowNested !== undefined) return rowNested === current.nested;
+  return !(current.nested && current.sharesKeyAcrossLevels === true);
+}
+
+/** Every item (top-level and nested) of `planText`'s latest rendering with its content hash, in plan order. */
+export function listPlanItemContentHashesV1(planText: string): PlanItemHashEntryV1[] {
+  const items = itemsInLatestRendering(planText);
+  const entries: PlanItemHashEntryV1[] = [];
+  const seen = new Map<string, number>();
+  let parentIndex: number | undefined;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!;
+    const key = normalizeChecklistItemTextV1(item.text);
+    const annotationFreeKey = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(item.text));
+    const level = item.nested ? "n" : "t";
+    const occurrence = (seen.get(`${level}${annotationFreeKey}`) ?? 0) + 1;
+    seen.set(`${level}${annotationFreeKey}`, occurrence);
+    if (item.nested) {
+      entries.push({
+        text: item.text,
+        key,
+        annotationFreeKey,
+        hash: computePlanItemContentHashV1(item.text),
+        checked: item.checked,
+        excluded: item.excluded,
+        nested: true,
+        occurrence,
+        ...(parentIndex !== undefined ? { parentIndex } : {}),
+      });
+      continue;
+    }
+    const children: string[] = [];
+    for (let j = i + 1; j < items.length && items[j]!.nested; j++) children.push(items[j]!.text);
+    parentIndex = entries.length;
+    entries.push({
+      text: item.text,
+      key,
+      annotationFreeKey,
+      hash: computePlanItemContentHashV1(item.text, children),
+      checked: item.checked,
+      excluded: item.excluded,
+      nested: false,
+      occurrence,
+    });
+  }
+  const topKeys = new Set(entries.filter((entry) => !entry.nested).map((entry) => entry.annotationFreeKey));
+  const nestedKeys = new Set(entries.filter((entry) => entry.nested).map((entry) => entry.annotationFreeKey));
+  return entries.map((entry) =>
+    topKeys.has(entry.annotationFreeKey) && nestedKeys.has(entry.annotationFreeKey)
+      ? { ...entry, sharesKeyAcrossLevels: true }
+      : entry
+  );
+}
+
+/** A reviewer entry that names more than one checked plan item, so it verifies none of them. */
+export interface AmbiguousVerificationEntryV1 {
+  /** The reviewer's text, as written. */
+  readonly text: string;
+  /** How many checked plan items carry that wording (across levels and copies). */
+  readonly matches: number;
+}
+
+/** A reviewer entry that cites an `[item:<id>]` Ensemble never issued for this plan, so it verifies nothing. */
+export interface UnknownVerificationIdV1 {
+  readonly id: string;
+  /** The label that followed the id, or `item:<id>` when there was none. */
+  readonly text: string;
+}
+
+/** One reviewer entry: its text, and the `[item:<id>]` it cited when it did. */
+export interface VerificationCandidateV1 {
+  readonly text: string;
+  readonly itemId?: string;
+  /** The reviewer's own evidence line for the entry, carried through to {@link CheckedVerificationTargetsV1.sources}. */
+  readonly evidence?: string;
+}
+
+export interface CheckedVerificationTargetsV1 {
+  /** The entry that selected each target, so a caller reads that entry's evidence line, not another's. */
+  readonly sources: ReadonlyMap<PlanItemHashEntryV1, VerificationCandidateV1>;
+  /** The checked, non-excluded items that exactly one reviewer entry names, in plan order. */
+  readonly targets: PlanItemHashEntryV1[];
+  /** Entries that matched several checked items; none of those items is a target. */
+  readonly ambiguous: AmbiguousVerificationEntryV1[];
+  /** Entries that cited an id Ensemble did not issue; recorded as nothing and reported. */
+  readonly unknownIds: UnknownVerificationIdV1[];
+}
+
+/**
+ * review1 (owner decision 2026-11-05): resolves what a reviewer's "Verified Complete" entries mean among the
+ * checked, non-excluded items of `planText`. An entry names an item by its text, and a top-level item and a
+ * nested child (or two copies at one level) can share that text, so the text alone cannot say which one it
+ * means. An entry that matches exactly one checked item verifies that item; an entry that matches more than
+ * one verifies none of them and is returned in `ambiguous` so the caller can say so. One entry is never fanned
+ * out to several items.
+ *
+ * Owner decision 2026-11-05 (item identity by design): an entry may instead cite the `[item:<id>]` Ensemble listed
+ * for the item, or a bare `Step N` that matches exactly one top-level item. An id verifies exactly the item it
+ * was issued for, even when that item shares its wording with another; Ensemble records nothing for an id it
+ * did not issue, and returns it in `unknownIds`. A `Step N` that names several items is ambiguous, like text.
+ */
+export function listCheckedVerificationTargetsV1(
+  planText: string,
+  candidates: readonly (string | VerificationCandidateV1)[]
+): CheckedVerificationTargetsV1 {
+  const all = listPlanItemContentHashesV1(planText);
+  // The hash list and the id list walk the same latest rendering, so an index names the same item in both.
+  const ids = listPlanItemIdsV1(planText);
+  const aligned = all.length === ids.length;
+  const entries = all.filter((entry) => entry.checked && !entry.excluded);
+  const targets = new Set<PlanItemHashEntryV1>();
+  const sources = new Map<PlanItemHashEntryV1, VerificationCandidateV1>();
+  const ambiguous: AmbiguousVerificationEntryV1[] = [];
+  const unknownIds: UnknownVerificationIdV1[] = [];
+  const seen = new Set<string>();
+  let current: VerificationCandidateV1 = { text: "" };
+  const add = (entry: PlanItemHashEntryV1): void => {
+    targets.add(entry);
+    if (!sources.has(entry)) sources.set(entry, current);
+  };
+  const addIfChecked = (entry: PlanItemHashEntryV1 | undefined): void => {
+    if (entry && entries.includes(entry)) add(entry);
+  };
+  for (const raw of candidates) {
+    const candidate: VerificationCandidateV1 = typeof raw === "string" ? { text: raw } : raw;
+    current = candidate;
+    if (candidate.itemId) {
+      const key = `id:${candidate.itemId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const index = aligned ? ids.findIndex((entry) => entry.itemId === candidate.itemId) : -1;
+      if (index < 0) unknownIds.push({ id: candidate.itemId, text: candidate.text });
+      else addIfChecked(all[index]);
+      continue;
+    }
+    const wanted = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(candidate.text));
+    if (seen.has(wanted)) continue;
+    seen.add(wanted);
+    const reference = aligned ? resolvePlanItemReferenceV1(planText, candidate.text) : undefined;
+    if (reference?.kind === "item") {
+      addIfChecked(all[reference.itemIndex]);
+      continue;
+    }
+    const bareStep = /^\W*(?:\*\*)?step\s+(\d+)\W*$/i.exec(candidate.text.trim());
+    if (bareStep && reference) {
+      // A bare `Step N` that does not resolve to one item: when several checked top-level items carry that step
+      // label (a repeated numbering, or the same item twice) it is ambiguous and verifies none of them.
+      const labelled = new RegExp(`^[\\s*_\`]*step\\s+${Number(bareStep[1])}(?!\\d)`, "i");
+      const matches = entries.filter((entry) => !entry.nested && labelled.test(entry.text)).length;
+      if (matches > 1) {
+        ambiguous.push({ text: candidate.text.trim(), matches });
+        continue;
+      }
+      if (reference.kind === "problem") continue;
+    }
+    const matching = entries.filter((entry) => entry.annotationFreeKey === wanted);
+    if (matching.length === 1) add(matching[0]!);
+    else if (matching.length > 1) ambiguous.push({ text: candidate.text.trim(), matches: matching.length });
+  }
+  return { targets: entries.filter((entry) => targets.has(entry)), ambiguous, unknownIds, sources };
+}
+
+/**
+ * review1 (owner decision 2026-11-05, item identity by design): for the text-based paths that tick or count items
+ * a review names (the card that applies reviewer-verified ticks, the open-items card), turns each Verified Complete
+ * entry into the plan item's own text. An entry citing an issued `[item:<id>]`, or a bare `Step N` that names one
+ * item, becomes that item's text; an entry citing an id Ensemble did not issue is returned in `unknownIds` and
+ * dropped; one whose item's wording another item shares (so its text would name both) is returned in `ambiguous`
+ * and dropped, because one entry is never fanned out. A plain text entry passes through unchanged.
+ */
+export function resolveVerifiedCompleteEntryTextsV1(
+  planText: string | undefined,
+  entries: readonly VerificationCandidateV1[]
+): {
+  readonly entries: readonly { readonly text: string; readonly evidence?: string }[];
+  readonly unknownIds: readonly UnknownVerificationIdV1[];
+  readonly ambiguous: readonly AmbiguousVerificationEntryV1[];
+} {
+  const resolved: { text: string; evidence?: string }[] = [];
+  const unknownIds: UnknownVerificationIdV1[] = [];
+  const ambiguous: AmbiguousVerificationEntryV1[] = [];
+  const ids = planText ? listPlanItemIdsV1(planText) : [];
+  const sharedWording = (text: string): number => {
+    const wanted = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(text));
+    return ids.filter(
+      (entry) => !entry.excluded && normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(entry.itemText)) === wanted
+    ).length;
+  };
+  for (const entry of entries) {
+    const evidence = entry.evidence !== undefined ? { evidence: entry.evidence } : {};
+    let named: { text: string } | undefined;
+    if (entry.itemId) {
+      const found = ids.find((candidate) => candidate.itemId === entry.itemId);
+      if (!found) {
+        unknownIds.push({ id: entry.itemId, text: entry.text });
+        continue;
+      }
+      named = { text: found.itemText };
+    } else if (planText) {
+      const reference = resolvePlanItemReferenceV1(planText, entry.text);
+      if (reference.kind === "item") named = { text: reference.itemText };
+      else if (reference.kind === "problem") {
+        const step = /^\W*(?:\*\*)?step\s+(\d+)\W*$/i.exec(entry.text.trim());
+        const matches = step ? listPlanItemStepOwnersV1(planText).filter((owner) => owner.stepNumber === Number(step[1])).length : 0;
+        if (matches > 1) ambiguous.push({ text: entry.text.trim(), matches });
+        continue;
+      }
+    }
+    if (named) {
+      const matches = sharedWording(named.text);
+      if (matches > 1) {
+        ambiguous.push({ text: entry.text.trim(), matches });
+        continue;
+      }
+      resolved.push({ text: named.text, ...evidence });
+      continue;
+    }
+    resolved.push({ text: entry.text, ...evidence });
+  }
+  return { entries: resolved, unknownIds, ambiguous };
+}
+
+/** One unchecked item a reviewer's Verified Complete entry asks Ensemble to tick (review1, item identity by design). */
+export interface UncheckedVerificationTargetV1 {
+  /** The plan's own text for the item. */
+  readonly text: string;
+  /** The issued id of the exact item, when the entry cited it (or a `Step N` that names one item). */
+  readonly itemId?: string;
+  readonly evidence?: string;
+}
+
+/**
+ * review1 (owner decision 2026-11-05, item identity by design): resolves a reviewer's Verified Complete entries
+ * to the unchecked, non-excluded items to tick, keeping the identity of an entry that named its item by an
+ * issued `[item:<id>]` (or a `Step N` that names one item). That entry targets exactly that item even when
+ * another item shares its wording, so a completed child is ticked while a same-worded parent is left alone. An
+ * id Ensemble did not issue, and an item that is already ticked or excluded, drop out. A plain text entry
+ * resolves to the first unchecked item with that wording, as before, unless an id entry already named that
+ * wording (so one item is never ticked twice). Entries are de-duplicated by id, or by wording for plain text.
+ */
+export function listUncheckedVerificationTargetsV1(
+  planText: string,
+  entries: readonly VerificationCandidateV1[]
+): UncheckedVerificationTargetV1[] {
+  const ids = listPlanItemIdsV1(planText);
+  const targets: UncheckedVerificationTargetV1[] = [];
+  const seenIds = new Set<string>();
+  const idWordingKeys = new Set<string>();
+  const plain: VerificationCandidateV1[] = [];
+  const evidenceOf = (entry: VerificationCandidateV1): { evidence?: string } =>
+    entry.evidence !== undefined ? { evidence: entry.evidence } : {};
+  for (const entry of entries) {
+    let found: PlanItemIdEntryV1 | undefined;
+    if (entry.itemId) {
+      found = ids.find((candidate) => candidate.itemId === entry.itemId);
+      if (!found) continue;
+    } else {
+      const reference = resolvePlanItemReferenceV1(planText, entry.text);
+      if (reference.kind === "problem") continue;
+      if (reference.kind === "item") found = ids[reference.itemIndex];
+      else {
+        plain.push(entry);
+        continue;
+      }
+    }
+    if (!found || found.checked || found.excluded || seenIds.has(found.itemId)) continue;
+    seenIds.add(found.itemId);
+    idWordingKeys.add(normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(found.itemText)));
+    targets.push({ text: found.itemText, itemId: found.itemId, ...evidenceOf(entry) });
+  }
+  const seenKeys = new Set<string>();
+  const unchecked = filterUncheckedPlanItemsV1(planText, plain.map((entry) => entry.text));
+  for (const text of unchecked) {
+    const key = normalizeChecklistItemTextV1(text);
+    if (seenKeys.has(key) || idWordingKeys.has(normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(text)))) continue;
+    seenKeys.add(key);
+    const source = plain.find((entry) => normalizeChecklistItemTextV1(entry.text) === key);
+    targets.push({ text, ...(source ? evidenceOf(source) : {}) });
+  }
+  return targets;
+}
+
+/**
+ * review1 (review fix): the items whose checkbox is ticked in `after` but not in `before` — the exact items a
+ * tick merge changed, with their level and copy number. Returns undefined when the two renderings do not line
+ * up item for item, so a caller falls back to naming items by text.
+ */
+export function listItemsTickedBetweenV1(before: string, after: string): PlanItemHashEntryV1[] | undefined {
+  const was = listPlanItemContentHashesV1(before);
+  const now = listPlanItemContentHashesV1(after);
+  if (was.length !== now.length) return undefined;
+  if (!was.every((entry, index) => entry.annotationFreeKey === now[index]!.annotationFreeKey && entry.nested === now[index]!.nested)) {
+    return undefined;
+  }
+  return was.filter((entry, index) => !entry.checked && now[index]!.checked);
+}
+
+/**
+ * review1 Step 2: the content hash of the first item in `planText` that `itemText` names (compared by
+ * text with Ensemble's annotations removed; a top-level item wins over a nested one of the same wording).
+ * Copies with the same wording and children hash alike, so the first copy is as good as any.
+ */
+export function findPlanItemContentHashV1(planText: string, itemText: string): string | undefined {
+  return findPlanItemHashEntryV1(planText, itemText)?.hash;
+}
+
+/** The first item in `planText` that `itemText` names (a top-level item wins over a nested one). */
+export function findPlanItemHashEntryV1(planText: string, itemText: string): PlanItemHashEntryV1 | undefined {
+  const wanted = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(itemText));
+  const named = listPlanItemContentHashesV1(planText).filter((entry) => entry.annotationFreeKey === wanted);
+  return named.find((entry) => !entry.nested) ?? named[0];
+}
+
+/**
+ * review1 Step 2: finds which stored rows apply to each plan item. Rows are matched by the item's
+ * content hash or, for legacy rows without one, by `itemKey`; `planRevision` is never consulted.
+ */
+export function indexPlanItemRowsV1<
+  R extends {
+    readonly itemKey: string;
+    readonly itemContentHash?: string;
+    readonly itemOccurrence?: number;
+    readonly itemNested?: boolean;
+  },
+>(
+  rows: readonly R[]
+): (
+  entry: Pick<PlanItemHashEntryV1, "key" | "annotationFreeKey" | "hash"> & {
+    readonly occurrence?: number;
+    readonly nested?: boolean;
+    readonly sharesKeyAcrossLevels?: boolean;
+  }
+) => R[] {
+  const byKey = new Map<string, R[]>();
+  const byHash = new Map<string, R[]>();
+  for (const row of rows) {
+    const bucket = row.itemContentHash === undefined ? byKey : byHash;
+    const id = row.itemContentHash ?? row.itemKey;
+    const list = bucket.get(id);
+    if (list) list.push(row);
+    else bucket.set(id, [row]);
+  }
+  return (entry) => {
+    // A hashed row that recorded which copy of identical items it was written for only applies to that copy.
+    const hashed = (byHash.get(entry.hash) ?? []).filter(
+      (row) => row.itemOccurrence === undefined || entry.occurrence === undefined || row.itemOccurrence === entry.occurrence
+    );
+    const found = new Set<R>([...hashed, ...(byKey.get(entry.key) ?? [])]);
+    for (const row of byKey.get(entry.annotationFreeKey) ?? []) found.add(row);
+    // A top-level leaf and an identically worded child hash alike: a row only applies to the level it was recorded for.
+    return [...found].filter((row) => rowLevelAppliesV1(row.itemNested, entry));
+  };
+}
+
+/**
+ * review1 Step 2: does a stored row (evidence entry, owner decision) still apply to the item it was
+ * recorded for? A row with a stored `itemContentHash` applies while the item's current hash equals it.
+ * A legacy row without a hash applies when its `itemKey` equals the item's current normalised text.
+ * `planRevision` is a record only and never consulted.
+ */
+export function planItemRowAppliesV1(
+  row: {
+    readonly itemKey: string;
+    readonly itemContentHash?: string;
+    readonly itemOccurrence?: number;
+    readonly itemNested?: boolean;
+  },
+  current: {
+    readonly key: string;
+    readonly annotationFreeKey: string;
+    readonly hash: string;
+    readonly occurrence?: number;
+    readonly nested?: boolean;
+    readonly sharesKeyAcrossLevels?: boolean;
+  }
+): boolean {
+  if (!rowLevelAppliesV1(row.itemNested, current)) return false;
+  if (row.itemContentHash !== undefined) {
+    if (row.itemContentHash !== current.hash) return false;
+    // A row that recorded which copy of identical items it was written for applies to that copy only.
+    return row.itemOccurrence === undefined || current.occurrence === undefined || row.itemOccurrence === current.occurrence;
+  }
+  return row.itemKey === current.key || row.itemKey === current.annotationFreeKey;
+}
+
+/**
  * A leading step label a round may omit when echoing an item: `Step 4:`,
  * `Step 4 —`, `4.`, or `**Step 4**`. Applied only after exact matching fails
  * (see {@link mergeChecklistProgressV1}), so an item whose own text really
@@ -1021,6 +1464,8 @@ export interface OpenPlanItemRecordV1 {
   readonly occurrence: number;
   /** True when this line is already ticked or carries the excluded marker. */
   readonly settled: boolean;
+  /** True when the line is ticked and not excluded (review1 Step 10: a tick the owner can still confirm). */
+  readonly ticked: boolean;
 }
 
 /**
@@ -1047,11 +1492,103 @@ function occurrenceKeyV1(text: string, settled: boolean): string {
   return exactItemKeyV1(withoutMarker.replace(/\s+— (?:Checked|Excluded by you): [\s\S]*$/, ""));
 }
 
-export function computeOpenPlanItemIdV1(itemText: string, occurrence: number): string {
+export function computeOpenPlanItemIdV1(itemText: string, occurrence: number, nested = false): string {
+  // review1 Step 9: a nested item's id is salted, so it never collides with a top-level item of the same wording;
+  // a top-level item's id is unchanged.
   return createHash("sha256")
-    .update(`${exactItemKeyV1(itemText)}\u0000${occurrence}`)
+    .update(`${nested ? "nested\u0000" : ""}${exactItemKeyV1(itemText)}\u0000${occurrence}`)
     .digest("hex")
     .slice(0, 16);
+}
+
+/** One checklist item (top-level or nested) with the id a round may refer to it by (review1 Step 9). */
+export interface PlanItemIdEntryV1 {
+  readonly itemId: string;
+  readonly itemText: string;
+  readonly nested: boolean;
+  readonly checked: boolean;
+  readonly excluded: boolean;
+  readonly occurrence: number;
+  /** The item's position among all items (nested ones included) of the latest rendering. */
+  readonly index: number;
+  /** The id of a nested item's parent. */
+  readonly parentId?: string;
+}
+
+/**
+ * review1 Step 9: every item of the latest rendering, nested ones included, with an occurrence-aware id (two
+ * items with the same wording get different ids; a settled item keeps the id it had while open).
+ */
+export function listPlanItemIdsV1(planOfRecord: string): readonly PlanItemIdEntryV1[] {
+  const seen = new Map<string, number>();
+  const entries: PlanItemIdEntryV1[] = [];
+  let parentId: string | undefined;
+  for (const item of itemsInLatestRendering(planOfRecord)) {
+    const settled = item.checked || item.excluded;
+    const key = `${item.nested ? "n" : "t"}${occurrenceKeyV1(item.text, settled)}`;
+    const occurrence = (seen.get(key) ?? 0) + 1;
+    seen.set(key, occurrence);
+    const itemId = computeOpenPlanItemIdV1(occurrenceKeyV1(item.text, settled), occurrence, item.nested);
+    entries.push({
+      itemId,
+      itemText: unescapeChecklistItemTextV1(item.text),
+      nested: item.nested,
+      checked: item.checked,
+      excluded: item.excluded,
+      occurrence,
+      index: entries.length,
+      ...(item.nested && parentId !== undefined ? { parentId } : {}),
+    });
+    if (!item.nested) parentId = itemId;
+  }
+  return entries;
+}
+
+/** Result of {@link resolvePlanItemReferenceV1}. */
+export type PlanItemReferenceResolutionV1 =
+  | { readonly kind: "not-a-reference" }
+  | { readonly kind: "item"; readonly itemText: string; readonly itemIndex: number }
+  | { readonly kind: "problem"; readonly reason: string };
+
+/**
+ * review1 Step 9: reads a claim's item text as a reference by id (`item:<id>` or `[item:<id>]`, optionally
+ * followed by the item's text) or as a bare `Step N` that names exactly one top-level item. Anything else is
+ * `not-a-reference` and is matched by text as before. An unknown id, or a `Step N` that names several items,
+ * is a problem with a true reason; it never ticks anything and never latches the checklist.
+ */
+export function resolvePlanItemReferenceV1(planOfRecord: string, reference: string): PlanItemReferenceResolutionV1 {
+  const idMatch = /^\W*item:\s*([0-9a-f]{16})\b/i.exec(reference.trim());
+  if (idMatch) {
+    const id = idMatch[1]!.toLowerCase();
+    const found = listPlanItemIdsV1(planOfRecord).find((entry) => entry.itemId === id);
+    return found
+      ? { kind: "item", itemText: found.itemText, itemIndex: found.index }
+      : {
+          kind: "problem",
+          reason: `item:${id} is not an item id in the plan of record (the plan may have changed since the list was shown), so nothing was ticked for it`,
+        };
+  }
+  const stepMatch = /^\W*(?:\*\*)?step\s+(\d+)\W*$/i.exec(reference.trim());
+  if (stepMatch) {
+    const step = Number(stepMatch[1]);
+    const owners = listPlanItemStepOwnersV1(planOfRecord).filter((owner) => owner.stepNumber === step);
+    if (owners.length === 1) {
+      const owner = owners[0]!;
+      const entry = listPlanItemIdsV1(planOfRecord).find(
+        (candidate) => !candidate.nested && candidate.itemId === owner.itemId
+      );
+      if (entry) {
+        return { kind: "item", itemText: owner.itemText, itemIndex: entry.index };
+      }
+    }
+    if (owners.length > 1) {
+      return {
+        kind: "problem",
+        reason: `“Step ${step}” names ${owners.length} plan items, so nothing was ticked for it; name each item by its [item:<id>] or its text`,
+      };
+    }
+  }
+  return { kind: "not-a-reference" };
 }
 
 /**
@@ -1080,6 +1617,7 @@ export function listOpenPlanItemRecordsV1(planOfRecord: string): readonly OpenPl
       itemText,
       occurrence,
       settled: item.checked || item.excluded,
+      ticked: item.checked && !item.excluded,
     });
   }
   return records;
@@ -1120,6 +1658,7 @@ export function listPlanItemStepOwnersV1(planOfRecord: string): readonly PlanIte
       itemText,
       occurrence,
       settled,
+      ticked: item.checked && !item.excluded,
     };
     const plainItem = itemText.replace(/^[\s*_`]+/, "");
     const itemStep = /^step\s+(\d+)(?!\d)/i.exec(plainItem) ?? /^(\d+)[.)](?!\d)/.exec(plainItem);
@@ -1202,6 +1741,11 @@ export type ApplyOpenPlanItemsFormResultV1 =
       readonly tickedWritten: readonly string[];
       /** Each excluded item's text as written (with its `— Excluded by you:` note). */
       readonly excludedWritten: readonly string[];
+      /**
+       * review1 Step 10: items that were already ticked in the plan and that the owner confirmed with "tick". The
+       * plan line is not rewritten; the caller records the owner's tick so the gate settles the item.
+       */
+      readonly confirmedTicked: readonly string[];
       readonly skipped: readonly OpenPlanItemsFormSkippedV1[];
     }
   | {
@@ -1236,7 +1780,9 @@ export function applyOpenPlanItemsFormV1(
   planOfRecord: string,
   formItemIds: ReadonlySet<string>,
   answers: readonly OpenPlanItemsFormAnswerV1[],
-  date: string
+  date: string,
+  /** Form items that were posted as already ticked: "tick" on one of these confirms the existing tick. */
+  confirmableIds: ReadonlySet<string> = new Set()
 ): ApplyOpenPlanItemsFormResultV1 {
   for (const answer of answers) {
     if (!formItemIds.has(answer.itemId)) {
@@ -1259,6 +1805,7 @@ export function applyOpenPlanItemsFormV1(
   const tickedWritten: string[] = [];
   const excludedWritten: string[] = [];
   const excludedItems: AcceptedNonGoalItemV1[] = [];
+  const confirmedTicked: string[] = [];
   const skipped: OpenPlanItemsFormSkippedV1[] = [];
   for (const answer of answers) {
     if (answer.choice === "leave") {
@@ -1271,6 +1818,11 @@ export function applyOpenPlanItemsFormV1(
         itemText: "",
         reason: "skipped: this item is no longer in the plan as written",
       });
+      continue;
+    }
+    if (current.ticked && answer.choice === "tick" && confirmableIds.has(answer.itemId)) {
+      // Ticked already but not settled by a review: the owner's "tick" confirms it without touching the line.
+      confirmedTicked.push(current.itemText);
       continue;
     }
     if (current.settled) {
@@ -1320,6 +1872,7 @@ export function applyOpenPlanItemsFormV1(
     excluded: excludedItems.map((item) => item.itemText),
     tickedWritten,
     excludedWritten,
+    confirmedTicked,
     skipped,
   };
 }
@@ -1701,6 +2254,74 @@ export function resolveBlockerPlanReferencesV1(
 }
 
 /**
+ * Index (into `lines`) of the last real checklist marker line: unfenced, standalone, and followed by at least
+ * one checklist item. The same rule as {@link scopeToLatestChecklistV1}, which cuts the document there.
+ */
+function findLatestChecklistMarkerLineIndexV1(lines: ReturnType<typeof walkLinesV1>): number | undefined {
+  const candidates: number[] = [];
+  const itemLines: number[] = [];
+  lines.forEach((line, i) => {
+    if (line.fenced) return;
+    if (STANDALONE_MARKER_LINE.test(line.text)) candidates.push(i);
+    else if (ANY_ITEM_LINE.test(line.text)) itemLines.push(i);
+  });
+  for (let c = candidates.length - 1; c >= 0; c--) {
+    const at = candidates[c]!;
+    if (itemLines.some((item) => item > at)) return at;
+  }
+  return undefined;
+}
+
+/** Headings that name a section of a round's own report. */
+const REPORT_SECTION_TITLES_V1: ReadonlySet<string> = new Set([
+  "plan item checklist",
+  "verification",
+  "plan deviations",
+  "remaining blockers",
+  "verified complete",
+  "owner decisions needed",
+  "files changed",
+  "implemented",
+]);
+
+/**
+ * Line index where the echoed plan ends and the round's own report begins, between `markerLine` and `boundary`
+ * (review1 Step 12). `## Plan Item Checklist` is never part of a plan. A report-section heading ends the echo
+ * when the echoed plan could not have carried it. With the plan of record in hand, that is a heading the plan
+ * lacks, or one that appears more often than the plan has it (the round's own `## Verification` after the
+ * plan's own, or the only `## Verification` when the plan has none). Without the plan, a repeated
+ * report-section heading is the round's own second copy. A repeated heading that names no report section (a
+ * plan phase the plan itself repeats) never ends the echo. With none of these, the echo runs to the
+ * `## Files Changed` boundary as before.
+ */
+function findEchoEndLineV1(
+  all: ReturnType<typeof headingsV1>,
+  markerLine: number,
+  boundary: number,
+  planOfRecord?: string
+): number {
+  const planCounts = new Map<string, number>();
+  if (planOfRecord !== undefined) {
+    for (const heading of headingsV1(scopeToLatestChecklistV1(planOfRecord).region)) {
+      const title = heading.title.trim().toLowerCase();
+      planCounts.set(title, (planCounts.get(title) ?? 0) + 1);
+    }
+  }
+  const seen = new Map<string, number>();
+  for (const heading of all) {
+    if (heading.line <= markerLine || heading.line >= boundary) continue;
+    const title = heading.title.trim().toLowerCase();
+    if (title === "plan item checklist") return heading.line;
+    const used = (seen.get(title) ?? 0) + 1;
+    seen.set(title, used);
+    if (!REPORT_SECTION_TITLES_V1.has(title)) continue;
+    const allowed = planOfRecord !== undefined ? (planCounts.get(title) ?? 0) : 1;
+    if (used > allowed) return heading.line;
+  }
+  return boundary;
+}
+
+/**
  * Split an implementation response into the checklist it echoed and the
  * summary it wrote.
  *
@@ -1720,13 +2341,46 @@ export function resolveBlockerPlanReferencesV1(
  *
  * With no `## Files Changed` heading the whole response is treated as the
  * echo, which only happens for a response that fails the shape gate anyway.
+ *
+ * review1 Step 12: only the ECHOED PLAN is echo. The echo is the block that starts at the response's standalone
+ * checklist marker and reproduces the checklist; everything outside that block is the round's own text,
+ * wherever it sits. A round that writes `## Plan Item Checklist` and `## Verification` before `## Files Changed`
+ * (bugs6 item 11: chat1's `runs/037`) used to have both read as echo and ignored, with the false reason that
+ * the report "has no `## Plan Item Checklist` section". A response with no marker and no checkbox before its
+ * `## Files Changed` has no echo at all, so all of it is the round's own.
  */
-export function splitSummaryAtEchoV1(summary: string): {
+export function splitSummaryAtEchoV1(
+  summary: string,
+  planOfRecord?: string
+): {
   echo: string;
   own: string;
 } {
   const all = headingsV1(summary);
   const at = findLastHeadingV1(all, "Files Changed");
+  if (at !== -1 && filesChangedIsSummaryBoundary(summary)) {
+    const lines = walkLinesV1(summary);
+    const markerLine = findLatestChecklistMarkerLineIndexV1(lines);
+    const boundary = all[at]?.line ?? 0;
+    if (markerLine !== undefined && markerLine < boundary) {
+      // The echo is the reproduced checklist block: from the marker to the first heading that can only be the
+      // round's own report (`## Plan Item Checklist`, or a heading the echoed plan already carried, such as the
+      // round's own `## Verification` after the plan's). Everything before the marker and from that heading on
+      // is the round's own text, wherever it sits relative to `## Files Changed`.
+      const echoEnd = findEchoEndLineV1(all, markerLine, boundary, planOfRecord);
+      return {
+        echo: lines.slice(markerLine, echoEnd).map((line) => line.raw).join(""),
+        own: [...lines.slice(0, markerLine), ...lines.slice(echoEnd)].map((line) => line.raw).join(""),
+      };
+    }
+    if (markerLine === undefined) {
+      const hasEchoedCheckboxes = lines.slice(0, boundary).some((line) => !line.fenced && ANY_ITEM_LINE.test(line.text));
+      if (!hasEchoedCheckboxes) {
+        // Nothing before the boundary reproduces a checklist: the whole response is the round's own text.
+        return { echo: "", own: summary };
+      }
+    }
+  }
   // The heading has to be a SUMMARY's file list, not a plan phase that happens
   // to carry that name. Splitting on the name alone let a response consisting
   // of nothing but the echoed plan split at the plan's own heading — so the
@@ -2178,6 +2832,32 @@ export function listNewlyCheckedChecklistItemsV1(before: string, after: string):
   return added;
 }
 
+/**
+ * review1 Step 9: the same comparison as {@link listNewlyCheckedChecklistItemsV1}, but each newly checked
+ * item keeps WHICH copy of identically worded items it is (1-based, counted among items of its own level), so a
+ * claim recorded for the second copy is stored against the second copy and not the first. `nested` says which
+ * level the copy number counts in.
+ */
+export function listNewlyCheckedChecklistItemOccurrencesV1(
+  before: string,
+  after: string
+): readonly { readonly text: string; readonly occurrence: number; readonly nested: boolean }[] {
+  const settledBefore = new Set<string>();
+  for (const entry of listPlanItemContentHashesV1(before)) {
+    if (entry.checked && !entry.excluded) {
+      settledBefore.add(`${entry.nested ? "n" : "t"}${entry.annotationFreeKey}#${entry.occurrence}`);
+    }
+  }
+  const added: { text: string; occurrence: number; nested: boolean }[] = [];
+  for (const entry of listPlanItemContentHashesV1(after)) {
+    if (!entry.checked || entry.excluded) continue;
+    if (settledBefore.has(`${entry.nested ? "n" : "t"}${entry.annotationFreeKey}#${entry.occurrence}`)) continue;
+    // Nested items keep their copy number too: it counts among nested items of the same wording.
+    added.push({ text: entry.text, occurrence: entry.occurrence, nested: entry.nested });
+  }
+  return added;
+}
+
 /** A plan area whose unticked boxes are checks for a person (or Ensemble's own verification run), not work a round can build. */
 const HANDOFF_SECTION_PATTERN = /\b(verification|hand-?off)\b/i;
 
@@ -2343,6 +3023,154 @@ export function settleChecklistItemV1(
   };
 }
 
+/** Result of {@link rewordChecklistItemV1}. */
+export interface RewordChecklistItemResultV1 {
+  /** The updated plan text — `planOfRecord` itself when no line matched. */
+  readonly content: string;
+  /** The item's text before the rewording, or `undefined` when no line matched. */
+  readonly previousItemText: string | undefined;
+}
+
+/**
+ * review1 Step 4: replaces ONE checklist item's wording, scoped through the same latest-rendering line walk as
+ * {@link settleChecklistItemV1} instead of the first textual match anywhere in the file (which could hit a
+ * copy of the item in an older rendering, a nested item, or prose). The item is the `occurrence`-th
+ * (1-based, default first) top-level item whose text, without Ensemble's annotations, matches `itemText`.
+ * The checkbox state and a trailing exclusion marker are kept; every other byte is preserved.
+ */
+/**
+ * review1 Step 4: how many top-level checklist items of the latest rendering read as `itemText` (compared the way
+ * {@link rewordChecklistItemV1} compares). More than one means a text-only target is ambiguous: the caller needs the
+ * occurrence the owner meant.
+ */
+export function countTopLevelPlanItemsNamedV1(planOfRecord: string, itemText: string): number {
+  const key = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(itemText));
+  return listPlanItemContentHashesV1(planOfRecord).filter((entry) => !entry.nested && entry.annotationFreeKey === key)
+    .length;
+}
+
+export function rewordChecklistItemV1(
+  planOfRecord: string,
+  itemText: string,
+  newText: string,
+  note: string,
+  occurrence = 1
+): RewordChecklistItemResultV1 {
+  const key = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(itemText));
+  const cleanNote = note.replace(/\s+/g, " ").trim();
+  const replacement = cleanNote ? `${newText.trim()} — ${cleanNote}` : newText.trim();
+  let previousItemText: string | undefined;
+  let seen = 0;
+  const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
+  const rewritten = walkLinesV1(region)
+    .map((line) => {
+      if (line.fenced || previousItemText !== undefined) {
+        return line.raw;
+      }
+      return line.raw.replace(
+        ITEM_LINE,
+        (whole, open: string, state: string, close: string, text: string, trailing: string) => {
+          if (/^[ \t]/.test(open) || normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(text)) !== key) {
+            return whole;
+          }
+          seen++;
+          if (seen < occurrence) {
+            return whole;
+          }
+          previousItemText = unescapeChecklistItemTextV1(text);
+          const markerLen = isExcludedChecklistItemText(text) ? (trailingExcludedMarkerLengthV1(text) ?? 0) : 0;
+          const marker = markerLen > 0 ? ` ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}` : "";
+          return `${open}${state}${close}${replacement}${marker}${trailing}`;
+        }
+      );
+    })
+    .join("");
+  return {
+    content: previousItemText !== undefined ? `${prefix}${rewritten}` : planOfRecord,
+    previousItemText,
+  };
+}
+
+/** One reviewer-verified narrowing: the item, the part of it that does not apply, and the evidence for that. */
+export interface VerifiedNarrowingInputV1 {
+  readonly itemText: string;
+  readonly notApplicable: string;
+  readonly evidence: string;
+}
+
+/** Result of {@link applyVerifiedNarrowingsToPlanV1}. */
+export interface ApplyVerifiedNarrowingsResultV1 {
+  readonly content: string;
+  readonly applied: readonly VerifiedNarrowingInputV1[];
+  readonly skipped: readonly { readonly itemText: string; readonly reason: string }[];
+}
+
+/**
+ * review1 Step 43: records each reviewer-verified narrowing as a NESTED, already-excluded child of the item it
+ * narrows, noted `narrowed (reviewer-verified): <evidence>`. A nested exclusion settles by the same rule every
+ * nested item does, so the parent stops waiting on work that does not apply, and the part that was cut stays
+ * visible in the plan. Idempotent: a narrowing whose line is already under the item is skipped. An item that is
+ * not a top-level item of the latest rendering is skipped with a reason, never guessed at.
+ */
+export function applyVerifiedNarrowingsToPlanV1(
+  planOfRecord: string,
+  narrowings: readonly VerifiedNarrowingInputV1[]
+): ApplyVerifiedNarrowingsResultV1 {
+  let content = planOfRecord;
+  const applied: VerifiedNarrowingInputV1[] = [];
+  const skipped: { itemText: string; reason: string }[] = [];
+  const clean = (text: string): string => text.replace(/\s+/g, " ").trim().replace(/\.$/, "");
+  for (const narrowing of narrowings) {
+    const key = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(narrowing.itemText));
+    const part = clean(narrowing.notApplicable);
+    const evidence = clean(narrowing.evidence);
+    if (!key || !part || !evidence) {
+      skipped.push({ itemText: narrowing.itemText, reason: "the narrowing names no item, part or evidence" });
+      continue;
+    }
+    const noteText = `${part} — narrowed (reviewer-verified): ${evidence}.`;
+    const { prefix, region } = scopeToLatestChecklistV1(content);
+    const lines = walkLinesV1(region);
+    const parentIndex = lines.findIndex((line) => {
+      if (line.fenced) {
+        return false;
+      }
+      const match = ITEM_LINE.exec(line.raw);
+      return !!match && !/^[ \t]/.test(match[1]!) && normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(match[4]!)) === key;
+    });
+    if (parentIndex === -1) {
+      skipped.push({ itemText: narrowing.itemText, reason: "it is not a top-level item of the plan's checklist" });
+      continue;
+    }
+    // Already recorded: a nested line under this item that carries the same note.
+    let alreadyThere = false;
+    for (let j = parentIndex + 1; j < lines.length; j++) {
+      const match = ITEM_LINE.exec(lines[j]!.raw);
+      if (match && !/^[ \t]/.test(match[1]!)) {
+        break;
+      }
+      if (match && normalizeChecklistItemTextV1(match[4]!).includes(normalizeChecklistItemTextV1(noteText))) {
+        alreadyThere = true;
+        break;
+      }
+    }
+    if (alreadyThere) {
+      continue;
+    }
+    const parentRaw = lines[parentIndex]!.raw;
+    const eol = parentRaw.endsWith("\r\n") ? "\r\n" : "\n";
+    const child = `  - [ ] ${noteText} ${EXCLUDED_CHECKLIST_ITEM_MARKER_V1}${eol}`;
+    const parentWithEol = /\r?\n$/.test(parentRaw) ? parentRaw : `${parentRaw}${eol}`;
+    content =
+      prefix +
+      lines
+        .map((line, index) => (index === parentIndex ? `${parentWithEol}${child}` : line.raw))
+        .join("");
+    applied.push(narrowing);
+  }
+  return { content, applied, skipped };
+}
+
 /**
  * Count the plan of record's checklist, or `undefined` when it carries none.
  *
@@ -2421,6 +3249,71 @@ export interface OwnerDecisionRowV1 {
   readonly planRevision: string;
   readonly itemKey: string;
   readonly decision: string;
+  /** review1 Step 2: the content hash of the item when the decision was recorded. */
+  readonly itemContentHash?: string;
+  /** review1 Step 2: which copy of identical items the decision was recorded for. */
+  readonly itemOccurrence?: number;
+  /** review1 (review fix): the nesting level the decision was recorded for. */
+  readonly itemNested?: boolean;
+}
+
+/**
+ * review1 Step 2: which top-level items are settled by a reviewer verification or an owner tick, matched to
+ * each item by content hash (or, for legacy rows, by text) — never by plan revision. A ticked item also needs
+ * every nested child excluded or ticked and settled the same way.
+ */
+function settlementByItemV1(
+  planOfRecord: string,
+  itemEvidence: readonly {
+    readonly itemKey: string;
+    readonly itemContentHash?: string;
+    readonly itemOccurrence?: number;
+    readonly itemNested?: boolean;
+    readonly verifications?: readonly unknown[];
+    readonly claims?: readonly { readonly at: string }[];
+  }[],
+  ownerDecisions: readonly OwnerDecisionRowV1[]
+): {
+  readonly entry: PlanItemHashEntryV1;
+  readonly verified: boolean;
+  readonly owner: boolean;
+  readonly childrenSettled: boolean;
+  readonly unsettledChildren: readonly PlanItemHashEntryV1[];
+  readonly claimedAt?: string;
+  readonly index: number;
+}[] {
+  const entries = listPlanItemContentHashesV1(planOfRecord);
+  const evidenceFor = indexPlanItemRowsV1(itemEvidence);
+  const ownerFor = indexPlanItemRowsV1(ownerDecisions.filter((row) => row.decision === "tick"));
+  const verifiedOf = (entry: PlanItemHashEntryV1): boolean =>
+    evidenceFor(entry).some((row) => (row.verifications?.length ?? 0) > 0);
+  const ownerOf = (entry: PlanItemHashEntryV1): boolean => ownerFor(entry).length > 0;
+  const result: ReturnType<typeof settlementByItemV1> = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!;
+    if (entry.nested) continue;
+    const unsettledChildren: PlanItemHashEntryV1[] = [];
+    for (let j = i + 1; j < entries.length && entries[j]!.nested; j++) {
+      const child = entries[j]!;
+      if (!child.excluded && (!child.checked || !(verifiedOf(child) || ownerOf(child)))) unsettledChildren.push(child);
+    }
+    let claimedAt: string | undefined;
+    for (const row of evidenceFor(entry)) {
+      for (const claim of row.claims ?? []) {
+        if (claimedAt === undefined || claim.at < claimedAt) claimedAt = claim.at;
+      }
+    }
+    result.push({
+      entry,
+      verified: verifiedOf(entry),
+      owner: ownerOf(entry),
+      childrenSettled: unsettledChildren.length === 0,
+      unsettledChildren,
+      ...(claimedAt !== undefined ? { claimedAt } : {}),
+      index: i,
+    });
+  }
+  return result;
 }
 
 /** Separate visible checkboxes from completion that has reviewer provenance. */
@@ -2429,41 +3322,24 @@ export function countChecklistEvidenceProgressV1(
   itemEvidence: readonly {
     readonly planRevision: string;
     readonly itemKey: string;
+    readonly itemContentHash?: string;
     readonly verifications?: readonly unknown[];
   }[],
   ownerDecisions: readonly OwnerDecisionRowV1[] = []
 ): ChecklistEvidenceProgressV1 | undefined {
   const display = countChecklistProgressV1(planOfRecord);
   if (!display) return undefined;
-  const revision = getPlanRevisionV1(planOfRecord);
-  const verifiedKeys = new Set(itemEvidence
-    .filter((entry) => entry.planRevision === revision && (entry.verifications?.length ?? 0) > 0)
-    .map((entry) => entry.itemKey));
-  // bugs4 item 7: a form tick is an explicit owner decision. It settles the
-  // item for the gate, but only while the box is still ticked in the plan
-  // (the loop below), and it is counted apart from reviewer verification.
-  const ownerKeys = new Set(ownerDecisions
-    .filter((row) => row.planRevision === revision && row.decision === "tick")
-    .map((row) => row.itemKey));
-  const items = itemsInLatestRendering(planOfRecord);
+  // review1 Step 2: rows match the item they were recorded for (content hash, or text for legacy rows), not
+  // the plan revision. bugs4 item 7: a form tick is an explicit owner decision. It settles the item for the
+  // gate, but only while the box is still ticked in the plan, and it is counted apart from reviewer
+  // verification.
   let verified = 0;
   let provisional = 0;
   let ownerSettled = 0;
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i]!;
-    if (item.nested || item.excluded || !item.checked) continue;
-    let childrenSettled = true;
-    for (let j = i + 1; j < items.length && items[j]!.nested; j++) {
-      const child = items[j]!;
-      const childKey = normalizeChecklistItemTextV1(child.text);
-      if (!child.excluded && (!child.checked || !(verifiedKeys.has(childKey) || ownerKeys.has(childKey)))) {
-        childrenSettled = false;
-        break;
-      }
-    }
-    const key = normalizeChecklistItemTextV1(item.text);
-    if (verifiedKeys.has(key) && childrenSettled) verified++;
-    else if (ownerKeys.has(key) && childrenSettled) ownerSettled++;
+  for (const item of settlementByItemV1(planOfRecord, itemEvidence, ownerDecisions)) {
+    if (item.entry.excluded || !item.entry.checked) continue;
+    if (item.verified && item.childrenSettled) verified++;
+    else if (item.owner && item.childrenSettled) ownerSettled++;
     else provisional++;
   }
   const settled = verified + ownerSettled + display.closedWithoutDoing;
@@ -2481,6 +3357,66 @@ export function countChecklistEvidenceProgressV1(
   };
 }
 
+/** One top-level item with the gate's verdict on it (review1 Step 8). */
+export interface PlanItemSettlementV1 {
+  readonly key: string;
+  readonly hash: string;
+  readonly settled: boolean;
+  /** `Step N` when the item starts with a step label, else its first words. */
+  readonly label: string;
+}
+
+/** A short label for an item in chat lines and tooltips. */
+export function labelPlanItemV1(itemText: string): string {
+  const step = /^\W*step\s+(\d+)\b/i.exec(itemText);
+  return step ? `Step ${step[1]}` : truncateChecklistItemTextV1(stripPlanItemAnnotationsV1(itemText), 60);
+}
+
+/**
+ * review1 Step 8: whether the gate counts each top-level item as settled — excluded, or ticked and verified or
+ * owner-settled with every child settled — by the item's content hash. The basis for noticing which items a plan
+ * change sent back to the review.
+ */
+export function listPlanItemSettlementV1(
+  planOfRecord: string,
+  itemEvidence: Parameters<typeof settlementByItemV1>[1],
+  ownerDecisions: readonly OwnerDecisionRowV1[] = []
+): PlanItemSettlementV1[] {
+  return settlementByItemV1(planOfRecord, itemEvidence, ownerDecisions).map((item) => ({
+    key: item.entry.key,
+    hash: item.entry.hash,
+    settled: item.entry.excluded || (item.entry.checked && (item.verified || item.owner) && item.childrenSettled),
+    label: labelPlanItemV1(item.entry.text),
+  }));
+}
+
+/**
+ * review1 Step 61 (review fix): the plan items still neither ticked nor excluded, read from the same per-item
+ * settlement the gate and the Tasks pane use, so nested work is included. A top-level item that is not ticked is
+ * listed itself; a ticked top-level item with an unticked, unexcluded child is represented by that child, named
+ * "<child> (under <parent label>)", because a checked parent with unfinished work under it is not done. Ticked
+ * items that only lack a review's check are not listed here; they count as `provisional` in the shared counts.
+ */
+export function listOpenPlanItemsForEndV1(
+  planOfRecord: string,
+  itemEvidence: Parameters<typeof settlementByItemV1>[1],
+  ownerDecisions: readonly OwnerDecisionRowV1[] = []
+): string[] {
+  const open: string[] = [];
+  for (const item of settlementByItemV1(planOfRecord, itemEvidence, ownerDecisions)) {
+    if (item.entry.excluded) continue;
+    if (!item.entry.checked) {
+      open.push(unescapeChecklistItemTextV1(item.entry.text));
+      continue;
+    }
+    for (const child of item.unsettledChildren) {
+      if (child.checked || child.excluded) continue;
+      open.push(`${unescapeChecklistItemTextV1(child.text)} (under ${labelPlanItemV1(item.entry.text)})`);
+    }
+  }
+  return open;
+}
+
 /**
  * What would satisfy the test-evidence rule for an item held back only for a missing
  * test report (bugs4 items 11 and 21): an editing round whose `## Verification` lists the
@@ -2494,9 +3430,15 @@ export const TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1 =
 /** A ticked top-level item that only a model has claimed (no reviewer or owner settlement yet). */
 export interface ProvisionalTickedItemV1 {
   readonly text: string;
+  /** review1 (owner decision 2026-11-05): the id a reviewer cites in `## Verified Complete` for this item. */
+  readonly id: string;
   readonly testDependent: boolean;
-  /** Earliest recorded claim time for the item at the current plan revision, when one exists. */
+  /** Earliest recorded claim time for the item, when one exists. */
   readonly claimedAt?: string;
+  /** Ticked nested items that no reviewer or owner has settled yet (review1 Step 6). */
+  readonly unverifiedChildren?: readonly string[];
+  /** The ids of {@link unverifiedChildren}, in the same order. */
+  readonly unverifiedChildIds?: readonly string[];
 }
 
 /**
@@ -2511,44 +3453,41 @@ export function listProvisionalTickedItemsV1(
   itemEvidence: readonly {
     readonly planRevision: string;
     readonly itemKey: string;
+    readonly itemContentHash?: string;
     readonly verifications?: readonly unknown[];
     readonly claims?: readonly { readonly at: string }[];
   }[],
   ownerDecisions: readonly OwnerDecisionRowV1[] = []
 ): ProvisionalTickedItemV1[] {
-  const revision = getPlanRevisionV1(planOfRecord);
-  const current = itemEvidence.filter((entry) => entry.planRevision === revision);
-  const verifiedKeys = new Set(current.filter((e) => (e.verifications?.length ?? 0) > 0).map((e) => e.itemKey));
-  const ownerKeys = new Set(
-    ownerDecisions.filter((row) => row.planRevision === revision && row.decision === "tick").map((row) => row.itemKey)
-  );
-  const earliestClaim = new Map<string, string>();
-  for (const entry of current) {
-    for (const claim of entry.claims ?? []) {
-      const known = earliestClaim.get(entry.itemKey);
-      if (known === undefined || claim.at < known) earliestClaim.set(entry.itemKey, claim.at);
-    }
-  }
-  const items = itemsInLatestRendering(planOfRecord);
+  // review1 Step 2 / Step 6: rows match items by content hash (or text for legacy rows); a ticked child
+  // that no reviewer or owner has settled is listed under its parent so the reviewer is asked about it.
   const found: { item: ProvisionalTickedItemV1; order: number }[] = [];
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i]!;
-    if (item.nested || item.excluded || !item.checked) continue;
-    let childrenSettled = true;
-    for (let j = i + 1; j < items.length && items[j]!.nested; j++) {
-      const child = items[j]!;
-      const childKey = normalizeChecklistItemTextV1(child.text);
-      if (!child.excluded && (!child.checked || !(verifiedKeys.has(childKey) || ownerKeys.has(childKey)))) {
-        childrenSettled = false;
-        break;
-      }
-    }
-    const key = normalizeChecklistItemTextV1(item.text);
-    if ((verifiedKeys.has(key) || ownerKeys.has(key)) && childrenSettled) continue;
-    const claimedAt = earliestClaim.get(key);
+  // The hash list and the id list walk the same latest rendering, so an index names the same item in both.
+  const ids = listPlanItemIdsV1(planOfRecord);
+  const hashEntries = listPlanItemContentHashesV1(planOfRecord);
+  for (const settlement of settlementByItemV1(planOfRecord, itemEvidence, ownerDecisions)) {
+    const { entry } = settlement;
+    if (entry.excluded || !entry.checked) continue;
+    if ((settlement.verified || settlement.owner) && settlement.childrenSettled) continue;
+    const openChildren = settlement.unsettledChildren.filter((child) => child.checked);
+    const children = openChildren.map((child) => child.text);
+    // `settlementByItemV1` builds its own entries, so a child is found again by what identifies it, not by reference.
+    const childIds = openChildren.map((child) => {
+      const at = hashEntries.findIndex(
+        (candidate) =>
+          candidate.nested && candidate.hash === child.hash && candidate.key === child.key && candidate.occurrence === child.occurrence
+      );
+      return ids[at]?.itemId ?? "";
+    });
     found.push({
-      item: { text: item.text, testDependent: isTestDependentChecklistItemV1(item.text), ...(claimedAt ? { claimedAt } : {}) },
-      order: i,
+      item: {
+        text: entry.text,
+        id: ids[settlement.index]?.itemId ?? "",
+        testDependent: isTestDependentChecklistItemV1(entry.text),
+        ...(settlement.claimedAt ? { claimedAt: settlement.claimedAt } : {}),
+        ...(children.length > 0 ? { unverifiedChildren: children, unverifiedChildIds: childIds } : {}),
+      },
+      order: settlement.index,
     });
   }
   return found
@@ -2578,7 +3517,14 @@ export function formatProvisionalTickedItemsForReviewerV1(
   const lines: string[] = [];
   let chars = 0;
   for (const item of provisional) {
-    const line = `- ${item.text}${item.testDependent ? " [needs a passing test report]" : ""}`;
+    const childLines = (item.unverifiedChildren ?? []).map(
+      (child, index) =>
+        `  - ${item.unverifiedChildIds?.[index] ? `[item:${item.unverifiedChildIds[index]}] ` : ""}${child} [nested: verify separately]`
+    );
+    const line = [
+      `- ${item.id ? `[item:${item.id}] ` : ""}${item.text}${item.testDependent ? " [needs a passing test report]" : ""}`,
+      ...childLines,
+    ].join("\n");
     if (lines.length >= limits.maxItems || chars + line.length > limits.maxChars) break;
     lines.push(line);
     chars += line.length + 1;
@@ -2587,7 +3533,7 @@ export function formatProvisionalTickedItemsForReviewerV1(
   return [
     `${provisional.length} ticked item${provisional.length === 1 ? " is" : "s are"} still provisional (ticked by a round, not yet verified by a reviewer). ` +
       `Listed oldest first${hidden > 0 ? `; ${lines.length} shown, ${hidden} more come up in later reviews` : ""}.`,
-    "For each one you personally confirmed against the workspace, name it in `## Verified Complete`, copying its text verbatim. Leave out any you did not check.",
+    "For each one you personally confirmed against the workspace, name it in `## Verified Complete` by its `[item:<id>]`, copying the id exactly (the item's text may follow it). Leave out any you did not check.",
     `Items marked [needs a passing test report] also need an applicable durable passing report from the list above. ${TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1}`,
     ...lines,
   ].join("\n");
@@ -2598,7 +3544,9 @@ export function formatProvisionalTickedItemsForReviewerV1(
  * items the gate counts as settled, using the gate's own numbers. Shown where
  * the owner acts (the open-items form result, the cards).
  */
-export function describeChecklistGateGapV1(progress: ChecklistEvidenceProgressV1): string {
+export function describeChecklistGateGapV1(
+  progress: Pick<ChecklistEvidenceProgressV1, "verified" | "provisional" | "ownerSettled">
+): string {
   const ticked = progress.verified + progress.provisional + progress.ownerSettled;
   const parts = [`${ticked} ticked`, `${progress.verified} verified by review`];
   if (progress.ownerSettled > 0) parts.push(`${progress.ownerSettled} settled by you`);
@@ -3204,9 +4152,22 @@ export type TestReportDiagnosisV1 =
   | { readonly kind: "not-applicable"; readonly reason: string };
 
 const TEST_FILE_TOKEN_V1 = /[\w@.\-/\\]+?\.(?:test|spec)\.(?:[cm]?[jt]sx?)(?![\w-])/gi;
-/** "post-edit source state", "post-edit run", "final source", "tree fingerprint": the run used the edited tree. */
+/**
+ * A statement that the run used the edited tree. review1 Step 13: besides "post-edit source state", "post-edit
+ * run", "final source" and "tree fingerprint", plain statements count: "on the working tree after the edit",
+ * "the current working tree", "no source edits between runs", "the edited tree".
+ */
 export const POST_EDIT_STATEMENT_V1 =
-  /post[- ]edit(?:\s+(?:source(?:\s+state)?|tree|state|run|working\s+tree))?|final\s+(?:post-edit\s+)?(?:source|tree)|tree[- ]fingerprint/i;
+  /post[- ]edit(?:\s+(?:source(?:\s+state)?|tree|state|run|working\s+tree))?|final\s+(?:post-edit\s+)?(?:source|tree)|tree[- ]fingerprint|(?:working\s+)?tree\s+after\s+(?:the|this\s+round'?s?|my)\s+edits?|after\s+(?:the|this\s+round'?s?|my)\s+(?:last\s+)?edits?\b|(?:the\s+)?current\s+working\s+tree|no\s+(?:source\s+)?(?:edits?|changes?)\s+(?:were\s+made\s+)?between\s+(?:the\s+)?runs?|(?:the\s+)?edited\s+(?:working\s+)?(?:tree|source)/i;
+/**
+ * A statement that the tests ran BEFORE this round's edits. A report is post-edit unless it says so (review1
+ * Step 13): "before the edit", "prior to my changes", "pre-edit", "stale tree".
+ */
+export const PRE_EDIT_STATEMENT_V1 =
+  /\b(?:before|prior\s+to|ahead\s+of)\s+(?:the|this\s+round'?s?|my|any)\s+(?:edits?|changes?|modifications?)\b|\bpre[- ]edit\b|\bstale\s+(?:tree|source|build)\b/i;
+/** The state recorded for a report that does not say either way: post-edit by default. */
+export const ASSUMED_POST_EDIT_SOURCE_STATE_V1 =
+  "post-edit source state (assumed: the report does not say the tests ran before the edits)";
 /** A listed file the round says it did not run is not covered by the command above it. */
 const NOT_RUN_LINE_V1 = /\bnot\s+run\b|\bskipp|\bcould\s+not\b|\brefused\b/i;
 
@@ -3279,11 +4240,19 @@ export function diagnoseApplicablePassingTestReportForItemV1(
   if (!isTestDependentChecklistItemV1(itemText)) return no("the item is not test-dependent");
   const wanted = normalizeChecklistItemTextV1(itemText);
   const planItemKeys = collectChecklistItemKeysV1(planOfRecord);
-  const { own } = splitSummaryAtEchoV1(editingRoundReport);
+  const { own } = splitSummaryAtEchoV1(editingRoundReport, planOfRecord);
   const all = headingsV1(own);
+  // review1 Step 14: a reason is never false. A section missing from the round's own text may still exist inside
+  // the block read as the echoed plan, and the reason then says that, and what to change.
+  const missingSectionReason = (name: string): string => {
+    const existsElsewhere = findLastHeadingV1(headingsV1(editingRoundReport), name) >= 0;
+    return existsElsewhere
+      ? `the report's \`## ${name}\` section sits inside the block that reproduces the plan's checklist, so it was read as part of the plan; move it below that block`
+      : `the report has no \`## ${name}\` section (add one ${name === "Plan Item Checklist" ? "with an entry `<item text> — done — <test file or command>` for this item" : "that lists each test command in backticks with its passed and failed counts"})`;
+  };
   const checklistAt = findLastHeadingV1(all, "Plan Item Checklist");
   const checklistHeading = checklistAt < 0 ? undefined : all[checklistAt];
-  if (!checklistHeading) return no("the report has no `## Plan Item Checklist` section");
+  if (!checklistHeading) return no(missingSectionReason("Plan Item Checklist"));
   const lines = walkLinesV1(own);
   let checklistEnd = lines.length;
   for (let i = checklistAt + 1; i < all.length; i++) {
@@ -3301,29 +4270,42 @@ export function diagnoseApplicablePassingTestReportForItemV1(
     const parsed = parsePlanItemChecklistLine(line.text, planItemKeys);
     if (parsed && parsed.status.toLowerCase().startsWith("done") &&
         normalizeChecklistItemTextV1(parsed.itemText) === wanted) {
-      itemClaimEvidence = parsed.evidence;
+      // review1 Step 14: the test files an entry lists in bullets nested under it ("— done — these tests exist and pass
+      // in the command below:" then one file per sub-bullet, as chat1's runs/029, 033 and 037 wrote it) are part of
+      // that entry's evidence. Without them the entry named no test file and every such report was rejected.
+      const claimIndent = /^\s*/.exec(line.text)?.[0].length ?? 0;
+      const nested: string[] = [];
+      for (let j = i + 1; j < checklistEnd; j++) {
+        const next = lines[j];
+        if (!next || next.fenced || next.text.trim() === "") break;
+        if ((/^\s*/.exec(next.text)?.[0].length ?? 0) <= claimIndent) break;
+        nested.push(next.text.trim().replace(/^[-*+]\s+/, ""));
+      }
+      itemClaimEvidence = [parsed.evidence, ...nested].join(" ").trim();
       claimedDone = true;
       break;
     }
   }
-  if (!claimedDone) return no("the round did not claim this item done in its `## Plan Item Checklist`");
+  if (!claimedDone) {
+    return no("the round did not claim this item done in its `## Plan Item Checklist` (add `<exact item text> — done — <test file or command>`)");
+  }
   // A backticked span with a space is a command; a single token is a file or test name.
   const evidenceCommands = [...itemClaimEvidence.matchAll(/`([^`]+)`/g)]
     .map((m) => (m[1] ?? "").trim())
     .filter((span) => /\s/.test(span));
   const evidenceNamesTests = /\btests?\b|\.(?:test|spec)\.|\bvitest\b|\bjest\b/i.test(itemClaimEvidence);
   if (!itemClaimEvidence || (!evidenceNamesTests && evidenceCommands.length === 0)) {
-    return no("the item's evidence names no test file, test name or command");
+    return no("the item's evidence names no test file, test name or command (name the test file, for example `foo.test.ts`, or the command in backticks)");
   }
   const evidenceKey = itemClaimEvidence
     .replace(/^\s*test(?:\s+evidence)?\s*[:=]\s*/i, "")
     .trim()
     .toLowerCase();
-  if (!evidenceKey) return no("the item's evidence names no test file, test name or command");
+  if (!evidenceKey) return no("the item's evidence names no test file, test name or command (name the test file, for example `foo.test.ts`, or the command in backticks)");
 
   const verificationAt = findLastHeadingV1(all, "Verification");
   const verificationHeading = verificationAt < 0 ? undefined : all[verificationAt];
-  if (!verificationHeading) return no("the report has no `## Verification` section");
+  if (!verificationHeading) return no(missingSectionReason("Verification"));
   let verificationEnd = lines.length;
   for (let i = verificationAt + 1; i < all.length; i++) {
     const heading = all[i];
@@ -3335,12 +4317,15 @@ export function diagnoseApplicablePassingTestReportForItemV1(
   const verificationLines = lines
     .slice(verificationHeading.line + 1, verificationEnd)
     .filter((line) => line && !line.fenced);
-  const statementLine = verificationLines.find((line) => POST_EDIT_STATEMENT_V1.test(line.text));
-  if (!statementLine) {
+  // review1 Step 13: a report counts as post-edit unless it says the tests ran before the edits.
+  const explicitStatementLine = verificationLines.find((line) => POST_EDIT_STATEMENT_V1.test(line.text));
+  const preEditLine = explicitStatementLine ? undefined : verificationLines.find((line) => PRE_EDIT_STATEMENT_V1.test(line.text));
+  if (preEditLine) {
     return no(
-      "the Verification section does not say the run used the post-edit tree (for example “post-edit source state”, “final source” or a tree fingerprint)"
+      `the Verification section says the tests ran before this round's edits (“${preEditLine.text.trim().slice(0, 100)}”); run them again after the edits and say so`
     );
   }
+  const statementLine = explicitStatementLine ?? { text: ASSUMED_POST_EDIT_SOURCE_STATE_V1 };
 
   // A Markdown list item and its more-deeply indented continuation lines are one
   // record: the command, any files listed under it, and its counts. A sibling
@@ -3373,7 +4358,9 @@ export function diagnoseApplicablePassingTestReportForItemV1(
       text: recordLines.join(" "),
     });
   }
-  if (records.length === 0) return no("the Verification section lists no backticked command");
+  if (records.length === 0) {
+    return no("the Verification section lists no backticked command (put each test command in backticks, with its passed and failed counts)");
+  }
 
   const build = (record: VerificationRecordV1, identity: string): ApplicablePlanItemTestReportV1 | undefined => {
     const passes = countsInRecordV1(record.text, /(\d+)\s+(?:tests?\s+)?pass(?:ed|ing)?\b|\bpass(?:ed)?\s*[:=]?\s*(\d+)/gi);
@@ -3413,7 +4400,9 @@ export function diagnoseApplicablePassingTestReportForItemV1(
       return no(`no Verification command names ${named.length > 0 ? `\`${target}\`` : `“${evidenceKey.slice(0, 80)}”`}`);
     }
     const report = covering.map((r) => build(r, evidenceKey)).find((r): r is ApplicablePlanItemTestReportV1 => r !== undefined);
-    if (!report) return no(`the command covering \`${target}\` did not report “N passed” with 0 failed`);
+    if (!report) {
+      return no(`the command covering \`${target}\` did not report “N passed” and “0 failed” (state both counts next to the command)`);
+    }
     firstReport ??= report;
   }
   return firstReport ? { kind: "applicable", report: firstReport } : no("no Verification command matched the item's evidence");
@@ -3476,24 +4465,63 @@ export function hasApplicablePassingTestReportForItemV1(
 export function formatOpenPlanItemsForRoundV1(planOfRecord: string, editingRoundReport?: string): string {
   const parsedItems = itemsInLatestRendering(planOfRecord).filter((item) => !item.excluded);
   const provisionalTestItems = new Set(listProvisionalTestDependentChecklistItemsV1(planOfRecord, editingRoundReport));
-  const items = parsedItems
-    .filter((item) => !item.checked || provisionalTestItems.has(unescapeChecklistItemTextV1(item.text)))
-    .map((item) => ({
-      text: unescapeChecklistItemTextV1(item.text),
-      provisional: item.checked,
-    }));
+  // review1 Step 9: every item carries an occurrence-aware id a round may use instead of quoting the text.
+  const idsByText = new Map<string, string[]>();
+  for (const entry of listPlanItemIdsV1(planOfRecord)) {
+    const bucket = idsByText.get(`${entry.nested ? "n" : "t"}${entry.itemText}`) ?? [];
+    bucket.push(entry.itemId);
+    idsByText.set(`${entry.nested ? "n" : "t"}${entry.itemText}`, bucket);
+  }
+  const takenIds = new Map<string, number>();
+  const idOf = (text: string, nested: boolean): string => {
+    const key = `${nested ? "n" : "t"}${text}`;
+    const used = takenIds.get(key) ?? 0;
+    takenIds.set(key, used + 1);
+    return idsByText.get(key)?.[used] ?? "";
+  };
+  type OpenListedItem = { text: string; provisional: boolean; id: string; children: { text: string; id: string }[]; heldOpen?: boolean };
+  const items: OpenListedItem[] = [];
+  let current: OpenListedItem | undefined;
+  let lastTopLevel: { text: string; id: string } | undefined;
+  for (const item of parsedItems) {
+    const text = unescapeChecklistItemTextV1(item.text);
+    const id = idOf(text, item.nested);
+    if (item.nested) {
+      // An open nested child holds its parent open; list it under the parent it belongs to, even when the
+      // parent's own box is ticked (the parent is then listed as held open by its child).
+      if (!item.checked) {
+        if (!current && lastTopLevel) {
+          current = { text: lastTopLevel.text, provisional: false, id: lastTopLevel.id, children: [], heldOpen: true };
+          items.push(current);
+        }
+        current?.children.push({ text, id });
+      }
+      continue;
+    }
+    lastTopLevel = { text, id };
+    if (!item.checked || provisionalTestItems.has(text)) {
+      current = { text, provisional: item.checked, id, children: [] };
+      items.push(current);
+    } else {
+      current = undefined;
+    }
+  }
   if (items.length === 0) {
     return "The plan of record has no unchecked, non-excluded top-level checklist items.";
   }
   const hasProvisionalItems = items.some((item) => item.provisional);
   return [
     "This is the only ordered list of open plan items eligible for completion claims in this round. The item text and embedded identifiers are copied from the plan of record in its original order. Start with item 1. Do not invent, renumber, combine, paraphrase, or claim an item that is absent from this list.",
+    "Each item also carries an id like [item:0123456789abcdef]. In `## Plan Item Checklist` you may name an item by that id (for example `item:0123456789abcdef — done — <evidence>`) instead of quoting its text.",
     ...(hasProvisionalItems
       ? [
           "A checked item marked PROVISIONAL is not verified: no applicable test report is associated with that item. Keep it open until an Implementation or Apply Review report names the test file or test name in that item's checklist evidence and reports a matching command, passed and failed counts, and the post-edit source state tested.",
         ]
       : []),
-    ...items.map((item, index) => `${index + 1}. ${item.provisional ? "[PROVISIONAL — evidence missing] " : ""}${item.text}`),
+    ...items.flatMap((item, index) => [
+      `${index + 1}. [item:${item.id}] ${item.provisional ? "[PROVISIONAL — evidence missing] " : ""}${item.heldOpen ? "[ticked, held open by an open nested item] " : ""}${item.text}`,
+      ...item.children.map((child) => `   - [item:${child.id}] (nested, open) ${child.text}`),
+    ]),
     `First item to work on: ${items[0]?.text}`,
   ].join("\n");
 }
@@ -3881,7 +4909,12 @@ export function filterAlreadyCheckedPlanItemsV1(
  *    its verification evidence, so the caller can record them in the run log
  *    for audit rather than treating every tick as identical.
  */
-export type MergeChecklistProgressResultV1 =
+export type MergeChecklistProgressResultV1 = MergeChecklistProgressOutcomeV1 & {
+  /** review1 Step 9: id or `Step N` references that named no single item, each with a true reason. */
+  readonly referenceProblems?: readonly string[];
+};
+
+type MergeChecklistProgressOutcomeV1 =
   | { readonly kind: "unchanged"; readonly alreadyRecorded?: readonly string[] }
   | { readonly kind: "no-report"; readonly alreadyRecorded?: readonly string[] }
   | {
@@ -3941,11 +4974,25 @@ export function mergeChecklistProgressV1(
   summary: string,
   options?: { readonly reviewerVerified?: boolean }
 ): MergeChecklistProgressResultV1 {
+  // review1 Step 9: claims by item id or a bare `Step N` are resolved to the item they name; a reference that
+  // names nothing (or several items) is reported here with a true reason and is never an unmatched claim, so
+  // it can never latch the checklist.
+  const referenceProblems: string[] = [];
+  const result = mergeChecklistProgressCoreV1(planOfRecord, summary, options, referenceProblems);
+  return referenceProblems.length > 0 ? { ...result, referenceProblems } : result;
+}
+
+function mergeChecklistProgressCoreV1(
+  planOfRecord: string,
+  summary: string,
+  options: { readonly reviewerVerified?: boolean } | undefined,
+  referenceProblems: string[]
+): MergeChecklistProgressResultV1 {
   // Only the echoed checklist counts as reported progress. The summary's own
   // `## Verification` is itself "a short checklist" per the prompt, so reading
   // the whole response let verification ticks add to the echo's — checking
   // more copies of a duplicated item than the round actually reported done.
-  const { echo, own } = splitSummaryAtEchoV1(summary);
+  const { echo, own } = splitSummaryAtEchoV1(summary, planOfRecord);
   const reported = new Map<string, number>(collectCheckedChecklistCountsV1(echo));
 
   // Original (pre-normalization) text for each reported key, so a "no-match"
@@ -3978,7 +5025,16 @@ export function mergeChecklistProgressV1(
   // excluded needs no evidence to be harmless. It is "already recorded": never an
   // unmatched claim, so it can never set the unreliable-checklist latch.
   const alreadyRecorded: string[] = [];
-  for (const claim of collectRetroactiveTickClaimsV1(own, planItemKeys)) {
+  // A claim that named its item by id (or by a unique `Step N`) targets that exact line, whichever of several
+  // identically worded items it is; the count-based owed logic below must not move it to another copy.
+  const targetedIndexesByKey = new Map<string, Set<number>>();
+  for (const rawClaim of collectRetroactiveTickClaimsV1(own, planItemKeys)) {
+    const reference = resolvePlanItemReferenceV1(planOfRecord, rawClaim.itemText);
+    if (reference.kind === "problem") {
+      referenceProblems.push(reference.reason);
+      continue;
+    }
+    const claim = reference.kind === "item" ? { ...rawClaim, itemText: reference.itemText } : rawClaim;
     const key = normalizeChecklistItemTextV1(claim.itemText);
     if (claim.evidence.length === 0) {
       if (isChecklistClaimTextAlreadyRecordedV1(planOfRecord, claim.itemText)) {
@@ -3990,6 +5046,11 @@ export function mergeChecklistProgressV1(
     }
     reported.set(key, (reported.get(key) ?? 0) + 1);
     retroactiveKeys.add(key);
+    if (reference.kind === "item") {
+      const targeted = targetedIndexesByKey.get(key) ?? new Set<number>();
+      targeted.add(reference.itemIndex);
+      targetedIndexesByKey.set(key, targeted);
+    }
     if (!retroactiveEvidenceByKey.has(key)) {
       retroactiveEvidenceByKey.set(key, claim.evidence);
     }
@@ -4122,6 +5183,7 @@ export function mergeChecklistProgressV1(
         reported.delete(key);
         retroactiveKeys.delete(key);
         retroactiveEvidenceByKey.delete(key);
+        targetedIndexesByKey.delete(key);
         unverifiedTestItems.push(itemText);
       }
     }
@@ -4159,10 +5221,13 @@ export function mergeChecklistProgressV1(
     }
   }
   for (const [key, count] of reported) {
-    owed.set(key, (owed.get(key) ?? 0) + count);
+    // Targeted claims are applied to their own lines below; only the untargeted remainder is a count owed.
+    const untargeted = count - (targetedIndexesByKey.get(key)?.size ?? 0);
+    owed.set(key, (owed.get(key) ?? 0) + (untargeted > 0 ? untargeted : 0));
   }
 
   let changed = false;
+  let itemOrdinal = -1;
   const retroactiveTicks: { itemText: string; evidence: string }[] = [];
   const mergedRegion = walkLinesV1(region)
     .map((line) => {
@@ -4172,15 +5237,18 @@ export function mergeChecklistProgressV1(
       return line.raw.replace(
         ITEM_LINE,
         (whole, open: string, state: string, close: string, text: string, trailing: string) => {
+          itemOrdinal++;
           if (state.toLowerCase() === "x") {
             return whole;
           }
           const key = normalizeChecklistItemTextV1(text);
-          const remaining = owed.get(key) ?? 0;
-          if (remaining <= 0) {
-            return whole;
+          if (targetedIndexesByKey.get(key)?.has(itemOrdinal) !== true) {
+            const remaining = owed.get(key) ?? 0;
+            if (remaining <= 0) {
+              return whole;
+            }
+            owed.set(key, remaining - 1);
           }
-          owed.set(key, remaining - 1);
           changed = true;
           if (retroactiveKeys.has(key)) {
             retroactiveTicks.push({

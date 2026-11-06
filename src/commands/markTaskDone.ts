@@ -17,6 +17,7 @@ import { retirePendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisi
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { describeTaskActionFailureV1 } from "../utils/taskActionOutcomeTextV1";
 import { reportTaskHeldRefusalV1 } from "../utils/taskHeldRefusalNoticeV1";
+import { confirmOpenPlanItemsAtEndV1 } from "./openPlanItemsAtEndV1";
 
 /**
  * Accepted argument shapes for markTaskDone.
@@ -207,7 +208,19 @@ export async function markTaskDone(
     return;
   }
 
-  // ── Step 1: Acquire the task lock and complete — no checks, no prompts ───
+  // ── review1 Step 61: open plan items are listed once, before the lock is taken ─
+  // "Stop" completes nothing; no card when nothing is open. Asked before the task lock so the wait holds nothing.
+  if (
+    (await confirmOpenPlanItemsAtEndV1({ taskFolderUri, stage: "publish", command: "Mark Done" })) === "stop"
+  ) {
+    NotificationRouter.showInformation(
+      `${formatNotificationTaskLabelV1(resolvedTask.progress.displayName, resolvedTask.folderName)}: not marked done — plan items are still open. ` +
+        "Tick or exclude them (Tick or Exclude a Checklist Item…), then choose Complete Task again."
+    );
+    return;
+  }
+
+  // ── Step 1: Acquire the task lock and complete — no prompts beyond the above ─
   // Task-level: completing a task is not scoped to one stage, so it spins the
   // task row rather than a stage row. This is an instant mutation (taxonomy),
   // so the lock is held only for the persistence writes below.

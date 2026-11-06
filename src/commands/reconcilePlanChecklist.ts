@@ -21,8 +21,8 @@ import {
 import { loadLatchingClaimsV1 } from "../utils/latchingClaimsFromRunLogV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { readTextIfExists, statIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
+import { computePlanItemCountsV1 } from "../utils/effectiveReviewProgress";
 import {
-  countChecklistEvidenceProgressV1,
   describeChecklistGateGapV1,
   listUncheckedChecklistItemTextsV1,
   filterAlreadyCheckedPlanItemsV1,
@@ -51,6 +51,7 @@ import {
 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
+import { APPLY_TICKS_DECISION_KEY_V1, SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1 } from "./verifiedTicksHeldOptionsV1";
 import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
 import { ChatTarget } from "../views/chatView";
 import { deriveApplicableVerifiedTicksV1, writeVerifiedTicksToPlanV1 } from "./applyReviewerVerifiedTicks";
@@ -67,6 +68,7 @@ import {
   parseChecklistItemPriorityV1,
   parseChecklistItemStepNumberV1,
   areAllUnmatchedChecklistClaimsAlreadySettledV1,
+  resolveVerifiedCompleteEntryTextsV1,
 } from "../utils/implementationChecklist";
 import { ReviewBlocker } from "../utils/reviewReadiness";
 import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
@@ -373,7 +375,8 @@ async function computeReviewVerifiedCoverageV1(
         coveredItems.push(item);
       }
     }
-    for (const item of filterAlreadyCheckedPlanItemsV1(planOfRecord, verified.items)) {
+    const namedItems = resolveVerifiedCompleteEntryTextsV1(planOfRecord, verified.entries).entries.map((entry) => entry.text);
+    for (const item of filterAlreadyCheckedPlanItemsV1(planOfRecord, namedItems)) {
       verifiedKeys.add(normalizeChecklistItemTextV1(item));
     }
     // Review-flagged (2026-08-25, new architectural blocker): a supersession
@@ -1547,6 +1550,17 @@ export async function runAutomaticChecklistReconciliationV1(
  * only recommends "Mark reconciled" when that evidence covers every
  * outstanding item.
  */
+/** True when a pending decision with `decisionKey` exists for the task (workspace state; false with no context). */
+export function hasPendingChecklistCardV1(canonicalId: string, decisionKey: string): boolean {
+  const context = getExtensionContextV1();
+  if (!context) {
+    return false;
+  }
+  return new WorkflowDecisionStoreV1(context.workspaceState)
+    .listPending(canonicalId)
+    .some((d) => d.decisionKey === decisionKey);
+}
+
 export type ReconcileDecisionPostResultV1 =
   | { readonly kind: "posted" }
   | { readonly kind: "noChecklist" }
@@ -1611,6 +1625,11 @@ export async function postReconcilePlanChecklistDecisionV1(
    */
   rejectionLeadNote?: string
 ): Promise<ReconcileDecisionPostResultV1> {
+  // review1 Step 10: one checklist card per task. While the reviewer-verified ticks card is pending it is that
+  // card (apply the ticks, settle the rest item by item, not yet), so no second checklist card is posted.
+  if (hasPendingChecklistCardV1(canonicalId, APPLY_TICKS_DECISION_KEY_V1)) {
+    return { kind: "posted" };
+  }
   // bugs4 item 15: with no triggering summary in scope, the claims that set the latch
   // are read back from the latching round's run log (complete lists only), so the card
   // judges the real claims instead of "not available for this invocation".
@@ -1632,11 +1651,8 @@ export async function postReconcilePlanChecklistDecisionV1(
     return { kind: "noChecklist" };
   }
 
-  const gateEvidence = countChecklistEvidenceProgressV1(
-    plan.text,
-    progress.planItemEvidence ?? [],
-    progress.planItemOwnerDecisions ?? []
-  );
+  // review1 Step 5: the gate figures come from the shared counts.
+  const gateEvidence = computePlanItemCountsV1({ planText: plan.text, progress });
   const { evidence, allUncheckedCovered, coveredItemsCount, coveredItems, perStage } = await gatherReconcileEvidenceV1(
     folderUri,
     plan.text,
@@ -2002,24 +2018,9 @@ export async function postReconcilePlanChecklistDecisionV1(
   // caching the plan's CONTENT into args — only the reference travels.
   const decisionId = crypto.randomUUID();
 
-  // RC2 item 8, Step 36: when an `applyReviewerVerifiedTicks` card is
-  // already pending for this task, this card's own "applyVerifiedTicks"
-  // option offers the exact same effect under a different label — that is
-  // what let one card's Apply silently withdraw the other's plateau card
-  // while the duplicate on THIS card kept doing nothing when pressed
-  // afterward (RC1, 2026-09-26). The v1 fix (deliberately limited — merging
-  // or removing the duplicate is workflow 12's): point the label at the
-  // other card instead of restating it, while keeping this option's real,
-  // idempotent command effect untouched.
-  const pendingApplyTicksCardV1 = ((): boolean => {
-    const context = getExtensionContextV1();
-    if (!context) {
-      return false;
-    }
-    return new WorkflowDecisionStoreV1(context.workspaceState)
-      .listPending(canonicalId)
-      .some((d) => d.decisionKey === "applyReviewerVerifiedTicks");
-  })();
+  // review1 Step 10: the early return above means no reviewer-verified ticks card is pending here, so this card's
+  // own apply option is the only one and needs no "same as the card above" wording.
+  const pendingApplyTicksCardV1 = false;
 
   // RC3 item 4, Step 3: captured now, at post time — see
   // `fastForwardResumeSuffixV1`'s doc comment for why this can't be
@@ -2053,7 +2054,7 @@ export async function postReconcilePlanChecklistDecisionV1(
         // bugs4 item 14: the counts are the completeness gate's own, with ticked and
         // verified apart, so this card never calls provisional ticks "settled".
         (gateEvidence
-          ? `${gateEvidence.gate.settled}/${gateEvidence.gate.total} items settled for the completeness gate ` +
+          ? `${gateEvidence.settled}/${gateEvidence.total} items settled for the completeness gate ` +
             `(${describeChecklistGateGapV1(gateEvidence)}` +
             (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
             `), with ${counted.remaining} unticked. `
@@ -2160,6 +2161,36 @@ export async function postReconcilePlanChecklistDecisionV1(
                       ...ffResume.extraArgs,
                       blockerStage: soleBlockerGuidance.stage,
                       blockerDescription: soleBlockerGuidance.blocker.description,
+                    },
+                  ],
+                },
+              },
+            ]
+          : []),
+        // review1 Step 10: this is the task's one checklist card, so it offers the same item-by-item settlement as
+        // the reviewer-verified ticks card. The form reads the plan at choice time, so it carries no stale list.
+        ...(counted.remaining > 0 || (gateEvidence?.provisional ?? 0) > 0
+          ? [
+              {
+                optionId: "settleRest",
+                label: "Settle the open items one by one",
+                resumeKind: "unpause" as const,
+                consequence:
+                  "Shows a form in this chat with every plan item that is still open or ticked without a review " +
+                  "check, so you can tick, confirm or exclude each one. Nothing is changed or run until you press " +
+                  "Apply on that form.",
+                effect: {
+                  kind: "command" as const,
+                  command: SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1,
+                  args: [
+                    {
+                      taskFolderPath,
+                      ...(progress.displayName ? { displayName: progress.displayName } : {}),
+                      stage: progress.currentStage,
+                      exceptItems: [] as string[],
+                      ...(ffResume.extraArgs.resumeFastForwardV1
+                        ? { resumeFastForwardV1: ffResume.extraArgs.resumeFastForwardV1 }
+                        : {}),
                     },
                   ],
                 },

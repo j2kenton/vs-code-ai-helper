@@ -15,11 +15,23 @@ import {
 } from "../utils/implementationArtifactResolver";
 import {
   filterAlreadyCheckedPlanItemsV1,
-  filterUncheckedPlanItemsV1,
   formatChecklistItemGlyphV1,
   mergeChecklistProgressV1,
   normalizeChecklistItemTextV1,
   getPlanRevisionV1,
+  findPlanItemHashEntryV1,
+  indexPlanItemRowsV1,
+  listCheckedVerificationTargetsV1,
+  listUncheckedVerificationTargetsV1,
+  resolveVerifiedCompleteEntryTextsV1,
+  listPlanItemIdsV1,
+  type AmbiguousVerificationEntryV1,
+  type UnknownVerificationIdV1,
+  listItemsTickedBetweenV1,
+  listPlanItemContentHashesV1,
+  type PlanItemHashEntryV1,
+  planItemRowAppliesV1,
+  stripPlanItemAnnotationsV1,
   isTestDependentChecklistItemV1,
   POST_EDIT_STATEMENT_V1,
   reportCommandCoversTestIdentityV1,
@@ -36,6 +48,7 @@ import {
 import {
   APPLY_TICKS_DECISION_KEY_V1,
   APPLY_TICKS_NOW_OPTION_ID_V1,
+  SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1,
   buildHeldTicksAnswerOptionsV1,
 } from "./verifiedTicksHeldOptionsV1";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
@@ -50,10 +63,12 @@ import { WorkflowDecisionCommandResultV1, WorkflowDecisionOptionV1 } from "../ty
 import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
 import { fastForwardResumeSuffixV1, FastForwardResumeStateV1 } from "./fastForwardResumeSuffixV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
-import { invalidatePlanItemEvidenceForPlanRevisionV1 } from "../utils/taskProgressTransforms";
+import { prunePlanItemEvidenceForPlanV1 } from "../utils/taskProgressTransforms";
+import { testDependencyStatesStillCurrentV1 } from "../utils/testDependencyStateV1";
 import { recordPlanItemReviewerVerificationV1 } from "../utils/taskProgressTransforms";
+import { refreshPlanItemSettlementSnapshotV1 } from "./planItemSettlementNoticeV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
-import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import { buildWithheldTestEvidenceCardInputV1 } from "../utils/withheldTestEvidenceCardV1";
 import { isFormContinuationPendingV1 } from "../utils/formPlanWriteMarkerV1";
 
 /**
@@ -87,6 +102,12 @@ type ApplyArg =
        */
       offeredItems?: readonly string[];
       /**
+       * Owner decision 2026-11-05 (item identity by design): the issued item id of each entry in `offeredItems`
+       * (same index; `null` where the review named the item by its text). With it, confirming the card applies only
+       * the exact items it offered, never a same-worded twin.
+       */
+      offeredItemIds?: readonly (string | null)[];
+      /**
        * RC3 item 4, Step 3: whether a Fast Forward run was genuinely active
        * for this task at the moment this card was POSTED, captured then
        * (`getFastForwardRunStateV1`) and baked into this option's own args —
@@ -104,6 +125,7 @@ function normalizeArg(arg: ApplyArg | undefined):
       taskFolderPath?: string;
       reviewStage?: TaskStage;
       offeredItems?: readonly string[];
+      offeredItemIds?: readonly (string | null)[];
       resumeFastForwardV1?: FastForwardResumeStateV1;
     }
   | undefined {
@@ -118,6 +140,7 @@ function normalizeArg(arg: ApplyArg | undefined):
     taskFolderPath?: string;
     reviewStage?: TaskStage;
     offeredItems?: readonly string[];
+    offeredItemIds?: readonly (string | null)[];
     resumeFastForwardV1?: FastForwardResumeStateV1;
   };
   if (explicit.canonicalId || explicit.taskFolderPath) {
@@ -126,6 +149,7 @@ function normalizeArg(arg: ApplyArg | undefined):
       taskFolderPath: explicit.taskFolderPath,
       reviewStage: explicit.reviewStage,
       offeredItems: explicit.offeredItems,
+      offeredItemIds: explicit.offeredItemIds,
       resumeFastForwardV1: explicit.resumeFastForwardV1,
     };
   }
@@ -168,6 +192,12 @@ export interface VerifiedTicksDerivationV1 {
   readonly reviewFilename: string;
   readonly applicable: readonly string[];
   /**
+   * Owner decision 2026-11-05 (item identity by design): the issued id of the exact item for each entry in
+   * `applicable`, same order/index, `undefined` where the review named the item by its text. An entry with an id
+   * ticks and verifies exactly that item, even when another item shares its wording.
+   */
+  readonly applicableItemIds?: readonly (string | undefined)[];
+  /**
    * RC3 item 1, Step 2c: the reviewer's own `evidence:` sentence for each
    * entry in `applicable`, same order/index, `undefined` when the review
    * carries no evidence line for that item (an older review, or one where
@@ -189,7 +219,7 @@ export interface VerifiedTicksDerivationV1 {
  * workspace. Used to resolve the workspace-root-relative paths a test report's
  * `sourceFileStates` snapshots were captured against.
  */
-function resolveWorkspaceRootForTaskV1(folderUri: vscode.Uri): string | undefined {
+export function resolveWorkspaceRootForTaskV1(folderUri: vscode.Uri): string | undefined {
   const taskPath = path.resolve(folderUri.fsPath);
   const folders = vscode.workspace.workspaceFolders ?? [];
   const containing = folders
@@ -209,6 +239,11 @@ async function reportSourceStateStillCurrentV1(
   report: PlanItemTestReportV1,
   workspaceRoot: string | undefined
 ): Promise<boolean> {
+  // review1 Step 15: a report that recorded what it depends on (its test files, their direct imports and the
+  // test-run config) is current while those are unchanged; the rest of the tree may have moved on.
+  if (report.testDependencyStates?.length) {
+    return testDependencyStatesStillCurrentV1(report.testDependencyStates, workspaceRoot);
+  }
   if (report.sourceFilesTruncated) {
     return false;
   }
@@ -301,40 +336,77 @@ export async function postWithheldTestEvidenceOutcomeInChatV1(
   withheldTestItems: readonly string[],
   withheldReasons?: ReadonlyMap<string, string>
 ): Promise<boolean> {
-  const pointer = await offerActionInChatV1({
+  // review1 Step 34 / Step 53: no option dispatches a model round to produce the report (it may be refused the test
+  // command, and tends to make edits). The card offers Ensemble's own Publish Checks run, the owner's recorded run,
+  // and the owner's tick.
+  const read = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath)).catch(() => undefined);
+  if (!read || !read.ok) {
+    return false;
+  }
+  const stage = read.decoded.progress.currentStage;
+  const reasonByKey = withheldReasons;
+  const card = buildWithheldTestEvidenceCardInputV1({
     taskFolderPath,
+    stage,
     taskLabel,
-    actionLabel: "Run the next stage action",
-    command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
-    args: [{ taskFolderPath }],
-    noticeText:
-      `The review named ${withheldTestItems.length} item${withheldTestItems.length === 1 ? "" : "s"} as verified, but no ticks were applied: ` +
-      describeWithheldTestItemsV1(withheldTestItems, 12, withheldReasons),
-    actionConsequence:
-      "Dispatches this stage's next action. It only produces the missing report if that round can run the named tests and lists them under ## Verification.",
-    recommend: {
-      target: "none",
-      reasoning:
-        "A round that runs the named tests would produce the report. Run one only if its test command is allowed; otherwise record the run yourself or settle the items by hand.",
-    },
-    optional: true,
-    doNothingOption: {
-      label: "Not now",
-      consequence: "Does nothing. The items stay provisional and the checklist is unchanged.",
-    },
-  }).catch(() => undefined);
-  return pointer !== undefined;
+    items: withheldTestItems,
+    reasonFor: (item) => reasonByKey?.get(normalizeChecklistItemTextV1(item)),
+  });
+  const posted = await postWorkflowDecisionV1(
+    { ...card, suppressNotification: true },
+    {
+      canonicalId: normalizePath(taskFolderPath),
+      taskFolderPath,
+      stage,
+      taskName: read.decoded.progress.displayName,
+    }
+  ).catch(() => undefined);
+  return posted !== undefined;
 }
 
-/** True when the owner recorded a passing (exit 0) hand-run covering this item in this plan revision. */
+/**
+ * review1 Step 34 / Step 53: after evidence arrives (a Publish Checks report recorded for an item, or the owner's
+ * passing run), applies the review's held ticks at once, through the same derivation and monotonic merge. Returns
+ * how many were ticked and which items are still held, so the caller can say so. Does nothing off a review stage.
+ */
+export async function applyHeldVerifiedTicksAfterEvidenceV1(
+  taskFolderPath: string,
+  taskLabel?: string
+): Promise<{ readonly ticked: number; readonly stillWithheld: readonly string[] }> {
+  const folderUri = vscode.Uri.file(taskFolderPath);
+  const read = await readTaskProgressStrictV1(folderUri).catch(() => undefined);
+  if (!read || !read.ok || !isReviewStage(read.decoded.progress.currentStage)) {
+    return { ticked: 0, stillWithheld: [] };
+  }
+  const derived = await deriveApplicableVerifiedTicksV1(folderUri, read.decoded.progress.currentStage);
+  if (derived.kind !== "ok") {
+    return { ticked: 0, stillWithheld: derived.withheldTestItems ?? [] };
+  }
+  const applied = await applyVerifiedTicksAtOnceV1(folderUri, derived.derivation, taskLabel);
+  return {
+    ticked: applied.kind === "applied" ? applied.count : 0,
+    stillWithheld: derived.derivation.withheldTestItems,
+  };
+}
+
+/**
+ * True when the owner recorded a passing (exit 0) hand-run covering this item. review1 Step 2: the run applies
+ * while the item is unchanged (its content hash, when the run stored one), not while the plan revision is.
+ */
 export function ownerRecordedPassingRunCoversItemV1(
   ownerTestRuns: readonly PlanItemOwnerTestRunV1[],
-  planRevision: string,
-  itemKey: string
+  itemKey: string,
+  itemContentHash?: string,
+  itemOccurrence?: number
 ): boolean {
-  return ownerTestRuns.some(
-    (run) => run.planRevision === planRevision && run.exitCode === 0 && run.itemKeys.includes(itemKey)
-  );
+  return ownerTestRuns.some((run) => {
+    if (run.exitCode !== 0 || !run.itemKeys.includes(itemKey)) return false;
+    const stored = run.itemContentHashes?.[itemKey];
+    if (stored !== undefined && itemContentHash !== undefined && stored !== itemContentHash) return false;
+    // A run recorded for one copy of identical items covers that copy only.
+    const storedOccurrence = run.itemOccurrences?.[itemKey];
+    return storedOccurrence === undefined || itemOccurrence === undefined || storedOccurrence === itemOccurrence;
+  });
 }
 
 /**
@@ -347,32 +419,43 @@ export function ownerRecordedPassingRunCoversItemV1(
 async function gateTestDependentItemsV1(
   items: readonly string[],
   evidenceRecords: readonly PlanItemEvidenceV1[],
-  planRevision: string,
+  planText: string,
   workspaceRoot: string | undefined,
-  ownerTestRuns: readonly PlanItemOwnerTestRunV1[] = []
+  ownerTestRuns: readonly PlanItemOwnerTestRunV1[] = [],
+  /** review1 (review fix): the plan item each of `items` means, by position; falls back to naming it by text. */
+  itemEntries: readonly (PlanItemHashEntryV1 | undefined)[] = []
 ): Promise<{
   accepted: string[];
+  /** Positions in `items` of the accepted ones, aligned with `accepted` and `testReportRoundIds`. */
+  acceptedIndices: number[];
   testReportRoundIds: string[][];
   withheld: string[];
   /** Normalized item key to the plain reason that item is withheld (bugs4 Step 20). */
   withheldReasons: Map<string, string>;
 }> {
   const accepted: string[] = [];
+  const acceptedIndices: number[] = [];
   const testReportRoundIds: string[][] = [];
   const withheld: string[] = [];
   const withheldReasons = new Map<string, string>();
-  for (const itemText of items) {
+  for (const [itemIndex, itemText] of items.entries()) {
     // bugs4 item 11/21: the SAME classifier the gate uses. A private word-regex copy here held
     // back every item that merely mentioned "test", so a populated Verified Complete block
     // produced zero verifications.
     if (!isTestDependentChecklistItemV1(itemText)) {
       accepted.push(itemText);
+      acceptedIndices.push(itemIndex);
       testReportRoundIds.push([]);
       continue;
     }
     const itemKey = normalizeChecklistItemTextV1(itemText);
-    const candidateReports = evidenceRecords
-      .filter((record) => record.planRevision === planRevision && record.itemKey === itemKey)
+    // review1 Step 2: rows for this item (by content hash, or text for legacy rows), whatever plan revision
+    // they were recorded at.
+    const itemEntry = itemEntries[itemIndex] ?? findPlanItemHashEntryV1(planText, itemText);
+    const itemRows = evidenceRecords.filter((record) =>
+      itemEntry !== undefined ? planItemRowAppliesV1(record, itemEntry) : record.itemKey === itemKey
+    );
+    const candidateReports = itemRows
       .flatMap((record) => record.testReports ?? [])
       .filter((report) =>
         report.passed > 0 &&
@@ -380,8 +463,12 @@ async function gateTestDependentItemsV1(
         // bugs4 item 21: the SAME statement the report parser accepted ("post-edit run", "final
         // source", a tree fingerprint). A narrower copy here withheld every report the parser had
         // just accepted when the round wrote "on the final source".
-        POST_EDIT_STATEMENT_V1.test(report.sourceState) &&
-        reportCommandCoversTestIdentityV1(report.command, report.testIdentity)
+        // review1 Step 34: a Publish Checks report is Ensemble's own run on the tree as it stands, not a round's
+        // claim, so it needs no post-edit sentence (it still goes through the source-state check below).
+        // Likewise its test files came from the run's own output, not from a command line to match them against.
+        (report.source === "publishChecks" ||
+          (POST_EDIT_STATEMENT_V1.test(report.sourceState) &&
+            reportCommandCoversTestIdentityV1(report.command, report.testIdentity)))
       );
     const currentReports: PlanItemTestReportV1[] = [];
     for (const report of candidateReports) {
@@ -394,16 +481,15 @@ async function gateTestDependentItemsV1(
       // bugs4 item 21 / Step 19: a passing run the owner recorded by hand is test evidence for
       // the items it names (an explicit owner decision, with owner provenance). Unlike an
       // editing round's report it is not tied to a source fingerprint: the owner ran it.
-      if (ownerRecordedPassingRunCoversItemV1(ownerTestRuns, planRevision, itemKey)) {
+      if (ownerRecordedPassingRunCoversItemV1(ownerTestRuns, itemKey, itemEntry?.hash, itemEntry?.occurrence)) {
         accepted.push(itemText);
+        acceptedIndices.push(itemIndex);
         testReportRoundIds.push([]);
         continue;
       }
       withheld.push(itemText);
       // bugs4 Step 20: say which obstacle held this item, so the card never has to guess.
-      const recordedReports = evidenceRecords
-        .filter((record) => record.planRevision === planRevision && record.itemKey === itemKey)
-        .flatMap((record) => record.testReports ?? []);
+      const recordedReports = itemRows.flatMap((record) => record.testReports ?? []);
       withheldReasons.set(
         itemKey,
         recordedReports.length === 0
@@ -415,9 +501,93 @@ async function gateTestDependentItemsV1(
       continue;
     }
     accepted.push(itemText);
+    acceptedIndices.push(itemIndex);
     testReportRoundIds.push([...new Set(currentReports.map((report) => report.roundId))]);
   }
-  return { accepted, testReportRoundIds, withheld, withheldReasons };
+  return { accepted, acceptedIndices, testReportRoundIds, withheld, withheldReasons };
+}
+
+/**
+ * review1 Step 43: the normalised keys of the plan items that carry a reviewer verification that still applies to
+ * them. Read BEFORE a narrowing is written, so the verification the item had can be carried to its new wording.
+ */
+export async function listReviewerVerifiedItemKeysV1(
+  folderUri: vscode.Uri,
+  planText: string
+): Promise<ReadonlySet<string>> {
+  const progressRead = await readTaskProgressStrictV1(folderUri);
+  if (!progressRead.ok) return new Set();
+  const evidenceFor = indexPlanItemRowsV1(progressRead.decoded.progress.planItemEvidence ?? []);
+  return new Set(
+    listPlanItemContentHashesV1(planText)
+      // A narrowing adds a nested child to a top-level item, so only a top-level verification is carried: a
+      // verified child of the same wording says nothing about the item being narrowed.
+      .filter((entry) => !entry.nested && evidenceFor(entry).some((record) => (record.verifications?.length ?? 0) > 0))
+      .map((entry) => entry.key)
+  );
+}
+
+/**
+ * review1 Step 43: after a narrowing changed an item (its content hash moved with the new nested child), records
+ * the reviewer's verification again under the new plan, with the narrowing's evidence as provenance. Only items
+ * that were verified before are passed in, so a narrowing never turns an unverified item into a verified one.
+ */
+export async function carryReviewerVerificationToNarrowedItemsV1(
+  folderUri: vscode.Uri,
+  newPlanText: string,
+  items: readonly { readonly itemText: string; readonly evidence: string }[]
+): Promise<number> {
+  if (items.length === 0) return 0;
+  const planRevision = getPlanRevisionV1(newPlanText);
+  const at = new Date().toISOString();
+  await patchTaskProgressStrictV1(folderUri, (progress) =>
+    items.reduce(
+      (next, item) =>
+        recordPlanItemReviewerVerificationV1(next, {
+          planRevision,
+          planText: newPlanText,
+          itemText: item.itemText,
+          at,
+          evidence: item.evidence,
+        }),
+      progress
+    )
+  );
+  return items.length;
+}
+
+/**
+ * review1 (owner decision 2026-11-05): says in the chat which reviewer entries named several checked plan items
+ * and therefore verified none of them, so the owner knows those items stay as they were until a reviewer names
+ * one unambiguously (for example by step number).
+ */
+async function postAmbiguousVerificationChatLineV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  reviewFilename: string,
+  ambiguous: readonly AmbiguousVerificationEntryV1[],
+  unknownIds: readonly UnknownVerificationIdV1[] = []
+): Promise<void> {
+  if (ambiguous.length > 0) {
+    const lines = ambiguous.map((entry) => `- "${entry.text}" (matches ${entry.matches} checked items)`);
+    await postTicksChatLineV1(
+      taskFolderPath,
+      stage,
+      `${reviewFilename} named ${ambiguous.length === 1 ? "an item" : `${ambiguous.length} items`} as verified complete ` +
+        `with wording that fits more than one checked plan item, so it verified none of them:\n${lines.join("\n")}\n` +
+        `Those items stay as they were. They count once a review names the one it means unambiguously, for example by its [item:<id>] or step number.`
+    );
+  }
+  if (unknownIds.length > 0) {
+    const lines = unknownIds.map((entry) => `- item:${entry.id}${entry.text === `item:${entry.id}` ? "" : ` ("${entry.text}")`}`);
+    await postTicksChatLineV1(
+      taskFolderPath,
+      stage,
+      `${reviewFilename} cited ${unknownIds.length === 1 ? "an item id" : `${unknownIds.length} item ids`} Ensemble did not issue for this plan, ` +
+        `so nothing was recorded for ${unknownIds.length === 1 ? "it" : "them"} (the plan may have changed since the list was shown):\n${lines.join("\n")}\n` +
+        `The next review can name the item again by its current [item:<id>].`
+    );
+  }
 }
 
 /**
@@ -450,38 +620,53 @@ export async function recordReviewerVerificationOfTickedItemsV1(
   const progressRead = await readTaskProgressStrictV1(folderUri);
   if (!progressRead.ok) return 0;
   const evidenceRecords = progressRead.decoded.progress.planItemEvidence ?? [];
-  const alreadyVerified = new Set(evidenceRecords
-    .filter((record) => record.planRevision === planRevision && (record.verifications?.length ?? 0) > 0)
-    .map((record) => record.itemKey));
-  const ticked = filterAlreadyCheckedPlanItemsV1(plan.text, verified.items)
-    .filter((item) => !alreadyVerified.has(normalizeChecklistItemTextV1(item)));
+  // review1 Step 2: verified means a verification on a row that still applies to the item.
+  const evidenceFor = indexPlanItemRowsV1(evidenceRecords);
+  // review1 (owner decision 2026-11-05): a reviewer names an item by its text, which a top-level item and a
+  // nested child, or two copies at one level, can share. An entry that names exactly one checked item verifies
+  // it; an entry that names several verifies none of them and is said so in the chat, never fanned out.
+  // Owner decision 2026-11-05 (item identity by design): an entry may cite the `[item:<id>]` Ensemble issued, or a
+  // `Step N` that names one item; a verification is recorded only for an id Ensemble issued.
+  const resolved = listCheckedVerificationTargetsV1(plan.text, verified.entries);
+  await postAmbiguousVerificationChatLineV1(
+    folderUri.fsPath,
+    reviewStage,
+    reviewFilename,
+    resolved.ambiguous,
+    resolved.unknownIds
+  );
+  const ticked = resolved.targets.filter(
+    (entry) => !evidenceFor(entry).some((record) => (record.verifications?.length ?? 0) > 0)
+  );
   if (ticked.length === 0) return 0;
-  const { accepted, testReportRoundIds } = await gateTestDependentItemsV1(
-    ticked,
+  const { acceptedIndices, testReportRoundIds } = await gateTestDependentItemsV1(
+    ticked.map((entry) => entry.text),
     evidenceRecords,
-    planRevision,
+    plan.text,
     resolveWorkspaceRootForTaskV1(folderUri),
-    progressRead.decoded.progress.planItemOwnerTestRuns ?? []
+    progressRead.decoded.progress.planItemOwnerTestRuns ?? [],
+    ticked
   );
-  if (accepted.length === 0) return 0;
-  const evidenceByKey = new Map<string, string | undefined>(
-    verified.entries.map((entry) => [normalizeChecklistItemTextV1(entry.text), entry.evidence])
-  );
+  if (acceptedIndices.length === 0) return 0;
   const verifiedAt = new Date().toISOString();
   await patchTaskProgressStrictV1(folderUri, (progress) =>
-    accepted.reduce((next, itemText, index) => {
+    acceptedIndices.reduce((next, tickedIndex, index) => {
+      const entry = ticked[tickedIndex]!;
       const roundIds = testReportRoundIds[index] ?? [];
       return recordPlanItemReviewerVerificationV1(next, {
         planRevision,
-        itemText,
+        planText: plan.text,
+        itemText: entry.text,
+        itemOccurrence: entry.occurrence,
+        itemNested: entry.nested,
         at: verifiedAt,
-        evidence: evidenceByKey.get(normalizeChecklistItemTextV1(itemText)) ??
+        evidence: resolved.sources.get(entry)?.evidence ??
           `verified by reviewer in ${reviewStage} review (${reviewFilename})`,
         ...(roundIds.length ? { testReportRoundIds: roundIds } : {}),
       });
     }, progress)
   );
-  return accepted.length;
+  return acceptedIndices.length;
 }
 
 /**
@@ -516,7 +701,8 @@ export async function recordReviewerVerificationOfTickedItemsV1(
 export async function deriveApplicableVerifiedTicksV1(
   folderUri: vscode.Uri,
   reviewStage: TaskStage,
-  offeredItems?: readonly string[]
+  offeredItems?: readonly string[],
+  offeredItemIds?: readonly (string | null | undefined)[]
 ): Promise<DeriveVerifiedTicksResultV1> {
   if (!isReviewStage(reviewStage)) {
     return {
@@ -551,36 +737,67 @@ export async function deriveApplicableVerifiedTicksV1(
     };
   }
 
-  const applicableFromReview = filterUncheckedPlanItemsV1(plan.text, verified.items);
+  // Owner decision 2026-11-05 (item identity by design): an entry that cites an issued `[item:<id>]` (or a
+  // `Step N` naming one item) targets exactly that item, whichever other item shares its wording; an unissued id
+  // or an item already ticked drops out. A plain text entry matches by wording, as before.
+  const allTargets = listUncheckedVerificationTargetsV1(plan.text, verified.entries);
+  const namedTexts = resolveVerifiedCompleteEntryTextsV1(plan.text, verified.entries).entries.map((entry) => entry.text);
   // Scope to exactly what this card offered, when it offered anything: a
   // review file that changed between post and confirm (newly verifying a
   // DIFFERENT item, say) must never let a stale card apply something it
-  // never promised — see this function's doc comment.
-  const offeredKeys = offeredItems ? new Set(offeredItems.map(normalizeChecklistItemTextV1)) : undefined;
-  const candidates = offeredKeys
-    ? applicableFromReview.filter((item) => offeredKeys.has(normalizeChecklistItemTextV1(item)))
-    : applicableFromReview;
-  const planRevision = getPlanRevisionV1(plan.text);
+  // never promised — see this function's doc comment. Offered items are texts, so two same-worded targets pass
+  // only as many times as the card offered that wording.
+  //
+  // When the card also recorded the issued id of each item it offered (same index as `offeredItems`), an id target
+  // passes only if its own id was offered, whatever its wording; only text-only targets are matched by wording, and
+  // only against text-only offers. So a card that offered the first of two same-worded items can never apply the
+  // second, even when a newer review now verifies only the second.
+  const idsAligned = offeredItems !== undefined && offeredItemIds !== undefined && offeredItemIds.length === offeredItems.length;
+  const offeredIdSet = new Set<string>();
+  const offeredBudget = new Map<string, number>();
+  (offeredItems ?? []).forEach((offered, index) => {
+    const offeredId = idsAligned ? offeredItemIds[index] : undefined;
+    if (offeredId) {
+      offeredIdSet.add(offeredId);
+      return;
+    }
+    const key = normalizeChecklistItemTextV1(offered);
+    offeredBudget.set(key, (offeredBudget.get(key) ?? 0) + 1);
+  });
+  const scopedTargets = offeredItems
+    ? allTargets.filter((target) => {
+        if (idsAligned && target.itemId) return offeredIdSet.has(target.itemId);
+        const key = normalizeChecklistItemTextV1(target.text);
+        const left = offeredBudget.get(key) ?? 0;
+        if (left <= 0) return false;
+        offeredBudget.set(key, left - 1);
+        return true;
+      })
+    : allTargets;
+  const planTextForIds = plan.text;
+  const hashEntries = listPlanItemContentHashesV1(planTextForIds);
+  const idEntries = listPlanItemIdsV1(planTextForIds);
+  // The hash list and the id list walk the same rendering, so an index names the same item in both.
+  const candidateEntries = scopedTargets.map((target) =>
+    target.itemId && hashEntries.length === idEntries.length
+      ? hashEntries[idEntries.findIndex((entry) => entry.itemId === target.itemId)]
+      : undefined
+  );
   const progressRead = await readTaskProgressStrictV1(folderUri);
   const evidenceRecords = progressRead.ok ? progressRead.decoded.progress.planItemEvidence ?? [] : [];
-  const {
-    accepted: applicable,
-    testReportRoundIds: applicableTestReportRoundIds,
-    withheld: withheldTestItems,
-    withheldReasons,
-  } = await gateTestDependentItemsV1(
-    candidates,
+  const gated = await gateTestDependentItemsV1(
+    scopedTargets.map((target) => target.text),
     evidenceRecords,
-    planRevision,
+    plan.text,
     resolveWorkspaceRootForTaskV1(folderUri),
-    progressRead.ok ? progressRead.decoded.progress.planItemOwnerTestRuns ?? [] : []
+    progressRead.ok ? progressRead.decoded.progress.planItemOwnerTestRuns ?? [] : [],
+    candidateEntries
   );
-  const evidenceByKeyV1 = new Map<string, string | undefined>(
-    verified.entries.map((entry) => [normalizeChecklistItemTextV1(entry.text), entry.evidence])
-  );
-  const applicableEvidence = applicable.map((item) => evidenceByKeyV1.get(normalizeChecklistItemTextV1(item)));
+  const { accepted: applicable, testReportRoundIds: applicableTestReportRoundIds, withheld: withheldTestItems, withheldReasons } = gated;
+  const applicableItemIds = gated.acceptedIndices.map((index) => scopedTargets[index]?.itemId);
+  const applicableEvidence = gated.acceptedIndices.map((index) => scopedTargets[index]?.evidence);
   if (applicable.length === 0) {
-    const alreadyAppliedCount = filterAlreadyCheckedPlanItemsV1(plan.text, offeredItems ?? verified.items).length;
+    const alreadyAppliedCount = filterAlreadyCheckedPlanItemsV1(plan.text, offeredItems ?? namedTexts).length;
     if (withheldTestItems.length > 0) {
       return {
         kind: "blocked",
@@ -604,6 +821,7 @@ export async function deriveApplicableVerifiedTicksV1(
       reviewStage,
       reviewFilename,
       applicable,
+      applicableItemIds,
       applicableEvidence,
       applicableTestReportRoundIds,
       withheldTestItems,
@@ -675,6 +893,9 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
     };
   }
   const { reviewFilename, applicable, applicableEvidence, withheldTestItems, withheldReasons } = derived.derivation;
+  // The issued id of each offered item (`null` for a text-only entry), recorded on the card so confirming it later
+  // ticks exactly these items.
+  const offeredItemIds = applicable.map((_, index) => derived.derivation.applicableItemIds?.[index] ?? null);
   const withheldNote = withheldTestItems.length > 0
     ? `\nWithheld and still provisional because no applicable passing Implementation or Apply Review test report was found. ${describeWithheldTestItemsV1(withheldTestItems, 12, withheldReasons)}` +
       ` ${SETTLE_WITHHELD_ITEMS_HINT_V1}`
@@ -693,6 +914,14 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
   const fastForwardState = getFastForwardRunStateV1(taskFolderPath);
   const ffResume = fastForwardResumeSuffixV1(taskFolderPath, fastForwardState);
 
+  // review1 Step 10: one checklist card per task. This card carries the reconcile card's actions (apply the
+  // reviewer-verified ticks, settle the rest item by item, not yet), so a pending reconcile card is withdrawn.
+  await withdrawWorkflowDecisionsByKeyV1(
+    { taskFolderPath, canonicalId },
+    "reconcilePlanChecklist",
+    "superseded by the task's single checklist card (the reviewer-verified ticks card)"
+  );
+
   const decision = await postWorkflowDecisionV1(
     {
       decisionKey: "applyReviewerVerifiedTicks",
@@ -710,6 +939,9 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
           optionId: "apply",
           label: `Apply ${applicable.length} Reviewer-Verified Tick${applicable.length === 1 ? "" : "s"}${ffResume.labelSuffix}`,
           resumeKind: "continue",
+          // review1 Step 53: a monotonic tick merge (it can only tick items the review verified) then the stage's
+          // next action; safe to run when the owner does not answer.
+          unattendedSafe: true,
           consequence:
             `Ticks these ${applicable.length} item(s) in plan-final.md, sourced from ${reviewFilename}, then ` +
             "dispatches this stage's next action:\n" +
@@ -731,7 +963,33 @@ export async function postApplyReviewerVerifiedTicksDecisionV1(
           effect: {
             kind: "command",
             command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
-            args: [{ taskFolderPath, canonicalId, reviewStage, offeredItems: applicable, ...ffResume.extraArgs }],
+            args: [{ taskFolderPath, canonicalId, reviewStage, offeredItems: applicable, offeredItemIds, ...ffResume.extraArgs }],
+          },
+        },
+        // review1 Step 10: this is the task's one checklist card. The rest of the open items are settled from here,
+        // item by item, in the open-items form (read at choice time, minus the items "apply" ticks).
+        {
+          optionId: "settleRest",
+          label: "Settle the other open items one by one",
+          resumeKind: "unpause",
+          consequence:
+            "Shows a form in this chat with every other plan item that is still open, so you can tick or exclude " +
+            `each one (the ${applicable.length} reviewer-verified item(s) above are left out; apply them with ` +
+            "the first option). Nothing is ticked or run until you press Apply on that form.",
+          effect: {
+            kind: "command",
+            command: SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1,
+            args: [
+              {
+                taskFolderPath,
+                ...(displayName ? { displayName } : {}),
+                stage: reviewStage,
+                exceptItems: applicable,
+                ...(ffResume.extraArgs.resumeFastForwardV1
+                  ? { resumeFastForwardV1: ffResume.extraArgs.resumeFastForwardV1 }
+                  : {}),
+              },
+            ],
           },
         },
         {
@@ -861,15 +1119,43 @@ export type WriteVerifiedTicksResultV1 =
  */
 export async function writeVerifiedTicksToPlanV1(
   folderUri: vscode.Uri,
-  derivation: VerifiedTicksDerivationV1
+  selected: VerifiedTicksDerivationV1
 ): Promise<WriteVerifiedTicksResultV1> {
-  const { reviewStage: resolvedStage, reviewFilename, applicable } = derivation;
+  const { reviewStage: resolvedStage, reviewFilename } = selected;
   const freshPlan = await readPlanOfRecordV1(folderUri);
   if (!freshPlan.hasChecklist || !freshPlan.text) {
     return { kind: "noChecklist" };
   }
   const evidence = `verified by reviewer in ${resolvedStage} review (${reviewFilename})`;
-  const synthetic = buildSyntheticVerifiedCompleteSummaryV1(applicable, evidence);
+  // Owner decision 2026-11-05 (item identity by design): an entry that carries the id of the exact item ticks that
+  // item through an `item:<id>` claim, so a same-worded item is never ticked in its place. When the plan moved on
+  // and that item is no longer open (ticked or excluded in the meantime, or reworded so its id is gone), the entry is
+  // dropped: it never falls back to the item's wording, which could tick a still-open twin. The card is re-derived
+  // from the review the next time instead.
+  const freshIdEntries = listPlanItemIdsV1(freshPlan.text);
+  const keptIndices = selected.applicable
+    .map((_, index) => index)
+    .filter((index) => {
+      const itemId = selected.applicableItemIds?.[index];
+      return itemId === undefined || freshIdEntries.some((entry) => entry.itemId === itemId && !entry.checked && !entry.excluded);
+    });
+  if (keptIndices.length === 0) {
+    return { kind: "refused" };
+  }
+  const pick = <T>(values: readonly T[]): T[] => keptIndices.map((index) => values[index] as T);
+  const derivation: VerifiedTicksDerivationV1 = {
+    ...selected,
+    applicable: pick(selected.applicable),
+    applicableItemIds: selected.applicableItemIds ? pick(selected.applicableItemIds) : undefined,
+    applicableEvidence: pick(selected.applicableEvidence),
+    applicableTestReportRoundIds: pick(selected.applicableTestReportRoundIds),
+  };
+  const { applicable } = derivation;
+  const claimTexts = applicable.map((itemText, index) => {
+    const itemId = derivation.applicableItemIds?.[index];
+    return itemId !== undefined ? `item:${itemId}` : itemText;
+  });
+  const synthetic = buildSyntheticVerifiedCompleteSummaryV1(claimTexts, evidence);
   const merged = mergeChecklistProgressV1(freshPlan.text, synthetic, { reviewerVerified: true });
   if (merged.kind !== "merged") {
     return { kind: "notMerged" };
@@ -882,14 +1168,57 @@ export async function writeVerifiedTicksToPlanV1(
   if (!written) {
     return { kind: "refused" };
   }
-  const planRevision = getPlanRevisionV1(freshPlan.text);
+  const freshPlanText = freshPlan.text;
+  const planRevision = getPlanRevisionV1(freshPlanText);
   const verifiedAt = new Date().toISOString();
   await patchTaskProgressStrictV1(folderUri, (progress) => {
-    const currentRevision = invalidatePlanItemEvidenceForPlanRevisionV1(progress, planRevision);
+    const currentRevision = prunePlanItemEvidenceForPlanV1(progress, freshPlanText);
+    // review1 (review fix): record each verification for the exact item the merge ticked, at its own level and
+    // copy, so a verification for a child never lands on a same-worded top-level item (or the reverse).
+    const tickedItems = listItemsTickedBetweenV1(freshPlanText, merged.content);
+    if (tickedItems !== undefined && tickedItems.length > 0) {
+      const freshHashEntries = listPlanItemContentHashesV1(freshPlanText);
+      const usedIndices = new Set<number>();
+      // An entry whose claim went through `item:<id>` belongs to that id's item only, never to a wording match.
+      const claimedById = (candidateIndex: number): boolean => claimTexts[candidateIndex]?.startsWith("item:") === true;
+      return tickedItems.reduce((next, entry) => {
+        // The entry that named this exact item by id wins; otherwise the first unused entry with its wording.
+        const position = freshHashEntries.findIndex(
+          (candidate) =>
+            candidate.nested === entry.nested &&
+            candidate.occurrence === entry.occurrence &&
+            candidate.annotationFreeKey === entry.annotationFreeKey
+        );
+        const entryItemId = position >= 0 && freshHashEntries.length === freshIdEntries.length ? freshIdEntries[position]?.itemId : undefined;
+        let index = entryItemId !== undefined ? (derivation.applicableItemIds ?? []).findIndex((id) => id === entryItemId) : -1;
+        if (index < 0) {
+          index = applicable.findIndex(
+            (itemText, candidateIndex) =>
+              !usedIndices.has(candidateIndex) &&
+              !claimedById(candidateIndex) &&
+              normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(itemText)) === entry.annotationFreeKey
+          );
+        }
+        if (index < 0) return next;
+        usedIndices.add(index);
+        const testReportRoundIds = derivation.applicableTestReportRoundIds[index] ?? [];
+        return recordPlanItemReviewerVerificationV1(next, {
+          planRevision,
+          planText: freshPlanText,
+          itemText: entry.text,
+          itemOccurrence: entry.occurrence,
+          itemNested: entry.nested,
+          at: verifiedAt,
+          evidence: derivation.applicableEvidence[index] ?? `verified by reviewer in ${resolvedStage} review (${reviewFilename})`,
+          ...(testReportRoundIds.length ? { testReportRoundIds } : {}),
+        });
+      }, currentRevision);
+    }
     return applicable.reduce((next, itemText, index) => {
       const testReportRoundIds = derivation.applicableTestReportRoundIds[index] ?? [];
       return recordPlanItemReviewerVerificationV1(next, {
         planRevision,
+        planText: freshPlanText,
         itemText,
         at: verifiedAt,
         evidence: derivation.applicableEvidence[index] ?? `verified by reviewer in ${resolvedStage} review (${reviewFilename})`,
@@ -911,6 +1240,8 @@ export async function writeVerifiedTicksToPlanV1(
     "plan-final.md's checklist ticks changed, superseding the pending tick-application card"
   );
   await withdrawStaleOpenItemsCardV1(folderUri, merged.content);
+  // review1 Step 8: the applied ticks changed the count; keep the settlement snapshot (and the tooltip note) current.
+  await refreshPlanItemSettlementSnapshotV1(folderUri);
   return { kind: "applied", count: applicable.length };
 }
 
@@ -958,7 +1289,12 @@ export async function applyReviewerVerifiedTicksConfirmedV1(
   const taskLabel = formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName);
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
   const reviewStage = normalized?.reviewStage ?? resolved.progress.currentStage;
-  const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage, normalized?.offeredItems);
+  const derived = await deriveApplicableVerifiedTicksV1(
+    folderUri,
+    reviewStage,
+    normalized?.offeredItems,
+    normalized?.offeredItemIds
+  );
   if (derived.kind === "blocked") {
     const postedInChat =
       derived.withheldTestItems !== undefined &&
@@ -1072,7 +1408,12 @@ export async function applyReviewerVerifiedTicksNowV1(
   const folderUri = vscode.Uri.file(resolved.taskFolderPath);
   const reviewStage = normalized?.reviewStage ?? resolved.progress.currentStage;
   const offered = normalized?.offeredItems ?? [];
-  const derived = await deriveApplicableVerifiedTicksV1(folderUri, reviewStage, normalized?.offeredItems);
+  const derived = await deriveApplicableVerifiedTicksV1(
+    folderUri,
+    reviewStage,
+    normalized?.offeredItems,
+    normalized?.offeredItemIds
+  );
   if (derived.kind === "blocked") {
     const count = derived.alreadyAppliedCount ?? 0;
     return {
@@ -1098,6 +1439,7 @@ export async function applyReviewerVerifiedTicksNowV1(
         optionId: APPLY_TICKS_NOW_OPTION_ID_V1,
         acceptedAt: new Date().toISOString(),
         itemKeys: applicable,
+        itemIds: applicable.map((_, index) => derived.derivation.applicableItemIds?.[index] ?? null),
       });
       armDeferredOptionRunV1({
         key: `ticks-now:${normalizePath(resolved.taskFolderPath)}`,
@@ -1139,6 +1481,133 @@ export async function applyReviewerVerifiedTicksNowV1(
   return { outcome: "done" };
 }
 
+/** review1 Step 53 (owner, 2026-11-05): the Undo of an at-once tick, run from the notification's button. */
+export const UNDO_REVIEWER_VERIFIED_TICKS_COMMAND_V1 = "vs-code-ai-helper.undoReviewerVerifiedTicks";
+
+/** One plan line as it was before an at-once tick and as the tick wrote it. */
+export interface TickLineRestoreV1 {
+  readonly before: string;
+  readonly after: string;
+}
+
+/**
+ * The lines an at-once tick changed. The merge only edits lines in place; if the line count differs the
+ * change is not a plain per-line tick and no exact undo can be offered (`undefined`).
+ */
+export function diffTickedLinesV1(before: string, after: string): TickLineRestoreV1[] | undefined {
+  const a = before.split("\n");
+  const b = after.split("\n");
+  if (a.length !== b.length) {
+    return undefined;
+  }
+  const changed: TickLineRestoreV1[] = [];
+  for (let index = 0; index < a.length; index++) {
+    if (a[index] !== b[index]) {
+      changed.push({ before: a[index]!, after: b[index]! });
+    }
+  }
+  return changed;
+}
+
+/** The one chat line and notification for an at-once tick: the items, the review and its evidence per item. */
+export function describeTicksAppliedAtOnceV1(derivation: VerifiedTicksDerivationV1): string {
+  const parts = derivation.applicable.map((item, index) => {
+    const evidence = derivation.applicableEvidence[index];
+    return `${item} — ${evidence ?? "no evidence line in this review (older review format)"}`;
+  });
+  return `Ticked ${derivation.applicable.length === 1 ? "1 item" : `${derivation.applicable.length} items`} (verified by ${derivation.reviewFilename}): ${parts.join("; ")}`;
+}
+
+export type ApplyTicksAtOnceResultV1 =
+  | { readonly kind: "applied"; readonly count: number; readonly undoable: boolean }
+  | { readonly kind: "notApplied" };
+
+/**
+ * review1 Step 53 (owner, 2026-11-05): a review that names unticked plan items as verified complete has them
+ * ticked as soon as it ends, with no card and no countdown. The merge is the same monotonic one "Apply the N
+ * ticks now" uses, and test items without a valid report were already withheld by the derivation. One chat
+ * line and one notification say what was ticked and why; the notification carries an Undo that restores exactly
+ * those lines. Nothing is dispatched: a Fast Forward run goes on to its own next round, and without one the task
+ * waits where it was.
+ */
+export async function applyVerifiedTicksAtOnceV1(
+  folderUri: vscode.Uri,
+  derivation: VerifiedTicksDerivationV1,
+  taskLabel?: string
+): Promise<ApplyTicksAtOnceResultV1> {
+  const planBefore = (await readPlanOfRecordV1(folderUri)).text;
+  const written = await writeVerifiedTicksToPlanV1(folderUri, derivation);
+  if (written.kind !== "applied") {
+    return { kind: "notApplied" };
+  }
+  const planAfter = (await readPlanOfRecordV1(folderUri)).text;
+  const restores = planBefore !== undefined && planAfter !== undefined ? diffTickedLinesV1(planBefore, planAfter) : undefined;
+  const undoable = restores !== undefined && restores.length > 0;
+  const text = describeTicksAppliedAtOnceV1(derivation);
+  await postTicksChatLineV1(folderUri.fsPath, derivation.reviewStage, text);
+  NotificationRouter.showInformation(
+    taskLabel ? `${taskLabel} — ${text}` : text,
+    undefined,
+    undefined,
+    undefined,
+    undoable
+      ? {
+          command: UNDO_REVIEWER_VERIFIED_TICKS_COMMAND_V1,
+          title: "Undo",
+          args: [{ taskFolderPath: folderUri.fsPath, restores, ...(taskLabel ? { taskLabel } : {}) }],
+        }
+      : undefined
+  );
+  return { kind: "applied", count: written.count, undoable };
+}
+
+/**
+ * Undo of {@link applyVerifiedTicksAtOnceV1}: puts back exactly the lines the tick wrote. A line the owner has
+ * edited since is left alone and reported; nothing else in the plan changes.
+ */
+export async function undoReviewerVerifiedTicksV1(arg?: {
+  taskFolderPath?: string;
+  restores?: readonly TickLineRestoreV1[];
+  /** The task's quoted label, carried from the notification the Undo sits on. */
+  taskLabel?: string;
+}): Promise<{ restored: number; skipped: number }> {
+  if (!arg?.taskFolderPath || !arg.restores || arg.restores.length === 0) {
+    return { restored: 0, skipped: 0 };
+  }
+  const folderUri = vscode.Uri.file(arg.taskFolderPath);
+  const taskLabel = arg.taskLabel ?? formatNotificationTaskLabelV1(undefined, arg.taskFolderPath);
+  const plan = await readPlanOfRecordV1(folderUri);
+  if (!plan.text) {
+    NotificationRouter.showWarning(`${taskLabel} — The ticks could not be undone: plan-final.md was not found.`);
+    return { restored: 0, skipped: arg.restores.length };
+  }
+  const lines = plan.text.split("\n");
+  let restored = 0;
+  for (const { before, after } of arg.restores) {
+    const index = lines.indexOf(after);
+    if (index === -1) {
+      continue;
+    }
+    lines[index] = before;
+    restored++;
+  }
+  const skipped = arg.restores.length - restored;
+  if (restored > 0) {
+    const written = await writeTextFileIfUnchangedV1(getCanonicalImplementationUri(folderUri), plan.text, lines.join("\n"));
+    if (!written) {
+      NotificationRouter.showWarning(`${taskLabel} — plan-final.md changed while the ticks were being undone, so nothing was written. Try Undo again.`);
+      return { restored: 0, skipped: arg.restores.length };
+    }
+    await refreshPlanItemSettlementSnapshotV1(folderUri);
+  }
+  const text =
+    skipped === 0
+      ? `Undid the reviewer-verified tick${restored === 1 ? "" : "s"}: ${restored} line${restored === 1 ? "" : "s"} restored in plan-final.md.`
+      : `Undid ${restored} of ${arg.restores.length} reviewer-verified ticks; ${skipped} line${skipped === 1 ? " was" : "s were"} edited since and left as they are.`;
+  NotificationRouter.showInformation(`${taskLabel} — ${text}`);
+  return { restored, skipped };
+}
+
 /** "Apply Review" for a review stage (the round whose end the ticks wait for), "round" otherwise. */
 function describeRoundNounV1(stage: TaskStage): string {
   return isReviewStage(stage) ? "Apply Review" : "round";
@@ -1163,7 +1632,7 @@ export async function applyAcceptedTicksNowV1(taskFolderPath: string): Promise<n
   for (const decision of accepted) {
     const answer = decision.deferredAnswer!;
     const folderUri = vscode.Uri.file(taskFolderPath);
-    const derived = await deriveApplicableVerifiedTicksV1(folderUri, decision.stage, answer.itemKeys);
+    const derived = await deriveApplicableVerifiedTicksV1(folderUri, decision.stage, answer.itemKeys, answer.itemIds);
     if (derived.kind === "blocked") {
       await store.clearDeferredAnswer(decision.decisionId, true);
       await postTicksChatLineV1(
@@ -1241,6 +1710,10 @@ export function registerApplyReviewerVerifiedTicksCommands(
     vscode.commands.registerCommand(
       "vs-code-ai-helper.applyReviewerVerifiedTicksNow",
       (arg?: ApplyArg) => applyReviewerVerifiedTicksNowV1(inventory, currentTaskStore, arg)
-    )
+    ),
+    vscode.commands.registerCommand(UNDO_REVIEWER_VERIFIED_TICKS_COMMAND_V1, (arg?: {
+      taskFolderPath?: string;
+      restores?: readonly TickLineRestoreV1[];
+    }) => undoReviewerVerifiedTicksV1(arg))
   );
 }

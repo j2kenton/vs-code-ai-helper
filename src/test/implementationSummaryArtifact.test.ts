@@ -1047,11 +1047,19 @@ void describe("a plan with a checklist does not require the round to echo it (RC
       "",
       "- `src/a.ts` — did a thing",
     ].join("\n");
+    // The plan of record ends with that Verification section too, as a generated plan does; the echo reproduces
+    // it, so it is the plan's heading and not the round's own (review1 Step 12).
+    const planWithVerification = `${CHECKLIST_PLAN_OF_RECORD}\n\n## Verification\n\n- Run the full test suite after each part lands\n`;
     const issue = describeImplementationSummaryShapeIssue(truncated, {
-      planChecklist: CHECKLIST_PLAN_OF_RECORD,
+      planChecklist: planWithVerification,
     });
     assert.ok(issue, "the echoed checklist's Verification is not the summary's");
     assert.match(issue, /Verification/);
+    // A plan with no Verification heading cannot have carried that one, so there it is the round's own.
+    assert.equal(
+      describeImplementationSummaryShapeIssue(truncated, { planChecklist: CHECKLIST_PLAN_OF_RECORD }),
+      undefined
+    );
   });
 
   void it("accepts the same response once its own Verification follows", () => {
@@ -3113,8 +3121,9 @@ void describe("Part 5: naming and resolving outstanding checklist items", () => 
       ].join("\n");
       const result = formatOpenPlanItemsForRoundV1(plan);
       assert.match(result, /Start with item 1/);
-      assert.match(result, /1\. \*\*Step 2: First open item\.\*\* Keep this exact text\./);
-      assert.match(result, /2\. \*\*Step 4: Next open item\.\*\*/);
+      // review1 Step 9: each item also carries an id a round may use instead of quoting the text.
+      assert.match(result, /1\. \[item:[0-9a-f]{16}\] \*\*Step 2: First open item\.\*\* Keep this exact text\./);
+      assert.match(result, /2\. \[item:[0-9a-f]{16}\] \*\*Step 4: Next open item\.\*\*/);
       assert.ok(result.endsWith("First item to work on: **Step 2: First open item.** Keep this exact text."));
       assert.doesNotMatch(result, /Step 1: Already built|Step 3: Excluded branch/);
     });
@@ -3132,8 +3141,8 @@ void describe("Part 5: naming and resolving outstanding checklist items", () => 
         "- [ ] **Step 3: Add retries and preserve the retry cause.**",
       ].join("\n");
       const result = formatOpenPlanItemsForRoundV1(plan);
-      assert.match(result, /1\. \*\*Step 2: Add retries\.\*\*/);
-      assert.match(result, /2\. \*\*Step 3: Add retries and preserve the retry cause\.\*\*/);
+      assert.match(result, /1\. \[item:[0-9a-f]{16}\] \*\*Step 2: Add retries\.\*\*/);
+      assert.match(result, /2\. \[item:[0-9a-f]{16}\] \*\*Step 3: Add retries and preserve the retry cause\.\*\*/);
       assert.match(result, /Do not invent, renumber, combine, paraphrase/);
     });
 
@@ -3147,8 +3156,8 @@ void describe("Part 5: naming and resolving outstanding checklist items", () => 
       ].join("\n");
       const result = formatOpenPlanItemsForRoundV1(plan);
       assert.match(result, /checked item marked PROVISIONAL is not verified/);
-      assert.match(result, /1\. \[PROVISIONAL — evidence missing\] \*\*Step 1: Add regression tests\./);
-      assert.match(result, /2\. \*\*Step 3: Add failure cases\./);
+      assert.match(result, /1\. \[item:[0-9a-f]{16}\] \[PROVISIONAL — evidence missing\] \*\*Step 1: Add regression tests\./);
+      assert.match(result, /2\. \[item:[0-9a-f]{16}\] \*\*Step 3: Add failure cases\./);
       assert.doesNotMatch(result, /Step 2: Update documentation|Step 4: Excluded tests/);
       assert.ok(result.endsWith("First item to work on: **Step 1: Add regression tests.** Preserve this exact text."));
     });

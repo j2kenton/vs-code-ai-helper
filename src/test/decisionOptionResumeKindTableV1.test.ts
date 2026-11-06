@@ -134,6 +134,11 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "utils/reviewEscalation.ts", optionId: "publishAnyway", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: publishAnyway dispatches the publish continuation" },
   { file: "utils/reviewEscalation.ts", optionId: "acknowledgeAdvance", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: acknowledgeAdvance routes through the Step-3 Advance path, not doNothing" },
   { file: "utils/reviewEscalation.ts", optionId: "handleMyself", occurrence: 2, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: handleMyself variant leaves task paused" },
+  // review1 Step 58: "I've made changes — re-check" re-runs only the review, and only when the inputs changed.
+  { file: "utils/reviewEscalation.ts", optionId: "recheckAfterMyChanges", occurrence: 0, resumeKind: "continue", dispatchProof: "keepIteratingTextV1.test.ts: offers 'I've made changes — re-check' only when the review's inputs changed" },
+  // review1 Step 48: the environmental-failure card's investigate and look-myself options.
+  { file: "utils/reviewEscalation.ts", optionId: "investigateFailure", occurrence: 0, resumeKind: "continue", dispatchProof: "environmentalFailureCardV1.test.ts: Investigate dispatches the diagnostic round with the failure and the environment" },
+  { file: "utils/reviewEscalation.ts", optionId: "lookMyself", occurrence: 0, resumeKind: "unpause", dispatchProof: "environmentalFailureCardV1.test.ts: offers Investigate, look myself and accept" },
   // RC4 item 3: the narrowing card's two options (plateau card, `narrowing` present).
   { file: "utils/reviewEscalation.ts", optionId: "acceptNarrowing", occurrence: 0, resumeKind: "continue", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: the entry is appended once and the re-review is dispatched with skipUnchangedTreeGuard" },
   { file: "utils/reviewEscalation.ts", optionId: "keepItemOpen", occurrence: 0, resumeKind: "unpause", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: keepItemOpen dispatches nothing" },
@@ -154,10 +159,13 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "commands/reconcilePlanChecklist.ts", optionId: "reconcile", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: reconcile clears the flag without dispatching the stage" },
   { file: "commands/reconcilePlanChecklist.ts", optionId: "continueStage", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: continueStage dispatches the stage action" },
   { file: "commands/reconcilePlanChecklist.ts", optionId: "notYet", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: notYet dispatches nothing" },
+  // review1 Step 10: the merged checklist card's item-by-item option opens the open-items form and dispatches nothing.
+  { file: "commands/reconcilePlanChecklist.ts", optionId: "settleRest", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: settleRest opens the open-items form and dispatches nothing" },
 
   // src/commands/applyReviewerVerifiedTicks.ts
   { file: "commands/applyReviewerVerifiedTicks.ts", optionId: "apply", occurrence: 0, resumeKind: "continue", dispatchProof: "applyReviewerVerifiedTicksCommand.test.ts: apply dispatches the stage's next action after ticking" },
   { file: "commands/applyReviewerVerifiedTicks.ts", optionId: "skip", occurrence: 0, resumeKind: "unpause", dispatchProof: "applyReviewerVerifiedTicksCommand.test.ts: skip dispatches nothing" },
+  { file: "commands/applyReviewerVerifiedTicks.ts", optionId: "settleRest", occurrence: 0, resumeKind: "unpause", dispatchProof: "applyReviewerVerifiedTicksCommand.test.ts: settleRest opens the open-items form and dispatches nothing" },
 
   // src/commands/reviewActions.ts
   { file: "commands/reviewActions.ts", optionId: "retry", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts / reviewRouting.test.ts: retry re-dispatches the stage action" },
@@ -168,8 +176,6 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "commands/reviewActions.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewRouting.test.ts: notNow dispatches nothing" },
   { file: "commands/reviewActions.ts", optionId: "goToReviewAndApply", occurrence: 1, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: goToReviewAndApply (second card site) dispatches goToReviewAndApplyV1" },
   { file: "commands/reviewActions.ts", optionId: "notNow", occurrence: 1, resumeKind: "unpause", dispatchProof: "reviewRouting.test.ts: notNow (second card site) dispatches nothing" },
-  { file: "commands/reviewActions.ts", optionId: "goToReviewAndApply", occurrence: 2, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: goToReviewAndApply (third card site) dispatches goToReviewAndApplyV1" },
-  { file: "commands/reviewActions.ts", optionId: "letItRun", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: letItRun leaves the running round to finish — the process continues" },
   { file: "commands/reviewActions.ts", optionId: "retrySameModel", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewActions review-degenerate decision test: retrySameModel reruns the review" },
   { file: "commands/reviewActions.ts", optionId: "chooseDifferentModel", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewActions review-degenerate decision test: chooseDifferentModel opens model selection and reruns" },
   { file: "commands/reviewActions.ts", optionId: "commitAndPush", occurrence: 0, resumeKind: "continue", dispatchProof: "publishOwnershipMatrix: clean Publish review offers Commit & Push" },
@@ -397,6 +403,14 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   // Corrected during verification: skip's effect IS doNothing
   // (applyReviewerVerifiedTicks.ts:222), not a command.
   [rowKey("commands/applyReviewerVerifiedTicks.ts", "skip", 0), { kind: "trivial-no-dispatch" }],
+  // review1 Step 10: the merged checklist card's "settle the rest" option opens the open-items form (a command that
+  // only shows the form); both cards build it from the same helper, and reconcilePlanChecklistCommand.test.ts asserts it.
+  [rowKey("commands/reconcilePlanChecklist.ts", "settleRest", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
+  [rowKey("commands/applyReviewerVerifiedTicks.ts", "settleRest", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "recheckAfterMyChanges", 0), { kind: "runtime-test", proofFiles: ["keepIteratingTextV1.test.ts"] }],
+  // review1 Step 48: Investigate dispatches the diagnostic round; "I'll look at it myself" dispatches nothing.
+  [rowKey("utils/reviewEscalation.ts", "investigateFailure", 0), { kind: "runtime-test", proofFiles: ["environmentalFailureCardV1.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "lookMyself", 0), { kind: "trivial-no-dispatch" }],
 
   [rowKey("commands/reviewActions.ts", "retry", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts", "reviewRouting.test.ts"] }],
   // Both rows below have a genuine runtime
@@ -425,24 +439,7 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   // literal is present, never a dispatch effect.
   [rowKey("commands/reviewActions.ts", "goToReviewAndApply", 1), { kind: "runtime-test", proofFiles: ["reviewRouting.test.ts", "commandArgNormalization.test.ts"], extraAnchors: ["resumeIfPausedThenGoToReviewAndApplyV1"] }],
   [rowKey("commands/reviewActions.ts", "notNow", 1), { kind: "trivial-no-dispatch" }],
-  [rowKey("commands/reviewActions.ts", "goToReviewAndApply", 2), { kind: "runtime-test", proofFiles: ["reviewRouting.test.ts", "commandArgNormalization.test.ts"], extraAnchors: ["resumeIfPausedThenGoToReviewAndApplyV1"] }],
-  // letItRun: re-verified 2026-09-24. Unlike copilotImplementationRunner.ts's
-  // "continue" and quota.ts's original "resume" (both AWAITED by their caller,
-  // which then branches on the returned optionId — a real fork only a runtime
-  // test can prove), this decision is posted via a bare, un-awaited
-  // `postWorkflowDecisionV1(...)` (reviewActions.ts, the preImplementationRouting
-  // card) — fire-and-forget, never `awaitWorkflowDecisionAnswerV1`. The
-  // calling code checks only whether `decision` is `undefined` (no extension
-  // context to post through) and unconditionally "falls through to run
-  // Implementation" either way — see the comment immediately after the
-  // `postWorkflowDecisionV1` call ("this must not gate the current run").
-  // No production code path ever reads WHICH option the user chooses, so
-  // there is no fork left for a runtime test to exercise: the type system
-  // (effect: doNothing) plus this call-shape fact together already guarantee
-  // the already-running round is genuinely left alone whichever option is
-  // picked, or before it is even answered. This is the same "genuinely
-  // nothing to test" bar the trivial-no-dispatch bucket exists for.
-  [rowKey("commands/reviewActions.ts", "letItRun", 0), { kind: "trivial-no-dispatch" }],
+  // review1 Step 18: the third goToReviewAndApply site and `letItRun` (the preImplementationRouting card) are gone.
   [rowKey("commands/reviewActions.ts", "retrySameModel", 0), { kind: "runtime-test", proofFiles: ["reviewRoutingMalformedBlockers.test.ts"] }],
   [rowKey("commands/reviewActions.ts", "chooseDifferentModel", 0), { kind: "runtime-test", proofFiles: ["reviewRoutingMalformedBlockers.test.ts"] }],
   [rowKey("commands/reviewActions.ts", "commitAndPush", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],

@@ -38,6 +38,7 @@ import {
   ProviderSignInAction,
 } from "../runners/providers";
 import { NotificationRouter } from "../utils/notificationRouter";
+import { asOwnerEntryPointV1 } from "../state/automationDispatchContextV1";
 
 type IncomingMessage =
   | { type: "ready" }
@@ -276,7 +277,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
 
-    webviewView.webview.onDidReceiveMessage(async (data: IncomingMessage) => {
+    webviewView.webview.onDidReceiveMessage(asOwnerEntryPointV1(async (data: IncomingMessage) => {
       switch (data.type) {
         case "ready": {
           // Collapsing this panel makes VS Code deallocate its webview
@@ -491,7 +492,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           break;
         }
       }
-    });
+    }));
 
     // Model settings and provider selection can be edited directly in
     // settings.json, or from a different workspace via the Global scope —

@@ -269,6 +269,8 @@ function makeTaskFolder(
   );
   fs.writeFileSync(path.join(folderPath, "task.md"), "# Task\n\nDo the thing.\n", "utf8");
   fs.writeFileSync(path.join(folderPath, "plan-final.md"), PLAN_FINAL, "utf8");
+  // review1 Step 18: a round on a reviewed stage is rendered with the review, which needs the approved plan too.
+  fs.writeFileSync(path.join(folderPath, "plan.md"), PLAN_FINAL, "utf8");
   fs.writeFileSync(path.join(folderPath, "impl-summary.md"), PRIOR_SUMMARY, "utf8");
   fs.writeFileSync(path.join(folderPath, "impl-summary_prev.md"), PRIOR_SUMMARY_PREV, "utf8");
   fs.writeFileSync(path.join(folderPath, "impl-high-review.md"), PRIOR_REVIEW, "utf8");
@@ -973,6 +975,39 @@ void describe("deferred/incomplete round recovery (end to end)", () => {
  * than silently downgrading to a checklist-driven Implementation round.
  */
 void describe("Apply Review continuation reconstruction (item 17b, fail-closed)", () => {
+  void it("review1 Step 18: a FRESH round on a reviewed stage whose review cannot be rendered is refused, not run on the checklist prompt", async () => {
+    const { folderPath, progress } = makeTaskFolder("fresh_reviewed_round_unrenderable", {
+      reviewScoreHistory: [
+        {
+          stage: "impl-high-review" as const,
+          score: 6,
+          attemptId: "attempt-reviewed",
+          at: "2026-01-02T00:00:00.000Z",
+          blockerCount: 1,
+          taskFixableCount: 1,
+        },
+      ],
+    });
+    // The review exists but the approved plan the apply template needs does not, so the review cannot be rendered.
+    fs.rmSync(path.join(folderPath, "plan.md"), { force: true }); // deliberate: removal is the behaviour under test
+
+    const run = await runHarnessed(folderPath, progress, {
+      status: "completed",
+      filesChanged: ["src/should-not-run.ts"],
+      filesChangedUnknown: false,
+      summary: GOOD_SUMMARY,
+      runnerId: "test-cli",
+      providerLabel: "Test CLI",
+      storedModelId: "cli:test-model",
+    });
+
+    assert.equal(run.prompts.length, 0, "no prompt may be assembled for a reviewed stage without its review");
+    assert.ok(
+      run.notifications.some((n) => /could not be rendered into its prompt/.test(n.message)),
+      `expected a refusal warning; got: ${JSON.stringify(run.notifications)}`
+    );
+  });
+
   void it("refuses to run under a lost apply-review mandate rather than silently downgrading to checklist-driven Implementation", async () => {
     const { folderPath, progress } = makeTaskFolder("apply_review_continuation_lost", {
       pendingImplReviewFiles: ["src/newfile.ts"],
@@ -1022,7 +1057,7 @@ void describe("Apply Review continuation reconstruction (item 17b, fail-closed)"
 
     // A warning names the reconstruction failure.
     assert.ok(
-      run.notifications.some((n) => /could not be reconstructed/.test(n.message)),
+      run.notifications.some((n) => /could not be rendered into its prompt/.test(n.message)),
       `expected a reconstruction-failure warning; got: ${JSON.stringify(run.notifications)}`
     );
   });
@@ -3530,8 +3565,9 @@ void describe("a zero-change round with unticked plan items is refused without a
       providerLabel: "Test CLI",
       storedModelId: "cli:test-model",
     });
+    // review1 Step 18: this stage has a review on record, so the round is dispatched (and recorded) as apply-review.
     const failedRows = (readProgress(folderPath).roundLedger ?? []).filter(
-      (row) => row.mode === "implementation" && row.state === "failed"
+      (row) => (row.mode === "implementation" || row.mode === "apply-review") && row.state === "failed"
     );
     assert.ok(failedRows.length > 0, "the failed round must be terminalized as failed");
     const row = failedRows[failedRows.length - 1]!;

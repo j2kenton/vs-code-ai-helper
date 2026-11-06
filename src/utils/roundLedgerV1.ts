@@ -266,6 +266,10 @@ import {
   type ForeignTaskArtifactSnapshotV1,
 } from "./foreignTaskArtifactContainmentV1";
 import { normalizePath } from "./taskRoot";
+import { hasAutomaticOriginV1 } from "../state/automationDispatchContextV1";
+import { fastForwardRoundFieldsV1, isFastForwardRunActiveV1 } from "./activeFastForwardRunsV1";
+import { recordRoundEndedInWatchV1 } from "./taskProgressWatchV1";
+import { formatRepeatedRejectionLineV1 } from "./reportContractRejectionsV1";
 import { getLiveTaskOperationV1, isOperationLiveByIdV1 } from "./liveTaskOperationLookupV1";
 import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
 import {
@@ -815,6 +819,17 @@ export async function terminalizeRoundV1(
     if (options.postTerminalizePatch) {
       next = options.postTerminalizePatch(next, nextEntry);
     }
+    // review1 Step 23: every ledger ending feeds the one "is this task moving?" record the gate in front of
+    // every automatic dispatch reads. A round is automatic when automation started it: an automatic-origin call
+    // tree, a scheduling intent, a recovery continuation, or a Fast Forward run in progress for the task.
+    next = recordRoundEndedInWatchV1(next, nextEntry, {
+      automatic:
+        hasAutomaticOriginV1() ||
+        nextEntry.intentId !== undefined ||
+        nextEntry.continuationOf !== undefined ||
+        isFastForwardRunActiveV1(options.taskFolderUri.fsPath),
+      ...(options.roundOutcomeClassification?.modelId !== undefined ? { model: options.roundOutcomeClassification.modelId } : {}),
+    });
     // v1 fixes 2, item 8: a completed round that arranged nothing further
     // hands the task back to the human (see the transform's doc comment).
     return handBackToHumanAfterCompletedRoundV1(next, nextEntry);
@@ -929,6 +944,12 @@ export async function terminalizeRoundV1(
   }
   const mayPostOutcomeLine = claimTerminalLineV1(terminalLineKey, "ledger") && !observerLinePersisted;
   let outcomeText: string | undefined;
+  // review1 Step 35: the third rejection of the same kind in a task is a pattern. While automation is still running
+  // there is no stop card to carry it, so the round-end line says how many times it has happened and what to do.
+  const repeatedRejectionNote =
+    entry.state === "rejected" && (hasAutomaticOriginV1() || isFastForwardRunActiveV1(options.taskFolderUri.fsPath))
+      ? formatRepeatedRejectionLineV1(patched.reportContractRejections) || undefined
+      : undefined;
   try {
     outcomeText = formatRoundOutcomeMessageV1(
       entry,
@@ -936,7 +957,7 @@ export async function terminalizeRoundV1(
         ? patched.roundLedger?.find((candidate) => candidate.roundId === entry.continuationOf)?.startedAt
         : undefined,
       patched,
-      [options.chatAttributionNote, foreignArtifactNote].filter(Boolean).join("\n\n") || undefined
+      [options.chatAttributionNote, foreignArtifactNote, repeatedRejectionNote].filter(Boolean).join("\n\n") || undefined
     );
     if (mayPostOutcomeLine) {
       await appendChatMessageV1(
@@ -1333,6 +1354,7 @@ export async function claimImplementationRoundLedgerV1(
           stage,
           mode,
           state: "open",
+          ...fastForwardRoundFieldsV1(folderUri.fsPath),
         }
       : {
           roundId: candidateRoundId,
@@ -1341,6 +1363,7 @@ export async function claimImplementationRoundLedgerV1(
           mode,
           startedAt: new Date().toISOString(),
           state: "open",
+          ...fastForwardRoundFieldsV1(folderUri.fsPath),
           ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
         };
     finalRoundId = openRow.roundId;

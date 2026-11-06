@@ -19,6 +19,7 @@
 
 import { createHash } from "crypto";
 import { BlockerLineageDeclaration, TaskProgress, TaskStage } from "../types/taskProgress";
+import { listPlanItemStepOwnersV1 } from "./implementationChecklist";
 
 /**
  * Stages from which a review can be run, mapped to the review stage it
@@ -260,9 +261,21 @@ export type BlockerCategory = "architectural" | "completion" | "review-confidenc
 export type BlockerResolver =
   | "task-fixable"
   | "environmental"
+  | "environmental-fixable"
   | "unverifiable"
   | "spec-defect"
   | "needs-toolchain";
+
+/**
+ * review1 Step 47: `environmental` keeps its meaning (no code change resolves it); `environmental-fixable` is
+ * environmental in origin but a bounded code change, usually outside the plan's scope, resolves it (a test that
+ * reads developer configuration, a config missing an exclusion, a path the host spells differently). A reviewer
+ * who cannot tell uses `environmental-fixable` and states the uncertainty. Neither is something an in-plan round
+ * fixes, so routing and escalation treat them alike; only the offer differs ("Investigate it for me").
+ */
+export function isEnvironmentalResolverV1(resolver: string | undefined): boolean {
+  return resolver === "environmental" || resolver === "environmental-fixable";
+}
 
 export interface ReviewBlocker {
   category: BlockerCategory;
@@ -534,7 +547,7 @@ const VERIFIED_COMPLETE_EVIDENCE_LINE_RE = /^\s+evidence:\s*(.+?)\s*$/;
  * first bracket and finds a category name there instead.
  */
 const BLOCKER_LINE_RE =
-  /^\s*[-*]\s*(?:\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*)?\[\s*(task-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(?:\[\s*(new|same\s*:\s*[\w-]+|narrowed\s*:\s*[\w-]+)\s*\]\s*)?(.+?)\s*$/i;
+  /^\s*[-*]\s*(?:\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*)?\[\s*(task-fixable|environmental-fixable|environmental|unverifiable|spec-defect|needs-toolchain)\s*\]\s*(?:\[\s*(new|same\s*:\s*[\w-]+|narrowed\s*:\s*[\w-]+)\s*\]\s*)?(.+?)\s*$/i;
 
 /** bugs5 Step 24: agent-gatherable evidence form */
 export const AGENT_CAN_GATHER_RE = /\bagent can gather\s*\((?:cost:\s*)?([^)]+)\)/i;
@@ -856,7 +869,14 @@ function roundKnownToChangeNothingV1(
  */
 export function reviewPredatesLatestImplementationRoundV1(
   progress: Pick<TaskProgress, "stageReviewPasses" | "reviewScoreHistory" | "roundLedger">,
-  stage: TaskStage
+  stage: TaskStage,
+  /**
+   * review1 Step 32: when the owner is CONTINUING a lost editing round (an Apply Review or Implementation round
+   * that failed or was cut off after editing), that round's own edits do not make the review it was working from
+   * stale: continuing is exactly "act on this review against the tree as that round left it". Only lost editing
+   * rounds are ignored; a completed round that changed files still stales the review.
+   */
+  options?: { readonly ignoreLostEditingRounds?: boolean }
 ): boolean {
   const current = progress.stageReviewPasses?.[stage];
   if (current === undefined) {
@@ -880,8 +900,16 @@ export function reviewPredatesLatestImplementationRoundV1(
     if (!Number.isFinite(started) || started <= published) {
       return false;
     }
+    if (options?.ignoreLostEditingRounds === true && isLostRoundStateV1(row.state)) {
+      return false;
+    }
     return !roundKnownToChangeNothingV1(row);
   });
+}
+
+/** A terminal ledger state that means the round did not finish (the user's own cancel is not one). */
+function isLostRoundStateV1(state: string): boolean {
+  return state === "failed" || state === "rejected" || state === "interrupted" || state === "quota-blocked";
 }
 
 /**
@@ -1234,9 +1262,18 @@ export function computeReviewFreshness(
 export function isReviewDispatchAgainstUnchangedTreeV1(
   existingReviewContent: string | undefined,
   headSha: string | undefined,
-  currentTreeFingerprint: string | undefined
+  currentTreeFingerprint: string | undefined,
+  /**
+   * review1 Step 27: true when the review's other inputs (`plan.md`, `plan-final.md`, `task.md`) changed after the
+   * review was written. The code fingerprint cannot see the task folder, so an owner decision recorded in `task.md`
+   * or an Accepted Non-Goals entry in `plan.md` leaves the tree "unchanged" while the review is stale.
+   */
+  reviewInputsChanged?: boolean
 ): boolean {
   if (!existingReviewContent || !headSha) {
+    return false;
+  }
+  if (reviewInputsChanged === true) {
     return false;
   }
   if (hasArtifactChangeStaleBannerV1(existingReviewContent)) {
@@ -1445,7 +1482,7 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
     }
     const lineage = parseLineageBracket(lineageRaw);
     let resolvedResolver = resolver.toLowerCase() as BlockerResolver;
-    if (resolvedResolver === "environmental" && AGENT_CAN_GATHER_RE.test(description)) {
+    if (isEnvironmentalResolverV1(resolvedResolver) && AGENT_CAN_GATHER_RE.test(description)) {
       resolvedResolver = "task-fixable";
     }
     blockers.push({
@@ -1457,6 +1494,64 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
     });
   }
   return { blockPresent: true, blockers, malformedLines };
+}
+
+const VERIFIED_NARROWING_BLOCK_RE =
+  /<!--\s*verified-narrowing:start\s*-->([\s\S]*?)<!--\s*verified-narrowing:end\s*-->/i;
+const VERIFIED_NARROWING_PART_LINE_RE = /^\s+not applicable:\s*(.+?)\s*$/i;
+
+/** One narrowing a reviewer verified: the plan item, the part of it that does not apply, and checkable evidence. */
+export interface ReviewVerifiedNarrowingV1 {
+  readonly itemText: string;
+  readonly notApplicable: string;
+  readonly evidence: string;
+}
+
+/**
+ * review1 Step 43: parse the `## Verified narrowing` block a reviewer files when it CAN check that part of a
+ * ticked plan item does not apply:
+ *
+ *   <!-- verified-narrowing:start -->
+ *   - <exact plan item text, copied verbatim>
+ *     not applicable: <the part that does not apply>
+ *     evidence: <checkable evidence: the file or symbol opened and what it shows>
+ *   <!-- verified-narrowing:end -->
+ *
+ * An entry missing either continuation line is dropped (a narrowing without checkable evidence is the owner's
+ * decision, not the reviewer's). An absent block yields an empty list.
+ */
+export function parseReviewVerifiedNarrowingsV1(content: string): ReviewVerifiedNarrowingV1[] {
+  const match = VERIFIED_NARROWING_BLOCK_RE.exec(content);
+  if (!match) {
+    return [];
+  }
+  const entries: { itemText: string; notApplicable?: string; evidence?: string }[] = [];
+  for (const line of (match[1] ?? "").split(/\r?\n/)) {
+    if (!line.trim()) {
+      continue;
+    }
+    const part = VERIFIED_NARROWING_PART_LINE_RE.exec(line);
+    const evidence = VERIFIED_COMPLETE_EVIDENCE_LINE_RE.exec(line);
+    const last = entries[entries.length - 1];
+    if (part?.[1] && last && last.notApplicable === undefined) {
+      last.notApplicable = part[1];
+      continue;
+    }
+    if (evidence?.[1] && last && last.evidence === undefined) {
+      last.evidence = evidence[1];
+      continue;
+    }
+    const item = VERIFIED_COMPLETE_LINE_RE.exec(line);
+    const itemText = item?.[1]?.replace(/^\[[ xX]\]\s+/, "").trim();
+    if (itemText) {
+      entries.push({ itemText });
+    }
+  }
+  return entries.flatMap((entry) =>
+    entry.notApplicable && entry.evidence
+      ? [{ itemText: entry.itemText, notApplicable: entry.notApplicable, evidence: entry.evidence }]
+      : []
+  );
 }
 
 /** Result of {@link parseReviewVerifiedCompleteV1}. */
@@ -1474,8 +1569,15 @@ export interface ReviewVerifiedCompleteEvidence {
    * callers show a fixed "older review format" fallback in that case, never
    * a sentence pulled from anywhere else in the review.
    */
-  readonly entries: readonly { readonly text: string; readonly evidence?: string }[];
+  readonly entries: readonly { readonly text: string; readonly evidence?: string; readonly itemId?: string }[];
 }
+
+/**
+ * review1 (owner decision 2026-11-05, item identity by design): a Verified Complete entry may cite the item by
+ * the `[item:<id>]` Ensemble listed for it, optionally followed by the item's text. Captures the id and whatever
+ * text follows it.
+ */
+const VERIFIED_COMPLETE_ITEM_ID_RE = /^[\s*_`[(]*item:\s*([0-9a-f]{16})(?![0-9a-z])[\s*_`\])]*(?:[:—–-]+\s*)?([\s\S]*)$/i;
 
 /**
  * Parse the machine-readable `## Verified Complete` block a reviewer may emit
@@ -1507,8 +1609,8 @@ export function parseReviewVerifiedCompleteV1(content: string): ReviewVerifiedCo
   }
   const body = match[1] ?? "";
   const items: string[] = [];
-  const entries: { text: string; evidence?: string }[] = [];
-  let lastEntry: { text: string; evidence?: string } | undefined;
+  const entries: { text: string; evidence?: string; itemId?: string }[] = [];
+  let lastEntry: { text: string; evidence?: string; itemId?: string } | undefined;
   for (const line of body.split(/\r?\n/)) {
     if (!line.trim()) {
       continue;
@@ -1518,8 +1620,13 @@ export function parseReviewVerifiedCompleteV1(content: string): ReviewVerifiedCo
     // box; the plan item's own text never starts with one, so drop it before matching.
     const itemText = lineMatch?.[1]?.replace(/^\[[ xX]\]\s+/, "").trim();
     if (itemText) {
-      items.push(itemText);
-      lastEntry = { text: itemText, evidence: undefined };
+      // An entry that cites `[item:<id>]` names the item by that id; any text after it is only a label.
+      const idMatch = VERIFIED_COMPLETE_ITEM_ID_RE.exec(itemText);
+      const itemId = idMatch?.[1]?.toLowerCase();
+      const label = idMatch?.[2]?.replace(/^\[[ xX]\]\s+/, "").trim();
+      const text = itemId ? (label ? label : `item:${itemId}`) : itemText;
+      items.push(text);
+      lastEntry = { text, evidence: undefined, ...(itemId ? { itemId } : {}) };
       entries.push(lastEntry);
       continue;
     }
@@ -1628,6 +1735,8 @@ export interface ParsedOwnerDecisionOptionV1 {
     /** Checklist items the option settles (verbatim text), when it marks itself `[exclude]`. */
     readonly items?: readonly string[];
     readonly newText?: string;
+    /** review1 Step 4: which of several identically worded top-level items a `reword` is about (1-based). */
+    readonly itemOccurrence?: number;
   };
   /**
    * True when choosing this option keeps the plan as written (it starts "Reject", "Keep the plan", ...).
@@ -1645,6 +1754,11 @@ export interface ParsedOwnerDecisionBlockV1 {
     readonly optionId: string;
     readonly reason: string;
   };
+  /**
+   * review1 Step 42: set when a card should carry no recommended option (a deviation the review has not
+   * checked); the text is the card's reason for recommending nothing.
+   */
+  readonly noRecommendationReason?: string;
   readonly technicalDetails?: string;
   readonly rawContentHash: string;
   readonly rawContent: string;
@@ -1688,6 +1802,44 @@ function slugOwnerDecisionTextV1(text: string): string {
     .replace(/[`*_]/g, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * review1 Step 42: an item that says there is nothing to decide ("None.", "**None** beyond …", "No deviations",
+ * "Nothing to report"), in bold, italic, dash or bullet form. It raises no card.
+ */
+const NONE_ITEM_TEXT_RE = /^[\s>*_`~\-–—•]*(?:none|n\/a|no\s+(?:plan\s+)?deviations?|nothing)\b/i;
+
+export function isNoneItemTextV1(text: string): boolean {
+  return NONE_ITEM_TEXT_RE.test(text.trim()) || isClosingStatusItemTextV1(text);
+}
+
+/**
+ * review1 Step 42 (owner, 2026-11-04; bugs6 item 19): a closing status line that only says there is nothing
+ * more ("Otherwise none.", "Nothing else.", "No other deviations.", "That is all."), wherever "none" or
+ * "nothing" falls in the line. Kept to one short sentence that names no step or code, so a real departure
+ * that happens to contain the word is never swallowed.
+ */
+const CLOSING_STATUS_RE =
+  /\b(?:none|nothing|no\s+(?:other|further|more|additional|remaining)\s+(?:plan\s+)?(?:deviations?|decisions?|departures?)|that(?:'s|\s+is)\s+all)\b/i;
+
+export function isClosingStatusItemTextV1(text: string): boolean {
+  const plain = text
+    .replace(/[*_~]/g, "")
+    .replace(/^[\s>\-–—•]+/, "")
+    .trim();
+  if (plain.length === 0 || plain.length > 80 || plain.includes("\n") || plain.includes("`")) {
+    return false;
+  }
+  if (/\bsteps?\s+\d/i.test(plain)) {
+    return false;
+  }
+  return CLOSING_STATUS_RE.test(plain);
+}
+
+/** The block's text without a leading `###` heading line. */
+function ownerDecisionBlockBodyV1(rawBlock: string): string {
+  return rawBlock.replace(/^###+[ \t]+[^\n]*\n?/, "").trim();
 }
 
 /** The text of a `## <heading>` section, up to the next level-2 heading or HTML comment. */
@@ -1761,6 +1913,11 @@ export function parseOwnerDecisionsNeededV1(content: string): readonly ParsedOwn
   const results: ParsedOwnerDecisionBlockV1[] = [];
   splitOwnerDecisionBlocksV1(sectionBody).forEach((rawBlock, idx) => {
     if (!rawBlock) {
+      return;
+    }
+    // review1 Step 42: "None. …" is a statement that nothing needs deciding, not a decision to raise.
+    const blockBody = ownerDecisionBlockBodyV1(rawBlock);
+    if (blockBody.length === 0 ? isNoneItemTextV1(rawBlock.replace(/^###+[ \t]+/, "")) : isNoneItemTextV1(blockBody)) {
       return;
     }
     let id = `owner-decision-${idx + 1}`;
@@ -1879,7 +2036,237 @@ export function parseOwnerDecisionsNeededV1(content: string): readonly ParsedOwn
 /**
  * bugs5 Step 23: parse `## Plan deviations` section from implementation/apply output.
  */
-export function parsePlanDeviationsV1(content: string): readonly ParsedOwnerDecisionBlockV1[] {
+export interface PlanDeviationContextV1 {
+  /** "Implementation" or "Apply Review": the round that reported the deviation. */
+  readonly roundName?: string;
+  /** The plan of record, used to name the step a deviation departs from. */
+  readonly planOfRecord?: string;
+  /** The latest review's text, used to say whether it already verified the departure. */
+  readonly latestReviewText?: string;
+}
+
+/**
+ * review1 Step 42: true when a review sentence naming `Step N` says, affirmatively, that it verified or accepted
+ * that step. A negated mention ("Step 43 is not verified", "has not verified Step 43", "never accepted") is not a
+ * verification, and neither is "unverified"; only the text after the step mention in the same sentence is read.
+ */
+export function reviewAffirmsStepVerifiedV1(reviewText: string, step: number, deviationText?: string): boolean {
+  const mention = new RegExp(`\\bstep\\s+${step}(?!\\d)`, "ig");
+  // Describing a mechanism ("uses an alternate mechanism") is not accepting it, so only verify/accept verbs count.
+  const positive = /\b(?:verified|accepted)\b/i;
+  // "verified for the tick path, but …", "only partly accepted", "still needs owner approval": the departure
+  // itself is not affirmed.
+  const contrast = /\b(?:but|however|except|although|though|only|partly|partially|other than|still\s+(?:needs?|requires?)|awaits?|pending)\b/i;
+  // `no-card` is a compound adjective, not a negation.
+  const negation = /\b(?:not|never|no(?!-)|cannot|without|isn't|wasn't|hasn't|haven't|didn't|doesn't|can't)\b|n't\b/i;
+  const sentences = reviewText.split(/(?<=[.;!?])\s+|\n+/);
+  // With the particular departure in hand, a sentence only verifies it when it talks about it (shares at least
+  // two distinctive words with it), and any sentence about it that refuses it settles the question.
+  const departureTerms = deviationText === undefined ? undefined : distinctiveTermsV1(deviationText);
+  const talksAboutDeparture = (sentence: string): boolean => {
+    if (departureTerms === undefined) return true;
+    const terms = distinctiveTermsV1(sentence);
+    let shared = 0;
+    for (const term of terms) if (departureTerms.has(term)) shared += 1;
+    return shared >= Math.min(2, departureTerms.size);
+  };
+  // A departure that leaves something out ("narrowings are written with no card") is only verified by a sentence
+  // that talks about the omission itself. Verifying the thing that was left out ("the narrowing card text is
+  // verified") shares the words but says nothing about leaving it out.
+  const omissionTerms = deviationText === undefined ? [] : departureOmissionTermsV1(deviationText);
+  // The cue and the thing left out must sit together ("no card", "skipped the confirmation"). A cue elsewhere in
+  // the sentence ("the card text is verified without changes") does not say the card was left out.
+  const coversDepartureOmission = (sentence: string): boolean => {
+    if (omissionTerms.length === 0) return true;
+    const stated = new Set(departureOmissionTermsV1(sentence));
+    return omissionTerms.every((term) => stated.has(term));
+  };
+  if (departureTerms !== undefined) {
+    const refusal = /\b(?:unverified|rejected?|unsupported|fabricated|contradict\w*|fails?|failed|not\s+(?:verified|accepted|supported|acceptable)|cannot\s+(?:verify|accept))\b/i;
+    // A sentence that leaves the departure waiting on the owner ("still needs owner approval", "awaiting your
+    // sign-off") is a refusal too, even though it never says "not verified". It only has to be about the
+    // departure (one shared term, or the step named), because it often restates it in a few words.
+    const pendingOwner =
+      /\b(?:still\s+(?:needs?|requires?)|awaits?|awaiting|pending|needs?|requires?|subject\s+to)\b[^.;!?\n]*\b(?:owner|your|human)\b[^.;!?\n]*\b(?:approval|decision|sign-?off|confirmation|consent)\b|\bowner\s+(?:approval|sign-?off|decision)\s+(?:is\s+)?(?:still\s+)?(?:needed|required|pending|outstanding)\b/i;
+    const sharesAnyTerm = (sentence: string): boolean => {
+      for (const term of distinctiveTermsV1(sentence)) if (departureTerms.has(term)) return true;
+      return false;
+    };
+    for (const sentence of sentences) {
+      if (refusal.test(sentence) && talksAboutDeparture(sentence)) {
+        return false;
+      }
+      mention.lastIndex = 0;
+      if (pendingOwner.test(sentence) && (sharesAnyTerm(sentence) || mention.test(sentence))) {
+        return false;
+      }
+    }
+  }
+  for (const sentence of sentences) {
+    mention.lastIndex = 0;
+    const found = mention.exec(sentence);
+    if (!found) {
+      continue;
+    }
+    const after = sentence.slice(found.index + found[0].length);
+    const positiveMatch = positive.exec(after);
+    if (!positiveMatch) {
+      continue;
+    }
+    // A negation between the step mention and the verb ("is not verified"), or right before it in the same
+    // clause ("has not verified"), makes it a refusal. Only the part before the verb matters.
+    const before = sentence.slice(Math.max(0, found.index - 40), found.index + found[0].length + positiveMatch.index);
+    const rest = sentence.slice(found.index + found[0].length + positiveMatch.index + positiveMatch[0].length);
+    if (
+      !negation.test(before) &&
+      !contrast.test(before) &&
+      !contrast.test(rest) &&
+      talksAboutDeparture(sentence) &&
+      coversDepartureOmission(sentence)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const DEPARTURE_STOP_WORDS_V1: ReadonlySet<string> = new Set([
+  "step", "steps", "plan", "deviation", "deviations", "departure", "round", "review", "reviewer", "verified",
+  "accepted", "that", "this", "with", "from", "have", "were", "been", "which", "their", "there", "when", "than",
+  "into", "also", "instead", "built", "work", "item", "items", "does", "while", "what", "about", "after", "because",
+]);
+
+/**
+ * The things a departure says were left out: "no card", "without a card", "skipped the confirmation",
+ * "omits the sign-off". Returned as the same normalised terms `distinctiveTermsV1` produces.
+ */
+function departureOmissionTermsV1(text: string): string[] {
+  const found = new Set<string>();
+  const pattern = /\b(?:no|without|skip(?:s|ped|ping)?|omit(?:s|ted|ting)?|drops?|dropped|removes?|removed|lacks?)[-\s]+(?:(?:a|an|the|any|its|their)\s+)?([a-z][a-z-]{3,})(?!\s+(?:text|wording|copy|label|changes?)\b)/gi;
+  // "no longer", "no more", "without any": not things that were left out.
+  const notAThing = new Set(["longer", "more", "other", "need", "such", "change", "changes", "further"]);
+  for (const match of text.matchAll(pattern)) {
+    for (const term of distinctiveTermsV1(match[1]!)) if (!notAThing.has(term)) found.add(term);
+  }
+  return [...found];
+}
+
+/** Lower-case words of four or more letters that say something about a departure, split at hyphens. */
+function distinctiveTermsV1(text: string): Set<string> {
+  const terms = new Set<string>();
+  for (const word of text.toLowerCase().match(/[a-z][a-z]{3,}/g) ?? []) {
+    if (DEPARTURE_STOP_WORDS_V1.has(word)) continue;
+    // A crude plural strip so "narrowings" and "narrowing" are the same term.
+    terms.add(word.length > 4 && word.endsWith("s") ? word.slice(0, -1) : word);
+  }
+  return terms;
+}
+
+/** The step number a deviation's text names ("Step 18", "Steps 19/22"), resolved against the plan's own steps. */
+function stepNamedByDeviationV1(text: string, planOfRecord: string | undefined): number | undefined {
+  const named = /\bsteps?\s+(\d+)(?!\d)/i.exec(text);
+  if (!named) {
+    return undefined;
+  }
+  const step = Number(named[1]);
+  if (planOfRecord === undefined) {
+    return step;
+  }
+  return listPlanItemStepOwnersV1(planOfRecord).some((owner) => owner.stepNumber === step) ? step : undefined;
+}
+
+/**
+ * review1 Step 42 (owner, 2026-11-04; bugs6 item 17): a line about a deviation a round already reported, not a
+ * new one ("the earlier deviation is withdrawn", "the plan's own deviations still stand", "already noted"). It
+ * raises no card.
+ */
+const STATUS_NOTE_ITEM_RE = /\b(?:withdrawn|still\s+stands?|already\s+noted|no\s+longer\s+(?:a\s+)?deviations?)\b/i;
+
+/**
+ * The top-level bullets of a list as separate items. A bullet indented deeper than the shallowest bullet, and
+ * any continuation line, belongs to the item above it (kept with its leading `-`).
+ */
+function splitTopLevelBulletsV1(body: string): string[] {
+  const bullet = /^(\s*)[-*]\s+(.*)$/;
+  const lines = body.split("\n");
+  let topIndent = Number.POSITIVE_INFINITY;
+  for (const line of lines) {
+    const match = bullet.exec(line);
+    if (match) topIndent = Math.min(topIndent, match[1]!.length);
+  }
+  if (!Number.isFinite(topIndent)) {
+    return [];
+  }
+  const items: string[] = [];
+  let current: string[] | undefined;
+  for (const line of lines) {
+    const match = bullet.exec(line);
+    if (match && match[1]!.length <= topIndent) {
+      if (current) items.push(current.join("\n").trim());
+      current = [match[2]!];
+    } else if (current && line.trim().length > 0) {
+      current.push(line.trim());
+    }
+  }
+  if (current) items.push(current.join("\n").trim());
+  return items.filter((item) => item.length > 0);
+}
+
+/**
+ * review1 Step 42: the text of a "None beyond …" deviations section after the "None". It belongs in the
+ * round's summary line, never on a card.
+ */
+export function planDeviationsNoneNoteV1(content: string): string | undefined {
+  const sectionBody = ownerDecisionSectionV1(content, "Plan deviations");
+  if (!sectionBody || !NONE_ITEM_TEXT_RE.test(sectionBody.trim())) {
+    return undefined;
+  }
+  const note = sectionBody.replace(NONE_ITEM_TEXT_RE, "").replace(/^[\s.:,;—–-]+/, "").trim();
+  return note.length > 0 ? note : undefined;
+}
+
+/**
+ * review1 Step 42 (owner, 2026-11-04; bugs6 item 19): which option a deviation card recommends. Approve only
+ * when the latest review verified the deviation. Reject when it drops plan scope or an owner sign-off (an
+ * exclusion, a narrowing, a skipped card or confirmation). Otherwise neither is recommended and the card says
+ * the review has not checked it.
+ */
+const DEVIATION_DROPS_SCOPE_RE =
+  /\b(?:exclu(?:de[sd]?|sions?)|narrow(?:s|ed|ing|ings)?|descop\w*|skipp?(?:s|ed|ing)?|drops?|dropped|left\s+out|without\s+(?:a\s+)?(?:card|confirmation|sign-?off|approval)|no\s+(?:card|confirmation|sign-?off))\b/i;
+
+function deviationRecommendationV1(
+  raw: string,
+  verifiedByReview: boolean,
+  hasReview: boolean
+): Pick<ParsedOwnerDecisionBlockV1, "recommendation" | "noRecommendationReason"> {
+  if (verifiedByReview) {
+    return {
+      recommendation: {
+        optionId: "approve-deviation",
+        reason: "Verified by the review: it checked this departure and found it acceptable.",
+      },
+    };
+  }
+  if (DEVIATION_DROPS_SCOPE_RE.test(raw)) {
+    return {
+      recommendation: {
+        optionId: "reject-deviation",
+        reason:
+          "This departure drops plan scope or an owner sign-off (an exclusion, a narrowing, or a skipped card or confirmation), and the review has not verified it. Rejecting keeps the plan as written.",
+      },
+    };
+  }
+  return {
+    noRecommendationReason: hasReview
+      ? "The latest review has not checked this departure, so neither choice is recommended."
+      : "No review has checked this departure yet, so neither choice is recommended.",
+  };
+}
+
+export function parsePlanDeviationsV1(
+  content: string,
+  context: PlanDeviationContextV1 = {}
+): readonly ParsedOwnerDecisionBlockV1[] {
   const sectionBody = ownerDecisionSectionV1(content, "Plan deviations");
   if (!sectionBody) {
     return [];
@@ -1889,14 +2276,11 @@ export function parsePlanDeviationsV1(content: string): readonly ParsedOwnerDeci
   if (/(?:^|\n)###+[ \t]/.test(sectionBody)) {
     items.push(...splitOwnerDecisionBlocksV1(sectionBody));
   } else {
-    // Bullet items
-    const bullets = [...sectionBody.matchAll(/(?:^|\n)\s*[-*]\s+([^\n]+(?:\n(?!\s*[-*]\s+)[^\n]+)*)/g)];
+    // Bullet items: one per TOP-LEVEL bullet, whose indented sub-bullets ("Why", "What changed", "Trade-off") are
+    // that deviation's body and never cards of their own.
+    const bullets = splitTopLevelBulletsV1(sectionBody);
     if (bullets.length > 0) {
-      for (const b of bullets) {
-        if (b && b[1]) {
-          items.push(b[1].trim());
-        }
-      }
+      items.push(...bullets);
     } else {
       // Paragraphs
       const paragraphs = sectionBody.split(/\n\s*\n/).map((p) => p.trim()).filter((p) => p.length > 0);
@@ -1907,16 +2291,36 @@ export function parsePlanDeviationsV1(content: string): readonly ParsedOwnerDeci
   const results: ParsedOwnerDecisionBlockV1[] = [];
   for (let idx = 0; idx < items.length; idx++) {
     const raw = items[idx];
-    if (!raw || /^(?:none|n\/a|no (?:plan )?deviations?)\b[\s.]*$/i.test(raw.replace(/^#+[^\n]*\n?/, "").trim())) {
+    if (!raw) {
+      continue;
+    }
+    // review1 Step 42: "None", "None beyond …", "No deviations" and "Nothing …" raise no card (a `###` heading
+    // line does not count as the item's text).
+    const itemText = raw.replace(/^#+[^\n]*\n?/, "").trim();
+    if (isNoneItemTextV1(itemText.length > 0 ? itemText : raw) || STATUS_NOTE_ITEM_RE.test(raw)) {
       continue;
     }
     const rawContentHash = createHash("sha256").update(raw.trim(), "utf8").digest("hex");
     // Keyed by content, not position: a different deviation in a later round is a different card.
     const id = `plan-deviation-${rawContentHash.slice(0, 8)}`;
+    const roundName = context.roundName ?? "The round";
+    const step = stepNamedByDeviationV1(raw, context.planOfRecord);
+    const title = step !== undefined
+      ? `${roundName} built Step ${step} differently from the plan`
+      : `${roundName} reports a departure from the plan`;
+    const verifiedByReview =
+      step !== undefined &&
+      context.latestReviewText !== undefined &&
+      reviewAffirmsStepVerifiedV1(context.latestReviewText, step, raw);
+    const reviewView = context.latestReviewText === undefined
+      ? ""
+      : verifiedByReview
+        ? " The latest review already verified it."
+        : " The latest review has not verified it.";
     results.push({
       id,
-      planPurpose: "Plan deviation reported by round",
-      problem: raw,
+      planPurpose: title,
+      problem: `${raw.trim()}${reviewView}`,
       options: [
         {
           id: "approve-deviation",
@@ -1927,14 +2331,12 @@ export function parsePlanDeviationsV1(content: string): readonly ParsedOwnerDeci
         {
           id: "reject-deviation",
           label: "Reject plan deviation",
-          consequence: "Rejects this deviation; next round must implement according to original plan.",
+          consequence:
+            "Rejects this deviation. Work already done is kept in the working tree; the next round must bring it back in line with the original plan.",
           rejects: true,
         },
       ],
-      recommendation: {
-        optionId: "approve-deviation",
-        reason: "Review and approve if the deviation is acceptable.",
-      },
+      ...deviationRecommendationV1(raw, verifiedByReview, context.latestReviewText !== undefined),
       rawContentHash,
       rawContent: raw.trim(),
     });

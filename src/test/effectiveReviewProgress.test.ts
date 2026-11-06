@@ -519,8 +519,10 @@ void describe("readDisplayPlanChecklistProgressV1", () => {
       nodePath.join(__dirname, "..", "..", "src", "views", "taskTreeProvider.ts"),
       "utf8"
     );
-    assert.match(providerSource, /implementationDisplayCountsV1\(display\.verifiedCounts\)/);
-    assert.doesNotMatch(providerSource, /implementationDisplayCountsV1\(display\.counts\)/);
+    // review1 Step 5: the tree takes the percentage from the shared counts' `shown` (the gate's settled count
+    // through `implementationDisplayCountsV1`), never from the ticked boxes.
+    assert.match(providerSource, /complete: display\.shown\.complete/);
+    assert.doesNotMatch(providerSource, /display\.withRoundProgress|display\.display\./);
   });
 
   void it("returns undefined (not applicable) for a plan with no checklist, even when latched", async () => {
@@ -558,7 +560,10 @@ void describe("round-progress.md — display-only merge", () => {
       assert.equal(display?.counts.total, 5);
 
       const forDisplay = await readEffectivePlanChecklistProgressForDisplayV1(uri);
-      assert.equal(forDisplay?.settled, 3, "the second display reader must merge the same in-round tick");
+      // review1 Step 5: the live tick is a separate detail, never mixed into the gate's count.
+      assert.equal(forDisplay?.roundTicks, 1, "the second display reader reports the same in-round tick as a detail");
+      assert.equal(forDisplay?.ticked, 2);
+      assert.equal(forDisplay?.settled, 0);
 
       const onDisk = nodeFs.readFileSync(nodePath.join(uri.fsPath, "plan-final.md"), "utf8");
       assert.equal(onDisk, PLAN_TWO_OF_FIVE, "the merge must never write plan-final.md itself");

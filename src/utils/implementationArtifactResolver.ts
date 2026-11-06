@@ -218,7 +218,7 @@ export function assessImplementationSummarySectionsV1(
 ): ImplementationSummarySectionPresenceV1 {
   const scope =
     expectations.planChecklist !== undefined
-      ? splitSummaryAtEchoV1(trimmed).own
+      ? splitSummaryAtEchoV1(trimmed, expectations.planChecklist).own
       : trimmed;
 
   const all = headingsV1(scope);
@@ -230,7 +230,7 @@ export function assessImplementationSummarySectionsV1(
     // Only the echo region counts. Searching the whole response let a
     // `## Verification` box whose text happened to match a plan item satisfy
     // the echo requirement with no echo present at all.
-    echoesPlanChecklist(splitSummaryAtEchoV1(trimmed).echo, expectations.planChecklist) ||
+    echoesPlanChecklist(splitSummaryAtEchoV1(trimmed, expectations.planChecklist).echo, expectations.planChecklist) ||
     // A round that fixed a review blocker without ticking any checkbox has
     // nothing to echo — the marker is its explicit, reasoned statement of
     // that, and is accepted in place of the echo rather than rejected as a
@@ -782,7 +782,7 @@ export function parseReportedFilesChangedV1(
   }
   const scope =
     expectations.planChecklist !== undefined
-      ? splitSummaryAtEchoV1(trimmed).own
+      ? splitSummaryAtEchoV1(trimmed, expectations.planChecklist).own
       : trimmed;
   const all = headingsV1(scope);
   const index = findLastHeadingV1(all, "Files Changed");

@@ -72,3 +72,41 @@ export function withAutomationDispatchContextV1<A, R>(
 export function describeAutomationDefaultV1(what: string, chosen: string): string {
   return `[automation] ${what}: no human attached, took the non-destructive default (${chosen}).`;
 }
+
+/**
+ * review1 Step 24: marks a call tree whose automatic dispatch already passed the "is this working?" gate
+ * (`admitAutomaticDispatchV1`). The work-admission layer reads it to refuse an automatic claim that skipped the gate.
+ */
+const automaticGatePassed = new AsyncLocalStorage<true>();
+
+/** Run `body` as automatic work that has passed the progress gate. Implies automatic origin. */
+export function runWithAdmittedAutomaticDispatchV1<T>(body: () => T): T {
+  return runWithAutomaticOriginV1(() => automaticGatePassed.run(true, body));
+}
+
+/** True inside {@link runWithAdmittedAutomaticDispatchV1}. */
+export function hasPassedAutomaticGateV1(): boolean {
+  return automaticGatePassed.getStore() === true;
+}
+
+/**
+ * review1 Step 24 (shared boundary): marks a call tree as started by the owner (a command they ran, a button they
+ * clicked in a webview). The work-admission layer records a claim as the owner's only inside this scope and only
+ * when no automatic origin applies; anything else, including a path nobody marked, counts as automatic.
+ */
+const ownerOrigin = new AsyncLocalStorage<true>();
+
+/** Run `body` as owner-started work. Nestable; scoped to this call tree. Automatic origin still wins inside it. */
+export function runWithOwnerOriginV1<T>(body: () => T): T {
+  return ownerOrigin.run(true, body);
+}
+
+/** True inside {@link runWithOwnerOriginV1}. */
+export function hasOwnerOriginV1(): boolean {
+  return ownerOrigin.getStore() === true;
+}
+
+/** Wrap an owner-facing entry point (command handler, webview message handler) so its call tree is owner-started. */
+export function asOwnerEntryPointV1<A extends unknown[], R>(handler: (...args: A) => R): (...args: A) => R {
+  return (...args: A): R => runWithOwnerOriginV1(() => handler(...args));
+}

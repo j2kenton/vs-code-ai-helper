@@ -10,16 +10,10 @@ import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { captureRaisedNoticesV1, formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { assertLegacyAiRouteAllowedV0 } from "../services/legacyAiActionSafetyGateV0";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
-import {
-  decidePostReviewActionV1,
-  IMPL_REVIEW_STAGES_V1,
-} from "../utils/reviewRouting";
-import { readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
-import { countChecklistEvidenceProgressV1 } from "../utils/implementationChecklist";
-import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { isEffectivelyPausedV1 } from "../state/effectivePauseStatusV1";
 import { publishDispatchCommandV1 } from "../utils/publishStageActionsV1";
+import { endFastForwardRunChainV1, isFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
 import {
   clearStageActionRefusalReasonV1,
   describeStageActionTerminalOutcomeV1,
@@ -73,7 +67,18 @@ export async function applyCurrentStageAction(
   explicitArg?: ApplyArg
 ): Promise<boolean> {
   const refusal: StageActionRefusalV1 = {};
-  const dispatched = await applyCurrentStageActionCore(inventory, currentTaskStore, explicitArg, refusal);
+  let dispatched = false;
+  try {
+    dispatched = await applyCurrentStageActionCore(inventory, currentTaskStore, explicitArg, refusal);
+  } finally {
+    // review1 Step 54: this stage action is one independent action. However it ends (refused before dispatch, e.g.
+    // no model configured; failed; or done), an "and keep going" answer bound to its run chain stops matching, so a
+    // later action starts clean. A live Fast Forward run owns its own chain and is left alone.
+    const chainFolder = refusal.taskFolderPath ?? explicitArg?.taskFolderPath;
+    if (chainFolder && !isFastForwardRunActiveV1(chainFolder)) {
+      endFastForwardRunChainV1(chainFolder);
+    }
+  }
   const taskKey = refusal.taskFolderPath ?? explicitArg?.taskFolderPath;
   if (taskKey) {
     if (dispatched) {
@@ -219,64 +224,8 @@ async function applyCurrentStageActionCore(
   }
 
   if (stage === "impl") {
-    // Implementation is rendered with the plan checklist and NOT with the
-    // review, so it is structurally blind to a standing blocker. Running it
-    // while the newest impl review still reports task-fixable work is the
-    // stall this routing exists to prevent: the reviewer keeps reporting the
-    // same defects, every round is answered by the one action that cannot see
-    // them, and the checklist it CAN see has nothing actionable left. See
-    // decidePostReviewActionV1 for the observed case.
-    const decision = decidePostReviewActionV1({
-      history: resolvedTask.progress.reviewScoreHistory,
-      stages: IMPL_REVIEW_STAGES_V1,
-        hasUntickedChecklistItems: await readPlanOfRecordV1(vscode.Uri.file(resolvedTask.taskFolderPath)).then((record) =>
-          record.text === undefined
-            ? (record.counts?.remaining ?? 0) > 0
-            : (countChecklistEvidenceProgressV1(
-                record.text,
-                resolvedTask.progress.planItemEvidence ?? [],
-                resolvedTask.progress.planItemOwnerDecisions ?? []
-              )?.gate.remaining ?? 0) > 0
-        ),
-      continuationOwed: resolvedTask.progress.implRecovery !== undefined,
-      pendingImplReviewFilesCount: resolvedTask.progress.pendingImplReviewFiles?.length ?? 0,
-    });
-    if (decision.action === "apply-review") {
-      // Say WHY the button did something other than the stage's usual action.
-      // A silent substitution is the same opaque "big red button" problem in
-      // the other direction.
-      NotificationRouter.showInformation(
-        `${taskLabel}: running Apply Review instead of Implementation. ${decision.reason}`
-      );
-      // Moves to the review stage first: the task is at `impl` here, which is
-      // precisely why this branch was reached, and every apply command
-      // refuses out of stage. See goToReviewAndApplyV1.
-      const { result: applied, notices: applyNotices } = await captureRaisedNoticesV1(() => goToReviewAndApplyV1({
-        taskFolderPath: resolvedTask.taskFolderPath,
-        reviewStage:
-          decision.reviewStage === "impl-high-review"
-            ? "impl-high-review"
-            : "impl-low-review",
-        // Relay a scheduler-supplied token (see `ApplyArg` above) so a
-        // scheduled dispatch that lands on this redirect adopts the
-        // scheduler's already-live admission instead of racing a fresh
-        // genesis against it (2026-09-09 review completion blocker,
-        // narrowed).
-        admissionHandoffTokenV1: explicitArg?.admissionHandoffTokenV1,
-      }));
-      if (!applied) {
-        const terminal = peekStageActionTerminalOutcomeV1(resolvedTask.taskFolderPath);
-        if (terminal) {
-          refusal.reason = describeStageActionTerminalOutcomeV1(terminal);
-        } else {
-          const stated = applyNotices[applyNotices.length - 1];
-          refusal.reason = stated
-            ? `Apply Review declined to start: ${stated}`
-            : noStatedReasonV1("Apply Review");
-        }
-      }
-      return applied;
-    }
+    // review1 Step 18: one dispatch after a review. Implementation is rendered with the review whenever the stage
+    // has one (see runImplementationWithAI), so this no longer routes to Apply Review or moves the stage.
     return await dispatch("vs-code-ai-helper.runImplementationWithAI");
   }
 

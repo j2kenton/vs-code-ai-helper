@@ -66,10 +66,21 @@ import { formatDisplayTimestampPairV1, formatTimeHHmm, formatTimestampForDisplay
 import { buildRunStripV1, runStripChangedV1, type RunStripV1 } from "./chatRunStripV1";
 import {
   appendOwnerEvidenceThenV1,
+  appendOwnerEvidenceV1,
   OWNER_EVIDENCE_ANSWER_MARKER_V1,
   OwnerEvidenceSubmissionErrorV1,
 } from "../utils/ownerEvidenceV1";
 import { isChatFreeTextQuestionV1, settleChatFreeTextQuestionV1 } from "../utils/chatFreeTextV1";
+import {
+  collectOwnerEvidenceFormAnswersV1,
+  isOwnerEvidenceUpFrontFormV1,
+  MAX_OWNER_EVIDENCE_UP_FRONT_FIELDS_V1,
+} from "../utils/ownerEvidenceUpFrontV1";
+import {
+  isOwnerRunFormV1,
+  mergeOwnerRunFormValuesIntoEffectV1,
+  readOwnerRunFormValuesV1,
+} from "../utils/ownerRunFormV1";
 import { describeResumeFailureWithStoredAnswerV1 } from "../utils/storedAnswerResumeV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import type { TaskOperationSnapshot } from "../utils/taskOperations";
@@ -113,6 +124,7 @@ import {
   APPLY_OPTION_ID_V1,
   HELD_CARD_STAYS_OPEN_NOTE_V1,
   buildHeldTicksAnswerOptionsV1,
+  offeredTickItemIdsOfV1,
   offeredTickItemsOfV1,
 } from "../commands/verifiedTicksHeldOptionsV1";
 import {
@@ -137,8 +149,21 @@ import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTex
 import { offerBusyRefusalChoicesInChatV1 } from "../utils/busyRefusalChoicesV1";
 import { createAdmissionHeldNotifierV1 } from "../commands/releaseStuckAdmissionMarkers";
 import { deriveApplicableVerifiedTicksV1 } from "../commands/applyReviewerVerifiedTicks";
+import { PROGRESS_WATCH_DECISION_KEY_V1, recordOwnerActionForTaskV1 } from "../commands/automaticDispatchGateV1";
+import {
+  baseOptionIdOfKeepGoingV1,
+  currentRunBindingV1,
+  isKeepGoingOptionIdV1,
+  keepGoingKeyV1,
+} from "../utils/autoContinueKeepGoingV1";
+import {
+  WAIT_FOR_ME_OPTION_ID_V1,
+  describeAutoContinueNoteV1,
+  hasRunningAutoContinueCountdownV1,
+} from "../utils/autoContinueV1";
+import { AUTOMATION_STOPPED_DECISION_KEY_V1, postStageReadyCardIfReadyV1 } from "../commands/automationStoppedCardV1";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
-import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
+import { ESCALATION_DECISION_KEYS_V1, postRemainingOwnerEvidenceStepsV1 } from "../utils/reviewEscalation";
 import {
   currentActorNameV1,
   describeCardDismissalV1,
@@ -149,15 +174,17 @@ import {
   retireQuestionIfWaiterGoneV1,
 } from "../utils/cardLifecycleV1";
 import {
+  formatPlanItemCountsLineV1,
   readEffectivePlanChecklistProgressForDisplayV1,
   readEffectivePlanChecklistProgressV1,
 } from "../utils/effectiveReviewProgress";
-import { formatChecklistPercentV1, truncateChecklistItemTextV1 } from "../utils/implementationChecklist";
+import { truncateChecklistItemTextV1 } from "../utils/implementationChecklist";
 import { renderHandoffFieldLineV1 } from "../types/handoffGuidanceV1";
 import { isWaitingForHumanV1 } from "../utils/taskWatchdogV1";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
 import { setChatRevealHandlerV1 } from "./chatRevealV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { asOwnerEntryPointV1 } from "../state/automationDispatchContextV1";
 import {
   formatNotificationTaskLabelV1,
   notificationTaskDisplayNameV1,
@@ -1094,6 +1121,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   // 2026-09-17).
   /** Decision ids whose answer is in flight to the runner (hostRelayV1.ts). */
   private readonly decisionsBeingAnsweredV1 = new Set<string>();
+  /** review1 Step 53: decisions whose answer is being given by a countdown, not by the owner. */
+  private readonly automaticResolutionsV1 = new Set<string>();
+
+  /**
+   * review1 Step 53: runs a card's option because its countdown ended with no answer. Behaves exactly like the
+   * owner choosing it (same record, same effect, same guards), except that it does not count as an owner action.
+   */
+  async resolveWorkflowDecisionAutomaticallyV1(decisionId: string, optionId: string): Promise<RelayedResolutionOutcomeV1> {
+    this.automaticResolutionsV1.add(decisionId);
+    try {
+      return await this.resolveWorkflowDecision(decisionId, optionId);
+    } finally {
+      this.automaticResolutionsV1.delete(decisionId);
+    }
+  }
+
+  /** Appends a status line to the chat the decision belongs to (used by the auto-continue sweep). */
+  async appendDecisionStatusLineV1(decisionId: string, text: string): Promise<void> {
+    const decision = this.workflowDecisionStore.get(decisionId);
+    if (!decision) return;
+    const identity = this.identityForDecision(decision);
+    if (identity) await this.appendStatusLineV1(text, decision.stage, identity);
+  }
   /**
    * Whether a decision id belongs to another window (the runner), so its
    * answer must be relayed rather than recorded here. extension.ts installs
@@ -1123,6 +1173,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private lastRunStripV1: RunStripV1 | undefined;
   private lastRunStripPostAtV1 = 0;
   private runStripPostTimerV1: ReturnType<typeof setTimeout> | undefined;
+  /** review1 Step 53: redraws a card whose auto-continue countdown is running, so its minutes count down. */
+  private autoContinueRedrawTimerV1: ReturnType<typeof setTimeout> | undefined;
   private operationTraceWriteQueueV1: Promise<void> = Promise.resolve();
   /**
    * Coalesces renders requested by the four reactive subscriptions below
@@ -1363,6 +1415,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       clearTimeout(this.runStripPostTimerV1);
       this.runStripPostTimerV1 = undefined;
     }
+    if (this.autoContinueRedrawTimerV1 !== undefined) {
+      clearTimeout(this.autoContinueRedrawTimerV1);
+      this.autoContinueRedrawTimerV1 = undefined;
+    }
   }
 
   setDefaultTargetFactory(factory: () => Promise<ChatTarget | undefined>): void {
@@ -1414,7 +1470,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.view = view;
     view.webview.options = { enableScripts: true };
     view.webview.html = this.html();
-    view.webview.onDidReceiveMessage(async (message: unknown) => {
+    // review1 Step 24: a click in this webview is owner-started work, so its admission claims record `origin: "owner"`.
+    view.webview.onDidReceiveMessage(asOwnerEntryPointV1(async (message: unknown) => {
       if (isReadyMessage(message)) {
         // The webview's own script just finished installing its message
         // listener — it may have missed the render() this method already
@@ -1638,7 +1695,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           message: text,
         });
       }
-    });
+    }));
     // retainContextWhenHidden keeps the webview's DOM/script state alive
     // across a hide/show cycle (e.g. switching to Source Control and back),
     // but the underlying transcript on disk can still have changed while
@@ -2295,7 +2352,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     );
     const started = await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndRerunReview", {
       taskFolderPath: identity.taskFolderPath,
-    }, { skipUnchangedTreeGuardV1: true });
+    }, {
+      skipUnchangedTreeGuardV1: true,
+      // review1 Step 41: this command is awaited for the whole review, so the line is posted when the review is
+      // dispatched (after the resume completed), not after it has finished.
+      onDispatchingV1: () => {
+        void this.appendStatusLineV1(`Saved; re-running ${STAGE_DISPLAY_NAMES[stage]} now.`, stage, identity).catch(
+          () => undefined
+        );
+      },
+    });
     if (started !== true) {
       throw new Error("the stage review did not start");
     }
@@ -2666,6 +2732,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       NotificationRouter.showWarning(`${taskLabel} — ${message}`);
       return { ok: false, message };
     }
+    // review1 Step 44 (owner decision 2026-11-04): the up-front owner-evidence form has a field for each step.
+    // Every answered field is saved under `## Owner evidence` in task.md; no review is re-run (none has run yet).
+    const evidenceAnswers = collectOwnerEvidenceFormAnswersV1(record.questions, answers);
+    if (evidenceAnswers.length > 0) {
+      try {
+        for (const entry of evidenceAnswers) {
+          await appendOwnerEvidenceV1(identity.taskFolderPath, entry.blocker, entry.answer);
+        }
+      } catch (error) {
+        const message = `Your answers were recorded in the chat but could not be written to task.md (${error instanceof Error ? error.message : String(error)}). Edit task.md under ## Owner evidence by hand.`;
+        NotificationRouter.showWarning(`${taskLabel} — ${message}`);
+        return { ok: false, message };
+      }
+    }
+    // A full form had no room for every step: ask the steps after its last field next.
+    if (
+      isOwnerEvidenceUpFrontFormV1(record.questions) &&
+      record.questions.length >= MAX_OWNER_EVIDENCE_UP_FRONT_FIELDS_V1
+    ) {
+      const lastQuestion = record.questions[record.questions.length - 1];
+      const lastShownEvidence = lastQuestion?.kind === "text" ? lastQuestion.helpText : undefined;
+      if (lastShownEvidence !== undefined) {
+        void postRemainingOwnerEvidenceStepsV1({
+          folderUri: vscode.Uri.file(identity.taskFolderPath),
+          stage: record.stage,
+          lastShownEvidence,
+        }).catch(() => undefined);
+      }
+    }
     const singleChoiceAnswer = answers.find(
       (a): a is Extract<StructuredAnswerV1, { kind: "singleChoice"; state: "answered" }> =>
         a.kind === "singleChoice" && a.state === "answered"
@@ -2677,7 +2772,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       );
       const option = question?.options.find((o) => o.optionId === singleChoiceAnswer.selectedOptionId);
       if (effect && option) {
-        return { ok: true, effectToRun: { stage: record.stage, option, effect } };
+        // review1 Step 50: the owner-run form's typed fields travel to the record command in its arguments.
+        const effectWithValues = isOwnerRunFormV1(record.questions)
+          ? mergeOwnerRunFormValuesIntoEffectV1(effect, readOwnerRunFormValuesV1(answers))
+          : effect;
+        return { ok: true, effectToRun: { stage: record.stage, option, effect: effectWithValues } };
       }
     }
     return { ok: true };
@@ -3417,6 +3516,50 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (optionId === DISMISS_DECISION_OPTION_ID_V1) {
       return this.dismissWorkflowDecisionV1(decisionId, ctx);
     }
+    // review1 Step 54: "<option> and keep going" runs the option and remembers, for this kind of card in this run,
+    // that later ones are applied at once. Choosing the plain option by hand ends that. Nothing is recorded or
+    // cleared here: both happen only after the store accepts the answer (below), so a stale or refused answer
+    // changes nothing.
+    let keepGoingToRecordV1: string | undefined;
+    let keepGoingToClearV1: string | undefined;
+    {
+      const keepGoingCard = this.workflowDecisionStore.get(decisionId);
+      if (keepGoingCard !== undefined && isKeepGoingOptionIdV1(optionId)) {
+        const baseId = baseOptionIdOfKeepGoingV1(optionId);
+        keepGoingToRecordV1 = keepGoingKeyV1(keepGoingCard.taskCanonicalId, keepGoingCard.decisionKey, baseId);
+        optionId = baseId;
+      } else if (
+        keepGoingCard?.autoContinue !== undefined &&
+        keepGoingCard.autoContinue.optionId === optionId &&
+        !this.automaticResolutionsV1.has(decisionId)
+      ) {
+        keepGoingToClearV1 = keepGoingKeyV1(keepGoingCard.taskCanonicalId, keepGoingCard.decisionKey, optionId);
+      }
+    }
+    // review1 Step 53: "Wait for me" stops the countdown and leaves the card open, waiting for the owner.
+    if (optionId === WAIT_FOR_ME_OPTION_ID_V1) {
+      const waiting = this.workflowDecisionStore.get(decisionId);
+      if (waiting) {
+        if (waiting.autoContinue !== undefined) {
+          // Wait for me also ends "keep going" for this kind of card.
+          await this.workflowDecisionStore.clearKeepGoing(
+            keepGoingKeyV1(waiting.taskCanonicalId, waiting.decisionKey, waiting.autoContinue.optionId)
+          );
+        }
+        await this.workflowDecisionStore.cancelAutoContinue(decisionId, "you pressed Wait for me");
+        const waitingIdentity = this.identityForDecision(waiting, ctx);
+        if (waitingIdentity) {
+          await this.appendStatusLineV1(
+            "Countdown stopped. The card stays open and nothing runs until you choose.",
+            waiting.stage,
+            waitingIdentity
+          );
+          void recordOwnerActionForTaskV1(waitingIdentity.taskFolderPath, "you pressed Wait for me");
+        }
+      }
+      await this.render();
+      return { ok: true };
+    }
     // On a relayed resolution the decision's own record is the identity for
     // EVERY branch, including the refusals: the runner's panel is not what
     // the user clicked in, and on a headless runner there is no panel at all.
@@ -3486,6 +3629,43 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     } else {
       const { decision, option } = result;
       outcome = { ok: true, transitioned: true };
+      // review1 Step 54: the answer was accepted, so "keep going" is bound to the run that is current now (this
+      // session and this task's Fast Forward run); a later run does not inherit it.
+      if (keepGoingToRecordV1 !== undefined) {
+        await this.workflowDecisionStore.recordKeepGoing(
+          keepGoingToRecordV1,
+          currentRunBindingV1(decision.taskCanonicalId)
+        );
+        const keepGoingIdentity = this.identityForDecision(decision, ctx);
+        if (keepGoingIdentity) {
+          await this.appendStatusLineV1(
+            "Keeping going: later cards of this kind in this run will be applied at once, each with a line here. " +
+              "Press Wait for me on one to stop that.",
+            decision.stage,
+            keepGoingIdentity
+          );
+        }
+      } else if (keepGoingToClearV1 !== undefined) {
+        await this.workflowDecisionStore.clearKeepGoing(keepGoingToClearV1);
+      }
+      // review1 Step 23: answering any card is something the owner did, which counts as progress for the
+      // "is this working?" check and resets the count (the stop card's own commands record it too).
+      // "Not now" on the stop card itself keeps the hold: automation stays stopped until the owner decides.
+      // review1 Step 53: a countdown that ran the option by itself is Ensemble's act, not the owner's, so it must not
+      // reset the "is this working?" count.
+      if (
+        clickIdentity?.taskFolderPath &&
+        !this.automaticResolutionsV1.has(decisionId) &&
+        !(decision.decisionKey === PROGRESS_WATCH_DECISION_KEY_V1 && option.optionId === "notNow")
+      ) {
+        void recordOwnerActionForTaskV1(clickIdentity.taskFolderPath, `you answered “${decision.decisionKey}”`).then(() =>
+          // review1 Step 31: answering the last card can leave the stage ready to move on; say so at once.
+          // The stop and ready cards themselves are not re-announced by their own answer.
+          decision.decisionKey === AUTOMATION_STOPPED_DECISION_KEY_V1
+            ? undefined
+            : postStageReadyCardIfReadyV1(clickIdentity.taskFolderPath, "After your answer")
+        );
+      }
       const identity = this.identityForDecision(decision, ctx);
       if (option.optionId === "checkAfterInstall") {
         // Keep the owner's deferred checks in the durable task run history as
@@ -3728,6 +3908,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       optionId,
       acceptedAt: new Date().toISOString(),
       itemKeys: offeredTickItemsOfV1(decision),
+      ...(offeredTickItemIdsOfV1(decision) ? { itemIds: offeredTickItemIdsOfV1(decision) } : {}),
     });
     if (!stored) return;
     await this.appendStatusLineV1(
@@ -3763,7 +3944,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           return { kind: "notCarriedOut", reason: "the card is no longer open." };
         }
         const offered = offeredTickItemsOfV1(current);
-        const covered = answer.itemKeys.filter((item) => offered.includes(item));
+        // The items the answer covers, with the issued id of each (from the card now open), so a same-worded twin
+        // the answer never covered is not ticked in its place.
+        const offeredIds = offeredTickItemIdsOfV1(current);
+        const answeredLeft = new Map<string, number>();
+        for (const key of answer.itemKeys) answeredLeft.set(key, (answeredLeft.get(key) ?? 0) + 1);
+        const covered: string[] = [];
+        const coveredIds: (string | null)[] = [];
+        offered.forEach((item, index) => {
+          const left = answeredLeft.get(item) ?? 0;
+          if (left <= 0) return;
+          answeredLeft.set(item, left - 1);
+          covered.push(item);
+          coveredIds.push(offeredIds?.[index] ?? null);
+        });
         const apply = current.options.find((candidate) => candidate.optionId === APPLY_OPTION_ID_V1);
         if (covered.length === 0 || !apply || apply.effect.kind !== "command") {
           return { kind: "notCarriedOut", reason: "none of the items you answered for are on the card any more." };
@@ -3777,6 +3971,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const result = await vscode.commands.executeCommand(apply.effect.command, {
             ...firstArg,
             offeredItems: covered,
+            ...(offeredIds ? { offeredItemIds: coveredIds } : {}),
           });
           if (result === false) {
             return { kind: "notCarriedOut", reason: "the action did not complete (see the notification)." };
@@ -4501,8 +4696,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       ).catch(() => undefined);
       if (!sameRenderTarget(target, this.target)) return;
       if (implCounted) {
-        label = `${label} — ${formatChecklistPercentV1(implCounted.settled, implCounted.total)}%` +
-          ` (${implCounted.verified} verified, ${implCounted.provisional} provisional)`;
+        label = `${label} — ${formatPlanItemCountsLineV1(implCounted)}`;
       }
     } else if (target && target.kind !== "global" && isReviewStage(target.stage)) {
       const reviewScoreLabel = await describeReviewStageScoreV1(
@@ -4581,7 +4775,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (
       target &&
       target.kind !== "global" &&
-      !activeDecisions.some((d) => d.decisionKey === "reconcilePlanChecklist")
+      // review1 Step 10: one checklist card per task, so the idle reconcile card is not synthesised beside the
+      // reviewer-verified ticks card.
+      !activeDecisions.some(
+        (d) => d.decisionKey === "reconcilePlanChecklist" || d.decisionKey === "applyReviewerVerifiedTicks"
+      )
     ) {
       const isTaskIdle =
         targetOps.length === 0 &&
@@ -4658,8 +4856,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         ? anchored
         : formatDisplayTimestampPairV1(decision.createdAt);
       const headingText = decisionHeadingV1(decision);
+      // review1 Step 53: the countdown sentence is drawn from the stored deadline each time, so it counts down and
+      // says so when the countdown was stopped.
+      const countdownNote = describeAutoContinueNoteV1(decision, Date.now());
       return {
       ...decision,
+      ...(countdownNote !== undefined ? { whyUserNeeded: `${decision.whyUserNeeded} ${countdownNote}` } : {}),
       gatingLine,
       atLabel,
       atTitle,
@@ -4694,6 +4896,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         : {}),
       };
     });
+    // review1 Step 53: while a countdown runs, draw the chat again every 30 s so the minutes left stay true.
+    if (this.autoContinueRedrawTimerV1 !== undefined) {
+      clearTimeout(this.autoContinueRedrawTimerV1);
+      this.autoContinueRedrawTimerV1 = undefined;
+    }
+    if (activeDecisions.some((decision) => hasRunningAutoContinueCountdownV1(decision))) {
+      this.autoContinueRedrawTimerV1 = setTimeout(() => {
+        this.autoContinueRedrawTimerV1 = undefined;
+        void this.render();
+      }, 30_000);
+    }
     const trimmedDecisionCards = [
       ...new Map(
         entries
