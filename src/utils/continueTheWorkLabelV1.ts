@@ -15,7 +15,7 @@ export function planItemsLeftFromCountsV1(counts: { readonly total: number; read
   return { left: Math.max(0, counts.total - counts.settled), total: counts.total };
 }
 
-/** "3 of 48 plan items left" — the figure shown next to the score and in the action label. */
+/** "3 of 48 plan items left" — the figure shown on cards, in the review row's tooltip and in the action label. */
 export function describePlanItemsLeftV1(items: PlanItemsLeftV1): string {
   return `${items.left} of ${items.total} plan items left`;
 }

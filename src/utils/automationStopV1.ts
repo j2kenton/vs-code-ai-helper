@@ -131,7 +131,7 @@ export function extractBuildNextLinesV1(reviewText: string | undefined, maxLines
   return out;
 }
 
-/** review1 Step 56: the same "N of M plan items left" figure the Tasks row and the stage action show, from Step 5's counts. */
+/** review1 Step 56: the same "N of M plan items left" figure the Tasks row tooltip and the stage action show, from Step 5's counts. */
 function itemsLeftOf(facts: AutomationStopFactsV1): PlanItemsLeftV1 | undefined {
   return facts.planItems && facts.planItems.total > 0 ? planItemsLeftFromCountsV1(facts.planItems) : undefined;
 }
