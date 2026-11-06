@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import {
   getModelSettings,
   isModelProviderEnabled,
+  isOpenCodeConnectedProvidersRowOnV1,
   isProviderEnabled,
   isProviderSelectionConfigured,
 } from "../config/settings";
@@ -2257,7 +2258,7 @@ export async function getAvailableModels(includeModelDisabled = false): Promise<
     CLI_PROVIDERS.map((def) => {
       const enabled =
         def.id === "opencode-cli"
-          ? isProviderEnabled("opencode-zen") || isProviderEnabled("opencode-go")
+          ? isProviderEnabled("opencode-zen") || isProviderEnabled("opencode-go") || isOpenCodeConnectedProvidersRowOnV1()
           : isProviderEnabled(def.id);
       return enabled && commandExists(def.command, def.commandAliases);
     })
@@ -2311,7 +2312,8 @@ export async function getAvailableModels(includeModelDisabled = false): Promise<
       if (
         def.id === "opencode-cli" &&
         providerAccountIdForModelId(id) === "opencode-cli" &&
-        SEEDED_CLI_MODEL_LISTS_V1.has(discoveredChoices)
+        (SEEDED_CLI_MODEL_LISTS_V1.has(discoveredChoices) ||
+          (!includeModelDisabled && !isOpenCodeConnectedProvidersRowOnV1()))
       ) {
         continue;
       }

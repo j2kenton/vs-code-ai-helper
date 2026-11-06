@@ -194,8 +194,10 @@ void describe("OpenCode Zen/Go provider-selection compatibility", () => {
       enabledProviders: { "opencode-cli": true },
     });
     try {
+      // The old key meant Zen and Go; it does not turn on the newer
+      // "other connected providers" row that reuses the key.
       assert.deepEqual(getEnabledProviders(), {
-        "opencode-cli": true,
+        "opencode-cli": false,
         "opencode-zen": true,
         "opencode-go": true,
       });

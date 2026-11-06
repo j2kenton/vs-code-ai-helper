@@ -746,11 +746,33 @@ export function isModelProviderEnabled(modelId: string | undefined): boolean {
   const accountId = providerAccountIdForModelId(modelId);
   if (accountId === "opencode-cli") {
     // A model from a provider connected in OpenCode with the owner's own key,
-    // not Zen or Go. Only its own row ("OpenCode · other connected
-    // providers") authorizes it; neither service checkbox does.
-    return getEnabledProviders()[accountId] === true;
+    // not Zen or Go. Its own row ("OpenCode · other connected providers")
+    // authorizes it; neither service checkbox does. A setting still in the
+    // pre-split shape (only the old single `opencode-cli` checkbox) keeps
+    // authorizing a model already saved in a chain, as it did before.
+    const configured = readSetting<Record<string, boolean>>(ENABLED_PROVIDERS_KEY, {});
+    return (
+      isOpenCodeConnectedProvidersRowOnV1() ||
+      (isLegacyOpenCodeCheckboxV1(configured) && configured["opencode-cli"] === true)
+    );
   }
   return isProviderEnabled(accountId);
+}
+
+/**
+ * True when the setting is still in the shape from before Zen and Go became
+ * their own rows: an `opencode-cli` value with no explicit Zen or Go value.
+ * Then `opencode-cli` meant "OpenCode" (Zen and Go), not the connected-
+ * providers row that now uses the same key, so it must not turn that row on.
+ */
+function isLegacyOpenCodeCheckboxV1(configured: Record<string, boolean>): boolean {
+  const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(configured, key);
+  return has("opencode-cli") && !has("opencode-zen") && !has("opencode-go");
+}
+
+/** Whether "OpenCode · other connected providers" is on (never implied by the pre-split checkbox). */
+export function isOpenCodeConnectedProvidersRowOnV1(): boolean {
+  return getEnabledProviders()["opencode-cli"] === true;
 }
 
 /** Explicit provider selection shared by Settings and runner guards. */
@@ -759,12 +781,14 @@ export function getEnabledProviders(): Record<string, boolean> {
   // Before Zen/Go became explicit Provider Selection rows, one
   // `opencode-cli` checkbox covered both namespaces. Preserve that prior
   // opt-in on read so existing configured models are not suddenly blocked;
-  // the next save writes the two explicit choices and drops the legacy key.
+  // the next save writes the explicit choices. In that pre-split shape the
+  // key does not mean the connected-providers row, which reads as off.
   if (!Object.prototype.hasOwnProperty.call(configured, "opencode-cli")) {
     return configured;
   }
   return {
     ...configured,
+    ...(isLegacyOpenCodeCheckboxV1(configured) ? { "opencode-cli": false } : {}),
     ...(configured["opencode-zen"] === undefined
       ? { "opencode-zen": configured["opencode-cli"] }
       : {}),
@@ -857,6 +881,12 @@ export async function migrateEnabledProvidersForExistingModels(): Promise<void> 
       if (!model) continue;
       enabled[providerAccountIdForModelId(model)] = true;
     }
+  }
+  // A stored model from a connected provider enables its own row; write Zen and
+  // Go explicitly so the result isn't read as the pre-split single checkbox.
+  if (enabled["opencode-cli"] === true) {
+    enabled["opencode-zen"] ??= false;
+    enabled["opencode-go"] ??= false;
   }
   if (Object.keys(enabled).length > 0) {
     await config.update(ENABLED_PROVIDERS_KEY, enabled, targetFor(ENABLED_PROVIDERS_KEY));
