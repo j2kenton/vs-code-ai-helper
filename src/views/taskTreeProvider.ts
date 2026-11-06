@@ -36,7 +36,6 @@ import {
 import { effectiveReviewProgressV1, readPlanItemCountsV1 } from "../utils/effectiveReviewProgress";
 import {
   describeContinueTheWorkLabelV1,
-  describePlanItemsLeftV1,
   planItemsLeftFromCountsV1,
   type PlanItemsLeftV1
 } from "../utils/continueTheWorkLabelV1";
@@ -999,12 +998,10 @@ export class StageNode extends vscode.TreeItem {
               implementationProgress.unverified === true
             )
           : undefined;
-      // review1 Step 56: the current review stage also shows how much of the plan is left, next to the score.
-      const planItemsLeftSuffix =
-        status === "current" && isReviewStage(stage) && readiness?.planItemsLeft
-          ? ` · ${describePlanItemsLeftV1(readiness.planItemsLeft)}`
-          : "";
-      const statusLabel = readinessLabel ? `${readinessLabel}${planItemsLeftSuffix}` : percentLabel;
+      // A review row shows its score only. "N of M plan items left" stays in the tooltip's "Next:" line and on the
+      // cards: next to a review score it read as a third progress figure beside the Implementation percentage
+      // (owner, 2026-11-06).
+      const statusLabel = readinessLabel ? readinessLabel : percentLabel;
       switch (status) {
         case "done":
           // Completed stages always render with the done/tick icon, regardless
