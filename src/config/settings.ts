@@ -745,9 +745,9 @@ export function isProviderEnabled(provider: string): boolean {
 export function isModelProviderEnabled(modelId: string | undefined): boolean {
   const accountId = providerAccountIdForModelId(modelId);
   if (accountId === "opencode-cli") {
-    // This is a saved model from an external OpenCode CLI namespace, not Zen
-    // or Go. Preserve legacy selections while their old checkbox exists, but
-    // never let either new service checkbox implicitly authorize it.
+    // A model from a provider connected in OpenCode with the owner's own key,
+    // not Zen or Go. Only its own row ("OpenCode · other connected
+    // providers") authorizes it; neither service checkbox does.
     return getEnabledProviders()[accountId] === true;
   }
   return isProviderEnabled(accountId);

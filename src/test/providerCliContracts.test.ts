@@ -391,7 +391,12 @@ void describe("provider CLI contracts", () => {
     const go = getProviderAccountEntry("opencode-go");
     assert.ok(zen, "expected the OpenCode Zen provider-account row");
     assert.ok(go, "expected the OpenCode Go provider-account row");
-    assert.strictEqual(getProviderAccountEntry("opencode-cli"), undefined);
+    // Providers connected in OpenCode with the owner's own key share one row of their own, never Zen's or Go's.
+    const connected = getProviderAccountEntry("opencode-cli");
+    assert.ok(connected, "expected the OpenCode connected-providers row");
+    assert.strictEqual(connected.label, "OpenCode · other connected providers");
+    assert.strictEqual(connected.enabledByDefault, false);
+    assert.deepStrictEqual(connected.signIn, { kind: "interactive", launch: "opencode", send: "/connect", validated: "verified" });
     assert.strictEqual(zen.label, "OpenCode Zen");
     assert.strictEqual(go.label, "OpenCode Go");
     assert.strictEqual(zen.signIn.kind, "interactive");
@@ -1303,7 +1308,9 @@ void describe("provider CLI contracts", () => {
     // in-session slash command (Claude), otherwise a terminal action with
     // the validated command line.
     for (const entry of PROVIDER_ACCOUNT_ENTRIES) {
-      if (entry.id === "copilot" || entry.id === "opencode-zen" || entry.id === "opencode-go") continue;
+      // OpenCode's rows (Zen, Go, connected providers) are logical accounts of one CLI, signed in through
+      // OpenCode's own /connect; they are checked in the OpenCode test above.
+      if (entry.id === "copilot" || entry.id === "opencode-zen" || entry.id === "opencode-go" || entry.id === "opencode-cli") continue;
       const cli = getCliProvider(entry.id);
       assert.ok(cli, `expected CLI definition for ${entry.id}`);
       if (cli.signInAction) {
@@ -1369,6 +1376,7 @@ void describe("provider CLI contracts", () => {
       "kiro-cli": { kind: "terminal" },
       "opencode-zen": { kind: "unsupported" },
       "opencode-go": { kind: "unsupported" },
+      "opencode-cli": { kind: "unsupported" },
       "cline-cli": { kind: "unsupported" },
       // Kimi Code CLI has no non-interactive usage/quota subcommand at all
       // (verified against its full --help command list) — see
@@ -1401,7 +1409,7 @@ void describe("provider CLI contracts", () => {
       if (entry.usage.kind === "unsupported") {
         assert.ok(entry.usage.reason.length > 0, `${entry.id} unsupported usage needs a reason`);
       }
-      if (entry.id === "opencode-zen" || entry.id === "opencode-go") {
+      if (entry.id === "opencode-zen" || entry.id === "opencode-go" || entry.id === "opencode-cli") {
         assert.match(entry.signInLabel, /^Connect OpenCode /, entry.id);
       } else {
         // Re-running the same flow while already authenticated is how a user

@@ -1925,6 +1925,19 @@ export function getSeededCatalogForAudit(): {
   };
 }
 
+/**
+ * The built-in (seeded) model lists, by identity. A cache entry still holding one of these means the CLI's own
+ * listing never replaced it (or failed), so it says nothing about which upstream providers are connected.
+ */
+const SEEDED_CLI_MODEL_LISTS_V1 = new WeakSet<readonly DiscoveredCliModel[]>();
+
+function seededCliModelListV1(models: readonly DiscoveredCliModel[]): readonly DiscoveredCliModel[] {
+  const list = [...models];
+  SEEDED_CLI_MODEL_LISTS_V1.add(list);
+  return list;
+}
+
+
 function createSeededCliModelCache(): Map<
   string,
   {
@@ -1935,7 +1948,7 @@ function createSeededCliModelCache(): Map<
   return new Map(
     Object.entries(SEEDED_CLI_MODELS).map(([providerId, models]) => [
       providerId,
-      { models: [...models] },
+      { models: seededCliModelListV1(models) },
     ])
   );
 }
@@ -2170,14 +2183,37 @@ export async function getAvailableCopilotModels(): Promise<
 }
 
 /** Label a CLI model by the service that will actually authorize and bill it. */
+/** Display names for OpenCode's upstream provider namespaces; any other namespace is shown as written. */
+const OPENCODE_UPSTREAM_PROVIDER_NAMES_V1: Readonly<Record<string, string>> = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+  google: "Google",
+  "github-copilot": "GitHub Copilot",
+  openrouter: "OpenRouter",
+  xai: "xAI",
+  mistral: "Mistral",
+  deepseek: "DeepSeek",
+};
+
+/**
+ * The picker group for a model OpenCode serves through a provider the owner connected themselves (not Zen or Go),
+ * e.g. `anthropic/claude-opus-5-5` -> "OpenCode · Anthropic (your own key)". It bills to that provider's account.
+ */
+export function openCodeConnectedProviderLabelV1(model: string | undefined): string {
+  const namespace = (model ?? "").split("/")[0] ?? "";
+  const name = OPENCODE_UPSTREAM_PROVIDER_NAMES_V1[namespace] ?? (namespace || "other provider");
+  return `OpenCode · ${name} (your own key)`;
+}
+
 function modelProviderLabel(
   def: CliProviderDefinition,
   model: string | undefined
 ): string {
   if (def.id === "opencode-cli") {
-    return providerAccountIdForModelId(toQualifiedModelId(def.id, model)) === "opencode-go"
-      ? "OpenCode Go (shared OpenCode account; subscription)"
-      : "OpenCode Zen (shared OpenCode account; pay as you go)";
+    const account = providerAccountIdForModelId(toQualifiedModelId(def.id, model));
+    if (account === "opencode-go") return "OpenCode Go (shared OpenCode account; subscription)";
+    if (account === "opencode-cli") return openCodeConnectedProviderLabelV1(model);
+    return "OpenCode Zen (shared OpenCode account; pay as you go)";
   }
   return `${def.label} (subscription CLI)`;
 }
@@ -2267,9 +2303,15 @@ export async function getAvailableModels(includeModelDisabled = false): Promise<
 
     for (const choice of discoveredChoices) {
       const id = toQualifiedModelId(def.id, choice.model);
+      // Discovered OpenCode models outside Zen and Go come only from providers the owner connected in OpenCode
+      // (`opencode models` lists connected providers only), so they are offered under their own Provider Selection
+      // row ("OpenCode · other connected providers", account id `opencode-cli`), off until the owner turns it on.
+      // Seeded external entries stay hidden, here too while the cache still holds the built-in list (no live
+      // listing yet, or it failed): a seed says nothing about what is connected.
       if (
         def.id === "opencode-cli" &&
-        providerAccountIdForModelId(id) === "opencode-cli"
+        providerAccountIdForModelId(id) === "opencode-cli" &&
+        SEEDED_CLI_MODEL_LISTS_V1.has(discoveredChoices)
       ) {
         continue;
       }

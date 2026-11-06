@@ -2546,6 +2546,24 @@ export const PROVIDER_ACCOUNT_ENTRIES: readonly ProviderAccountEntry[] = reorder
     },
     enabledByDefault: false,
   },
+  {
+    // Models OpenCode serves through providers the owner connected themselves (for example their own Anthropic API
+    // key), discovered from `opencode models`. Billed by that provider, not by OpenCode.
+    id: "opencode-cli",
+    label: "OpenCode · other connected providers",
+    signInLabel: "Connect OpenCode provider (your own key)",
+    signIn: { kind: "interactive", launch: "opencode", send: "/connect", validated: "verified" },
+    signInGuidance:
+      "In the terminal, choose the provider to connect (for example Anthropic) and paste that provider's own API key. " +
+      "Its models then appear in AI Models after the next model refresh, grouped as \"OpenCode · <provider> (your own key)\". " +
+      "They bill to that provider's account, not to OpenCode Zen or Go. Zen and Go models never use this row.",
+    usage: {
+      kind: "unsupported",
+      reason:
+        "OpenCode does not report usage for providers connected with your own key. Check usage in that provider's own console.",
+    },
+    enabledByDefault: false,
+  },
   // Antigravity is deliberately moved to the very end of the list (see
   // reorderAntigravityLast below): its permissionWarning explicitly names
   // Antigravity and is only meaningful when it's the last row, immediately
@@ -2714,9 +2732,9 @@ export function providerAccountIdForModelId(
   if (parsed.model?.startsWith("opencode/")) {
     return OPENCODE_ZEN_ACCOUNT_ID;
   }
-  // Retain the legacy adapter ID for saved external-provider selections.
-  // It deliberately has no visible Provider Selection row: new picker
-  // choices are limited to the explicitly supported Zen/Go services.
+  // Every other namespace is a provider the owner connected in OpenCode with
+  // their own key. They share the "OpenCode · other connected providers"
+  // Provider Selection row, separate from Zen and Go for quota and sign-in.
   return "opencode-cli";
 }
 
