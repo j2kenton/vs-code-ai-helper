@@ -13,6 +13,7 @@ import { recordStageActionTerminalOutcomeV1 } from "../utils/stageActionRefusalV
 import type { ProofOfLifeV1 } from "../utils/proofOfLifeV1";
 import { describeHeldAnswerRowInfoV1, type HeldAnswerRowInfoV1 } from "../utils/heldAnswerLifecycleV1";
 import { describeRunningRowEvidenceV1 } from "../utils/runningRowEvidenceV1";
+import { buildRunningRowTooltipV1, formatDurationV1 } from "./runningRowTooltipV1";
 import { getResilienceSettings, RESILIENCE_DEFAULTS } from "../config/settings";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
@@ -114,13 +115,7 @@ export const OPERATION_STUCK_CONTEXT_VALUE_V1 = "ensemble-operation-cancellable-
  * hour, `Xh Ym` from then on — matches the in-flight-activity worked
  * example ("2m 48s", "17m 42s"). `now` is injectable for tests. */
 export function formatElapsedForDisplay(originMs: number, now: number = Date.now()): string {
-  const totalSeconds = Math.max(0, Math.floor((now - originMs) / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-  if (hours > 0) {return `${hours}h ${minutes}m`;}
-  if (minutes > 0) {return `${minutes}m ${seconds}s`;}
-  return `${seconds}s`;
+  return formatDurationV1(now - originMs);
 }
 
 /** "06:02": the clock time an operation started, in the viewer's local time. */
@@ -533,14 +528,28 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
             element.heldAnswerV1 !== undefined ? OPERATION_HELD_CONTEXT_SUFFIX_V1 : ""
           }`
         : "ensemble-operation";
-      if (evidence.warning !== undefined || evidence.activityLine !== undefined || evidence.tooltipLines.length > 0) {
-        item.tooltip = [
-          `${label}${stageLabel ? ` · ${stageLabel}` : ""}`,
-          ...(evidence.warning !== undefined ? [evidence.warning] : []),
-          ...(evidence.activityLine !== undefined ? [evidence.activityLine] : []),
-          ...evidence.tooltipLines,
-        ].join("\n");
-      }
+      // bugs6 item 43: every running row has a hover listing what the grey line holds, one labelled fact per line.
+      const modelSegment = describeOperationModelSegmentV1({
+        modelId: element.modelId,
+        activity: element.activity,
+        detail: element.detail,
+      });
+      item.tooltip = buildRunningRowTooltipV1({
+        label,
+        ...(stageLabel !== undefined ? { stageLabel } : {}),
+        doing: activitySegment,
+        ...(element.modelId !== undefined ? { modelId: element.modelId } : {}),
+        ...(modelSegment !== undefined ? { modelSegment } : {}),
+        startedAt: element.startedAt,
+        ...(element.activityStartedAt !== undefined ? { activityStartedAt: element.activityStartedAt } : {}),
+        now: Date.now(),
+        ...(evidence.warning !== undefined ? { warning: evidence.warning } : {}),
+        ...(evidence.activityLine !== undefined ? { activityLine: evidence.activityLine } : {}),
+        evidenceLines: evidence.tooltipLines,
+        ...(element.heldAnswerV1 !== undefined ? { heldAnswer: describeHeldAnswerRowInfoV1(element.heldAnswerV1) } : {}),
+        cancellable: element.cancellable === true,
+        stuck: evidence.stuck,
+      });
       return item;
     }
 
