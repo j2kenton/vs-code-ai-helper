@@ -5139,3 +5139,67 @@ void describe("bugs5 Steps 7 and 9: a card a running command waits on", () => {
     }
   });
 });
+
+void describe("Chat With AI — stage arrows", () => {
+  void it("marks the button towards the current stage's open card, with the Tasks pane's count", async () => {
+    const folder = makeFolder(); // current stage: impl
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    const realFs = installRealFs(); // the count needs the task's current stage from task-progress.json
+    try {
+      const posted = await provider.workflowDecisionStore.post(decisionInput(folder));
+      assert.ok(posted.ok, posted.ok ? undefined : posted.reason);
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "plan-low-review" });
+      await waitForState(fake, (s) => (s.target as { stage?: string } | undefined)?.stage === "plan-low-review");
+      const nav = lastState(fake)?.stageNav as {
+        previous?: { stage: string; attention: number };
+        next?: { stage: string; label: string; attention: number };
+      };
+      assert.equal(nav.previous?.stage, "plan-high-review");
+      assert.equal(nav.previous?.attention, 0);
+      assert.equal(nav.next?.stage, "impl");
+      assert.equal(nav.next?.label, "Chat with Implementation [1]");
+    } finally {
+      realFs.restore();
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+
+  void it("opens the chosen stage of the same task, and ignores anything that isn't a stage", async () => {
+    const folder = makeFolder();
+    const provider = new ChatViewProvider(makeMemento());
+    const fake = makeFakeWebviewView();
+    const notify = installNotificationRouterCapture();
+    const cmds = installExecuteCommandCapture();
+    try {
+      provider.resolveWebviewView(fake.view);
+      await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl", taskName: "T" });
+      await waitForStateMessage(fake);
+      await fake.send({ type: "openStage", stage: "../escape", canonicalId: folder });
+      await fake.send({ type: "openStage", stage: "completed", canonicalId: folder });
+      // A click painted for another task (the panel switched before the new buttons painted).
+      await fake.send({ type: "openStage", stage: "publish", canonicalId: "/some/other/task" });
+      await fake.send({ type: "openStage", stage: "impl-high-review", canonicalId: folder });
+      await waitForState(fake, (s) => (s.target as { stage?: string } | undefined)?.stage === "impl-high-review");
+      const target = lastState(fake)?.target as { stage: string; canonicalId: string; taskName?: string };
+      assert.equal(target.stage, "impl-high-review");
+      assert.equal(target.canonicalId, folder);
+      assert.equal(target.taskName, "T");
+      const stages = fake.posted
+        .filter((m) => m.type === "state")
+        .map((m) => (m.target as { stage: string }).stage);
+      assert.ok(!stages.includes("completed") && !stages.includes("../escape") && !stages.includes("publish"));
+    } finally {
+      notify.restore();
+      cmds.restore();
+      provider.dispose();
+      safeRemoveDir(folder);
+    }
+  });
+});

@@ -181,6 +181,7 @@ function runPanel(): PanelHarness {
     "answering",
     "answering-text",
     "answering-cancel",
+    "stage-nav",
   ]) {
     elements.set(id, makeElement("div", id));
   }
@@ -1029,5 +1030,53 @@ void describe("the chat panel's inline script", () => {
       false,
       "no empty transcript may travel with it"
     );
+  });
+});
+
+void describe("the chat panel's stage arrows", () => {
+  const plain = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+  const nav = {
+    previous: { stage: "impl-high-review", label: "Chat with High-Level Code Review", attention: 0, tooltip: "Open the High-Level Code Review chat." },
+    next: { stage: "publish", label: "Chat with Publish [2]", attention: 2, tooltip: "Open the Publish chat. 2 items need you on Publish." },
+  };
+
+  void it("shows previous on the left and next on the right, the one that needs the owner marked", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ stageNav: nav }));
+    const bar = panel.byId("stage-nav");
+    assert.equal(bar.style.display, "flex");
+    assert.equal(bar.children.length, 2);
+    const [previous, next] = bar.children;
+    assert.equal(previous?.textContent, "\u25C0 Chat with High-Level Code Review");
+    assert.equal(previous?.className, "stage-nav-previous");
+    assert.equal(next?.textContent, "Chat with Publish [2] \u25B6");
+    assert.equal(next?.className, "stage-nav-next stage-nav-attention");
+    assert.equal(next?.title, "Open the Publish chat. 2 items need you on Publish.");
+  });
+
+  void it("asks the extension to open the chosen stage", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ stageNav: nav }));
+    const before = panel.outbound.length;
+    panel.byId("stage-nav").children[1]!.listeners.get("click")![0]!({});
+    assert.deepEqual(plain(panel.outbound.slice(before)), [{ type: "openStage", stage: "publish", canonicalId: "/w/t1" }]);
+  });
+
+  void it("clears the buttons when a switch to another task fails to paint", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ stageNav: nav }));
+    panel.post({ type: "renderFailed", target: { kind: "task", canonicalId: "/w/t2", stage: "impl" }, label: "Other", errorMessage: "x" });
+    const bar = panel.byId("stage-nav");
+    assert.equal(bar.children.length, 0);
+    assert.equal(bar.style.display, "none");
+  });
+
+  void it("hides the bar when there is no stage to move to (the global assistant)", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ stageNav: nav }));
+    panel.post(stateMessage({ target: { kind: "global" }, stageNav: undefined }));
+    const bar = panel.byId("stage-nav");
+    assert.equal(bar.children.length, 0);
+    assert.equal(bar.style.display, "none");
   });
 });

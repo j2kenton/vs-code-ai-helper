@@ -8,7 +8,13 @@ import { normalizePath } from "../utils/taskRoot";
 import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
 import { isReviewStage, STAGE_DISPLAY_NAMES, TaskProgress, TaskStage } from "../types/taskProgress";
 import type { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
-import { describeReviewStageScoreV1 } from "./taskTreeProvider";
+import {
+  countPendingDecisionsForStageRowV1,
+  countUnresolvedInteractionsV1,
+  describeReviewStageScoreV1,
+} from "./taskTreeProvider";
+import { buildStageNavV1, isNavigableStageV1, StageNavV1 } from "./chatStageNavV1";
+import { isTaskStatusHiddenFromDecisionsV1 } from "../services/hostDecisionMirrorV1";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { notifyDesktop } from "../utils/desktopNotifier";
 import { formatTaskNameForDisplay, taskKey, taskOperations } from "../utils/taskOperations";
@@ -1541,6 +1547,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             state: toggle.state as ChatCardViewV1["state"],
             expanded: toggle.expanded,
           });
+        }
+        return;
+      }
+      // The stage arrows under the composer (chatStageNavV1.ts): open the neighbouring stage's chat
+      // of the same task. Only a real stage of a stage chat; the global assistant has no stages.
+      if (
+        message &&
+        typeof message === "object" &&
+        (message as { type?: unknown }).type === "openStage" &&
+        this.target &&
+        this.target.kind !== "global"
+      ) {
+        const stage = (message as { stage?: unknown }).stage;
+        // The click names the task its buttons were painted for. A click that lands after the panel
+        // switched task (before the new buttons painted) must not open the other task's stage.
+        const canonicalId = (message as { canonicalId?: unknown }).canonicalId;
+        if (isNavigableStageV1(stage) && stage !== this.target.stage && canonicalId === this.target.canonicalId) {
+          await this.open({ ...this.target, stage });
         }
         return;
       }
@@ -5578,10 +5602,15 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // Best effort: a stale entry left behind is ignored by isCardExpandedV1 anyway.
       }
     }
+    const stageNav = await this.buildStageNavForTargetV1(target, progressForBadgeFallback, interactions);
+    if (!sameRenderTarget(target, this.target)) {
+      return;
+    }
     await this.view?.webview.postMessage({
       type: "state",
       target: this.target,
       label,
+      stageNav,
       entries: conversationEntries,
       timeline: conversationTimeline,
       interactions: displayInteractions,
@@ -5595,6 +5624,39 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       errorMessage,
       emptyNotice,
     });
+  }
+
+  /**
+   * The previous/next stage buttons (chatStageNavV1.ts). Their counts are the Tasks pane's: open
+   * cards and unanswered questions on the task's current stage, none for a finished task. Never
+   * fails a render: on any read problem the buttons show without a count.
+   */
+  private async buildStageNavForTargetV1(
+    target: ChatTarget | undefined,
+    progress: TaskProgress | undefined,
+    interactionsForTargetStage: readonly ChatDocumentInteractionV1[]
+  ): Promise<StageNavV1 | undefined> {
+    if (!target || target.kind === "global") {
+      return undefined;
+    }
+    const currentStage = progress?.currentStage;
+    let attention = 0;
+    try {
+      if (currentStage !== undefined && !isTaskStatusHiddenFromDecisionsV1(progress?.status)) {
+        const pending = this.workflowDecisionStore
+          .listPending(target.canonicalId)
+          .filter((decision) => !this.isAnswerInFlightV1(decision));
+        const unresolved = await countUnresolvedInteractionsV1(progress?.status ?? "", async () =>
+          currentStage === target.stage
+            ? interactionsForTargetStage
+            : readChatInteractions(target.taskFolderPath, target.canonicalId, currentStage)
+        );
+        attention = countPendingDecisionsForStageRowV1(pending, currentStage, currentStage, unresolved);
+      }
+    } catch {
+      attention = 0;
+    }
+    return buildStageNavV1({ stage: target.stage, currentStage, attentionOnCurrentStage: attention });
   }
 
   private html(): string {
@@ -5859,6 +5921,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--ensemble-info-foreground); }
         #send-reason { display: none; margin-left: var(--ensemble-space-2); font-size: 0.85em; color: var(--ensemble-muted-foreground); }
         #answering { display: none; margin: 0 0 var(--ensemble-space-2); font-weight: bold; color: var(--ensemble-info-foreground); }
+        #stage-nav { display: none; justify-content: space-between; gap: var(--ensemble-space-2); margin-top: var(--ensemble-space-3); }
+        #stage-nav button {
+          background-color: var(--vscode-button-secondaryBackground);
+          color: var(--vscode-button-secondaryForeground);
+          border: var(--ensemble-border-width) solid transparent;
+          padding: var(--ensemble-space-1) var(--ensemble-space-2);
+          border-radius: var(--ensemble-radius);
+          cursor: pointer;
+          max-width: 49%;
+        }
+        #stage-nav button:hover { background-color: var(--vscode-button-secondaryHoverBackground); }
+        #stage-nav button:focus-visible { outline: var(--ensemble-focus-width) solid var(--vscode-focusBorder); outline-offset: var(--ensemble-border-width); }
+        #stage-nav .stage-nav-next { margin-left: auto; }
+        /* The Tasks pane's "needs you" yellow (charts.yellow), so the two read as one signal. */
+        #stage-nav button.stage-nav-attention { color: var(--vscode-charts-yellow); border-color: var(--vscode-charts-yellow); font-weight: bold; }
       </style>
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
@@ -5870,7 +5947,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="steering-note" role="note">Rounds don't read this chat. To change what the next rounds do, ask here to record it in the plan (for example, "add to the plan: skip the memory work"), or edit <code>plan-final.md</code> yourself.</div>
       <div id="answering" role="status" aria-live="polite"><span id="answering-text"></span> <button type="button" id="answering-cancel" title="Stop answering this card and go back to normal chat">Cancel</button></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" id="send-btn" title="Send message (Enter)">Send</button><span id="send-reason" role="status"></span></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
+      <nav id="stage-nav" aria-label="Other stages of this task"></nav>
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason'), snav=document.getElementById('stage-nav');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
@@ -5879,6 +5957,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       function persistScroll(){ if(currentKey===undefined) return; scrollPositions[currentKey]=window.scrollY; v.setState({scrollPositions:scrollPositions}); }
       // run1 Step 20: Chat With AI says nothing about what is running; Notifications answers that. The only
       // line left is the banner for a question waiting on the owner, which is part of the conversation.
+      // The stage arrows (chatStageNavV1.ts): previous on the left, next on the right; yellow with a
+      // count when something there needs the owner.
+      function renderStageNav(nav,forTarget){
+        if(!snav) return;
+        snav.replaceChildren();
+        const add=(btn,arrowBefore,cls)=>{
+          if(!btn) return;
+          const el=document.createElement('button');el.type='button';el.className=cls+(btn.attention>0?' stage-nav-attention':'');
+          el.textContent=arrowBefore?('\u25C0 '+btn.label):(btn.label+' \u25B6');el.title=btn.tooltip||'';
+          el.setAttribute('data-stage',btn.stage);
+          el.addEventListener('click',()=>v.postMessage({type:'openStage',stage:btn.stage,canonicalId:forTarget&&forTarget.canonicalId}));
+          snav.appendChild(el);
+        };
+        add(nav&&nav.previous,true,'stage-nav-previous');
+        add(nav&&nav.next,false,'stage-nav-next');
+        snav.style.display=snav.children.length?'flex':'none';
+      }
       function renderWaiting(waitingForUser,waitingSource){
         if(waitingForUser){
           bt.textContent='Waiting for your answer';b.style.display='block';
@@ -6533,7 +6628,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             // every Reply control post to the new target, so the user would
             // have been answering task B while reading task A
             // (verification review, 2026-09-18).
-            m.replaceChildren();dc.replaceChildren();dc.style.display='none';renderInteractions([]);
+            m.replaceChildren();dc.replaceChildren();dc.style.display='none';renderInteractions([]);renderStageNav(undefined);
             en.textContent='';en.style.display='none';
             renderWaiting(false,undefined);
             c.textContent=s.label??'Chat';
@@ -6551,6 +6646,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         const stick=!switchedChat&&isNearBottom();
         c.textContent=s.label??'No chat available yet.';
         sn.style.display=(s.target&&s.target.kind!=='global')?'block':'none';
+        renderStageNav(s.stageNav,s.target);
         function renderMessage(x){
           const row=document.createElement('div');row.className='msg-row';
           const meta=buildMsgMeta(x.text,x.atLabel,x.atTitle);
