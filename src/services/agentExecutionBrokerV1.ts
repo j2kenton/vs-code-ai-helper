@@ -61,15 +61,18 @@ export const DEFAULT_SPOOL_THRESHOLD_BYTES_V1 = 256 * 1024;
  * may finish sooner, but no unresolved transport may hold a task operation
  * and its admission indefinitely.
  *
- * 60 minutes, the same wall clock a CLI round gets (`cliAgentRunner.ts`
- * `RUN_TIMEOUT_MS`). It was 15 minutes, which only ever bit Copilot: a Copilot
+ * 4 hours, the same far-off backstop a CLI round gets (`ensemble.resilience.roundBackstopHours`,
+ * default 4; run1 Step 12). A busy round is never stopped for its length: the idle and repeat stops
+ * catch a stuck one far sooner, and this bound only guards a transport that is somehow still alive
+ * long after it should have ended. It was 60 minutes (and before that 15), which cut working rounds
+ * off. The 15 minutes only ever bit Copilot: a Copilot
  * round or plan runs as one brokered tool session of up to `MAX_TOOL_ROUNDS_V1`
  * sequential model calls, and a Copilot plan generation on a large task was
  * cut off at exactly 15:00 per model (observed 2026-09-25, wt-b, two models,
  * 30:00 total, then `candidatesExhausted`). The bound exists to stop a hung
  * transport from holding the task for ever, not to budget a working session.
  */
-export const DEFAULT_INVOCATION_WALL_CLOCK_MS_V1 = 60 * 60_000;
+export const DEFAULT_INVOCATION_WALL_CLOCK_MS_V1 = 4 * 60 * 60_000;
 
 /**
  * Bounded grace a process-owning transport gets, after the broker cancels the
@@ -208,7 +211,7 @@ export interface AgentExecutionBrokerOptionsV1 {
   readonly spoolStore?: BoundedResultStoreV1;
   /** Byte size above which a sealed response is spooled instead of held in memory. */
   readonly spoolThresholdBytes?: number;
-  /** Wall-clock limit for one transport invocation; defaults to 60 minutes. */
+  /** Wall-clock limit for one transport invocation; defaults to 4 hours. */
   readonly invocationTimeoutMs?: number;
   /**
    * Grace a process-owning transport gets, after cancellation, to confirm its

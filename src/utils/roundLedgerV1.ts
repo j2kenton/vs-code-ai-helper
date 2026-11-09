@@ -266,10 +266,57 @@ import {
   type ForeignTaskArtifactSnapshotV1,
 } from "./foreignTaskArtifactContainmentV1";
 import { normalizePath } from "./taskRoot";
-import { hasAutomaticOriginV1 } from "../state/automationDispatchContextV1";
+import { taskOperations } from "./taskOperations";
+import { currentHeldDispatchIdV1, hasAutomaticOriginV1 } from "../state/automationDispatchContextV1";
 import { fastForwardRoundFieldsV1, isFastForwardRunActiveV1 } from "./activeFastForwardRunsV1";
 import { recordRoundEndedInWatchV1 } from "./taskProgressWatchV1";
 import { formatRepeatedRejectionLineV1 } from "./reportContractRejectionsV1";
+
+/** run1 Step 26: a round opened by carrying out a held owner answer records the answer's dispatch id. */
+function heldDispatchFieldV1(): { heldDispatchId?: string } {
+  const id = currentHeldDispatchIdV1();
+  return id !== undefined ? { heldDispatchId: id } : {};
+}
+
+/**
+ * run1 Step 25: other-task `task.md` edits already said once on an end line (task folder name and
+ * content hash), so later end lines skip them. The record is the running task's own
+ * `notedForeignEdits` progress field, so it survives a reload.
+ */
+const NOTED_FOREIGN_EDITS_LIMIT_V1 = 100;
+
+function notedForeignEditKeyV1(taskFolderPath: string, sha256: string): string {
+  return `${path.basename(path.resolve(taskFolderPath))}:${sha256}`;
+}
+
+async function readNotedForeignEditsV1(taskFolderPath: string): Promise<ReadonlySet<string>> {
+  try {
+    const parsed = JSON.parse(await fs.promises.readFile(path.join(taskFolderPath, "task-progress.json"), "utf8")) as {
+      notedForeignEdits?: unknown;
+    };
+    return new Set(Array.isArray(parsed.notedForeignEdits) ? parsed.notedForeignEdits.filter((e): e is string => typeof e === "string") : []);
+  } catch {
+    return new Set();
+  }
+}
+
+/** Best-effort: a failed write only means the same edit may be said once more on a later end line. */
+async function recordNotedForeignEditsV1(
+  taskFolderUri: vscode.Uri,
+  keys: readonly string[]
+): Promise<void> {
+  if (keys.length === 0) {
+    return;
+  }
+  try {
+    await patchTaskProgressStrictV1(taskFolderUri, (current) => {
+      const merged = [...new Set([...(current.notedForeignEdits ?? []), ...keys])].slice(-NOTED_FOREIGN_EDITS_LIMIT_V1);
+      return { ...current, notedForeignEdits: merged };
+    });
+  } catch {
+    // Never blocks the round's end line.
+  }
+}
 import { getLiveTaskOperationV1, isOperationLiveByIdV1 } from "./liveTaskOperationLookupV1";
 import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
 import {
@@ -624,6 +671,13 @@ export function formatRoundOutcomeMessageV1(
           : "no files changed"
       );
     }
+    // A stop sentence from `describeRoundStopV1` already says it; do not repeat it on the same line.
+    if (outcome.observedFiles?.length && !outcome.rejectionReason?.includes("while it ran")) {
+      const count = outcome.observedFiles.length;
+      parts.push(
+        `${count} file${count === 1 ? "" : "s"} changed in the workspace while it ran, not proven to be this round's`
+      );
+    }
     if (outcome.reviewerChallengedNonGoal?.length) {
       parts.push(
         `re-raised a blocker the plan declares out of scope: ${outcome.reviewerChallengedNonGoal.join(", ")}`
@@ -884,7 +938,28 @@ export async function terminalizeRoundV1(
             .map((line) => line.replace(/^\s*-\s*\[[ xX]\]\s+/, "").replace(/^\*\*(.*?)\*\*$/, "$1").trim())
             .filter(Boolean)
         );
+        const alreadyNotedEdits = await readNotedForeignEditsV1(currentTaskFolderPath);
+        // run1 Step 25: the window is when the round's model process ran, as its runner recorded it. The
+        // ledger's own start and end include preparation and bookkeeping, where other writes land too, so
+        // a round with no recorded process window (a review, a round that never spawned) offers no advice.
+        const roundStartMs = Date.parse(entry.outcome?.processStartedAt ?? "");
+        const roundEndMs = Date.parse(entry.outcome?.processEndedAt ?? "");
+        const ledgerStartMs = Date.parse(entry.startedAt);
+        const ledgerEndMs = entry.endedAt !== undefined ? Date.parse(entry.endedAt) : Date.now();
         const result = await containForeignTaskArtifactChangesV1(changes, currentTaskFolderPath, {
+          // A task folder New Task made at any point in the round's whole span is Ensemble's own.
+          ...(Number.isFinite(ledgerStartMs) && Number.isFinite(ledgerEndMs)
+            ? { createdWithinWindow: { startMs: ledgerStartMs, endMs: ledgerEndMs } }
+            : {}),
+          // run1 Step 25: this round's process window, and the names its own content would carry, so
+          // "move it into this task" is offered only with that evidence. A round running in the other
+          // task makes its writes that round's own; an owner edit is said once per task and content.
+          ...(Number.isFinite(roundStartMs) && Number.isFinite(roundEndMs)
+            ? { roundWindow: { startMs: roundStartMs, endMs: roundEndMs } }
+            : {}),
+          currentTaskNames: [path.basename(currentTaskFolderPath)],
+          isRoundRunningInTask: (folder) => taskOperations.hasRootOperationForTask(folder),
+          isEditAlreadyNoted: (folder, sha256) => alreadyNotedEdits.has(notedForeignEditKeyV1(folder, sha256)),
           isConcurrentForeignUpdate: [...foreignFolders].some((folder) => {
             try {
               const state = JSON.parse(fs.readFileSync(path.join(folder, "task-progress.json"), "utf8")) as { status?: unknown };
@@ -909,6 +984,10 @@ export async function terminalizeRoundV1(
             );
           },
         });
+        await recordNotedForeignEditsV1(
+          options.taskFolderUri,
+          (result.notedEdits ?? []).map((edit) => notedForeignEditKeyV1(edit.taskFolderPath, edit.sha256))
+        );
         foreignArtifactNote = result.chatNotices.length > 0
           ? [
               "Task-artifact changes were detected under another task folder. Recovery was limited to artifacts whose ownership could be established:",
@@ -1355,6 +1434,7 @@ export async function claimImplementationRoundLedgerV1(
           mode,
           state: "open",
           ...fastForwardRoundFieldsV1(folderUri.fsPath),
+          ...heldDispatchFieldV1(),
         }
       : {
           roundId: candidateRoundId,
@@ -1364,6 +1444,7 @@ export async function claimImplementationRoundLedgerV1(
           startedAt: new Date().toISOString(),
           state: "open",
           ...fastForwardRoundFieldsV1(folderUri.fsPath),
+          ...heldDispatchFieldV1(),
           ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
         };
     finalRoundId = openRow.roundId;

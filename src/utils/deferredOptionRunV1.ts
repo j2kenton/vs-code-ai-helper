@@ -26,19 +26,29 @@ export interface DeferredOptionRunInputV1 {
   readonly pollMs?: number;
   /** A stuck round must not hold an answer forever. */
   readonly maxWaitMs?: number;
+  /** The waiter table this window arms in; defaults to the process-wide one. */
+  readonly registry?: DeferredRunRegistryV1;
 }
 
-const armed = new Map<string, { cancel(): void }>();
+/** One window's table of armed waiters. Two windows each have their own; nothing is shared between them. */
+export type DeferredRunRegistryV1 = Map<string, { cancel(): void }>;
+
+export function createDeferredRunRegistryV1(): DeferredRunRegistryV1 {
+  return new Map();
+}
+
+const defaultRegistryV1 = createDeferredRunRegistryV1();
 
 export const DEFERRED_OPTION_POLL_MS_V1 = 3_000;
 export const DEFERRED_OPTION_MAX_WAIT_MS_V1 = 6 * 60 * 60 * 1000;
 
-export function isDeferredOptionRunArmedV1(key: string): boolean {
-  return armed.has(key);
+export function isDeferredOptionRunArmedV1(key: string, registry: DeferredRunRegistryV1 = defaultRegistryV1): boolean {
+  return registry.has(key);
 }
 
 /** Returns false when this answer is already waiting (nothing new is armed). */
 export function armDeferredOptionRunV1(input: DeferredOptionRunInputV1): boolean {
+  const armed = input.registry ?? defaultRegistryV1;
   if (armed.has(input.key)) {
     return false;
   }
@@ -96,8 +106,8 @@ export function armDeferredOptionRunV1(input: DeferredOptionRunInputV1): boolean
   return true;
 }
 
-export function cancelDeferredOptionRunV1(key: string): void {
-  armed.get(key)?.cancel();
+export function cancelDeferredOptionRunV1(key: string, registry: DeferredRunRegistryV1 = defaultRegistryV1): void {
+  registry.get(key)?.cancel();
 }
 
 /** The one chat sentence for what happened to a held answer. */

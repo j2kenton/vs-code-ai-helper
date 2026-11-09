@@ -149,6 +149,7 @@ import { registerPlanRevisionCommandsV1 } from "./commands/planRevisionV1";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { askChatChoiceV1 } from "./utils/chatChoiceV1";
+import { recordLocalEditorSaveV1 } from "./utils/localEditorSavesV1";
 import { resolveGlobalChatTargetOrDefaultV1 } from "./utils/globalChatTargetV1";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
@@ -214,6 +215,7 @@ import { installOperationNotificationBridge } from "./utils/operationNotificatio
 import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
+import { setOwnerCancelStoreV1 } from "./utils/ownerCancelRecordV1";
 import { readPublishChecksOutcomeV1, recoverAbandonedPublishChecksRunV1 } from "./utils/publishChecksOutcomeV1";
 import { announceInterruptedChecksRunV1 } from "./utils/interruptedChecksNoticeV1";
 import { retireFreeTextQuestionsFromEarlierActivationV1 } from "./utils/cardLifecycleV1";
@@ -439,6 +441,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // read, or the panel and tree never learn about them (the change signal is
   // keyed by Memento identity).
   configureWorkflowDecisionStateV1(decisionsState);
+  // run1 Step 28: an owner's Cancel is kept on disk, so a held answer recovered after a restart still knows about it.
+  setOwnerCancelStoreV1(context.workspaceState);
   const chatViewProvider = new ChatViewProvider(decisionsState);
   context.subscriptions.push(chatViewProvider);
   // bugs5 Steps 2-3 / item 10: answers the owner gave while a round was running live on the
@@ -940,6 +944,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return runUnattendedV1(() =>
             chatViewProvider.resolveWorkflowDecisionForRelayV1(request.decisionId, request.optionId)
           );
+        }
+        if (request.kind === "heldAnswerAction") {
+          if (typeof request.decisionId !== "string" || (request.action !== "runNow" && request.action !== "drop")) {
+            throw new Error("the held-answer request is malformed");
+          }
+          const outcome =
+            request.action === "runNow"
+              ? await chatViewProvider.runHeldAnswerNowV1(request.decisionId)
+              : await chatViewProvider.dropHeldAnswerV1(request.decisionId);
+          if (!outcome.ok) throw new Error(outcome.message);
+          return undefined;
         }
         if (request.kind === "cancelOperation") {
           // A viewer's Stop button on a row it mirrors from this runner. The
@@ -1648,6 +1663,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("vs-code-ai-helper.clearNotificationsSearch", () => applyNotificationsSearch(""))
   );
+  // run1 Step 11: remember saves made from an editor on this host, so a round's activity feed never
+  // counts the owner saving the round's own round-progress.md as the round being alive.
+  context.subscriptions.push(
+    vscode.workspace.onDidSaveTextDocument((document) => {
+      if (document.uri.scheme === "file") recordLocalEditorSaveV1(document.uri.fsPath);
+    })
+  );
+  // run1 Step 18: Wait on a row that warns "no activity". It hides the warning for another warning
+  // period and changes nothing else; the round is neither stopped nor extended.
+  context.subscriptions.push(vscode.commands.registerCommand(
+    "vs-code-ai-helper.waitOnOperation",
+    (node?: { id?: string }) => {
+      if (typeof node?.id === "string") statusTreeProvider.waitOnOperation(node.id);
+    }
+  ));
+  // run1 Step 30: the row's "Run it now" and "Drop it" for an owner answer held while a round runs. The
+  // runner holds the answer; a viewer window asks it through the relay, like Stop.
+  for (const action of ["runNow", "drop"] as const) {
+    context.subscriptions.push(vscode.commands.registerCommand(
+      action === "runNow" ? "vs-code-ai-helper.runHeldAnswerNow" : "vs-code-ai-helper.dropHeldAnswer",
+      async (node?: { taskName?: string; heldAnswerV1?: { decisionId?: string } }) => {
+        const decisionId = node?.heldAnswerV1?.decisionId;
+        if (typeof decisionId !== "string") return;
+        const taskName = node?.taskName;
+        try {
+          if (viewerHost) {
+            if (!hostRelay) throw new Error("this window has no connection to the runner");
+            const response = await hostRelay.send({ kind: "heldAnswerAction", decisionId, action }, { timeoutMs: 60 * 1000 });
+            if (!response.ok) throw new Error(response.reason ?? "the runner could not do that");
+            return;
+          }
+          const outcome =
+            action === "runNow"
+              ? await chatViewProvider.runHeldAnswerNowV1(decisionId)
+              : await chatViewProvider.dropHeldAnswerV1(decisionId);
+          if (!outcome.ok) throw new Error(outcome.message);
+        } catch (error) {
+          const failure = `Could not ${action === "runNow" ? "run" : "drop"} your held answer: ${error instanceof Error ? error.message : String(error)}`;
+          NotificationRouter.showWarning(
+            taskName !== undefined ? `${formatTaskNameForDisplay(taskName)} — ${failure}` : failure
+          );
+        }
+      }
+    ));
+  }
   // Inline cancel button on cancellable running-operation rows in the
   // Notifications view. Cancellation is a request: it fires the operation's
   // token (cascading to running children) and the row shows "cancelling…"
@@ -1770,6 +1830,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...(op.activity !== undefined ? { activity: op.activity } : {}),
           ...(op.activityStartedAt !== undefined ? { activityStartedAt: op.activityStartedAt } : {}),
           ...(op.resultTargetUri !== undefined ? { resultTargetUri: op.resultTargetUri } : {}),
+          ...(op.proofOfLifeV1 !== undefined ? { proofOfLifeV1: op.proofOfLifeV1 } : {}),
+          // run1 Step 30: the held owner answer rides on the task's root operation, so a viewer's row shows it.
+          ...(op.parentId === undefined && taskOperations.heldAnswerForTaskV1(op.key) !== undefined
+            ? { heldAnswerV1: taskOperations.heldAnswerForTaskV1(op.key) }
+            : {}),
         }));
       void writeRunnerOperationsSnapshotV1(relayDir, {
         writtenAt: Date.now(),

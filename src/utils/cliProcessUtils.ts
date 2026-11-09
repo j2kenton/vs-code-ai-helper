@@ -86,3 +86,108 @@ export function killProcessTree(child: cp.ChildProcess): void {
     }
   }
 }
+
+/**
+ * True while any process is still alive in the process group a detached child led. Probes the
+ * group only (never the bare pid, which a reused pid could answer for an unrelated process), so
+ * it is safe to call after the leader has exited. Always false on Windows, where there is no group.
+ */
+export function processGroupAliveV1(pid: number): boolean {
+  if (process.platform === "win32") {
+    return false;
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/**
+ * run1 Step 8: after a CLI exited on its own, stop whatever it left running (a background `sleep`,
+ * a Monitor) and confirm it, so no outcome is handed on while a descendant can still edit the
+ * workspace. True when nothing is left.
+ *
+ * POSIX: the process group the detached child led is probed, then stopped and confirmed (bounded).
+ * Windows has no group to probe and a gone leader can no longer be asked for its children, so the
+ * only thing available is a best-effort `taskkill /T /F` on the leader's pid (it follows the
+ * recorded parent links) which cannot be confirmed; that limit is deliberate and documented rather
+ * than claimed as confirmation.
+ */
+export async function stopLeftoverProcessGroupV1(child: cp.ChildProcess): Promise<boolean> {
+  const pid = child.pid;
+  if (pid === undefined) {
+    return true;
+  }
+  if (process.platform === "win32") {
+    killProcessTree(child);
+    return true;
+  }
+  if (!processGroupAliveV1(pid)) {
+    return true;
+  }
+  return (await stopProcessTreeConfirmedV1(child)).gone;
+}
+
+/** True while the child, or any process still in the group it leads, is alive. */
+function processTreeAliveV1(pid: number): boolean {
+  const probe = (target: number): boolean => {
+    try {
+      process.kill(target, 0);
+      return true;
+    } catch (error) {
+      // EPERM still means the process exists; only ESRCH means it is gone.
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+  return process.platform === "win32" ? probe(pid) : probe(-pid) || probe(pid);
+}
+
+/**
+ * run1 Step 8: stop a CLI process's whole tree and CONFIRM it, within a fixed bound.
+ *
+ * `killProcessTree` only sends the signal. A leader that ignores SIGTERM, or a descendant that does
+ * while the leader exits, would then outlive the round and keep editing the workspace. This sends
+ * SIGTERM to the group, waits `termMs` for the group to be gone, escalates to SIGKILL, and waits up
+ * to `killMs` more. It never waits longer than `termMs + killMs`, so settlement cannot hang on a
+ * process that cannot be killed; `gone` says whether the tree was confirmed gone.
+ */
+export async function stopProcessTreeConfirmedV1(
+  child: cp.ChildProcess,
+  options: { termMs?: number; killMs?: number; pollMs?: number } = {}
+): Promise<{ gone: boolean; escalated: boolean }> {
+  const pid = child.pid;
+  if (pid === undefined) {
+    return { gone: true, escalated: false };
+  }
+  const termMs = options.termMs ?? 3_000;
+  const killMs = options.killMs ?? 3_000;
+  const pollMs = options.pollMs ?? 50;
+  const waitGone = async (budgetMs: number): Promise<boolean> => {
+    const deadline = Date.now() + budgetMs;
+    while (processTreeAliveV1(pid)) {
+      if (Date.now() >= deadline) {
+        return false;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+    return true;
+  };
+  killProcessTree(child);
+  if (await waitGone(termMs)) {
+    return { gone: true, escalated: false };
+  }
+  if (process.platform !== "win32") {
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+    }
+  }
+  return { gone: await waitGone(killMs), escalated: true };
+}

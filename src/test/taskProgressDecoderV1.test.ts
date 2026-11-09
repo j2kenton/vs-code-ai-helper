@@ -57,6 +57,39 @@ void describe("taskProgressDecoderV1", () => {
     expectRecovery(doc({ roundLedger: [entry({ filesChanged: ["src/a.ts"], unattributedFiles: [""] })] }), "invalidFieldValue");
   });
 
+  void it("decodes the run1 activity fields on a round-ledger outcome and rejects malformed ones", () => {
+    const entry = (outcome: unknown): Record<string, unknown> => ({
+      roundId: "round-1",
+      attemptIds: ["round-1"],
+      stage: "impl",
+      mode: "implementation",
+      startedAt: "2026-07-01T10:00:00.000Z",
+      endedAt: "2026-07-01T10:05:00.000Z",
+      state: "failed",
+      outcome,
+    });
+    const ok = decodeTaskProgressTextV1(
+      doc({
+        roundLedger: [
+          entry({
+            filesChanged: ["src/a.ts"],
+            attributedFiles: ["src/a.ts"],
+            observedFiles: ["src/b.ts"],
+            stopCause: "ensembleIdleStop",
+            candidateStopCauses: ["ensembleIdleStop"],
+            processStartedAt: "2026-07-01T10:00:30.000Z",
+            processEndedAt: "2026-07-01T10:04:30.000Z",
+          }),
+        ],
+      })
+    );
+    assert.equal(ok.ok, true, ok.ok ? "" : ok.reason);
+    expectRecovery(doc({ roundLedger: [entry({ attributedFiles: "src/a.ts" })] }), "invalidFieldValue");
+    expectRecovery(doc({ roundLedger: [entry({ observedFiles: [""] })] }), "invalidFieldValue");
+    expectRecovery(doc({ roundLedger: [entry({ stopCause: 5 })] }), "invalidFieldValue");
+    expectRecovery(doc({ roundLedger: [entry({ processStartedAt: 5 })] }), "invalidFieldValue");
+  });
+
   void it("decodes bounded per-item provenance and rejects malformed claim records", () => {
     const validReport = { at: "2026-10-26T00:02:00.000Z", roundId: "round-2", testIdentity: "case.test.ts",
       command: "pnpm test case.test.ts", workingDirectory: "/workspace", passed: 1, failed: 0,

@@ -277,6 +277,9 @@ export interface WorkflowDecisionAutoContinueV1 {
   readonly cancelledReason?: string;
 }
 
+/** run1 Step 26: the life of a held option answer. `ran`, `dropped` and `uncertain` are final for the hold. */
+export type HeldAnswerStateV1 = "held" | "waitingForOwner" | "dispatching" | "ran" | "dropped" | "uncertain";
+
 /**
  * bugs5 Steps 2-3: an answer the owner gave while an operation was running on the task. It is
  * stored on the decision record (persisted, so it survives a reload) and carried out at the first
@@ -289,7 +292,25 @@ export interface WorkflowDecisionAutoContinueV1 {
  *   dispatched.
  */
 export interface WorkflowDecisionDeferredAnswerV1 {
-  readonly kind: "applyAndDispatch" | "ticksOnly";
+  /**
+   * `heldOption` (run1 Step 26): any other "continue" answer held while a round ran. It carries the lifecycle
+   * fields below; the two older kinds keep using `carriedOutAt` only.
+   */
+  readonly kind: "applyAndDispatch" | "ticksOnly" | "heldOption";
+  /** run1 Step 26: where a held option answer is in its life. Missing on the older kinds. */
+  readonly heldState?: HeldAnswerStateV1;
+  /** run1 Step 26: chosen before the answer is dispatched, and carried on the dispatched claim and ledger row. */
+  readonly dispatchId?: string;
+  /** run1 Step 26: the option's plain label ("Move on"), so a line can name it without the card. */
+  readonly optionLabel?: string;
+  /**
+   * run1 Step 26: written (durably) just before the dispatched command is executed. A command that takes no
+   * work admission leaves no claim or ledger row, so after a crash this marker is the only sign that it may
+   * have had an effect: activation then asks the owner instead of running it again.
+   */
+  readonly commandStartedAt?: string;
+  /** run1 Step 30: the owner pressed "Run it now"; the round was cancelled for it and this answer may run. */
+  readonly runNowRequestedAt?: string;
   readonly optionId: string;
   readonly acceptedAt: string;
   /** The offered items the answer covers (the item texts, which are the merge's own keys). */

@@ -107,8 +107,13 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const setModelCall = source.indexOf("options.operation?.setModel?.(dispatchModelId);", dispatchModelIdDecl);
     assert.ok(setModelCall >= 0, "expected setModel to be called once dispatchModelId is resolved");
 
-    const runningCall = source.indexOf("reportStageRunningV1(options.operation, stageToken);", setModelCall);
+    // run1 Step 19: the review's running report is the where-are-we line, passed the same stageToken.
+    const runningCall = source.indexOf("? publishReviewWhereLineV1()", setModelCall);
     assert.ok(runningCall >= 0, "runReviewForFolder must report a running activity");
+    assert.ok(
+      source.lastIndexOf("options.operation?.reportActivity(", runningCall) > setModelCall,
+      "the running report must go through reportActivity on the review's own operation"
+    );
 
     const executeActionCalls = indexOfAll("coordinator.executeAction({");
     const nextExecuteAction = executeActionCalls.find((idx) => idx > runningCall);

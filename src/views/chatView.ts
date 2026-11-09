@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as crypto from "crypto";
 import { isViewerHostV1 } from "../state/hostRoleV1";
+import { withTaskLock } from "../state/taskStateStore";
 import { VIEWER_DECISION_EFFECT_COMMANDS_V1 } from "../services/viewerForwardingV1";
 import * as path from "path";
 import { normalizePath } from "../utils/taskRoot";
@@ -62,8 +63,7 @@ import {
 import { applyOpenPlanItemsFormSubmissionV1, dismissOpenPlanItemsFormV1 } from "../commands/decideOpenPlanItemsV1";
 import { stripAttributionHeaders } from "../utils/fileUtils";
 import { writeRunLog } from "../utils/runLog";
-import { formatDisplayTimestampPairV1, formatTimeHHmm, formatTimestampForDisplay } from "../utils/timeFormat";
-import { buildRunStripV1, runStripChangedV1, type RunStripV1 } from "./chatRunStripV1";
+import { formatDisplayTimestampPairV1, formatTimestampForDisplay } from "../utils/timeFormat";
 import {
   appendOwnerEvidenceThenV1,
   appendOwnerEvidenceV1,
@@ -97,13 +97,31 @@ import {
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
   isWorkflowDecisionCommandResultV1,
+  type WorkflowDecisionDeferredAnswerV1,
 } from "../types/workflowDecisionV1";
 import {
   armDeferredOptionRunV1,
+  cancelDeferredOptionRunV1,
+  createDeferredRunRegistryV1,
   describeDeferredOptionHeldV1,
   describeDeferredOptionOutcomeV1,
   type DeferredRunOutcomeV1,
 } from "../utils/deferredOptionRunV1";
+import { lastRunEndedByForAnswerV1 } from "../utils/ownerCancelRecordV1";
+import {
+  buildHeldDispatchTraceV1,
+  decideHeldDispatchV1,
+  buildHeldAnswerOwnerCardInputV1,
+  describeHeldAnswerDroppedV1,
+  describeHeldAnswerStartingV1,
+  describeHeldAnswerUncertainV1,
+  describeHeldAnswerWaitingForOwnerV1,
+  isOwnerActionableHeldStateV1,
+  reconcileHeldAnswerV1,
+  type HeldAnswerOwnerCardFactsV1,
+  type HeldAnswerRowInfoV1,
+} from "../utils/heldAnswerLifecycleV1";
+import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { OperationEndedLineTrackerV1 } from "../utils/operationEndedLineV1";
 import { releaseOperationTerminalLineV1 } from "../utils/terminalLineEmitterV1";
@@ -132,7 +150,11 @@ import {
   markDecisionAnnouncedAsInformationOnlyV1,
   renotifyHeldDecisionsV1,
 } from "../utils/heldDecisionRenotifyV1";
-import { describeLiveTaskOperationV1, getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
+import {
+  describeLiveTaskOperationV1,
+  getLiveTaskOperationV1,
+  isTaskOperationRunningV1,
+} from "../utils/liveTaskOperationLookupV1";
 import {
   acquireOrAdoptWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
@@ -144,6 +166,8 @@ import {
   requestSafeAdmissionReleaseV1,
   trySafeAdmissionReleaseV1,
   recordAdmissionReleaseTriggerV1,
+  readAdmissionTraceForDispatchV1,
+  runHeldDispatchUnderAdmissionV1,
 } from "../state/workAdmissionV1";
 import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { offerBusyRefusalChoicesInChatV1 } from "../utils/busyRefusalChoicesV1";
@@ -184,7 +208,11 @@ import { isWaitingForHumanV1 } from "../utils/taskWatchdogV1";
 import { SchedulingIntentStoreV1 } from "../state/schedulingIntentV1";
 import { setChatRevealHandlerV1 } from "./chatRevealV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
-import { asOwnerEntryPointV1 } from "../state/automationDispatchContextV1";
+import {
+  asOwnerEntryPointV1,
+  runWithOwnerOriginV1,
+  type HeldDispatchGateV1,
+} from "../state/automationDispatchContextV1";
 import {
   formatNotificationTaskLabelV1,
   notificationTaskDisplayNameV1,
@@ -1042,6 +1070,8 @@ const LAST_CHAT_TARGET_KEY = "vs-code-ai-helper.chatView.lastTarget";
  * migration from the legacy per-workspace Memento transcript. */
 export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
   static readonly viewType = "vs-code-ai-helper.chatView";
+  /** run1 Step 26: this window's table of held answers waiting to run; another window has its own. */
+  private readonly deferredRunsV1 = createDeferredRunRegistryV1();
   private view?: vscode.WebviewView;
   private target?: ChatTarget;
   /**
@@ -1166,13 +1196,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
    * a different `detail`/`waitingForUser`) still repaints immediately.
    */
   private lastOperationsSignatureV1: string | undefined;
-  /**
-   * chat1 Step 6: the live run strip. It is posted as its own `runStrip` message, at most once a
-   * second, and never through a full render (RC2 item 11): progress ticks change only this line.
-   */
-  private lastRunStripV1: RunStripV1 | undefined;
-  private lastRunStripPostAtV1 = 0;
-  private runStripPostTimerV1: ReturnType<typeof setTimeout> | undefined;
   /** review1 Step 53: redraws a card whose auto-continue countdown is running, so its minutes count down. */
   private autoContinueRedrawTimerV1: ReturnType<typeof setTimeout> | undefined;
   private operationTraceWriteQueueV1: Promise<void> = Promise.resolve();
@@ -1298,30 +1321,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     return JSON.stringify(ops.map((op) => [op.id, op.state, op.waitingForUser, op.startedAt]));
   }
 
-  /** The strip for this panel's task: what is running now, or undefined when nothing is. */
-  private currentRunStripV1(): RunStripV1 | undefined {
-    const target = this.target;
-    if (!target || target.kind === "global") return undefined;
-    return buildRunStripV1(taskOperations.getTaskOperations(target.canonicalId), target.stage, (epochMs) =>
-      formatTimeHHmm(new Date(epochMs))
-    );
-  }
-
-  /** Post the strip if it changed, at most once a second; a burst of ticks costs one trailing post. */
-  private scheduleRunStripPostV1(): void {
-    if (!this.view || this.runStripPostTimerV1 !== undefined) return;
-    const wait = Math.max(0, this.lastRunStripPostAtV1 + 1000 - Date.now());
-    this.runStripPostTimerV1 = setTimeout(() => {
-      this.runStripPostTimerV1 = undefined;
-      const strip = this.currentRunStripV1();
-      if (!this.view || !runStripChangedV1(this.lastRunStripV1, strip)) return;
-      this.lastRunStripV1 = strip;
-      this.lastRunStripPostAtV1 = Date.now();
-      void this.view.webview.postMessage({ type: "runStrip", runStrip: strip ?? null });
-    }, wait);
-    this.runStripPostTimerV1.unref?.();
-  }
-
   constructor(private readonly state: vscode.Memento) {
     setChatRevealHandlerV1((decisionId) => this.revealForOwnerCardV1(decisionId));
     this.workflowDecisionStore = new WorkflowDecisionStoreV1(state);
@@ -1344,8 +1343,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // full render here.
     this.operationsSub = taskOperations.onDidChange(() => {
       if (!this.target || !this.view) return;
-      // chat1 Step 6: progress ticks update only the strip, in place.
-      this.scheduleRunStripPostV1();
       const signature = this.computeOperationsSignatureV1();
       if (signature === this.lastOperationsSignatureV1) return;
       this.lastOperationsSignatureV1 = signature;
@@ -1411,10 +1408,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.decisionsSub.dispose();
     this.chatHistorySub.dispose();
     this.schedulingIntentSub.dispose();
-    if (this.runStripPostTimerV1 !== undefined) {
-      clearTimeout(this.runStripPostTimerV1);
-      this.runStripPostTimerV1 = undefined;
-    }
     if (this.autoContinueRedrawTimerV1 !== undefined) {
       clearTimeout(this.autoContinueRedrawTimerV1);
       this.autoContinueRedrawTimerV1 = undefined;
@@ -1479,27 +1472,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // is exactly what left the panel stuck on "Loading chat…". Send the
         // current state now that we know someone is listening.
         void this.render();
-        return;
-      }
-      // chat1 Step 6: the strip's two links. Notifications has no way to select one row, so the link
-      // focuses the view; Stop is the cancel the Notifications row uses, for an operation of this task.
-      if (message && typeof message === "object" && (message as { type?: unknown }).type === "showRunInNotifications") {
-        await vscode.commands.executeCommand("vs-code-ai-helper.statusView.focus");
-        return;
-      }
-      if (
-        message &&
-        typeof message === "object" &&
-        (message as { type?: unknown }).type === "stopRunFromStrip" &&
-        typeof (message as { operationId?: unknown }).operationId === "string"
-      ) {
-        const operationId = (message as { operationId: string }).operationId;
-        if (
-          this.target &&
-          taskOperations.getTaskOperations(this.target.canonicalId).some((op) => op.id === operationId)
-        ) {
-          await vscode.commands.executeCommand("vs-code-ai-helper.cancelOperation", { id: operationId });
-        }
         return;
       }
       // chat1 Step 13: the owner expanded or collapsed one card. The page already toggled; this saves the
@@ -3217,7 +3189,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       if (!progress.implRecovery || (progress.pendingImplReviewFiles ?? []).length === 0) {
         return {
           stale: true,
-          reason: "the round's quarantined changes have already been resolved (reviewed, continued, or restored)",
+          reason: "the round's changed files have already been dealt with (reviewed, continued, or restored)",
         };
       }
       return { stale: false };
@@ -3834,53 +3806,263 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     decision: WorkflowDecisionV1,
     option: WorkflowDecisionOptionV1,
     identity: ChatIdentity,
-    runningDescription: string
+    runningDescription: string,
+    /** Activation re-arms an answer already on disk: nothing is recorded again and no "held" line is said. */
+    rearm = false
   ): Promise<void> {
     if (option.effect.kind !== "command") return;
+    // Only the runner (or a standalone window) carries a held answer out; a viewer never arms one.
+    if (isViewerHostV1()) return;
     const effect = option.effect;
     const taskPath = decision.taskCanonicalId;
     const key = `${decision.decisionId}:${option.optionId}`;
+    // run1 Step 28: set when Pause or Cancel kept the answer from running, so the report says that instead.
+    let waitingForOwnerLine: string | undefined;
+    let waitingForOwnerReason: "paused" | "cancelledByOwner" | undefined;
+    // Set when another dispatch of this same answer won (the swap, or the task's claim): that dispatch owns the
+    // record and reports it, so this one stays silent and leaves the record alone.
+    let lostToAnotherDispatch = false;
     const armedNow = armDeferredOptionRunV1({
+      registry: this.deferredRunsV1,
       key,
-      isTaskBusy: () => getLiveTaskOperationV1(taskPath) !== undefined,
+      // run1 Step 27: the registry's operations, not the Fast Forward run flag, decide whether the task is busy.
+      isTaskBusy: () => isTaskOperationRunningV1(taskPath),
       subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
       carryOut: async (): Promise<DeferredRunOutcomeV1> => {
         const read = await readTaskProgressStrictV1(vscode.Uri.file(taskPath)).catch(() => undefined);
         if (!read?.ok) {
           return { kind: "notCarriedOut", reason: "the task's progress file could not be read." };
         }
-        if (read.decoded.progress.currentStage !== decision.stage) {
+        // run1 Step 28: a pause wins over a held answer. It is not run; the owner is asked.
+        const heldRecord = this.workflowDecisionStore.get(decision.decisionId)?.deferredAnswer;
+        const chosenAtMs = heldRecord?.acceptedAt !== undefined ? Date.parse(heldRecord.acceptedAt) : Number.NaN;
+        // run1 Step 28: the same check runs again under the work-admission claim (the gate below), where
+        // Pause and the dispatch are ordered. This first pass keeps a plain pause or cancel from taking a
+        // claim at all, and from raising an admission failure the owner would have to read.
+        const dispatchId = crypto.randomUUID();
+        let gateOutcome: DeferredRunOutcomeV1 | undefined;
+        let swapped: WorkflowDecisionDeferredAnswerV1 | undefined;
+        let startingSaid = false;
+        const keepForOwner = async (
+          reason: "paused" | "cancelledByOwner",
+          from: "held" | "dispatching" = "held"
+        ): Promise<DeferredRunOutcomeV1> => {
+          await this.workflowDecisionStore.swapHeldAnswerState(decision.decisionId, from, {
+            heldState: "waitingForOwner",
+          });
+          waitingForOwnerLine = describeHeldAnswerWaitingForOwnerV1(option.label, reason);
+          waitingForOwnerReason = reason;
           return {
             kind: "notCarriedOut",
-            reason: `the task is now at ${STAGE_DISPLAY_NAMES[read.decoded.progress.currentStage]}, not ${STAGE_DISPLAY_NAMES[decision.stage]} where this card was raised.`,
+            reason: reason === "paused" ? "the task is paused." : "you cancelled the last round.",
+          };
+        };
+        const sayStarting = (chosenAt: string | undefined): void => {
+          if (startingSaid) return;
+          startingSaid = true;
+          void this.append(
+            "assistant",
+            describeHeldAnswerStartingV1(option.label, chosenAt, "an earlier round ran"),
+            decision.stage,
+            identity
+          ).catch(() => undefined);
+        };
+        /** Re-reads the status, decides, and swaps held to dispatching. Returns a refusal, or undefined to go. */
+        const checkAndSwap = async (): Promise<DeferredRunOutcomeV1 | undefined> => {
+          const reread = await readTaskProgressStrictV1(vscode.Uri.file(taskPath)).catch(() => undefined);
+          if (!reread?.ok) {
+            return { kind: "notCarriedOut", reason: "the task's progress file could not be read." };
+          }
+          const record = this.workflowDecisionStore.get(decision.decisionId)?.deferredAnswer;
+          const chosenMs = record?.acceptedAt !== undefined ? Date.parse(record.acceptedAt) : Number.NaN;
+          const verdict = decideHeldDispatchV1({
+            taskStatus: reread.decoded.progress.status === "paused" ? "paused" : "active",
+            // An ordinary Cancel since the answer was chosen blocks it; "Run it now" is the go-ahead.
+            lastRunEndedBy: Number.isFinite(chosenMs) ? lastRunEndedByForAnswerV1(taskPath, chosenMs) : "other",
+            runNowRequestedAt: record?.runNowRequestedAt,
+          });
+          if (verdict.kind === "waitForOwner") {
+            return keepForOwner(verdict.reason);
+          }
+          if (reread.decoded.progress.currentStage !== decision.stage) {
+            return {
+              kind: "notCarriedOut",
+              reason: `the task is now at ${STAGE_DISPLAY_NAMES[reread.decoded.progress.currentStage]}, not ${STAGE_DISPLAY_NAMES[decision.stage]} where this card was raised.`,
+            };
+          }
+          // run1 Step 26: held to dispatching in one swap that writes the dispatch id; a second caller that
+          // loses the swap runs nothing.
+          swapped = await this.workflowDecisionStore.swapHeldAnswerState(decision.decisionId, "held", {
+            heldState: "dispatching",
+            dispatchId,
+            commandStartedAt: undefined,
+          });
+          if (!swapped) {
+            lostToAnotherDispatch = true;
+            return { kind: "notCarriedOut", reason: "it was already being run, or has been dropped." };
+          }
+          // run1 Step 30: it is no longer waiting, so the running row stops showing it.
+          taskOperations.setHeldAnswerForTaskV1(taskPath, undefined);
+          return undefined;
+        };
+        /**
+         * Runs once, under the claim the dispatch took and inside the task's lock: the status is re-read and
+         * the answer is swapped from held to dispatching there. Pause commits through the same claim, so a
+         * pause either finished before this read (and wins) or waits behind the claim.
+         */
+        const gate: HeldDispatchGateV1 = {
+          ran: false,
+          run: async () => {
+            gateOutcome = await withTaskLock(taskPath, async () => {
+              const refusal = await checkAndSwap();
+              if (refusal !== undefined) return refusal;
+              // Step 29, at the start. Not awaited: the claim is held while this runs.
+              sayStarting(swapped?.acceptedAt);
+              return undefined;
+            });
+            return gateOutcome === undefined
+              ? undefined
+              : gateOutcome.kind === "notCarriedOut"
+                ? gateOutcome.reason
+                : "it could not run";
+          },
+        };
+        // First pass, before any claim: a pause or an owner's cancel never reaches the dispatch.
+        const firstRead = read.decoded.progress;
+        const firstVerdict = decideHeldDispatchV1({
+          taskStatus: firstRead.status === "paused" ? "paused" : "active",
+          lastRunEndedBy: Number.isFinite(chosenAtMs) ? lastRunEndedByForAnswerV1(taskPath, chosenAtMs) : "other",
+          runNowRequestedAt: heldRecord?.runNowRequestedAt,
+        });
+        if (firstVerdict.kind === "waitForOwner") {
+          return keepForOwner(firstVerdict.reason);
+        }
+        if (firstRead.currentStage !== decision.stage) {
+          return {
+            kind: "notCarriedOut",
+            reason: `the task is now at ${STAGE_DISPLAY_NAMES[firstRead.currentStage]}, not ${STAGE_DISPLAY_NAMES[decision.stage]} where this card was raised.`,
           };
         }
         try {
-          const result = await vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
+          // run1 Step 28: every held answer is carried out under the task's work admission, including a command
+          // that takes none of its own. The dispatch is the owner's own choice, so it runs as owner-started
+          // work; its claim carries the dispatch id that activation reads to tell that it ran, and the status
+          // re-read and the held-to-dispatching swap run under that claim (the gate above), before the command.
+          let droppedBeforeStart = false;
+          const dispatched = await runWithOwnerOriginV1(() =>
+            runHeldDispatchUnderAdmissionV1<unknown>({
+              taskFolderPath: taskPath,
+              dispatchId,
+              commandId: `heldAnswer:${effect.command}`,
+              gate,
+              body: async () => {
+                // Written before the command runs: a command that takes no work admission of its own leaves no
+                // ledger row, so after a crash this marker tells activation it may already have had its effect.
+                const started = await this.workflowDecisionStore.swapHeldAnswerState(decision.decisionId, "dispatching", {
+                  heldState: "dispatching",
+                  commandStartedAt: new Date().toISOString(),
+                });
+                if (!started) {
+                  droppedBeforeStart = true;
+                  return undefined;
+                }
+                return vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
+              },
+            })
+          );
+          if (dispatched.kind === "refused") {
+            // The gate declined (a pause or cancel landed first, or the answer was already run), or another
+            // round holds the task: nothing started, and the claim was given back.
+            if (
+              gateOutcome === undefined &&
+              dispatched.result.outcome === "busy" &&
+              dispatched.result.owner?.heldDispatchId !== undefined
+            ) {
+              // The task is held by another dispatch of a held answer: it owns the record and reports it.
+              lostToAnotherDispatch = true;
+            }
+            return (
+              gateOutcome ?? {
+                kind: "notCarriedOut",
+                reason: describeWorkAdmissionRefusalForUserV1(dispatched.result),
+              }
+            );
+          }
+          if (droppedBeforeStart) {
+            return { kind: "notCarriedOut", reason: "it was dropped before it could start." };
+          }
+          const result = dispatched.value;
           if (result === false) {
             return { kind: "notCarriedOut", reason: "the action did not complete (see the notification)." };
           }
           if (isWorkflowDecisionCommandResultV1(result) && result.outcome === "refused") {
             return { kind: "notCarriedOut", reason: result.message ?? "the action declined to run." };
           }
+          await this.workflowDecisionStore.swapHeldAnswerState(decision.decisionId, "dispatching", { heldState: "ran" });
           return { kind: "done" };
         } catch (error) {
-          return { kind: "notCarriedOut", reason: error instanceof Error ? error.message : String(error) };
+          return gateOutcome ?? { kind: "notCarriedOut", reason: error instanceof Error ? error.message : String(error) };
         }
       },
       report: async (outcome): Promise<void> => {
+        // The winning dispatch of this answer reports it and keeps the record; this one has nothing to add.
+        if (lostToAnotherDispatch) return;
+        // run1 Step 30: the row shows an answer kept back for the owner as such, and nothing once it ran or ended.
+        const stillWaiting = waitingForOwnerLine !== undefined && outcome.kind !== "done";
+        const rowInfo = this.heldAnswerRowInfoV1(decision.decisionId);
+        taskOperations.setHeldAnswerForTaskV1(
+          taskPath,
+          stillWaiting && rowInfo ? { ...rowInfo, state: "waitingForOwner" } : undefined
+        );
         try {
-          if (outcome.kind !== "done") {
-            await this.workflowDecisionStore.reopenResolved(decision.decisionId, option.optionId);
+          if (outcome.kind !== "done" && waitingForOwnerLine === undefined) {
+            // Other refusals drop the record and bring the card back.
+            await this.workflowDecisionStore.reopenResolved(decision.decisionId, option.optionId, {
+              keepHeldAnswer: false,
+            });
           }
-          await this.append("assistant", describeDeferredOptionOutcomeV1(option.label, outcome), decision.stage, identity);
+          await this.append(
+            "assistant",
+            waitingForOwnerLine ?? describeDeferredOptionOutcomeV1(option.label, outcome),
+            decision.stage,
+            identity
+          );
+          if (waitingForOwnerLine !== undefined && outcome.kind !== "done") {
+            // A pause or an owner's cancel keeps the record (waiting for the owner), and the owner is asked
+            // with its own card: Run it, or Drop it (which brings the original card back).
+            await this.postHeldAnswerOwnerCardV1(
+              decision.decisionId,
+              waitingForOwnerReason === "paused" ? "paused" : "cancelledByOwner"
+            );
+          }
           if (sameIdentity(this.target, identity)) await this.render();
         } catch {
           // The chat is best-effort here; the answer itself is already durable.
         }
       },
     });
-    if (armedNow) {
+    if (armedNow && rearm) {
+      // run1 Step 30: a re-armed answer is shown on the running row again after a reload.
+      const rowInfo = this.heldAnswerRowInfoV1(decision.decisionId);
+      if (rowInfo) taskOperations.setHeldAnswerForTaskV1(taskPath, rowInfo);
+    }
+    if (armedNow && !rearm) {
+      // run1 Step 26: the answer is kept on the decision, so a reload finds it again.
+      await this.workflowDecisionStore
+        .recordDeferredAnswer(decision.decisionId, {
+          kind: "heldOption",
+          heldState: "held",
+          optionId: option.optionId,
+          optionLabel: option.label,
+          acceptedAt: new Date().toISOString(),
+          itemKeys: [],
+        })
+        .catch(() => false);
+    }
+    if (armedNow && !rearm) {
+      // run1 Step 30: the running row shows "waiting to run: …, held since HH:MM" with Run it now / Drop it.
+      const rowInfo = this.heldAnswerRowInfoV1(decision.decisionId);
+      if (rowInfo) taskOperations.setHeldAnswerForTaskV1(taskPath, rowInfo);
       await this.append(
         "assistant",
         describeDeferredOptionHeldV1(runningDescription, option.label),
@@ -3888,6 +4070,119 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         identity
       );
     }
+  }
+
+  /**
+   * run1 Steps 26 and 28: asks the owner what to do with a held answer that did not run (a Pause or Cancel
+   * kept it back, or a restart left no way to tell whether it ran), with a card of its own: Run it (or Run it
+   * again) and Drop it.
+   */
+  private async postHeldAnswerOwnerCardV1(
+    decisionId: string,
+    why: HeldAnswerOwnerCardFactsV1["why"],
+    stageNow?: string
+  ): Promise<void> {
+    const held = this.workflowDecisionStore.get(decisionId);
+    const answer = held?.deferredAnswer;
+    if (!held || answer?.kind !== "heldOption") return;
+    const card = buildHeldAnswerOwnerCardInputV1({
+      heldDecisionId: decisionId,
+      taskCanonicalId: held.taskCanonicalId,
+      stage: held.stage,
+      label: answer.optionLabel ?? "your answer",
+      chosenAt: answer.acceptedAt,
+      why,
+      ...(stageNow !== undefined ? { stageNow } : {}),
+    });
+    await postWorkflowDecisionV1(card, {
+      canonicalId: held.taskCanonicalId,
+      taskFolderPath: held.taskCanonicalId,
+      stage: held.stage,
+    }).catch(() => undefined);
+  }
+
+  /** run1 Step 30: a decision's held answer as the running row shows it, from the record on disk. */
+  private heldAnswerRowInfoV1(decisionId: string): HeldAnswerRowInfoV1 | undefined {
+    const decision = this.workflowDecisionStore.get(decisionId);
+    const answer = decision?.deferredAnswer;
+    if (!decision || answer?.kind !== "heldOption") return undefined;
+    return {
+      decisionId,
+      optionId: answer.optionId,
+      label: answer.optionLabel ?? "your answer",
+      ...(answer.acceptedAt !== undefined ? { chosenAt: answer.acceptedAt } : {}),
+      state: answer.heldState === "waitingForOwner" ? "waitingForOwner" : "held",
+    };
+  }
+
+  /**
+   * run1 Step 30: the row's "Run it now". It is the owner's go-ahead for this answer: the go-ahead is recorded
+   * on the answer, then the round that is running is cancelled with the reason `runHeldAnswer`, which ends
+   * Fast Forward too, and the answer is dispatched once the task is free (through the same ordered check as any
+   * held answer). An answer kept back by a Pause or Cancel is armed again, with the go-ahead.
+   */
+  async runHeldAnswerNowV1(decisionId: string): Promise<{ ok: boolean; message: string }> {
+    const decision = this.workflowDecisionStore.get(decisionId);
+    const answer = decision?.deferredAnswer;
+    if (!decision || answer?.kind !== "heldOption" || !isOwnerActionableHeldStateV1(answer.heldState)) {
+      return { ok: false, message: "that answer is no longer waiting." };
+    }
+    const option = decision.options.find((candidate) => candidate.optionId === answer.optionId);
+    if (!option || option.effect.kind !== "command") {
+      return { ok: false, message: "the card no longer offers that choice." };
+    }
+    const marked = await this.workflowDecisionStore.swapHeldAnswerState(decisionId, answer.heldState, {
+      heldState: "held",
+      runNowRequestedAt: new Date().toISOString(),
+    });
+    if (!marked) {
+      return { ok: false, message: "it has already been run or dropped." };
+    }
+    const identity: ChatIdentity = { canonicalId: decision.taskCanonicalId, taskFolderPath: decision.taskCanonicalId };
+    // The owner's go-ahead also resumes a paused task: the held answer is dispatched on an active task.
+    const progress = await readTaskProgressStrictV1(vscode.Uri.file(decision.taskCanonicalId)).catch(() => undefined);
+    if (progress?.ok && progress.decoded.progress.status === "paused") {
+      await Promise.resolve(
+        vscode.commands.executeCommand("vs-code-ai-helper.resumeTask", { taskFolderPath: decision.taskCanonicalId })
+      ).catch(() => undefined);
+    }
+    // Waiting for the owner means nothing is armed; this arms it (a no-op while it is already armed).
+    await this.holdOptionUntilTaskFreeV1(decision, option, identity, "The running round", true);
+    const root = taskOperations.rootOperationForPauseV1(decision.taskCanonicalId);
+    if (root) {
+      taskOperations.cancelOperation(root.id, "notifications", "runHeldAnswer");
+    }
+    return { ok: true, message: "" };
+  }
+
+  /**
+   * run1 Step 30 and Step 29: the row's "Drop it". The held answer is not run; the chat says so and the card
+   * comes back for a fresh choice.
+   */
+  async dropHeldAnswerV1(decisionId: string): Promise<{ ok: boolean; message: string }> {
+    const decision = this.workflowDecisionStore.get(decisionId);
+    const answer = decision?.deferredAnswer;
+    if (!decision || answer?.kind !== "heldOption" || !isOwnerActionableHeldStateV1(answer.heldState)) {
+      return { ok: false, message: "that answer is no longer waiting." };
+    }
+    const dropped =await this.workflowDecisionStore.swapHeldAnswerState(decisionId, answer.heldState, {
+      heldState: "dropped",
+    });
+    if (!dropped) {
+      return { ok: false, message: "it has already been run or dropped." };
+    }
+    cancelDeferredOptionRunV1(`${decisionId}:${answer.optionId}`, this.deferredRunsV1);
+    taskOperations.setHeldAnswerForTaskV1(decision.taskCanonicalId, undefined);
+    const label = answer.optionLabel ?? "your answer";
+    await this.workflowDecisionStore.reopenResolved(decisionId, answer.optionId).catch(() => false);
+    await this.append(
+      "assistant",
+      describeHeldAnswerDroppedV1(label, "you dropped it."),
+      decision.stage,
+      { canonicalId: decision.taskCanonicalId, taskFolderPath: decision.taskCanonicalId }
+    ).catch(() => undefined);
+    if (this.target?.canonicalId === decision.taskCanonicalId) await this.render();
+    return { ok: true, message: "" };
   }
 
   /**
@@ -3934,6 +4229,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     identity: ChatIdentity
   ): void {
     armDeferredOptionRunV1({
+      registry: this.deferredRunsV1,
       key: `kept-answer:${decisionId}`,
       isTaskBusy: () => getLiveTaskOperationV1(taskPath) !== undefined,
       subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
@@ -4009,9 +4305,109 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     });
   }
 
+  /**
+   * run1 Step 26: activation's rule for one held option answer. Held is re-armed once; a dispatch that a
+   * restart cut off is never re-run by itself. Nothing yet carries the dispatch id onto a claim or ledger row,
+   * so a dispatching answer has no trace to read and is marked uncertain: the chat says so and offers the
+   * card again.
+   */
+  private async reconcileHeldOptionAnswerV1(decision: WorkflowDecisionV1): Promise<void> {
+    const answer = decision.deferredAnswer;
+    if (!answer || answer.kind !== "heldOption" || answer.heldState === undefined) return;
+    const identity: ChatIdentity = { canonicalId: decision.taskCanonicalId, taskFolderPath: decision.taskCanonicalId };
+    const trace =
+      answer.heldState === "dispatching" && answer.dispatchId !== undefined
+        ? await this.readHeldDispatchTraceV1(
+            decision.taskCanonicalId,
+            answer.dispatchId,
+            answer.commandStartedAt !== undefined
+          )
+        : undefined;
+    const action = reconcileHeldAnswerV1(answer.heldState, trace);
+    const label = answer.optionLabel ?? "your answer";
+    const option = decision.options.find((candidate) => candidate.optionId === answer.optionId);
+    if (action === "rearm" || action === "backToHeld") {
+      if (action === "backToHeld") {
+        // The dispatch never started: back to held, then through the usual checks (pause, cancel, stage).
+        const back = await this.workflowDecisionStore.swapHeldAnswerState(decision.decisionId, "dispatching", {
+          heldState: "held",
+        });
+        if (!back) return;
+      }
+      if (option) {
+        await this.holdOptionUntilTaskFreeV1(decision, option, identity, "An earlier round", true);
+      }
+      return;
+    }
+    if (action === "markRan" || action === "markRanWhenEnds") {
+      // The dispatch ran, or is running: record it as ran (when it ends), and never run it again.
+      armDeferredOptionRunV1({
+        registry: this.deferredRunsV1,
+        key: `${decision.decisionId}:ran`,
+        isTaskBusy: () => action === "markRanWhenEnds" && getLiveTaskOperationV1(decision.taskCanonicalId) !== undefined,
+        subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
+        carryOut: async (): Promise<DeferredRunOutcomeV1> => {
+          await this.workflowDecisionStore.swapHeldAnswerState(decision.decisionId, "dispatching", { heldState: "ran" });
+          return { kind: "done" };
+        },
+        report: async (outcome): Promise<void> => {
+          await this.append(
+            "assistant",
+            describeDeferredOptionOutcomeV1(label, outcome),
+            decision.stage,
+            identity
+          ).catch(() => undefined);
+        },
+      });
+      return;
+    }
+    if (action !== "uncertain") return;
+    const swapped = await this.workflowDecisionStore.swapHeldAnswerState(decision.decisionId, "dispatching", {
+      heldState: "uncertain",
+    });
+    if (!swapped) return;
+    try {
+      const read = await readTaskProgressStrictV1(vscode.Uri.file(decision.taskCanonicalId)).catch(() => undefined);
+      const stageName = read?.ok ? STAGE_DISPLAY_NAMES[read.decoded.progress.currentStage] : STAGE_DISPLAY_NAMES[decision.stage];
+      // The record stays on the decision, and nothing runs it again by itself: the owner is asked with a
+      // card that offers Run it again and Drop it.
+      await this.append(
+        "assistant",
+        describeHeldAnswerUncertainV1(label, answer.acceptedAt, stageName),
+        decision.stage,
+        identity
+      );
+      await this.postHeldAnswerOwnerCardV1(decision.decisionId, "uncertain", stageName);
+    } catch {
+      // The chat is best-effort here; the uncertain mark is already durable.
+    }
+  }
+
+  /**
+   * run1 Step 26: what the task's round ledger and admission markers show about a held-answer dispatch, or
+   * `undefined` when the task's progress cannot be read (nothing can then be concluded).
+   */
+  private async readHeldDispatchTraceV1(taskPath: string, dispatchId: string, commandStarted = false) {
+    const read = await readTaskProgressStrictV1(vscode.Uri.file(taskPath)).catch(() => undefined);
+    if (!read?.ok) return undefined;
+    return buildHeldDispatchTraceV1(
+      dispatchId,
+      read.decoded.progress.roundLedger ?? [],
+      readAdmissionTraceForDispatchV1(taskPath, dispatchId),
+      commandStarted,
+      getLiveTaskOperationV1(taskPath) !== undefined
+    );
+  }
+
   /** bugs5 Step 3: re-arms kept answers after a reload (the waiter map is memory only). */
   rearmKeptAnswersV1(): void {
     for (const decision of this.workflowDecisionStore.listWithPendingDeferredAnswer()) {
+      if (decision.deferredAnswer?.kind === "heldOption") {
+        // A viewer window only reads the runner's mirror of the answer. Carrying it out is the runner's alone
+        // (a viewer arming it as well would run it twice); the viewer's Run it now / Drop it go by relay.
+        if (!isViewerHostV1()) void this.reconcileHeldOptionAnswerV1(decision);
+        continue;
+      }
       if (decision.state !== "pending" || decision.deferredAnswer?.kind !== "applyAndDispatch") continue;
       // No panel is open at activation, so the identity comes from the record itself.
       const identity: ChatIdentity = { canonicalId: decision.taskCanonicalId, taskFolderPath: decision.taskCanonicalId };
@@ -5089,14 +5485,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // Best effort: a stale entry left behind is ignored by isCardExpandedV1 anyway.
       }
     }
-    const runStrip = this.currentRunStripV1();
-    this.lastRunStripV1 = runStrip;
-    this.lastRunStripPostAtV1 = Date.now();
     await this.view?.webview.postMessage({
       type: "state",
       target: this.target,
       label,
-      runStrip: runStrip ?? null,
       entries: conversationEntries,
       timeline: conversationTimeline,
       interactions: displayInteractions,
@@ -5223,17 +5615,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           margin: var(--ensemble-space-2) 0;
           font-style: italic;
           color: var(--ensemble-muted-foreground);
-        }
-        /* chat1 Step 6: the strip's two links read as links, not as card actions. */
-        #busy-indicator button.strip-link {
-          background: none;
-          border: none;
-          padding: 0;
-          margin-left: var(--ensemble-space-3);
-          font-style: normal;
-          color: var(--vscode-textLink-foreground);
-          text-decoration: underline;
-          cursor: pointer;
         }
         #empty-notice {
           display: none;
@@ -5391,49 +5772,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="decisions" role="list" aria-label="Pending workflow decisions"></div>
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
-      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span><span id="busy-detail" aria-live="off"></span><span id="busy-actions"></span></div>
+      <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span></div>
       <div id="steering-note" role="note">Rounds don't read this chat. To change what the next rounds do, ask here to record it in the plan (for example, "add to the plan: skip the memory work"), or edit <code>plan-final.md</code> yourself.</div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" id="send-btn" title="Send message (Enter)">Send</button><span id="send-reason" role="status"></span></form>
-      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), bd=document.getElementById('busy-detail'), ba=document.getElementById('busy-actions'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
+      <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
       const savedState = v.getState() || {};
       const scrollPositions = savedState.scrollPositions || {};
       let currentKey;
       function targetKey(t){ if(!t) return ''; return t.kind==='global' ? 'global' : (t.canonicalId+':'+t.stage); }
       function isNearBottom(){ return (document.documentElement.scrollHeight-window.scrollY-window.innerHeight)<60; }
       function persistScroll(){ if(currentKey===undefined) return; scrollPositions[currentKey]=window.scrollY; v.setState({scrollPositions:scrollPositions}); }
-      // chat1 Step 6: the live run strip. It sits in the busy indicator and is replaced in place, never
-      // appended. Only its label (busy-text) is a live region, so a progress tick is not announced.
-      let stripState=null, stripHead='', stripTimer, lastWaiting=false, lastWaitingSource;
-      function stripDetailText(st){
-        const parts=[];
-        if(st.model){parts.push(st.model);}
-        parts.push('since '+st.sinceClock+' ('+Math.max(0,Math.floor((Date.now()-st.startedAt)/60000))+' min)');
-        if(st.latest){parts.push(st.latest);}
-        return ' · '+parts.join(' · ');
-      }
-      function stripLink(text,message){
-        const btn=document.createElement('button');btn.type='button';btn.className='strip-link';btn.textContent=text;
-        btn.addEventListener('click',()=>{v.postMessage(message);});
-        return btn;
-      }
-      function renderStrip(st,waitingForUser,waitingSource){
-        stripState=st;lastWaiting=!!waitingForUser;lastWaitingSource=waitingSource;
-        if(st){
-          const head=st.waiting?st.label+' — waiting for your answer':'Running: '+st.label;
-          if(head!==stripHead){bt.textContent=head;stripHead=head;}
-          bd.textContent=stripDetailText(st);
-          if(ba.children.length===0||ba.getAttribute('data-op')!==st.operationId||ba.getAttribute('data-stop')!==String(!!st.cancellable)){
-            ba.replaceChildren();
-            ba.setAttribute('data-op',st.operationId);ba.setAttribute('data-stop',String(!!st.cancellable));
-            ba.appendChild(stripLink('Show in Notifications',{type:'showRunInNotifications'}));
-            if(st.cancellable){ba.appendChild(stripLink('Stop',{type:'stopRunFromStrip',operationId:st.operationId}));}
-          }
-          b.style.display='block';b.title=st.waiting&&waitingSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
-          if(stripTimer===undefined){stripTimer=setInterval(()=>{if(stripState){bd.textContent=stripDetailText(stripState);}},30000);}
-          return;
-        }
-        stripHead='';bd.textContent='';ba.replaceChildren();ba.removeAttribute('data-op');ba.removeAttribute('data-stop');
-        if(stripTimer!==undefined){clearInterval(stripTimer);stripTimer=undefined;}
+      // run1 Step 20: Chat With AI says nothing about what is running; Notifications answers that. The only
+      // line left is the banner for a question waiting on the owner, which is part of the conversation.
+      function renderWaiting(waitingForUser,waitingSource){
         if(waitingForUser){
           bt.textContent='Waiting for your answer';b.style.display='block';
           b.title=waitingSource==='liveOperation'?'A running operation is paused waiting on your input.':'';
@@ -6017,8 +6368,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
       window.addEventListener('message', event=>{
         const s=event.data;
-        // chat1 Step 6: a progress tick repaints only the strip, never the conversation.
-        if(s.type==='runStrip'){renderStrip(s.runStrip||null,lastWaiting,lastWaitingSource);return;}
         // chat1 Step 15: how a Dismiss went. On failure the card's controls come back with the reason.
         if(s.type==='cardActionResult'){reportCardActionResult(s);return;}
         // Scroll to a card that just revealed this view. Never focuses anything:
@@ -6077,7 +6426,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             // (verification review, 2026-09-18).
             m.replaceChildren();dc.replaceChildren();dc.style.display='none';renderInteractions([]);
             en.textContent='';en.style.display='none';
-            renderStrip(null,false,undefined);
+            renderWaiting(false,undefined);
             c.textContent=s.label??'Chat';
             currentKey=failedKey;
             e.textContent=s.unpaintedMessage??s.errorMessage??'';
@@ -6169,7 +6518,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         if(drafts){ restoreDrafts(drafts); }
         en.textContent=s.emptyNotice??'';en.style.display=s.emptyNotice?'block':'none';
         e.textContent=s.errorMessage??'';e.style.display=s.errorMessage?'block':'none';
-        renderStrip(s.runStrip||null,!!s.waitingForUser,s.waitingForUserSource);
+        renderWaiting(!!s.waitingForUser,s.waitingForUserSource);
         // RC3 item 8: Send is disabled only while THIS panel's own task is
         // busy (never while waiting for an answer in this chat, and never
         // for the Global Assistant, which is not tied to one task's run

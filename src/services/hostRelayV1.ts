@@ -69,6 +69,16 @@ export type HostRelayRequestV1 =
     }
   | {
       readonly id: string;
+      readonly kind: "heldAnswerAction";
+      /** run1 Step 30: a held owner answer the runner is holding (decision store on the runner). */
+      readonly decisionId: string;
+      /** "Run it now" or "Drop it" on the viewer's running row. */
+      readonly action: "runNow" | "drop";
+      readonly timeoutMs?: number;
+      readonly createdAt: string;
+    }
+  | {
+      readonly id: string;
       readonly kind: "cancelOperation";
       /** The runner's own id for a running operation it mirrored (hostOperationsMirrorV1.ts). */
       readonly operationId: string;
@@ -110,6 +120,8 @@ export interface HostRelayResponseV1 {
  *    only one of the options that decision defines. Effects that ask for a
  *    confirmation decline under `unattendedExecutionV1`, and effects that
  *    belong in the user's own window are handed back rather than run here.
+ *  - `heldAnswerAction`: only an answer the runner itself holds, and only to run it now (its own
+ *    Pause/Cancel ordering still applies) or drop it, which asks the owner again through its card.
  *  - `cancelOperation`: only an operation of THIS runner activation, and
  *    cancelling is the one thing that cannot leave work half-done.
  *
@@ -132,6 +144,7 @@ export interface HostRelayV1 {
     request: Omit<Extract<HostRelayRequestV1, { kind: "command" }>, "id" | "createdAt"> |
       Omit<Extract<HostRelayRequestV1, { kind: "interaction" }>, "id" | "createdAt"> |
       Omit<Extract<HostRelayRequestV1, { kind: "resolveDecision" }>, "id" | "createdAt"> |
+      Omit<Extract<HostRelayRequestV1, { kind: "heldAnswerAction" }>, "id" | "createdAt"> |
       Omit<Extract<HostRelayRequestV1, { kind: "cancelOperation" }>, "id" | "createdAt">,
     options?: { readonly timeoutMs?: number; readonly pollMs?: number }
   ): Promise<HostRelayResponseV1>;

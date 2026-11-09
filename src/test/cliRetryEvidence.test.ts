@@ -362,6 +362,8 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     models: [],
     usesLastMessageFile: false,
     textModeResponseContractV1: "repurposed-interactive-flow",
+    // run1 Step 12: only a provider whose output streams events gets an idle stop.
+    structuredEventStream: "opencode",
     buildArgs(): string[] {
       return ["run"];
     },
@@ -436,7 +438,8 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     const result = await resultPromise;
     assert.equal(result.status, "failed");
     assert.equal(result.timeoutReason, "inactivity");
-    assert.match(result.errorMessage ?? "", /produced no output for 15 minute\(s\)/);
+    assert.match(result.errorMessage ?? "", /did nothing of its own for 15 minute\(s\)/);
+    assert.equal(result.stopCauseV1, "ensembleIdleStop");
   });
 
   void it("does NOT fire while the stream stays active past the inactivity threshold", async (t) => {
@@ -473,6 +476,97 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     assert.equal(result.timeoutReason, undefined);
   });
 
+  void it("run1 Step 9: a stopped Claude round keeps the report it had already written (session 4003f046 shape)", async (t) => {
+    const handle = installFakeSpawn(t);
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    const report = "## Files Changed\n- src/a.ts\n\n## Verification\n- unit suite passes: 8676 tests, 0 fail";
+    const assistant = (text: string): string =>
+      `${JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } })}\n`;
+    const resultPromise = execCliAgent({
+      def: { ...fakeDef(), structuredEventStream: "claude" },
+      mode: "edit",
+      model: undefined,
+      prompt: "prompt",
+      cwd: process.cwd(),
+      token: fakeToken(),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const stdout = (handle.child as unknown as { stdout: EventEmitter }).stdout;
+    // The report is written, then each leftover monitor wakes the session and it answers again; the
+    // process never exits. Output keeps arriving (under the idle limit) until the wall clock stops it.
+    t.mock.timers.tick(10 * 60_000);
+    stdout.emit("data", Buffer.from(assistant(report)));
+    for (let i = 0; i < 5; i++) {
+      t.mock.timers.tick(10 * 60_000);
+      stdout.emit("data", Buffer.from(assistant("That was another monitor timing out with no events.")));
+    }
+
+    // run1 Step 8: the one settlement recovers the report itself, so the round is completed with it
+    // before any failure handling (terminalisation, a continuation) can see a failed result.
+    const result = await resultPromise;
+    assert.equal(result.status, "completed");
+    assert.equal(result.output, report);
+    assert.equal(result.recoveredReportV1, report);
+    assert.equal(result.endOfTurnStopV1, true);
+    // run1 Step 12: the session repeated the same message, so it is the repeat stop (not the
+    // far-off backstop) that ends it, and the report is still kept.
+    assert.equal(result.stopCauseV1, "ensembleRepeatStop");
+    assert.equal(result.errorMessage, undefined);
+    assert.equal(result.timeoutReason, undefined);
+  });
+
+  void it("run1 Step 12: a streaming round that keeps issuing tool calls for 2 hours is not stopped", async (t) => {
+    const handle = installFakeSpawn(t);
+    t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
+    const toolCall = (n: number): string =>
+      `${JSON.stringify({
+        type: "assistant",
+        message: { role: "assistant", content: [{ type: "tool_use", id: `t${n}`, name: "Bash", input: { command: `echo ${n}` } }] },
+      })}\n`;
+    const resultPromise = execCliAgent({
+      def: { ...fakeDef(), structuredEventStream: "claude" },
+      mode: "edit",
+      model: undefined,
+      prompt: "prompt",
+      cwd: process.cwd(),
+      token: fakeToken(),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const stdout = (handle.child as unknown as { stdout: EventEmitter }).stdout;
+    let settled = false;
+    void resultPromise.then(() => {
+      settled = true;
+    });
+    for (let minute = 1; minute <= 120; minute++) {
+      t.mock.timers.tick(60_000);
+      stdout.emit("data", Buffer.from(toolCall(minute)));
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false, "a round that is still working is not stopped for its length");
+    // Then it goes silent: 20 minutes later it is stopped as idle.
+    t.mock.timers.tick(20 * 60_000);
+    const result = await resultPromise;
+    assert.equal(result.status, "failed");
+    assert.equal(result.stopCauseV1, "ensembleIdleStop");
+  });
+
+  void it("run1 Step 9: describeCliSessionProgressV1 never says 'nothing' when the session has text", () => {
+    const msg = (text: string): string =>
+      JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+    const at = new Date(2026, 10, 3, 18, 9, 34);
+    assert.equal(
+      describeCliSessionProgressV1(
+        [msg("## Files Changed\n- a\n\n## Verification\n- ok")].join("\n"),
+        at
+      ),
+      "It wrote a report at 18:09 but did not exit."
+    );
+    assert.equal(
+      describeCliSessionProgressV1([msg("working on it"), msg("still working")].join("\n"), at),
+      "It wrote 2 messages, the last at 18:09, but no report, before it was stopped."
+    );
+  });
+
   void it("the wall-clock timeout is classified/worded distinctly from an inactivity kill", async (t) => {
     const handle = installFakeSpawn(t);
     t.mock.timers.enable({ apis: ["setTimeout", "setInterval", "Date"] });
@@ -488,10 +582,10 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     await new Promise((resolve) => setImmediate(resolve));
     assert.ok(handle.child, "the main provider spawn must have been invoked");
 
-    // Keep activity flowing every 10 minutes (under the 15-minute inactivity
-    // threshold) all the way to the 60-minute wall clock, so ONLY the flat
-    // wall-clock cap — never the inactivity watchdog — can fire.
-    for (let i = 0; i < 6; i++) {
+    // Keep activity flowing every 10 minutes (under the 20-minute idle time) all the way to the
+    // 4-hour backstop, so ONLY the far-off wall-clock cap, never the idle stop, can fire. A busy
+    // round is not stopped at 60 minutes any more.
+    for (let i = 0; i < 24; i++) {
       t.mock.timers.tick(10 * 60_000);
       (handle.child as unknown as { stdout: EventEmitter }).stdout.emit(
         "data",
@@ -502,7 +596,8 @@ void describe("execCliAgent inactivity watchdog (Part 7)", () => {
     const result = await resultPromise;
     assert.equal(result.status, "failed");
     assert.equal(result.timeoutReason, "wall-clock");
-    assert.match(result.errorMessage ?? "", /60-minute wall-clock limit/);
+    assert.match(result.errorMessage ?? "", /240-minute wall-clock limit/);
+    assert.equal(result.stopCauseV1, "ensembleBackstop");
     // Distinct from the inactivity wording pinned above.
     assert.doesNotMatch(result.errorMessage ?? "", /produced no output/);
     // Says how far the session got, not only that the clock ran out.

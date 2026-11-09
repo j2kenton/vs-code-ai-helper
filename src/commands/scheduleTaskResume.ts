@@ -2049,8 +2049,8 @@ export class TaskActionScheduler implements vscode.Disposable {
           NotificationRouter.showWarning(
             `⚠️ A stalled recovery continuation for "${notificationTaskDisplayNameV1(task.progress.displayName, task.taskFolderPath)}" ` +
               "was reclaimed and will be re-armed automatically (the round that had claimed it never " +
-              "finalized — the window running it likely died or the provider hit a usage limit). The " +
-              "unreported edits remain preserved in pendingImplReviewFiles."
+              "finished: the window running it probably closed or crashed). The changed files are " +
+              "kept for the next round."
           );
         }
         // Fall through into the pending-claim logic below using the

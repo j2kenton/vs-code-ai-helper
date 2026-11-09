@@ -2420,7 +2420,7 @@ void describe("describeOwedContinuationRowIndicatorV1", () => {
       MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1
     );
     assert.ok(indicator);
-    assert.match(indicator.description, /budget exhausted, needs your input/);
+    assert.match(indicator.description, /Ensemble stopped trying, needs your input/);
     assert.doesNotMatch(indicator.description, /will retry after/);
   });
 });

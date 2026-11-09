@@ -182,7 +182,7 @@ void describe("StatusTreeProvider row identity and lifecycle exclusivity", () =>
       const node = operationNodes(provider).find((n) => n.taskName === "no_model");
       assert.ok(node);
       const description = String(provider.getTreeItem(node).description ?? "");
-      assert.equal(description, "Implementation · running · 0s");
+      assert.match(description, /^Implementation · running · started \d\d:\d\d · 0s$/);
       assert.ok(!description.includes("· ·"), `expected no stray double-delimiter, got: ${description}`);
       assert.ok(!description.startsWith("·") && !description.endsWith("·"), `expected no leading/trailing delimiter, got: ${description}`);
 
@@ -191,12 +191,49 @@ void describe("StatusTreeProvider row identity and lifecycle exclusivity", () =>
       const nodeWithModel = operationNodes(provider).find((n) => n.taskName === "no_model");
       assert.ok(nodeWithModel);
       const withModel = String(provider.getTreeItem(nodeWithModel).description ?? "");
-      assert.equal(
+      assert.match(
         withModel,
-        `Implementation · running · ${describeModelWithProviderV1("claude-cli:sonnet@high")} · 0s`
+        new RegExp(
+          `^Implementation · running · ${describeModelWithProviderV1("claude-cli:sonnet@high").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} · started \\d\\d:\\d\\d · 0s$`
+        )
       );
       assert.match(withModel, /\(Claude Code\)/, "the operation row names the provider in words, not by prefix");
       assert.ok(!withModel.includes("claude-cli:"), "the raw provider prefix must not be shown");
+    } finally {
+      taskOperations.end(op);
+      provider.dispose();
+    }
+  });
+
+  void it("a silent round's row warns 'no activity' with Stop and Wait, and an observed change from another window neither updates the line nor hides it", () => {
+    const provider = new StatusTreeProvider();
+    const taskPath = `/dev/silent_row_${Math.floor(Math.random() * 1e9)}`;
+    const op = taskOperations.begin(taskPath, { label: "Silent Op", taskName: "silent_row", stage: "impl", cancellable: true });
+    assert.ok(op);
+    try {
+      const now = Date.now();
+      taskOperations.reportProofOfLifeForTask(taskPath, {
+        pid: 42,
+        processState: "alive",
+        lastContactAt: now - 15 * 60_000,
+        lastProgressAt: now - 15 * 60_000,
+        lastProgressWhat: "ran `pnpm run lint`",
+        lastObservedChangeAt: now - 5_000,
+        lastObservedChangeWhat: "`src/other.ts`",
+      });
+      const node = operationNodes(provider).find((n) => n.taskName === "silent_row");
+      assert.ok(node);
+      const item = provider.getTreeItem(node);
+      assert.match(String(item.description), /no activity for 15 min \(since \d\d:\d\d\) — may be stuck/);
+      assert.ok(!String(item.description).includes("src/other.ts"), "the other window's file is not the round's activity");
+      assert.equal(item.contextValue, "ensemble-operation-cancellable-stuck");
+      assert.match(String(item.tooltip), /src\/other\.ts.*not proven to be this round's/);
+
+      provider.waitOnOperation(node.id);
+      const waited = provider.getTreeItem(operationNodes(provider).find((n) => n.taskName === "silent_row")!);
+      assert.doesNotMatch(String(waited.description), /no activity/);
+      assert.equal(waited.contextValue, "ensemble-operation-cancellable");
+      assert.match(String(waited.description), /last activity 15 min ago: ran `pnpm run lint`/);
     } finally {
       taskOperations.end(op);
       provider.dispose();

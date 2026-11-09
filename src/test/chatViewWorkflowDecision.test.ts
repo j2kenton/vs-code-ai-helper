@@ -3455,10 +3455,10 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
           `run-status plumbing ("${goneMarker}") no longer belongs in Chat With AI`
         );
       }
-      // chat1 Step 6: "is it running?" has exactly one answer, the strip: a single element, replaced
-      // in place by `runStrip` messages and never appended to the transcript.
-      assert.equal(html.split('id="busy-indicator"').length - 1, 1, "one strip element");
-      assert.match(html, /s\.type==='runStrip'/, "progress ticks arrive as their own message");
+      // run1 Step 20: "is it running?" is answered in Notifications only. The chat keeps one banner
+      // element, for a question waiting on the owner, and no run strip.
+      assert.equal(html.split('id="busy-indicator"').length - 1, 1, "one banner element");
+      assert.equal(html.includes("runStrip"), false, "the chat has no run strip");
       assert.equal(html.includes("Progress:"), false, "the webview writes no Progress line of its own");
     } finally {
       provider.dispose();

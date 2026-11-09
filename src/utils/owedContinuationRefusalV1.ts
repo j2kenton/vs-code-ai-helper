@@ -1,4 +1,5 @@
 import { ImplRecoveryV1, MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1 } from "../types/taskProgress";
+import { describeChangedFilesKeptV1, describeEnsembleRetriesGaveUpV1 } from "./roundStopCauseV1";
 
 /**
  * The refusal explainer (task "Actionable Hand-offs", "Also in scope: when an
@@ -67,16 +68,16 @@ export function describeOwedContinuationRefusalV1(
       "goes stale, the recovery sweep reclaims and re-arms it automatically; a continuation you cancel is " +
       "held until you run it yourself."
     : budgetExhausted
-      ? " The continuation budget is exhausted, so automated recovery has stopped — retrying this action " +
-        "will not help either; the task needs a human decision."
+      ? ` ${describeEnsembleRetriesGaveUpV1(continuations)} Retrying this action will not help either; ` +
+        "the task needs your decision."
       : " This continuation is queued and will be retried automatically once any existing lease clears.";
   const filesClause =
     pendingFiles.length > 0
-      ? ` ${pendingFiles.length} file(s) are quarantined behind it, waiting for the continuation to report on ` +
+      ? ` ${describeChangedFilesKeptV1(pendingFiles.length)} They wait for the continuation to report on ` +
         `them:\n${pendingFiles.map((file) => `- ${file}`).join("\n")}`
       : record.filesChangedUnknown === true
-        ? " The changed files behind it could not be enumerated (recorded as unknown), so whether anything " +
-          "is quarantined cannot be confirmed from this message alone."
+        ? " The changed files behind it could not be listed, so whether any files are being kept for the " +
+          "next round cannot be confirmed from this message alone."
         : "";
   const remedyClause = record.ownerHold !== undefined
     ? ""

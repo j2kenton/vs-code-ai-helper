@@ -41,6 +41,16 @@ export function getLiveTaskOperationV1(taskFolderPath: string): LiveTaskOperatio
   return isFastForwardRunActiveV1(taskFolderPath) ? { label: "Fast Forward" } : undefined;
 }
 
+/**
+ * run1 Step 27: whether an operation is running for the task, as the registry sees it, without the Fast
+ * Forward run flag. A held owner answer waits for this: the flag outlives a run's rounds (and its
+ * registry row), so counting it kept an answer waiting for the whole run. Fast Forward itself ends at the
+ * next round boundary when an answer is held, which releases its row and lets the answer run.
+ */
+export function isTaskOperationRunningV1(taskFolderPath: string): boolean {
+  return lookup?.(taskFolderPath) !== undefined;
+}
+
 /** `"Fast Forward Review" (running 3 min so far)`, for card text. */
 export function describeLiveTaskOperationV1(op: LiveTaskOperationV1, now: number = Date.now()): string {
   if (op.startedAt === undefined) {

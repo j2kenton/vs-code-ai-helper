@@ -20,6 +20,8 @@ export const AUTO_CONTINUE_MAX_MINUTES_V1 = 1440;
 export interface AutoContinueTaskStateV1 {
   readonly progressVersion?: number;
   readonly roundCount?: number;
+  /** run1 Step 28: the owner paused the task. A countdown is never armed on, and never runs on, such a task. */
+  readonly paused?: boolean;
 }
 
 /** An option may run unattended only when it says so and cannot lose work or needs no judgement. */
@@ -60,7 +62,7 @@ export function planAutoContinueV1(
 ): WorkflowDecisionAutoContinueV1 | undefined {
   const wait = normaliseAutoContinueMinutesV1(minutes);
   const option = pickAutoContinueOptionV1(decision);
-  if (wait === 0 || option === undefined) {
+  if (wait === 0 || option === undefined || task.paused === true) {
     return undefined;
   }
   return {
@@ -166,6 +168,10 @@ export function evaluateAutoContinueV1(
   const option = decision.options.find((candidate) => candidate.optionId === armed.optionId);
   if (!isAutoContinueOptionV1(option)) {
     return { kind: "cancel", reason: "the option is no longer one that can run unattended" };
+  }
+  if (task.paused === true) {
+    // run1 Step 28: the owner's Pause wins over a countdown; the card waits for them.
+    return { kind: "cancel", reason: "you paused the task" };
   }
   if (armed.armedProgressVersion !== undefined && task.progressVersion !== undefined && task.progressVersion !== armed.armedProgressVersion) {
     return { kind: "cancel", reason: "the task changed while the card waited", stateChanged: true };

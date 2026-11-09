@@ -107,10 +107,15 @@ import {
   GENERATE_IMPL_ELIGIBLE_STAGES,
   applyReviewWithAI,
   normalizeReviewArg,
+  resumeReviewInteractionV1,
   runReviewForFolder,
   runReviewWithAI,
 } from "../commands/reviewActions";
 import { TaskInventory } from "../state/taskInventory";
+import { PrimarySessionLock } from "../state/primarySessionLock";
+import type { ChatInteractionRefV1, ChatViewProvider } from "../views/chatView";
+import { setStateLeaseWaitForTestsV1 } from "../state/taskStateStore";
+import { readChatHistory } from "../utils/chatHistoryStore";
 import { applyHighLevelReviewChanges } from "../commands/applyHighLevelReviewChanges";
 import { applyLowLevelReviewChanges } from "../commands/applyLowLevelReviewChanges";
 import {
@@ -6853,4 +6858,247 @@ void describe("applyHighLevelReviewChanges / applyLowLevelReviewChanges delegati
       }
     }
   );
+});
+
+// ---------------------------------------------------------------------------
+// run1 Steps 22 and 23: the production review entry point (runReviewForFolder) with another host
+// holding a workspace lease, and with a throw after the round's claim. These call the real function.
+// ---------------------------------------------------------------------------
+
+void describe("runReviewForFolder with another window holding the task-state lease (run1 Steps 22-23)", () => {
+  const fakeExtensionUri = vscode.Uri.file("/fake-extension-lease");
+  // The scope rebuild and the context pack read the workspace for real, so its root must exist.
+  const workspaceRoot: vscode.WorkspaceFolder = {
+    uri: vscode.Uri.file(REAL_TASK_ROOT),
+    name: "real-task-root",
+    index: 0,
+  };
+
+  function seedReviewTask(store: Map<string, string>, name: string, withTemplate: boolean): Promise<vscode.Uri> {
+    const folderUri = makeTaskFolderUri(name);
+    store.set(vscode.Uri.joinPath(folderUri, "plan.md").toString(), "# The Plan\n\nStep 1: Do X.");
+    store.set(vscode.Uri.joinPath(folderUri, "plan-final.md").toString(), "## Implementation\n\n- src/x.ts");
+    if (withTemplate) {
+      store.set(fakeExtensionUri.toString(), "extension root exists");
+      store.set(
+        vscode.Uri.joinPath(fakeExtensionUri, "resources", "prompts", "review-impl-high.md").toString(),
+        "# Impl Review\n{{plan}}\n{{implementation}}\n{{context_pack}}"
+      );
+    }
+    return seedProgress(store, folderUri, {
+      taskFolder: name,
+      currentStage: "impl-high-review",
+      status: "active",
+      createdAt: "2026-07-08T00:00:00.000Z",
+      updatedAt: "2026-07-08T00:00:00.000Z",
+      // No tracked files: the scope is rebuilt from the round ledger, which writes task state.
+      roundLedger: [
+        {
+          roundId: "round-impl-1",
+          attemptIds: ["a1"],
+          stage: "impl",
+          mode: "implementation",
+          startedAt: "2026-07-08T00:00:00.000Z",
+          state: "completed",
+          endedAt: "2026-07-08T00:10:00.000Z",
+          outcome: { filesChanged: ["src/x.ts"] },
+        },
+      ],
+      ownership: {
+        metaRoot: nodePath.dirname(folderUri.fsPath),
+        projectRoot: nodePath.dirname(folderUri.fsPath),
+        boundAt: "2026-07-08T00:00:00.000Z",
+        state: "resolved",
+      },
+    } as TaskProgress).then(() => folderUri);
+  }
+
+  function installLeaseTestStubs(): { restore: () => void } {
+    const lmObj = (vscode as unknown as { lm?: { selectChatModels?: () => Promise<unknown[]> } }).lm;
+    const origSelect = lmObj?.selectChatModels;
+    if (lmObj) {
+      lmObj.selectChatModels = (): Promise<unknown[]> => Promise.resolve([]);
+    }
+    const ws = vscode.workspace as unknown as Record<string, unknown>;
+    const origGetConfig = ws.getConfiguration;
+    const origDocs = ws.textDocuments;
+    // A model is configured for the review stage so the resume entry point gets past its model check.
+    const modelSettings = { "impl-high-review": { primary: "copilot-gpt-5.6-sol", strategy: "alert-and-wait" } };
+    ws.getConfiguration = (): unknown => ({
+      get: (_key: string, defaultValue?: unknown): unknown => defaultValue ?? undefined,
+      update: () => Promise.resolve(undefined),
+      has: () => false,
+      inspect: (key: string) => (key === "modelSettings" ? { key, globalValue: modelSettings } : undefined),
+    });
+    ws.textDocuments = [];
+    return {
+      restore: (): void => {
+        if (lmObj) {
+          lmObj.selectChatModels = origSelect;
+        }
+        ws.getConfiguration = origGetConfig;
+        ws.textDocuments = origDocs;
+      },
+    };
+  }
+
+  void it("a lease held briefly is waited for: the scope is rebuilt and no ended line is posted", async () => {
+    const store = new Map<string, string>();
+    const memFs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const stubs = installLeaseTestStubs();
+    let release: (() => Promise<void>) | undefined;
+    try {
+      const folderUri = await seedReviewTask(store, "lease-short-hold", true);
+      const hostB = new PrimarySessionLock(nodePath.join(nodePath.dirname(folderUri.fsPath), ".ensemble-meta.lock"));
+      release = await hostB.acquire();
+      setStateLeaseWaitForTestsV1([20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20]);
+      setTimeout(() => {
+        void release?.();
+        release = undefined;
+      }, 80);
+      await runReviewForFolder(fakeExtensionUri, folderUri, workspaceRoot, "impl", true);
+      const progress = await readStoredProgress(store, folderUri);
+      assert.deepEqual(progress?.implReviewFiles, ["src/x.ts"], "the scope was rebuilt once the lease was free");
+      const chat = await readChatHistory(folderUri.fsPath);
+      assert.equal(chat.some((m) => /_Ended:.*another window/.test(m.text)), false);
+      assert.equal(msgs.captured.some((m) => /another window was updating task state/.test(m.message)), false);
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      await release?.();
+      stubs.restore();
+      msgs.restore();
+      memFs.restore();
+    }
+  });
+
+  void it("a lease held past the wait ends the round with a named line and a Retry now notification", async () => {
+    const store = new Map<string, string>();
+    const memFs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const stubs = installLeaseTestStubs();
+    let release: (() => Promise<void>) | undefined;
+    try {
+      const folderUri = await seedReviewTask(store, "lease-exhausted", true);
+      const hostB = new PrimarySessionLock(nodePath.join(nodePath.dirname(folderUri.fsPath), ".ensemble-meta.lock"));
+      release = await hostB.acquire();
+      setStateLeaseWaitForTestsV1([5, 5]);
+      await runReviewForFolder(fakeExtensionUri, folderUri, workspaceRoot, "impl", true);
+      const chat = await readChatHistory(folderUri.fsPath);
+      assert.ok(
+        chat.some((m) => /_Ended:.*another window was updating task state for more than 30 s/.test(m.text)),
+        `expected the ended line, got: ${JSON.stringify(chat.map((m) => m.text))}`
+      );
+      assert.ok(
+        msgs.captured.some((m) => /another window was updating task state for more than 30 s/.test(m.message)),
+        `expected a notification naming the cause, got: ${JSON.stringify(msgs.captured)}`
+      );
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      await release?.();
+      stubs.restore();
+      msgs.restore();
+      memFs.restore();
+    }
+  });
+
+  void it("a throw after the claim closes the round's ledger row, so no row is left open", async () => {
+    const store = new Map<string, string>();
+    const memFs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const stubs = installLeaseTestStubs();
+    const mutableDisabled = LEGACY_AI_ROUTE_DISABLED_V0 as unknown as Set<string>;
+    try {
+      // The review route's safety gate is asserted AFTER the claim has opened the row, so disabling it is
+      // a throw at exactly that point.
+      const folderUri = await seedReviewTask(store, "throw-after-claim", true);
+      mutableDisabled.add("review.v1");
+      let thrown: unknown;
+      try {
+        await runReviewForFolder(fakeExtensionUri, folderUri, workspaceRoot, "impl", true);
+      } catch (error) {
+        thrown = error;
+      }
+      assert.ok(thrown !== undefined, "the error still propagates to the caller");
+      const progress = await readStoredProgress(store, folderUri);
+      const reviewRows = (progress?.roundLedger ?? []).filter((row) => row.mode === "review");
+      assert.ok(reviewRows.length >= 1, "the claim opened a review row");
+      assert.deepEqual(
+        reviewRows.filter((row) => row.state === "open" || row.state === "scheduled"),
+        [],
+        "no review row is left open"
+      );
+      const chat = await readChatHistory(folderUri.fsPath);
+      assert.ok(chat.some((m) => /_Ended:/.test(m.text)), "the ended line was posted");
+    } finally {
+      mutableDisabled.delete("review.v1");
+      stubs.restore();
+      msgs.restore();
+      memFs.restore();
+    }
+  });
+
+  void it("resumeReviewInteractionV1: a throw after the claim closes the round's ledger row and rethrows", async () => {
+    const store = new Map<string, string>();
+    const memFs = installMemStore(store);
+    const msgs = installMessageCapture();
+    const stubs = installLeaseTestStubs();
+    try {
+      const folderUri = await seedReviewTask(store, "resume-throw-after-claim", true);
+      const progress = await readStoredProgress(store, folderUri);
+      assert.ok(progress);
+      const inventory = {
+        getTaskByBindingId: () => ({
+          taskFolderPath: folderUri.fsPath,
+          workspaceFolder: vscode.Uri.file(REAL_TASK_ROOT),
+          progress,
+        }),
+      } as unknown as TaskInventory;
+      // The first thing the resume does after its claim is read the cancellation token, so a token whose
+      // reads throw is a throw at exactly that point.
+      const explodingToken = new Proxy(
+        {},
+        {
+          get: (): never => {
+            throw new Error("injected failure after the claim");
+          },
+        }
+      ) as unknown as vscode.CancellationToken;
+      let thrown: unknown;
+      try {
+        const early = await resumeReviewInteractionV1(
+          fakeExtensionUri,
+          inventory,
+          {} as ChatViewProvider,
+          {
+            operationId: "op-1",
+            interactionId: "int-1",
+            taskBindingId: "binding-1",
+            chatDocumentId: "doc-1",
+            sourceAttemptId: "att-1",
+          } as unknown as ChatInteractionRefV1,
+          "resume-1",
+          explodingToken
+        );
+        assert.fail(`the resume was expected to throw after its claim, but returned ${JSON.stringify(early)}`);
+      } catch (error) {
+        thrown = error;
+      }
+      assert.match(String((thrown as Error | undefined)?.message), /injected failure after the claim/);
+      const after = await readStoredProgress(store, folderUri);
+      const reviewRows = (after?.roundLedger ?? []).filter((row) => row.mode === "review");
+      assert.ok(reviewRows.length >= 1, "the claim opened a review row");
+      assert.deepEqual(
+        reviewRows.filter((row) => row.state === "open" || row.state === "scheduled"),
+        [],
+        "no review row is left open"
+      );
+      const chat = await readChatHistory(folderUri.fsPath);
+      assert.ok(chat.some((m) => /_Ended:/.test(m.text)), "the ended line was posted");
+    } finally {
+      stubs.restore();
+      msgs.restore();
+      memFs.restore();
+    }
+  });
 });

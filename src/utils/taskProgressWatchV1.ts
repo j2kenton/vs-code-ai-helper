@@ -26,6 +26,16 @@ const QUOTA_TEXT = /\b(quota|rate[- ]?limit|usage limit|too many requests|429|re
 const CUT_OFF_TEXT = /\b(55[- ]minute|time[- ]?limit|timed? ?out|turn limit|cut (?:short|off)|inactivity|waiting for the background|incomplete)\b/i;
 const REFUSED_TEXT = /\b(refus|declin|not allowed|permission denied|requires approval|blocked by policy)/i;
 
+/** Stop causes that are a cut-off: Ensemble's own stops, a provider's per-turn time cap, a vanished process. */
+const CUT_OFF_STOP_CAUSES_V1: ReadonlySet<string> = new Set([
+  "ensembleBackstop",
+  "ensembleIdleStop",
+  "ensembleRepeatStop",
+  "ensembleEndOfTurn",
+  "providerTimeCap",
+  "processEnded",
+]);
+
 /** Endings that count as "failed, refused or cut off" for the consecutive-failure limit. */
 const FAILED_KINDS: ReadonlySet<ProgressWatchEndingKindV1> = new Set([
   "cut-off", "quota", "provider-error", "refused", "rejected",
@@ -39,11 +49,19 @@ export function isFailedEndingKindV1(kind: ProgressWatchEndingKindV1): boolean {
 export function classifyRoundEndingV1(
   state: RoundLedgerStateV1,
   reason: string | undefined,
-  now: Date = new Date()
+  now: Date = new Date(),
+  stopCause?: string
 ): { readonly kind: ProgressWatchEndingKindV1; readonly quotaResetAt?: string } {
   const text = reason ?? "";
   const quotaResetAt = QUOTA_TEXT.test(text) ? parseQuotaResetV1(text, now) : undefined;
   const withReset = (kind: ProgressWatchEndingKindV1) => ({ kind, ...(quotaResetAt !== undefined ? { quotaResetAt } : {}) });
+  // run1 Step 15: a cause the round's settlement recorded decides the kind before any text does. Ensemble's
+  // own stops and a provider's per-turn time cap are cut-offs (the old text match read "Ensemble stopped the
+  // round" as a provider error); a provider limit is a quota ending.
+  if (stopCause !== undefined && (state === "failed" || state === "interrupted")) {
+    if (CUT_OFF_STOP_CAUSES_V1.has(stopCause)) return { kind: "cut-off" };
+    if (stopCause === "providerUsageLimit" || stopCause === "providerQuota") return withReset("quota");
+  }
   switch (state) {
     case "completed":
       return { kind: "completed" };
@@ -156,7 +174,13 @@ export function recordRoundEndedInWatchV1(
 ): TaskProgress {
   const now = input.now ?? new Date();
   const nowIso = now.toISOString();
-  const { kind, quotaResetAt } = classifyRoundEndingV1(entry.state, input.reason ?? entry.outcome?.rejectionReason, now);
+  const stopCause = entry.outcome?.stopCause;
+  const { kind, quotaResetAt } = classifyRoundEndingV1(
+    entry.state,
+    input.reason ?? entry.outcome?.rejectionReason,
+    now,
+    stopCause
+  );
   // A round that never ran, or that the owner stopped, says nothing about whether the task is moving.
   if (kind === "dropped" || kind === "cancelled") return progress;
 
@@ -167,6 +191,20 @@ export function recordRoundEndedInWatchV1(
     // This round moved the work: it is the progress, not another round without any.
     return { ...progress, progressWatch: withProgress(watch, nowIso, observed.moved) };
   }
+  // run1 Step 15: a round that was cut short or failed, but whose own stream shows it changing files, did
+  // work: that is progress, not another failure. Only files the round's stream named count. Files that
+  // merely changed in the workspace while it ran (`observedFiles`) and output alone never do.
+  const attributedFileCount = entry.outcome?.attributedFiles?.length ?? 0;
+  if (attributedFileCount > 0 && (kind === "completed" || isFailedEndingKindV1(kind))) {
+    return {
+      ...progress,
+      progressWatch: withProgress(
+        watch,
+        nowIso,
+        `a round changed ${attributedFileCount} file${attributedFileCount === 1 ? "" : "s"} ${kind === "completed" ? "and finished" : "before it was stopped"}`
+      ),
+    };
+  }
 
   const ending: ProgressWatchEndingV1 = {
     at: nowIso,
@@ -176,8 +214,10 @@ export function recordRoundEndedInWatchV1(
     stage: entry.stage,
     ...(input.model !== undefined ? { model: input.model } : {}),
     ...(quotaResetAt !== undefined ? { quotaResetAt } : {}),
+    ...(stopCause !== undefined ? { stopCause } : {}),
+    ...(attributedFileCount > 0 ? { attributedFileCount } : {}),
   };
-  const endings = [...watch.endings, ending].slice(-MAX_PROGRESS_WATCH_ENDINGS_V1);
+  const endings =[...watch.endings, ending].slice(-MAX_PROGRESS_WATCH_ENDINGS_V1);
   let autoRounds = watch.autoRoundsSinceProgress;
   let failedInARow = watch.consecutiveFailedAutoRounds;
   if (input.automatic) {
@@ -228,17 +268,39 @@ const KIND_PHRASES: Record<ProgressWatchEndingKindV1, (count: number, resetAt?: 
 
 /** "3 cut off, 57 quota reached, resets 13:27" — the round endings since the last progress, grouped. */
 export function describeRoundEndingsV1(endings: readonly ProgressWatchEndingV1[]): string {
-  const groups = new Map<ProgressWatchEndingKindV1, { count: number; resetAt?: string }>();
+  // run1 Step 15: a cut-off whose cause the settlement recorded is told apart: a model that kept repeating
+  // itself, one that went quiet, and a time limit are different things to do something about.
+  const groupKey = (ending: ProgressWatchEndingV1): string =>
+    ending.kind === "cut-off" && ending.stopCause !== undefined && CUT_OFF_PHRASES_BY_CAUSE_V1[ending.stopCause] !== undefined
+      ? `cut-off:${ending.stopCause}`
+      : ending.kind;
+  const groups = new Map<string, { kind: ProgressWatchEndingKindV1; count: number; resetAt?: string; stopCause?: string }>();
   for (const ending of endings) {
-    const group = groups.get(ending.kind) ?? { count: 0 };
+    const key = groupKey(ending);
+    const group = groups.get(key) ?? { kind: ending.kind, count: 0, ...(key.startsWith("cut-off:") && ending.stopCause !== undefined ? { stopCause: ending.stopCause } : {}) };
     group.count += 1;
     if (ending.quotaResetAt !== undefined && (group.resetAt === undefined || ending.quotaResetAt > group.resetAt)) {
       group.resetAt = ending.quotaResetAt;
     }
-    groups.set(ending.kind, group);
+    groups.set(key, group);
   }
-  return [...groups.entries()].map(([kind, group]) => KIND_PHRASES[kind](group.count, group.resetAt)).join(", ");
+  return [...groups.values()]
+    .map((group) =>
+      group.stopCause !== undefined
+        ? `${group.count} ${CUT_OFF_PHRASES_BY_CAUSE_V1[group.stopCause]}`
+        : KIND_PHRASES[group.kind](group.count, group.resetAt)
+    )
+    .join(", ");
 }
+
+const CUT_OFF_PHRASES_BY_CAUSE_V1: Record<string, string | undefined> = {
+  ensembleRepeatStop: "stopped because the model kept repeating itself",
+  ensembleIdleStop: "stopped with no reply from the model",
+  ensembleBackstop: "stopped at Ensemble's time limit",
+  ensembleEndOfTurn: "finished their turn but did not exit",
+  providerTimeCap: "ended at the provider's own time cap for one turn",
+  processEnded: "ended when the model's process disappeared",
+};
 
 /** The distinct models that ran since the last progress, in order of first appearance. */
 export function listModelsInEndingsV1(endings: readonly ProgressWatchEndingV1[]): string[] {
@@ -249,8 +311,33 @@ export function listModelsInEndingsV1(endings: readonly ProgressWatchEndingV1[])
   return seen;
 }
 
-/** True when the endings since the last progress are repeated provider failures (quota, cut-off, provider error). */
+/** Stop causes that are the provider's own limit or a sign-in failure: another model may well work. */
+const SWITCH_MODEL_STOP_CAUSES_V1: ReadonlySet<string> = new Set([
+  "providerUsageLimit",
+  "providerQuota",
+  "providerPayment",
+  "signIn",
+]);
+
+/**
+ * True when the endings since the last progress support "switch the model": repeated provider limits or
+ * sign-in failures, or the same model stopped twice for repeating itself.
+ */
 export function endingsAreRepeatedProviderFailuresV1(endings: readonly ProgressWatchEndingV1[]): boolean {
-  const failures = endings.filter((ending) => ending.kind === "quota" || ending.kind === "cut-off" || ending.kind === "provider-error");
+  // run1 Step 15: another model is recommended only for a provider limit, a sign-in failure, or the same
+  // model being stopped for repeating itself twice. A time limit, a quiet stretch, a vanished process, a
+  // finished turn that did not exit, a provider's per-turn cap and a generic failure never are.
+  const repeatStopsByModel = new Map<string, number>();
+  for (const ending of endings) {
+    if (ending.stopCause === "ensembleRepeatStop") {
+      const key = ending.model ?? "";
+      repeatStopsByModel.set(key, (repeatStopsByModel.get(key) ?? 0) + 1);
+    }
+  }
+  const failures = endings.filter((ending) => {
+    if (ending.stopCause === "ensembleRepeatStop") return (repeatStopsByModel.get(ending.model ?? "") ?? 0) >= 2;
+    if (ending.stopCause !== undefined) return SWITCH_MODEL_STOP_CAUSES_V1.has(ending.stopCause);
+    return ending.kind === "quota";
+  });
   return failures.length >= 2 && failures.length * 2 >= endings.length;
 }

@@ -16,6 +16,7 @@ import * as path from "node:path";
 import * as crypto from "node:crypto";
 import { resolveTaskRootCandidates } from "./taskRoot";
 import { wasExtensionTaskArtifactWriteV1 } from "./extensionTaskWriteRegistryV1";
+import { loadTaskCreationJournalV1 } from "../services/taskCreationIntentStoreV1";
 
 export const KNOWN_TASK_ARTIFACT_NAMES = Object.freeze([
   "round-progress.md",
@@ -66,8 +67,13 @@ export interface ForeignTaskArtifactContainmentResultV1 {
    */
   readonly ignoredChanges?: readonly {
     readonly change: ForeignTaskArtifactChangeV1;
-    readonly why: "extension-write" | "own-task-update";
+    readonly why: "extension-write" | "own-task-update" | "ensemble-created-task" | "already-noted";
   }[];
+  /**
+   * run1 Step 25: the other-task `task.md` edits this call put a one-line note on, so the caller can
+   * record them and later end lines skip them (once per task and content).
+   */
+  readonly notedEdits?: readonly { readonly taskFolderPath: string; readonly sha256: string }[];
 }
 
 function normalizePath(p: string): string {
@@ -282,6 +288,86 @@ export interface ContainmentOptionsV1 {
    * Defaults to the shared extension-write registry.
    */
   readonly isExtensionWrite?: (absolutePath: string, sha256: string) => boolean;
+  /**
+   * run1 Step 25: true when Ensemble's own New Task made this folder (it has a creation sentinel, or
+   * a matching creation intent). Every artifact of such a folder is Ensemble's own: no note, and
+   * never advice to move it into the running task. Defaults to {@link isEnsembleCreatedTaskFolderV1}
+   * limited to folders created inside `roundWindow`, so an established task keeps normal handling.
+   */
+  readonly isEnsembleCreatedFolder?: (taskFolderPath: string) => boolean | Promise<boolean>;
+  /** run1 Step 25: true while a round is running in that other task (its writes are that round's own). */
+  readonly isRoundRunningInTask?: (taskFolderPath: string) => boolean;
+  /** run1 Step 25: true when this exact task.md content was already noted for that task (once per task and content). */
+  readonly isEditAlreadyNoted?: (taskFolderPath: string, sha256: string) => boolean;
+  /**
+   * run1 Step 25: this round's process window. "Move it into this task" is offered only for a change
+   * whose modified time falls inside it AND whose content names this task (see `currentTaskNames`).
+   */
+  readonly roundWindow?: { readonly startMs: number; readonly endMs: number };
+  /**
+   * run1 Step 25: how long ago a task folder may have been created by New Task and still count as Ensemble's own
+   * ("created during this round"): the round's whole span, preparation and bookkeeping included. Defaults to
+   * `roundWindow`, which is the narrower process window.
+   */
+  readonly createdWithinWindow?: { readonly startMs: number; readonly endMs: number };
+  /** The running task's folder name and display name, for "its content names this task". */
+  readonly currentTaskNames?: readonly string[];
+}
+
+/** The creation sentinel Ensemble's New Task leaves in every task folder it makes. */
+export const CREATION_SENTINEL_FILE_NAME_V1 = ".ensemble-creation-sentinel-v1.json";
+
+/**
+ * run1 Step 25: a task folder Ensemble itself created through New Task. The creation sentinel is the
+ * sure sign; failing that, a creation journal and intent record for the folder (found beside it in
+ * the same `.ensemble` meta root) say the same. Any failure to read them means "not known to be
+ * Ensemble's own", never a throw.
+ */
+export async function isEnsembleCreatedTaskFolderV1(
+  taskFolderPath: string,
+  createdWithin?: { readonly startMs: number; readonly endMs: number }
+): Promise<boolean> {
+  // When a round window is given, only a folder created INSIDE it is exempt: an established task
+  // that merely has a creation sentinel keeps its normal handling (owner-edit note, containment).
+  const insideWindow = (createdAt: unknown): boolean => {
+    if (createdWithin === undefined) {
+      return true;
+    }
+    const at = typeof createdAt === "string" ? Date.parse(createdAt) : Number.NaN;
+    return Number.isFinite(at) && at >= createdWithin.startMs && at <= createdWithin.endMs;
+  };
+  try {
+    const raw = await fs.promises.readFile(path.join(taskFolderPath, CREATION_SENTINEL_FILE_NAME_V1), "utf8");
+    if (createdWithin === undefined) {
+      return true;
+    }
+    try {
+      return insideWindow((JSON.parse(raw) as { createdAt?: unknown }).createdAt);
+    } catch {
+      return false;
+    }
+  } catch {
+    // No sentinel: look for a matching creation intent.
+  }
+  try {
+    const loaded = await loadTaskCreationJournalV1(path.dirname(taskFolderPath), taskFolderPath);
+    return loaded.kind === "ok" && insideWindow(loaded.intent.createdAt);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether move advice may be offered: inside this round's process window, and naming this task. */
+function moveAdvicePermittedV1(change: ForeignTaskArtifactChangeV1, options: ContainmentOptionsV1 | undefined): boolean {
+  const window = options?.roundWindow;
+  if (window === undefined || change.content === undefined) {
+    return false;
+  }
+  if (change.fingerprint.mtimeMs < window.startMs || change.fingerprint.mtimeMs > window.endMs) {
+    return false;
+  }
+  const content = change.content;
+  return (options?.currentTaskNames ?? []).some((name) => name.length > 0 && content.includes(name));
 }
 
 /**
@@ -332,12 +418,31 @@ export async function containForeignTaskArtifactChangesV1(
 ): Promise<ForeignTaskArtifactContainmentResultV1> {
   const actions: ContainmentActionV1[] = [];
   const chatNotices: string[] = [];
-  const ignoredChanges: { change: ForeignTaskArtifactChangeV1; why: "extension-write" | "own-task-update" }[] = [];
+  const ignoredChanges: {
+    change: ForeignTaskArtifactChangeV1;
+    why: "extension-write" | "own-task-update" | "ensemble-created-task" | "already-noted";
+  }[] = [];
+  const notedEdits: { taskFolderPath: string; sha256: string }[] = [];
   const normalizedCurrent = normalizePath(currentTaskFolderPath);
+  const createdFolderCache = new Map<string, boolean>();
 
   for (const change of changes) {
     const destPath = path.join(normalizedCurrent, change.artifactName);
     const foreignPath = change.absolutePath;
+
+    // run1 Step 25: a task folder Ensemble's New Task made is Ensemble's own, whatever its files hold.
+    // Never reported, and never "move it into this task".
+    let ensembleCreated = createdFolderCache.get(change.foreignFolderPath);
+    if (ensembleCreated === undefined) {
+      ensembleCreated = options?.isEnsembleCreatedFolder
+        ? await options.isEnsembleCreatedFolder(change.foreignFolderPath)
+        : await isEnsembleCreatedTaskFolderV1(change.foreignFolderPath, options?.createdWithinWindow ?? options?.roundWindow);
+      createdFolderCache.set(change.foreignFolderPath, ensembleCreated);
+    }
+    if (ensembleCreated) {
+      ignoredChanges.push({ change, why: "ensemble-created-task" });
+      continue;
+    }
 
     // bugs4 item 8: an extension-originated write (pin, archive, rename,
     // watchdog, Tasks-pane edit), or a file whose own content names the task
@@ -366,11 +471,28 @@ export async function containForeignTaskArtifactChangesV1(
         outcome: "preserved-ambiguous",
         reason: "An existing task.md in another task's folder changed; left in place.",
       });
+      // run1 Step 25: with no round running in that task, an owner edit gets one short line, once per
+      // task and content, and the caller records it so later end lines skip it.
+      if (options?.isRoundRunningInTask?.(change.foreignFolderPath) !== true) {
+        if (options?.isEditAlreadyNoted?.(change.foreignFolderPath, change.fingerprint.sha256) === true) {
+          ignoredChanges.push({ change, why: "already-noted" });
+          continue;
+        }
+        notedEdits.push({ taskFolderPath: change.foreignFolderPath, sha256: change.fingerprint.sha256 });
+        chatNotices.push(`${path.basename(change.foreignFolderPath)} was edited outside this round; nothing needs doing.`);
+        continue;
+      }
       chatNotices.push(
         `Note: ${where}. If this round did not write it (an owner edit, an editor, another session or another task's round), nothing needs doing; this round's outcome is unaffected.`
       );
       continue;
     }
+
+    // run1 Step 25: "move it into this task" only when the change fell inside this round's process
+    // window and its content names this task. Without that evidence the note carries no advice.
+    const moveAdvice = moveAdvicePermittedV1(change, options)
+      ? ` if this round's provider wrote it, move it into '${destPath}'.`
+      : " Nothing was copied, and nothing needs doing unless you know this round wrote it.";
 
     // Check ambiguous ownership or concurrent foreign-task update
     if (options?.isConcurrentForeignUpdate) {
@@ -382,7 +504,7 @@ export async function containForeignTaskArtifactChangesV1(
         reason: "Concurrent foreign-task update detected; left in place.",
       });
       chatNotices.push(
-        `Note: ${where} while that task was active. It was left in place and no copy was made; if this round's provider wrote it, move it into '${destPath}'.`
+        `Note: ${where} while that task was active. It was left in place and no copy was made;${moveAdvice}`
       );
       continue;
     }
@@ -396,7 +518,7 @@ export async function containForeignTaskArtifactChangesV1(
         reason: "Artifact ownership was not established; left in place.",
       });
       chatNotices.push(
-        `Note: ${where}, but ownership was not established. It was left in place and no copy was made; if this round's provider wrote it, move it into '${destPath}'.`
+        `Note: ${where}, but ownership was not established. It was left in place and no copy was made;${moveAdvice}`
       );
       continue;
     }
@@ -412,7 +534,7 @@ export async function containForeignTaskArtifactChangesV1(
           reason: "Artifact content does not attribute ownership to the current task; left in place.",
         });
         chatNotices.push(
-          `Note: ${where}, and its content does not attribute it to this task, so ownership is ambiguous. It was left in place and no copy was made; if this round's provider wrote it, move it into '${destPath}'.`
+          `Note: ${where}, and its content does not attribute it to this task, so ownership is ambiguous. It was left in place and no copy was made;${moveAdvice}`
         );
         continue;
       }
@@ -482,6 +604,7 @@ export async function containForeignTaskArtifactChangesV1(
     actions,
     chatNotices,
     ignoredChanges,
+    notedEdits,
   };
 }
 

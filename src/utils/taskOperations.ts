@@ -17,6 +17,9 @@ import { inspectRoundGitInterferenceV1, withRoundGitStateObservationV1 } from ".
 import { offerRoundGitInterferenceDecisionV1 } from "./roundGitInterferenceDecisionV1";
 import { describeIndexLockSettlementV1 } from "./gitIndexLockV1";
 import { setLiveTaskOperationLookupV1, setOperationLiveByIdLookupV1 } from "./liveTaskOperationLookupV1";
+import type { ProofOfLifeV1 } from "./proofOfLifeV1";
+import type { HeldAnswerRowInfoV1 } from "./heldAnswerLifecycleV1";
+import { OwnerCancelReasonV1, recordOwnerCancelV1 } from "./ownerCancelRecordV1";
 
 const ROUND_GIT_OBSERVED_KINDS_V1 = new Set<OperationKind>([
   "draft-task", "generate-plan", "review", "apply-review", "generate-implementation",
@@ -367,6 +370,17 @@ export interface TaskOperationSnapshot {
    * entry is not a second one for the same event.
    */
   readonly reportedByCommandV1?: boolean;
+  /**
+   * run1 Step 16: evidence from the actual run for the one running row (process id, last output,
+   * last thing it provably did, process state, the settled outcome). Ephemeral like `activity`;
+   * mirrored to viewer windows so their row shows the runner's evidence.
+   */
+  readonly proofOfLifeV1?: ProofOfLifeV1;
+  /**
+   * run1 Step 30: the owner's answer held for this task, shown on the running row with Run it now / Drop it.
+   * Ephemeral, like `activity`; mirrored to viewer windows.
+   */
+  readonly heldAnswerV1?: HeldAnswerRowInfoV1;
 }
 
 /**
@@ -407,6 +421,10 @@ interface MutableOperation {
   endReasonV1?: string;
   /** See TaskOperationSnapshot.reportedByCommandV1. */
   reportedByCommandV1?: boolean;
+  /** See TaskOperationSnapshot.proofOfLifeV1. */
+  proofOfLifeV1?: ProofOfLifeV1;
+  /** See TaskOperationSnapshot.heldAnswerV1. */
+  heldAnswerV1?: HeldAnswerRowInfoV1;
   /** Set via TaskOperationHandle.settleAs; read back by runTrackedOperation before end() removes this row. */
   explicitOutcome?: { readonly state: "refused" | "failed" | "cancelled" | "interrupted"; readonly reason?: string };
   /** Who requested the cancellation — see `CancelSourceV1`. */
@@ -543,6 +561,8 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * "interrupted". Cancel is forwarded to the window that owns the work.
    */
   private mirrored = new Map<string, Map<string, MutableOperation>>();
+  /** run1 Step 30: the held owner answer per task (see `setHeldAnswerForTaskV1`). */
+  private readonly heldAnswers = new Map<string, HeldAnswerRowInfoV1>();
   private mirroredSignature = "";
   private mirroredCancel: ((operationId: string) => void) | undefined;
   private pendingChange = false;
@@ -690,6 +710,14 @@ export class TaskOperationRegistry implements vscode.Disposable {
           `TaskOperationRegistry.begin: workflow root "${spec.label}" (stage "${spec.stage}") was registered with a taskName ("${resolvedName}") that looks like a raw task-folder name — pass the result of resolveWorkflowRootTaskName(displayName, taskPath) instead.`
         );
       }
+    }
+
+    // run1 Step 24: two rounds that change code in the same workspace are refused before the second
+    // starts, never aborted mid-round. The caller says why through `otherTaskChangingCodeV1`. Children count
+    // too (owner decision 2026-11-07): an Apply Review that Fast Forward starts under its parent is a round
+    // that changes code. A child's own task is never "another task", so a task's own chain never blocks itself.
+    if (spec.kind !== undefined && CODE_CHANGING_KINDS_V1.has(spec.kind) && this.otherTaskChangingCodeV1(taskPath)) {
+      return null;
     }
 
     const id = `op-${this.operationNamespace}-${++this.operationSeq}`;
@@ -973,6 +1001,49 @@ export class TaskOperationRegistry implements vscode.Disposable {
   }
 
   /**
+   * run1 Step 16: record a running round's proof of life on the task's exclusive (root) operation,
+   * for code deep in the stack that never received the handle (mirrors `setResultTargetUriForTask`).
+   * Ephemeral display state, so the change is not persistence-relevant. False when the task has no
+   * live root operation here (a viewer window never has one for the runner's work).
+   */
+  reportProofOfLifeForTask(taskPath: string, proof: ProofOfLifeV1): boolean {
+    const key = taskKey(taskPath);
+    const exclusiveOp = [...(this.operations.get(key)?.values() ?? [])].find((op) => op.exclusive);
+    if (!exclusiveOp) {return false;}
+    exclusiveOp.proofOfLifeV1 = proof;
+    this.triggerChange(false);
+    return true;
+  }
+
+  /**
+   * run1 Step 30: the owner's answer held for a task (or `undefined` once it ran, was dropped or never was).
+   * Kept per task rather than on one operation, because a Fast Forward run replaces its rounds' operations
+   * while the answer waits. The running row reads it through {@link heldAnswerForTaskV1}.
+   */
+  setHeldAnswerForTaskV1(taskPath: string, info: HeldAnswerRowInfoV1 | undefined): void {
+    const key = taskKey(taskPath);
+    const before = this.heldAnswers.get(key);
+    if (info === undefined) {
+      if (before === undefined) {return;}
+      this.heldAnswers.delete(key);
+    } else {
+      this.heldAnswers.set(key, info);
+    }
+    this.triggerChange(false);
+  }
+
+  /** The held answer to show on a task's running row: this window's own, else the runner's mirrored one. */
+  heldAnswerForTaskV1(taskPath: string): HeldAnswerRowInfoV1 | undefined {
+    const key = taskKey(taskPath);
+    const own = this.heldAnswers.get(key);
+    if (own !== undefined) {return own;}
+    for (const op of this.mirrored.get(key)?.values() ?? []) {
+      if (op.heldAnswerV1 !== undefined) {return op.heldAnswerV1;}
+    }
+    return undefined;
+  }
+
+  /**
    * The exclusive (root) operation's cancellation token for a task, for code
    * deep in the stack that launches the actual provider process without ever
    * receiving the operation handle (runAiToFile, executeImplementationRun).
@@ -1004,6 +1075,24 @@ export class TaskOperationRegistry implements vscode.Disposable {
   }
 
   /**
+   * The root operation of a task in ANY window, for the Stop now button on a Pause: this window's own
+   * exclusive operation first, else the runner's mirrored one (its id carries the mirror prefix, so
+   * `cancelOperation` relays the cancel to the window that owns the process). Also says whether that
+   * root is a Fast Forward run, which a viewer window cannot read from its own Fast Forward state.
+   */
+  rootOperationForPauseV1(taskPath: string): { readonly id: string; readonly isFastForward: boolean } | undefined {
+    const key = taskKey(taskPath);
+    for (const keyMap of [this.operations.get(key), this.mirrored.get(key)]) {
+      const roots = [...(keyMap?.values() ?? [])].filter((op) => op.parentId === undefined);
+      const root = roots.find((op) => op.exclusive) ?? roots[0];
+      if (root) {
+        return { id: root.id, isFastForward: root.kind === "fast-forward" };
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * Request cancellation of an operation and all of its running descendants
    * (children first, per C1's cascade rule). Returns true when at least one
    * cancellable operation received the request. The operations stay
@@ -1011,7 +1100,7 @@ export class TaskOperationRegistry implements vscode.Disposable {
    * observe the token and call `end()` — cancellation is a request, not a
    * removal.
    */
-  cancelOperation(id: string, source: CancelSourceV1 = "unknown"): boolean {
+  cancelOperation(id: string, source: CancelSourceV1 = "unknown", ownerReason: OwnerCancelReasonV1 = "owner"): boolean {
     if (this.isMirroredOperation(id)) {
       for (const keyMap of this.mirrored.values()) {
         const op = keyMap.get(id);
@@ -1024,11 +1113,15 @@ export class TaskOperationRegistry implements vscode.Disposable {
       }
       return false;
     }
-    for (const keyMap of this.operations.values()) {
+    for (const [operationsKey, keyMap] of this.operations) {
       const op = keyMap.get(id);
       if (op) {
         const requested = this.cancelSubtree(keyMap, op, source);
         if (requested) {
+          // run1 Step 28: an owner's click is remembered, so a held answer does not run over it.
+          if (source !== "unknown") {
+            recordOwnerCancelV1(operationsKey, ownerReason);
+          }
           this.triggerChange(true);
           return true;
         }
@@ -1355,6 +1448,29 @@ export class TaskOperationRegistry implements vscode.Disposable {
     return false;
   }
 
+  /**
+   * run1 Step 24: another task in the same workspace (a sibling folder under the same `.ensemble`) that is
+   * running a round which changes code, in this window or the runner's. Operations of this task never count;
+   * its own admission rules cover them.
+   */
+  otherTaskChangingCodeV1(taskPath: string): { readonly taskName: string; readonly label: string } | undefined {
+    const key = taskKey(taskPath);
+    const tasksRoot = path.dirname(key);
+    for (const keyMaps of [this.operations, this.mirrored]) {
+      for (const [otherKey, keyMap] of keyMaps) {
+        if (otherKey === key || path.dirname(otherKey) !== tasksRoot) {
+          continue;
+        }
+        for (const op of keyMap.values()) {
+          if (op.state === "running" && op.kind !== undefined && CODE_CHANGING_KINDS_V1.has(op.kind)) {
+            return { taskName: op.taskName, label: op.label };
+          }
+        }
+      }
+    }
+    return undefined;
+  }
+
   busyLabel(taskPath: string): string | undefined {
     const ops = this.getTaskOperations(taskPath);
     // A refusal is usually the exclusive lock, but a conflict-key refusal can
@@ -1382,6 +1498,14 @@ export class TaskOperationRegistry implements vscode.Disposable {
  * (review, 2026-09-18).
  */
 export const FORCE_END_AFTER_IGNORED_CANCEL_MS_V1 = 60 * 1000;
+
+/** run1 Step 24: the operation kinds that change code in the workspace; at most one runs per workspace. */
+const CODE_CHANGING_KINDS_V1: ReadonlySet<OperationKind> = new Set<OperationKind>(["run-implementation", "apply-review"]);
+
+/** The refusal sentence for a second code-changing round (run1 Step 24). */
+export function describeOtherTaskChangingCodeV1(holder: { readonly taskName: string }): string {
+  return `${holder.taskName} is changing code in this workspace; start this when it ends.`;
+}
 
 /** Namespace for operations mirrored from another window (see `setMirroredOperations`). */
 export const MIRRORED_OPERATION_ID_PREFIX = "runner:";
@@ -1921,6 +2045,12 @@ async function showTaskBusyWarningInContext(taskPath: string): Promise<void> {
     NotificationRouter.showInformation(
       `The runner is running "${mirroredHolder.label}" for this task. Stop it from the Notifications view (or wait for it to finish), then try again.`
     );
+    return;
+  }
+  // run1 Step 24: nothing is running for THIS task, so the refusal came from another task changing code.
+  const otherTaskHolder = taskOperations.busyLabel(taskPath) === undefined ? taskOperations.otherTaskChangingCodeV1(taskPath) : undefined;
+  if (otherTaskHolder) {
+    NotificationRouter.showInformation(describeOtherTaskChangingCodeV1(otherTaskHolder));
     return;
   }
   const label = taskOperations.busyLabel(taskPath) ?? "An operation";

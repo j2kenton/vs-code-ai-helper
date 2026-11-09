@@ -7,6 +7,7 @@ import {
   captureForeignTaskArtifactSnapshotV1,
   containForeignTaskArtifactChangesV1,
   detectForeignTaskArtifactChangesV1,
+  isEnsembleCreatedTaskFolderV1,
   discoverTaskFoldersFromRootPathsV1,
   sanitizeAuthoritativePromptContextV1,
   sanitizeImplementationReviewContentV1,
@@ -209,5 +210,154 @@ void describe("foreign task artifact containment (Step 11 / Finding 3)", () => {
     assert.ok(!filtered.includes(`${legacyTask}/round-progress.md`));
     fs.rmSync(externalRoot, { recursive: true, force: true });
     fs.rmSync(legacyRoot, { recursive: true, force: true });
+  });
+});
+
+void describe("run1 Step 25: Ensemble's own new tasks, an owner edit said once, move advice only with evidence", () => {
+  let root: string;
+  let running: string;
+
+  before(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "foreign-new-task-"));
+    running = path.join(root, ".ensemble", "2026-11-02_task_1");
+    fs.mkdirSync(running, { recursive: true });
+    fs.writeFileSync(path.join(running, "plan-final.md"), "# running task", "utf8");
+  });
+
+  after(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  void it("task folders made by New Task during a round (creation sentinel) produce no note and no move advice", async () => {
+    const snapshot = await captureForeignTaskArtifactSnapshotV1(running, []);
+    const made: string[] = [];
+    for (const name of ["2026-11-05_task_1", "2026-11-05_task_2", "2026-11-05_task_3", "2026-11-05_task_4"]) {
+      const folder = path.join(root, ".ensemble", name);
+      fs.mkdirSync(folder, { recursive: true });
+      fs.writeFileSync(path.join(folder, ".ensemble-creation-sentinel-v1.json"), "{}", "utf8");
+      fs.writeFileSync(path.join(folder, "task.md"), "# a brand new task\n", "utf8");
+      made.push(folder);
+    }
+    const changes = await detectForeignTaskArtifactChangesV1(snapshot, made);
+    assert.ok(changes.length >= 4);
+    const result = await containForeignTaskArtifactChangesV1(changes, running);
+    assert.deepEqual(result.chatNotices, []);
+    assert.deepEqual(result.actions, []);
+    assert.ok(result.ignoredChanges?.every((ignored) => ignored.why === "ensemble-created-task"));
+  });
+
+  void it("only a folder created inside the round's window is exempt: an established task with a sentinel keeps normal handling", async () => {
+    const startMs = Date.parse("2026-11-05T05:55:00Z");
+    const endMs = Date.parse("2026-11-05T06:01:00Z");
+    const window = { startMs, endMs };
+    const established = path.join(root, ".ensemble", "2026-10-01_task_2");
+    const fresh = path.join(root, ".ensemble", "2026-11-05_task_3");
+    for (const [folder, createdAt] of [
+      [established, "2026-10-01T08:00:00Z"],
+      [fresh, "2026-11-05T05:58:19Z"],
+    ] as const) {
+      fs.mkdirSync(folder, { recursive: true });
+      fs.writeFileSync(
+        path.join(folder, ".ensemble-creation-sentinel-v1.json"),
+        JSON.stringify({ schemaVersion: 1, createdAt }),
+        "utf8"
+      );
+    }
+    assert.equal(await isEnsembleCreatedTaskFolderV1(fresh, window), true);
+    assert.equal(await isEnsembleCreatedTaskFolderV1(established, window), false);
+    // A sentinel with no readable creation time is not proof of creation inside the window.
+    fs.writeFileSync(path.join(established, ".ensemble-creation-sentinel-v1.json"), "{}", "utf8");
+    assert.equal(await isEnsembleCreatedTaskFolderV1(established, window), false);
+
+    // The owner edits the established task's task.md during the round: the once-per-content note appears.
+    fs.writeFileSync(path.join(established, "task.md"), "# before\n", "utf8");
+    const snapshot = await captureForeignTaskArtifactSnapshotV1(running, [established]);
+    fs.writeFileSync(path.join(established, "task.md"), "# the owner's edit\n", "utf8");
+    const changes = await detectForeignTaskArtifactChangesV1(snapshot, [established]);
+    const result = await containForeignTaskArtifactChangesV1(changes, running, {
+      roundWindow: window,
+      isRoundRunningInTask: () => false,
+    });
+    assert.deepEqual(result.chatNotices, ["2026-10-01_task_2 was edited outside this round; nothing needs doing."]);
+  });
+
+  void it("a folder New Task made during the round's preparation is still Ensemble's own, though outside the narrower process window", async () => {
+    const processWindow = { startMs: Date.parse("2026-11-05T06:00:00Z"), endMs: Date.parse("2026-11-05T06:10:00Z") };
+    const wholeRound = { startMs: Date.parse("2026-11-05T05:55:00Z"), endMs: Date.parse("2026-11-05T06:12:00Z") };
+    const early = path.join(root, ".ensemble", "2026-11-05_task_7");
+    const snapshot = await captureForeignTaskArtifactSnapshotV1(running, []);
+    fs.mkdirSync(early, { recursive: true });
+    fs.writeFileSync(
+      path.join(early, ".ensemble-creation-sentinel-v1.json"),
+      JSON.stringify({ schemaVersion: 1, createdAt: "2026-11-05T05:58:19Z" }),
+      "utf8"
+    );
+    fs.writeFileSync(path.join(early, "task.md"), "# a brand new task\n", "utf8");
+    const changes = await detectForeignTaskArtifactChangesV1(snapshot, [early]);
+    const result = await containForeignTaskArtifactChangesV1(changes, running, {
+      roundWindow: processWindow,
+      createdWithinWindow: wholeRound,
+      isRoundRunningInTask: () => false,
+    });
+    assert.deepEqual(result.chatNotices, []);
+    assert.deepEqual(result.actions, []);
+    // With only the narrower window it would not be recognised, which is why the whole-round span is passed.
+    assert.equal(await isEnsembleCreatedTaskFolderV1(early, processWindow), false);
+    assert.equal(await isEnsembleCreatedTaskFolderV1(early, wholeRound), true);
+  });
+
+  void it("an owner edit of another task's task.md gets one short line, once per task and content", async () => {
+    const other = path.join(root, ".ensemble", "2026-11-03_task_9");
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(other, "task.md"), "# before\n", "utf8");
+    const snapshot = await captureForeignTaskArtifactSnapshotV1(running, [other]);
+    fs.writeFileSync(path.join(other, "task.md"), "# after the owner edited it\n", "utf8");
+    const changes = await detectForeignTaskArtifactChangesV1(snapshot, [other]);
+
+    const noted = new Set<string>();
+    const options = {
+      isRoundRunningInTask: () => false,
+      isEditAlreadyNoted: (folder: string, sha: string) => noted.has(`${folder}:${sha}`),
+    };
+    const first = await containForeignTaskArtifactChangesV1(changes, running, options);
+    assert.deepEqual(first.chatNotices, ["2026-11-03_task_9 was edited outside this round; nothing needs doing."]);
+    for (const edit of first.notedEdits ?? []) noted.add(`${edit.taskFolderPath}:${edit.sha256}`);
+
+    const second = await containForeignTaskArtifactChangesV1(changes, running, options);
+    assert.deepEqual(second.chatNotices, []);
+    assert.equal(second.ignoredChanges?.[0]?.why, "already-noted");
+  });
+
+  void it("move advice appears only for a change inside the round's process window whose content names this task", async () => {
+    const other = path.join(root, ".ensemble", "2026-11-04_task_7");
+    fs.mkdirSync(other, { recursive: true });
+    const snapshot = await captureForeignTaskArtifactSnapshotV1(running, [other]);
+    fs.writeFileSync(path.join(other, "plan-final.md"), "mentions 2026-11-02_task_1 here", "utf8");
+    const changes = await detectForeignTaskArtifactChangesV1(snapshot, [other]);
+    const mtime = changes[0]!.fingerprint.mtimeMs;
+
+    const noEvidence = await containForeignTaskArtifactChangesV1(changes, running, { isEnsembleCreatedFolder: () => false });
+    assert.ok(noEvidence.chatNotices.length === 1 && !/move it into/.test(noEvidence.chatNotices[0]!));
+
+    const outsideWindow = await containForeignTaskArtifactChangesV1(changes, running, {
+      isEnsembleCreatedFolder: () => false,
+      roundWindow: { startMs: mtime - 10_000, endMs: mtime - 5_000 },
+      currentTaskNames: ["2026-11-02_task_1"],
+    });
+    assert.ok(!/move it into/.test(outsideWindow.chatNotices[0]!));
+
+    const notNamed = await containForeignTaskArtifactChangesV1(changes, running, {
+      isEnsembleCreatedFolder: () => false,
+      roundWindow: { startMs: mtime - 1_000, endMs: mtime + 1_000 },
+      currentTaskNames: ["some other task"],
+    });
+    assert.ok(!/move it into/.test(notNamed.chatNotices[0]!));
+
+    const evidence = await containForeignTaskArtifactChangesV1(changes, running, {
+      isEnsembleCreatedFolder: () => false,
+      roundWindow: { startMs: mtime - 1_000, endMs: mtime + 1_000 },
+      currentTaskNames: ["2026-11-02_task_1"],
+    });
+    assert.match(evidence.chatNotices[0]!, /move it into/);
   });
 });

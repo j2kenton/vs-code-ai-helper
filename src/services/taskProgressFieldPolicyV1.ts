@@ -143,6 +143,18 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve exactly.",
     reopen: "Preserve exactly — same reasoning as nextStage.",
   },
+  notedForeignEdits: {
+    migration: "Validate a bounded array of non-empty strings; absent on new tasks and on any record predating this field.",
+    nextStage: "Preserve exactly — an edit already said once for a task and content stays said, whatever stage the task is on.",
+    markTaskDone: "Preserve exactly.",
+    reopen: "Preserve exactly.",
+  },
+  ownerPausedAt: {
+    migration: "Validate an ISO time string; absent on new tasks and on any record predating this field.",
+    nextStage: "Preserve exactly — a stage transition is not a resume.",
+    markTaskDone: "Preserve exactly; every reader checks the task is still paused, and any status change away from paused retires it.",
+    reopen: "Preserve exactly; same reasoning as markTaskDone.",
+  },
   nameIsDefault: {
     migration: "Validate exact boolean/current optionality; derive during creation.",
     nextStage: "Preserve.",
@@ -629,6 +641,8 @@ export function applyNextStagePolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
+    notedForeignEdits: progress.notedForeignEdits,
+    ownerPausedAt: progress.ownerPausedAt,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
@@ -729,6 +743,8 @@ export function applyMarkTaskDonePolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
+    notedForeignEdits: progress.notedForeignEdits,
+    ownerPausedAt: progress.ownerPausedAt,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: input.now,
@@ -877,6 +893,8 @@ export function applyReopenPolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
+    notedForeignEdits: progress.notedForeignEdits,
+    ownerPausedAt: progress.ownerPausedAt,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
@@ -1022,6 +1040,8 @@ export function applyPlanRevisionPolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
+    notedForeignEdits: progress.notedForeignEdits,
+    ownerPausedAt: progress.ownerPausedAt,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,

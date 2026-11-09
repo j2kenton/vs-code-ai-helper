@@ -744,6 +744,19 @@ export interface TaskProgress {
    * keep counting up across visits, not restart at each one.
    */
   stageReviewPasses?: Partial<Record<TaskStage, number>>;
+  /**
+   * run1 Step 25 (additive): other tasks' `task.md` edits already said once on one of THIS task's round
+   * end lines, each as `<task folder name>:<sha256 of the content>`. Later end lines skip them, so an
+   * owner edit is noted once per task and content, across reloads. Bounded to the latest 100.
+   */
+  notedForeignEdits?: string[];
+  /**
+   * run1 Step 31 (additive): when the OWNER paused the task (ISO time). Written by Pause in whichever
+   * window took the click, so the runner that owns a Fast Forward run can say "stopped because you
+   * paused the task" even when the click came from a viewer window. Retired by any move away from
+   * `paused`; an escalation's own pause never sets it.
+   */
+  ownerPausedAt?: string;
 }
 
 /**
@@ -1543,6 +1556,10 @@ export interface ProgressWatchEndingV1 {
   readonly model?: string;
   /** ISO instant a quota failure said it resets, when the failure text carried one. */
   readonly quotaResetAt?: string;
+  /** run1 Step 15: the cause the round's one settlement recorded (a `RoundStopKindV1`), when it recorded one. */
+  readonly stopCause?: string;
+  /** run1 Step 15: how many files the round's own stream shows it changed (never files it could not prove). */
+  readonly attributedFileCount?: number;
 }
 
 /** `TaskProgress.progressWatch` (review1 Step 23). */
@@ -1692,6 +1709,20 @@ export interface RoundLedgerOutcomeV1 {
    * reconstruction subtracts them.
    */
   unattributedFiles?: readonly string[];
+  /**
+   * run1 Step 11: files the round's own stream named as edited, and files that changed in the
+   * workspace while it ran WITHOUT proof they were this round's (another window, a formatter, a
+   * command's output). Kept apart so the row never calls an unproven change the round's own.
+   */
+  attributedFiles?: readonly string[];
+  observedFiles?: readonly string[];
+  /** run1 Step 25: when the round's model process ran (ISO), the window other windows' changes are judged against. */
+  processStartedAt?: string;
+  processEndedAt?: string;
+  /** run1 Step 8: the cause the runner's single settlement recorded (a `RoundStopKindV1`). */
+  stopCause?: string;
+  /** run1 Step 8: an exhausted provider chain's per-candidate causes, for each candidate invoked. */
+  candidateStopCauses?: readonly string[];
   /** A review round's score out of 10, when this row is a review. */
   score?: number;
   /** A review round's blocker count actually raised by the reviewer
@@ -1850,6 +1881,11 @@ export interface RoundLedgerEntryV1 {
    * existed) the record cannot say either way.
    */
   fastForwardStampedV1?: true;
+  /**
+   * run1 Step 26: set when the round was started by carrying out a held owner answer; the id the answer's
+   * record wrote before it dispatched. Activation uses it to tell that a dispatch ran.
+   */
+  heldDispatchId?: string;
 }
 
 /** `RoundLedgerEntryV1.checklistRevisionAdopted` — see that field's own doc

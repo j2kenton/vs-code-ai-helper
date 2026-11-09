@@ -12,6 +12,12 @@ import * as path from "node:path";
 import { describe, it } from "node:test";
 import * as vscode from "vscode";
 import { startNewTask } from "../commands/startNewTask";
+import {
+  captureForeignTaskArtifactSnapshotV1,
+  containForeignTaskArtifactChangesV1,
+  CREATION_SENTINEL_FILE_NAME_V1,
+  detectForeignTaskArtifactChangesV1,
+} from "../utils/foreignTaskArtifactContainmentV1";
 import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { TaskProgress } from "../types/taskProgress";
@@ -452,4 +458,45 @@ void describe("startNewTask — legacy `creating` footprints are never auto-prom
       }
     }
   );
+});
+
+void describe("startNewTask during another task's round (run1 Step 25)", () => {
+  void it("tasks made by the real New Task while a round runs are not reported and never get 'move it into this task' advice", async () => {
+    const harness = installHarness();
+    try {
+      const runningTaskPath = path.join(harness.metaFolderPath, "2026-11-02_task_1");
+      fs.mkdirSync(runningTaskPath, { recursive: true });
+      const roundStartMs = Date.now() - 1000;
+      const snapshot = await captureForeignTaskArtifactSnapshotV1(runningTaskPath, []);
+      const created: string[] = [];
+      for (let index = 0; index < 2; index += 1) {
+        const folderName = await startNewTask(
+          harness.inventory,
+          vscode.Uri.file(harness.workspaceRoot),
+          harness.currentTaskStore
+        );
+        assert.ok(folderName);
+        created.push(path.join(harness.metaFolderPath, folderName));
+      }
+      const changes = await detectForeignTaskArtifactChangesV1(snapshot, created);
+      assert.ok(changes.length > 0, "the real New Task wrote task artifacts the detector sees");
+      assert.ok(
+        fs.existsSync(path.join(created[0]!, CREATION_SENTINEL_FILE_NAME_V1)),
+        "the real New Task leaves its creation sentinel"
+      );
+      const result = await containForeignTaskArtifactChangesV1(changes, runningTaskPath, {
+        roundWindow: { startMs: roundStartMs, endMs: Date.now() + 60_000 },
+        currentTaskNames: ["2026-11-02_task_1", "run1"],
+      });
+      assert.deepEqual(result.actions, [], "nothing is moved into the running task");
+      assert.deepEqual(result.chatNotices, [], "the end line carries no foreign-folder note");
+      assert.ok((result.ignoredChanges ?? []).length > 0);
+      assert.ok((result.ignoredChanges ?? []).every((entry) => entry.why === "ensemble-created-task"));
+      for (const folder of created) {
+        assert.ok(fs.existsSync(path.join(folder, "task.md")), "the new task is untouched");
+      }
+    } finally {
+      harness.restore();
+    }
+  });
 });

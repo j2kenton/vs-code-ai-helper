@@ -133,7 +133,8 @@ void describe("describeMidRoundOutcomeV1", () => {
       failureKind: "generic",
       dirtyTree: false,
     });
-    assert.match(text, /Cline CLI hit generic failure/);
+    assert.match(text, /^Cline CLI failed \(Unexpected tool-call format\)/);
+    assert.doesNotMatch(text.split(". ")[0] ?? "", /usage limit|quota/i);
     assert.match(text, /Unexpected tool-call format/);
     assert.match(text, /does not automatically retry this kind of failure against a backup model/);
     assert.doesNotMatch(text, /no backup model is configured/);
@@ -170,7 +171,7 @@ void describe("describeMidRoundOutcomeV1", () => {
       kind: "noBackupConfigured",
       failureKind: "temporarily-unavailable",
     });
-    assert.match(text, /Codex hit temporarily-unavailable failure/);
+    assert.match(text, /Codex reported an error: it was temporarily unavailable/);
     assert.match(text, /no backup model is configured/);
     assert.match(text, /no automatic fallback was attempted/);
   });
@@ -180,7 +181,7 @@ void describe("describeMidRoundOutcomeV1", () => {
       kind: "neverSwitchConfigured",
       failureKind: "quota",
     });
-    assert.match(text, /Codex hit quota failure/);
+    assert.match(text, /Codex hit a quota or rate limit/);
     assert.match(text, /Never switch/);
     assert.doesNotMatch(text, /no backup model is configured/);
   });
@@ -190,7 +191,7 @@ void describe("describeMidRoundOutcomeV1", () => {
       kind: "treeStateUnknown",
       failureKind: "quota",
     });
-    assert.match(text, /Gemini CLI hit quota failure/);
+    assert.match(text, /Gemini CLI hit a quota or rate limit/);
     assert.match(text, /working tree state unknown/);
     assert.match(text, /dirty-vs-clean tree could not be confirmed/);
   });
@@ -232,8 +233,32 @@ void describe("describeMidRoundOutcomeV1", () => {
       backups: [{ label: "Copilot x", outcome: "held-back", reason: "unavailable: not signed in" }],
       remedyText: "Rerun this stage later, or switch the stage's model.",
     });
-    assert.match(text, /^Claude Code hit a usage limit\. Backup Copilot x was held back: unavailable: not signed in\./);
+    // run1 Step 5: no limit text from the provider, so the headline never says "usage limit".
+    assert.match(text, /^Claude Code failed\. Backup Copilot x was held back: unavailable: not signed in\./);
+    assert.doesNotMatch(text, /usage limit/);
     assert.match(text, /switch the stage's model\.$/);
+  });
+
+  void it("run1 Step 5: a provider time cap and a real usage limit are told apart in the headline", () => {
+    const backups = [{ label: "Copilot x", outcome: "held-back" as const, reason: "unavailable: not signed in" }];
+    const timeCap = describeMidRoundOutcomeV1(
+      "Antigravity CLI",
+      "Antigravity CLI produced no output. [agy] print timeout after 55m0s with turn in progress; returning partial output.",
+      { kind: "backupsExhausted", cause: { kind: "providerTimeCap" }, backups, remedyText: "Run it again." }
+    );
+    assert.match(timeCap, /^Antigravity CLI ended its turn at its own time cap for a single turn/);
+    assert.doesNotMatch(timeCap, /usage limit/);
+    const limit = describeMidRoundOutcomeV1(
+      "Antigravity CLI",
+      "429 Individual quota reached. Resets in 1h13m30s.",
+      {
+        kind: "backupsExhausted",
+        cause: { kind: "providerUsageLimit", detail: "429 Individual quota reached." },
+        backups,
+        remedyText: "Run it again.",
+      }
+    );
+    assert.match(limit, /^Antigravity CLI hit a usage limit: 429 Individual quota reached/);
   });
 
   void it("RC4 item 1: a withheld dirty-tree message names the held-back backup", () => {

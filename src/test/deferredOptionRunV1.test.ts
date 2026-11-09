@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 import {
   armDeferredOptionRunV1,
   cancelDeferredOptionRunV1,
+  createDeferredRunRegistryV1,
   describeDeferredOptionHeldV1,
   describeDeferredOptionOutcomeV1,
   isDeferredOptionRunArmedV1,
@@ -80,6 +81,21 @@ void describe("armDeferredOptionRunV1 (bugs4 item 26)", () => {
     assert.equal(armDeferredOptionRunV1(h.input), false);
     cancelDeferredOptionRunV1(h.input.key);
     assert.equal(isDeferredOptionRunArmedV1(h.input.key), false);
+  });
+
+  void it("two windows each have their own table: the same answer is armed in both, and cancelling one leaves the other", () => {
+    const windowA = createDeferredRunRegistryV1();
+    const windowB = createDeferredRunRegistryV1();
+    const a = harness();
+    const b = harness();
+    const key = `shared-${Math.random()}`;
+    assert.equal(armDeferredOptionRunV1({ ...a.input, key, registry: windowA }), true);
+    assert.equal(armDeferredOptionRunV1({ ...b.input, key, registry: windowB }), true, "not blocked by the other window's waiter");
+    assert.equal(armDeferredOptionRunV1({ ...a.input, key, registry: windowA }), false, "within one window it is still one waiter");
+    cancelDeferredOptionRunV1(key, windowA);
+    assert.equal(isDeferredOptionRunArmedV1(key, windowA), false);
+    assert.equal(isDeferredOptionRunArmedV1(key, windowB), true);
+    cancelDeferredOptionRunV1(key, windowB);
   });
 
   void it("an effect that cannot be carried out is reported with its reason", async () => {

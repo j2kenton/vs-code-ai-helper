@@ -389,7 +389,10 @@ void describe("runReviewForFolder (impl-high-review) — real completion-check a
       // `close()` correctly hands control back rather than leaving a stale
       // check label in place or racing the stage's own transition.
       const lastCheckIdx = checkLabelIndices[checkLabelIndices.length - 1]!.index;
-      const runningIdx = deduped.indexOf("running", lastCheckIdx);
+      // run1 Step 19: that report is the where-are-we line ("...: review; then Apply Review if it finds fixes...").
+      const runningIdx = deduped.findIndex(
+        (label, index) => index > lastCheckIdx && /: review; then Apply Review if it finds fixes, or the next stage$/.test(label ?? "")
+      );
       assert.ok(runningIdx > lastCheckIdx, "the review's own 'running' report must follow the last completion-check label");
 
       assert.deepEqual(

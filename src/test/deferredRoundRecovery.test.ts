@@ -4649,7 +4649,7 @@ void describe("durable recovery transition (implRecovery, end to end)", () => {
       assert.match(args?.implementationTypeCheckErrorsV1 ?? "", /src\/rejected\.ts\(1,1\).*TS2304/);
     }
     const summary = fs.readFileSync(path.join(folderPath, "impl-summary.md"), "utf8");
-    assert.match(summary, /continuation budget is exhausted/);
+    assert.match(summary, /Ensemble tried 3 times by itself to finish this round and has stopped trying/);
   });
 
   void it("filesChangedUnknown is recorded honestly on the record instead of an empty quarantine list", async () => {

@@ -962,3 +962,52 @@ void describe("improveReviewScore — plan progress", () => {
     });
   });
 });
+
+void describe("run1 Step 32: a clean review never starts a polish Apply Review on plan-review stages", () => {
+  const CLEAN_PLAN_REVIEW: ReviewRoundOutcome = {
+    score: 8,
+    taskFixableCount: 0,
+    zeroFixableEvidence: true,
+    // Plan items that are open mean nothing to a plan review: nothing is built yet.
+    progress: { complete: 0, total: 10 },
+  };
+
+  void it("a clean plan review takes the clean-review path at the first clean round, with no Apply Review", async () => {
+    let applies = 0;
+    const result = await improveReviewScore({
+      context: fakeContext(),
+      stage: "plan-high-review",
+      baselineScore: 8,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(CLEAN_PLAN_REVIEW),
+      preLoopEvidence: { zeroFixableEvidence: true, planIncomplete: true },
+      cleanReviewNeverApplies: true,
+      cleanReviewIgnoresPlanItems: true,
+      maxAttempts: 5,
+    });
+    assert.strictEqual(applies, 0);
+    assert.strictEqual(result.zeroFixableSuccess, true);
+    assert.strictEqual(result.held?.kind, "clean-review");
+  });
+
+  void it("without the flag, a clean review whose plan counter still shows open items is a build mandate (unchanged for implementation stages)", async () => {
+    let applies = 0;
+    await improveReviewScore({
+      context: fakeContext(),
+      stage: "impl-high-review",
+      baselineScore: 8,
+      apply: () => {
+        applies += 1;
+        return Promise.resolve();
+      },
+      review: () => Promise.resolve(CLEAN_PLAN_REVIEW),
+      preLoopEvidence: { zeroFixableEvidence: true, planIncomplete: true },
+      cleanReviewNeverApplies: true,
+      maxAttempts: 1,
+    });
+    assert.strictEqual(applies, 1);
+  });
+});

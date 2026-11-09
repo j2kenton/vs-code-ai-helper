@@ -8,6 +8,8 @@ import { IncompleteTask } from "../types/incompleteTask";
 
 import { NotificationRouter } from "../utils/notificationRouter";
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
+import { isFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
+import { recordOwnerPauseV1 } from "../utils/ownerPauseRecordV1";
 import { runTrackedOperation, taskOperations } from "../utils/taskOperations";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 
@@ -158,7 +160,9 @@ export async function pauseTask(
       },
       async () => {
         const patched = await patchTaskProgressStrictV1(taskUri, (current) => {
-          const next = updateTaskStatus(current, "paused");
+          // The owner's pause is recorded on disk, so the runner that owns a Fast Forward run sees it
+          // even when this click came from a viewer window.
+          const next = { ...updateTaskStatus(current, "paused"), ownerPausedAt: new Date().toISOString() };
           return next.implRecovery
             ? {
                 ...next,
@@ -176,14 +180,41 @@ export async function pauseTask(
         return patched;
       }
     );
+    recordOwnerPauseV1(resolvedTask.taskFolderPath);
+    // run1 Step 31: the same notification offers "Stop now", which is an ordinary owner Cancel of the
+    // running round (the existing cancel command, so Pause and Cancel keep their one meaning).
+    // A viewer window pressing Pause sees the runner's round only as a mirrored operation, so the
+    // identity, and whether it is Fast Forward, come from the registry's local-or-mirrored root.
+    const rootOperation = roundRunning ? taskOperations.rootOperationForPauseV1(resolvedTask.taskFolderPath) : undefined;
+    const stopNow =
+      rootOperation !== undefined
+        ? {
+            command: "vs-code-ai-helper.cancelOperation",
+            title: "Stop now (cancel the round)",
+            args: [{ id: rootOperation.id }],
+          }
+        : undefined;
+    const fastForwardRunning =
+      roundRunning &&
+      (isFastForwardRunActiveV1(resolvedTask.taskFolderPath) || rootOperation?.isFastForward === true);
     if (paused?.implRecovery?.ownerHold !== undefined) {
       NotificationRouter.showInformation(
         `${taskLabel} is paused. Its owed implementation report is held: nothing restarts it until you choose Run Implementation.` +
-          (roundRunning ? " The round already running is not interrupted; cancel it to stop it now." : "")
+          (roundRunning ? " The round already running is not interrupted; cancel it to stop it now." : ""),
+        undefined,
+        undefined,
+        undefined,
+        stopNow
       );
     } else if (roundRunning) {
       NotificationRouter.showInformation(
-        `${taskLabel} is paused. The round already running is not interrupted and nothing new will start; cancel it to stop it now.`
+        fastForwardRunning
+          ? `${taskLabel} is paused. The running round finishes first, then Fast Forward stops.`
+          : `${taskLabel} is paused. The round already running is not interrupted and nothing new will start; cancel it to stop it now.`,
+        undefined,
+        undefined,
+        undefined,
+        stopNow
       );
     }
   } catch (error) {

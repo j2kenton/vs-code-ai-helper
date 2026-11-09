@@ -36,9 +36,11 @@ void describe("Claude Code report selection (bugs4 item 23)", () => {
     assert.equal(extractClaudeCliFinalOutput(stdout), SUMMARY);
   });
 
-  void it("takes the last message when it is itself the complete summary", () => {
+  // run1 Step 7 (bugs6 item 14) replaced "the last complete summary wins": a later message that holds the
+  // whole report again is a wake-up repeat, so the first complete report is the round's report.
+  void it("keeps the first complete summary when a later message posts it again", () => {
     const stdout = [assistant(SUMMARY), assistant(`${SUMMARY}\n\nAddendum.`)].join("\n");
-    assert.ok(extractClaudeCliFinalOutput(stdout).endsWith("Addendum."));
+    assert.equal(extractClaudeCliFinalOutput(stdout), SUMMARY);
   });
 
   void it("with no complete summary anywhere, the final message still wins (cut short stays cut short)", () => {

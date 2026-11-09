@@ -62,6 +62,7 @@ import {
 } from "./fastForwardResumeSuffixV1";
 import { getFastForwardSessionIdV1, isFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
 import { getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
+import { clearOwnerPauseV1 } from "../utils/ownerPauseRecordV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -491,6 +492,8 @@ export async function resumePausedTask(
         // one write. Never overwrites an existing `scheduledRun` — e.g. a
         // quota-park's own future rerun — which is a deliberate future
         // intent, not a stand-in for "nothing is arranged yet".
+        // run1 Step 31: resuming ends the owner's pause.
+        clearOwnerPauseV1(resolvedTask.taskFolderPath);
         const activated = await activateTask(
           inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId,
           {

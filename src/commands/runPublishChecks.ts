@@ -39,9 +39,11 @@ import { safeOpenTextDocument, writeTextFile, writeTextFileIfUnchangedV1 } from 
 import {
   COMMIT_AND_PUSH_COMMAND_V1,
   publishChecksPassedHeadingV1,
+  publishNextStepFromActionsV1,
   publishNextStepOfferV1,
   publishPartOneRunningLineV1,
 } from "../utils/publishStageActionsV1";
+import { publishNextAfterChecksV1 } from "../utils/whereAreWeV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
@@ -791,7 +793,13 @@ export async function runPublishChecks(
               // bugs3 Step 12: each command is announced as it starts (chat "Progress"
               // lines and the Tasks row read the operation's activity) and recorded in
               // the durable running record as it starts and settles.
-              const checkActivity = createCompletionCheckActivityAccumulatorV1(operation, undefined, Date.now());
+              const checkActivity = createCompletionCheckActivityAccumulatorV1(
+                operation,
+                undefined,
+                Date.now(),
+                // run1 Step 19: the row says which check of how many, and what comes next.
+                publishNextAfterChecksV1(publishNextStepFromActionsV1())
+              );
               let checkOutcome: Awaited<ReturnType<typeof runChecksFailedFirstV1>>;
               try {
                 checkOutcome = await runChecksFailedFirstV1({

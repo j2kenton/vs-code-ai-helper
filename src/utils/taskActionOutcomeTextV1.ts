@@ -53,9 +53,12 @@ function providerLogSuffix(provider: TaskActionOutcomeProviderV1 | undefined): s
   return ` [${provider.providerLabel}${model ? ` (${model})` : ""}]`;
 }
 
-function unavailableCandidateReasonsV1(outcome: Extract<TaskActionOutcomeV1, { kind: "unavailable" }>): string {
+function unavailableCandidateReasonsV1(
+  outcome: Extract<TaskActionOutcomeV1, { kind: "unavailable" }>,
+  options: { readonly raw?: boolean } = {}
+): string {
   const candidates = outcome.chainExhaustion?.candidates ?? [];
-  return candidates.length > 0 ? describeChainCandidatesV1(candidates) : "";
+  return candidates.length > 0 ? describeChainCandidatesV1(candidates, options) : "";
 }
 
 /**
@@ -233,10 +236,10 @@ export function describeTaskActionOutcomeForLogV1(
     case "unavailable":
       return outcome.code === "candidatesDeferred"
         ? `Status: unavailable (${outcome.code}) — each deferred candidate: ` +
-          `${unavailableCandidateReasonsV1(outcome) || "candidate details are unavailable in this record"}. ` +
+          `${unavailableCandidateReasonsV1(outcome, { raw: true }) || "candidate details are unavailable in this record"}. ` +
           "The task is parked with the earliest known reset time rather than treated as exhausted."
-        : outcome.code === "candidatesExhausted" && unavailableCandidateReasonsV1(outcome)
-          ? `Status: unavailable (${outcome.code}) — every model failed: ${unavailableCandidateReasonsV1(outcome)}.`
+        : outcome.code === "candidatesExhausted" && unavailableCandidateReasonsV1(outcome, { raw: true })
+          ? `Status: unavailable (${outcome.code}) — every model failed: ${unavailableCandidateReasonsV1(outcome, { raw: true })}.`
           : `Status: unavailable (${outcome.code})`;
     case "recoveryRequired":
       return `Status: recovery required (${outcome.code})`;

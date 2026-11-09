@@ -181,6 +181,14 @@ import {
   DegenerateReviewBackupAdvanceDecisionV1,
 } from "../utils/degenerateReviewBackupAdvanceV1";
 import { classifyFailure, parseQuotaResetV1, isQuotaResetBeyondThresholdV1 } from "../utils/quota";
+import { describeEnsembleRetriesGaveUpV1 } from "../utils/roundStopCauseV1";
+import {
+  describeSettledFailureV1,
+  stopCauseOfFailureEvidenceV1,
+  stopCauseOfTransportEvidenceV1,
+  type SettledRoundResultV1,
+} from "../utils/settledRoundWordingV1";
+import type { RoundStopKindV1 } from "../utils/roundStopCauseV1";
 import { QuotaParkRecordV1 } from "../types/taskProgress";
 import {
   BegunImplementationRecoveryV1,
@@ -245,7 +253,9 @@ import {
 } from "../utils/reviewPartialScopeV1";
 import { postPartialScopeDecisionV1, readPartialScopeAcceptanceV1 } from "./partialScopeDecisionV1";
 import { loadRetryFailedReviewOptionFieldsV1 } from "../utils/resumeActionPlanV1";
-import { applyReviewActivityV1, stepNameV1, stepProgressLabelV1 } from "../utils/stepLabelsV1";
+import { applyReviewActivityV1, stepNameV1, stepOutcomeNameV1, stepProgressLabelV1 } from "../utils/stepLabelsV1";
+import { publishReviewWhereLineV1, reviewStageWhereLineV1, whereAreWeLineV1 } from "../utils/whereAreWeV1";
+import { wasPausedByOwnerSinceV1 } from "../utils/ownerPauseRecordV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import {
   AUTO_REVIEW_TRANSITIONS,
@@ -477,10 +487,24 @@ import {
 } from "./reconcilePlanChecklist";
 import { postHandoffChecksDecisionV1 } from "./handoffChecksV1";
 import {
+  isStateLockExhaustedErrorV1,
+  reportRoundLostToStateLockV1,
+  RetryActionV1,
+  RoundLostToStateLockDepsV1,
+  STATE_LOCK_EXHAUSTED_CAUSE_V1,
+} from "./roundLostToStateLockV1";
+import { retryWhileStateLockHeldV1 } from "../state/stateLockRetryV1";
+import type { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
+import {
   listPendingWorkflowDecisionsForTaskV1,
+  openWorkflowDecisionStoreV1,
   postWorkflowDecisionV1,
   withdrawWorkflowDecisionsByKeyV1,
 } from "../utils/workflowDecisionDispatchV1";
+import {
+  describeFastForwardYieldedToHeldAnswerV1,
+  shouldFastForwardYieldToHeldAnswerV1,
+} from "../utils/heldAnswerLifecycleV1";
 import {
   describeOversizedInputRemedyV1,
   ImplReviewLedgerRowV1,
@@ -817,6 +841,23 @@ export function describeDeclinedHandOverV1(
   return stated
     ? `the queued ${commandName} command refused to start: ${stated}`
     : `the queued ${commandName} command returned without starting a round and recorded no cause; check the run log in the task's runs folder`;
+}
+
+/**
+ * run1 Step 19: the running row's "where are we" line for a review stage's Apply Review or review:
+ * the stage, the step, the Fast Forward round when one runs, and what comes next.
+ */
+function reviewStepActivityLineV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  step: "apply-review" | "re-review"
+): string {
+  const round = getFastForwardRunStateV1(taskFolderPath)?.attemptNumber;
+  return reviewStageWhereLineV1({
+    stageName: STAGE_DISPLAY_NAMES[stage] ?? stage,
+    step,
+    ...(round !== undefined ? { round } : {}),
+  });
 }
 
 /** The manual step, naming the stage only when the action's own name does not already. */
@@ -1396,6 +1437,21 @@ export async function claimReviewAttemptWithLiveLeaseV1(
     claimed = await claimReviewAttempt(folderUri, reviewAttemptId, targetStage);
   } catch (error) {
     await clearRoundLiveV1(reviewAttemptId);
+    if (isStateLockExhaustedErrorV1(error)) {
+      // run1 Step 22: the wait for the lease ran out before the claim, so there is no ledger row to
+      // close. The owner still gets the "_Ended:" line and the Retry now card.
+      await reportRoundLostToStateLockV1(
+        {
+          taskFolderPath: folderUri.fsPath,
+          stage: targetStage,
+          stepName: stepOutcomeNameV1("review", STAGE_DISPLAY_NAMES[targetStage]),
+          rowClosed: false,
+          beforeAnyWork: true,
+          retry: { command: "vs-code-ai-helper.resumeAndRerunReview", args: [{ taskFolderPath: folderUri.fsPath }] },
+        },
+        defaultRoundLostToStateLockDepsV1()
+      );
+    }
     throw error;
   }
   if (!claimed) {
@@ -1836,6 +1892,26 @@ export function isFreshEscalationForRideThroughV1(
 }
 
 /**
+ * run1 Step 27: true when a Fast Forward run is active on the task and an answer is held for the owner. Fast
+ * Forward ends at the round boundary to run that answer, so the re-review chained after an Apply Review (a
+ * same-stage round) is not started first.
+ */
+export function skipChainedReReviewForHeldAnswerV1(
+  taskFolderPath: string,
+  store: Pick<WorkflowDecisionStoreV1, "listWithPendingDeferredAnswer"> | undefined = openWorkflowDecisionStoreV1()
+): boolean {
+  // Only inside a Fast Forward run, whose loop yields at the boundary. A hand-started round keeps its re-review.
+  if (!isFastForwardRunActiveV1(taskFolderPath)) {
+    return false;
+  }
+  return (
+    store
+      ?.listWithPendingDeferredAnswer(taskFolderPath)
+      .some((candidate) => shouldFastForwardYieldToHeldAnswerV1(candidate.deferredAnswer)) ?? false
+  );
+}
+
+/**
  * Item 13 review finding (2026-08-20): the write-time CAS that un-pauses the
  * task for a ride-through previously checked only `status === "paused"` and
  * `escalation.stage === targetStage`. Between the read that decided to ride
@@ -1850,12 +1926,14 @@ export function isFreshEscalationForRideThroughV1(
  * `isFreshEscalationForRideThroughV1`.
  */
 export function escalationIdentityStillMatchesV1(
-  current: Pick<TaskProgress, "status" | "escalation">,
+  current: Pick<TaskProgress, "status" | "escalation"> & { readonly ownerPausedAt?: string },
   inspected: TaskEscalation,
   targetStage: TaskStage
 ): boolean {
   return (
     current.status === "paused" &&
+    // run1 Step 28: the owner's own Pause, landing between the read and this write, is never overwritten.
+    current.ownerPausedAt === undefined &&
     current.escalation?.stage === targetStage &&
     current.escalation?.kind === inspected.kind &&
     current.escalation?.at === inspected.at
@@ -3243,7 +3321,7 @@ export function settleOperationFailedForRoundOutcomeV1(
   outcome: TaskActionOutcomeV1 | undefined
 ): void {
   if (op && outcome && FAILED_ROUND_OUTCOME_KINDS_V1.has(outcome.kind)) {
-    op.settleAs("failed", describeTaskActionFailureV1(outcome));
+    op.settleAs("failed", describeReviewFailureV1(outcome).reason);
   }
 }
 
@@ -3303,7 +3381,13 @@ export function settleOperationFailedForRoundOutcomeV1(
 export function createCompletionCheckActivityAccumulatorV1(
   op: TaskOperationHandle | undefined,
   stageToken: number | undefined,
-  stageElapsedOrigin?: number
+  stageElapsedOrigin?: number,
+  /**
+   * run1 Step 19: set for Publish Checks, whose row then answers "where are we" in one line: the
+   * step, which check of how many, and what comes next ("Publish: running the checks, 2 of 4; then
+   * the Publish review · pnpm run lint"). Unset, the lines are the plain counts they always were.
+   */
+  publishNext?: string
 ): {
   onCheckEvent: {
     planned(total: number): void;
@@ -3313,6 +3397,19 @@ export function createCompletionCheckActivityAccumulatorV1(
   };
   close(): void;
 } {
+  const whereLead = (): string =>
+    whereAreWeLineV1({
+      scope: "Publish",
+      step: "running the checks",
+      position: { index: Math.min(completed + 1, Math.max(planned, 1)), total: planned },
+      ...(publishNext !== undefined ? { next: publishNext } : {}),
+    });
+  const whereDone = (): string =>
+    whereAreWeLineV1({
+      scope: "Publish",
+      step: `${completed} of ${planned} checks done`,
+      ...(publishNext !== undefined ? { next: publishNext } : {}),
+    });
   let planned = 0;
   let completed = 0;
   let closed = false;
@@ -3332,9 +3429,13 @@ export function createCompletionCheckActivityAccumulatorV1(
         earliestStart = info.startedAt;
       }
     }
-    const label = active.size === 1
-      ? `${representative!.command} · ${completed}/${planned} complete`
-      : `${active.size} checks running · ${representative!.command} (+${active.size - 1}) · ${completed}/${planned} complete`;
+    const label = publishNext !== undefined
+      ? active.size === 1
+        ? `${whereLead()} · ${representative!.command}`
+        : `${whereLead()} · ${active.size} checks at once, ${representative!.command} (+${active.size - 1})`
+      : active.size === 1
+        ? `${representative!.command} · ${completed}/${planned} complete`
+        : `${active.size} checks running · ${representative!.command} (+${active.size - 1}) · ${completed}/${planned} complete`;
     op!.reportActivity(label, { stageToken, elapsedOrigin: earliestStart });
   }
 
@@ -3367,7 +3468,7 @@ export function createCompletionCheckActivityAccumulatorV1(
         if (active.size > 0) {
           renderActive();
         } else {
-          op.reportActivity(`${completed}/${planned} complete`, {
+          op.reportActivity(publishNext !== undefined ? whereDone() : `${completed}/${planned} complete`, {
             stageToken,
             elapsedOrigin: stageElapsedOrigin,
           });
@@ -3378,7 +3479,7 @@ export function createCompletionCheckActivityAccumulatorV1(
           return;
         }
         if (op) {
-          op.reportActivity(`${completed}/${planned} complete · starting next batch`, {
+          op.reportActivity(publishNext !== undefined ? `${whereDone()} · starting the next batch` : `${completed}/${planned} complete · starting next batch`, {
             stageToken,
             elapsedOrigin: stageElapsedOrigin,
           });
@@ -5082,28 +5183,57 @@ export async function closeRoundRowIfDispatchThrowsV1<T>(
       folderUri,
       roundId,
       error instanceof Error ? error.message : String(error),
-      operationId
+      operationId,
+      isStateLockExhaustedErrorV1(error)
     );
+    if (isStateLockExhaustedErrorV1(error)) {
+      lockLossAlreadyToldV1.add(error as object);
+    }
     throw error;
   }
 }
+
+/** Errors whose lost-to-the-state-lease ending was already told, so the outer boundary does not tell it twice. */
+const lockLossAlreadyToldV1 = new WeakSet<object>();
 
 /** @internal shared by the implementation dispatch and post-dispatch boundary. */
 export async function closeImplementationRoundFailureV1(
   folderUri: vscode.Uri,
   roundId: string,
   reason: string,
-  operationId?: string
+  operationId?: string,
+  /** run1 Step 22: the round was lost to a task-state lease still held after the bounded wait. */
+  lockExhausted?: boolean | { readonly stage: TaskStage; readonly retryDelaysMs?: readonly number[]; readonly deps?: RoundLostToStateLockDepsV1 }
 ): Promise<void> {
+  let rowClosed = false;
+  let alreadyTerminal = false;
   try {
-    await terminalizeRoundV1(
-      roundId,
-      "failed",
-      { rejectionReason: formatProviderErrorV1(reason, { maxChars: 300, keepInternalCodes: true }) ?? reason.slice(0, 300) },
-      { taskFolderUri: folderUri }
-    );
+    const stepName = stepOutcomeNameV1("implementation", STAGE_DISPLAY_NAMES["impl"]);
+    const rejectionReason = lockExhausted
+      ? `${stepName} stopped: ${STATE_LOCK_EXHAUSTED_CAUSE_V1}`
+      : formatProviderErrorV1(reason, { maxChars: 300, keepInternalCodes: true }) ?? reason.slice(0, 300);
+    const close = () => terminalizeRoundV1(roundId, "failed", { rejectionReason }, { taskFolderUri: folderUri });
+    const closed = await (lockExhausted
+      ? retryWhileStateLockHeldV1(close, {
+          delaysMs: (typeof lockExhausted === "object" ? lockExhausted.retryDelaysMs : undefined) ?? [5_000],
+        })
+      : close());
+    rowClosed = closed.ok;
+    alreadyTerminal = closed.ok && closed.alreadyTerminal;
   } catch {
     // Preserve the original dispatch/post-dispatch error.
+  }
+  if (lockExhausted && !alreadyTerminal) {
+    await reportRoundLostToStateLockV1(
+      {
+        taskFolderPath: folderUri.fsPath,
+        stage: typeof lockExhausted === "object" ? lockExhausted.stage : "impl",
+        stepName: stepOutcomeNameV1("implementation", STAGE_DISPLAY_NAMES["impl"]),
+        rowClosed,
+        retry: { command: "vs-code-ai-helper.runImplementationWithAI", args: [{ taskFolderPath: folderUri.fsPath }] },
+      },
+      (typeof lockExhausted === "object" ? lockExhausted.deps : undefined) ?? defaultRoundLostToStateLockDepsV1()
+    );
   }
   try {
     await releaseImplRecoveryClaimV1(folderUri, {
@@ -5116,14 +5246,268 @@ export async function closeImplementationRoundFailureV1(
   }
 }
 
+/**
+ * run1 Step 8: the plain words for a failed round, read from the cause the runner's one settlement
+ * recorded on the result. The ledger row's reason, the "_Ended:" line, the notification and the card
+ * all take their sentence from here, so they cannot disagree about what stopped the round.
+ */
+function settledFailureWordingV1(result: SettledRoundResultV1): string | undefined {
+  const resilience = getResilienceSettings();
+  return describeSettledFailureV1(result, {
+    backstopMinutes: Math.round(resilience.roundBackstopHours * 60),
+    ...(resilience.inactivityTimeoutMinutes > 0 ? { idleMinutes: resilience.inactivityTimeoutMinutes } : {}),
+  });
+}
+
+/**
+ * run1 Step 8: a failed review/text round's sentence and stop cause. A single failed outcome whose
+ * transport code names one of Ensemble's own stops (the time limit, the idle stop, the repeat stop, an
+ * unconfirmed process stop) is worded through the same settled-cause wording as an implementation
+ * round, and its cause is recorded on the ledger row. Every other outcome keeps its own sentence.
+ */
+export function describeReviewFailureV1(outcome: TaskActionOutcomeV1): {
+  readonly reason: string;
+  readonly stopCause?: RoundStopKindV1;
+  /** An exhausted chain: the cause of each candidate that was actually invoked, in ranked order. */
+  readonly candidateStopCauses?: readonly RoundStopKindV1[];
+} {
+  const text = describeTaskActionFailureV1(outcome);
+  if (outcome.kind === "unavailable" && outcome.chainExhaustion !== undefined) {
+    // run1 Step 8: an exhausted chain records the cause of every candidate that was invoked, and the
+    // last one's cause is the round's cause; skipped candidates were never run and name no cause.
+    const candidates = outcome.chainExhaustion.candidates;
+    const invoked = candidates.filter((candidate) => (candidate.attemptIds?.length ?? 0) > 0);
+    const considered = invoked.length > 0 ? invoked : candidates;
+    const candidateStopCauses = considered.map((candidate) =>
+      stopCauseOfFailureEvidenceV1(
+        candidate.reason,
+        candidate.deferredFailureKind !== undefined ? { deferredFailureKind: candidate.deferredFailureKind } : {}
+      )
+    );
+    const last = candidateStopCauses[candidateStopCauses.length - 1];
+    return {
+      reason: text,
+      ...(last !== undefined ? { stopCause: last, candidateStopCauses } : {}),
+    };
+  }
+  if (outcome.kind !== "failed") {
+    return { reason: text };
+  }
+  const evidence = `${outcome.code}${outcome.detail ? `: ${outcome.detail}` : ""}`;
+  const stopCause = stopCauseOfFailureEvidenceV1(evidence);
+  if (stopCauseOfTransportEvidenceV1(evidence) === undefined) {
+    // Not one of Ensemble's own stops: the provider's or the process's own words stay (a limit the
+    // provider named is said in the provider's words), but the cause is still recorded on the row.
+    return { reason: text, stopCause };
+  }
+  const resilience = getResilienceSettings();
+  const worded = describeSettledFailureV1(
+    {
+      status: "failed",
+      errorMessage: text,
+      stopCauseV1: stopCause,
+      ...(outcome.provider?.providerLabel ? { providerLabel: outcome.provider.providerLabel } : {}),
+    },
+    {
+      backstopMinutes: Math.round(resilience.roundBackstopHours * 60),
+      ...(resilience.inactivityTimeoutMinutes > 0 ? { idleMinutes: resilience.inactivityTimeoutMinutes } : {}),
+      nextStep: "run it again",
+    }
+  );
+  return { reason: worded ?? text, stopCause };
+}
+
+/**
+ * run1 Step 8: the ledger row's outcome for a failed review round: the plain reason plus the settled
+ * stop cause (and, for an exhausted chain, each invoked candidate's cause).
+ *
+ * @internal exported for testing
+ */
+export function reviewFailureLedgerOutcomeV1(outcome: TaskActionOutcomeV1): {
+  rejectionReason: string;
+  stopCause?: string;
+  candidateStopCauses?: readonly string[];
+} {
+  const worded = describeReviewFailureV1(outcome);
+  return {
+    rejectionReason: worded.reason,
+    ...(worded.stopCause !== undefined ? { stopCause: worded.stopCause } : {}),
+    ...(worded.candidateStopCauses !== undefined ? { candidateStopCauses: worded.candidateStopCauses } : {}),
+  };
+}
+
+/**
+ * run1 Step 13: a round that ended WITHOUT a usable report (stopped, timed out, failed or incomplete)
+ * keeps the ticks it appended to its own `round-progress.md`. Its lines go through the SAME checks as a
+ * report's ticks (`mergeChecklistProgressV1`: item text or id must name one plan item, test-dependent
+ * items need a passing report), and the items that tick are recorded with the round as claim evidence,
+ * provisional until a review verifies them, exactly as a report's ticks are. The file is removed only
+ * once its ticks are banked; when nothing could be merged it is left in place, so a stop never wipes
+ * the evidence of finished work.
+ *
+ * Returns how many items were ticked. Best-effort: nothing here may change how the round ended.
+ *
+ * @internal exported for testing
+ */
+export async function keepStoppedRoundProgressV1(
+  folderUri: vscode.Uri,
+  roundId: string,
+  preRoundChecklistText?: string
+): Promise<number> {
+  try {
+    const roundProgressUri = vscode.Uri.joinPath(folderUri, "round-progress.md");
+    const roundProgressText = await readTextIfExists(roundProgressUri);
+    if (!roundProgressText || roundProgressText.trim().length === 0) {
+      return 0;
+    }
+    const planOfRecordUri = getCanonicalImplementationUri(folderUri);
+    const plan = await readPlanOfRecordV1(folderUri);
+    let planText = plan.hasChecklist ? plan.text : undefined;
+    if (planText === undefined) {
+      return 0;
+    }
+    // A stopped round may have edited the item SET of the checklist; that is reverted as for any round.
+    if (preRoundChecklistText !== undefined && planText !== preRoundChecklistText) {
+      if (detectChecklistItemSetMutationV1(preRoundChecklistText, planText) !== undefined) {
+        await writeTextFile(planOfRecordUri, preRoundChecklistText);
+        planText = preRoundChecklistText;
+      }
+    }
+    const merged = mergeChecklistProgressV1(planText, roundProgressText);
+    if (merged.kind !== "merged") {
+      return 0;
+    }
+    const written = await writeTextFileIfUnchangedV1(planOfRecordUri, planText, merged.content);
+    if (!written) {
+      return 0;
+    }
+    const newlyChecked = listNewlyCheckedChecklistItemOccurrencesV1(planText, merged.content);
+    if (newlyChecked.length > 0) {
+      const planRevision = getPlanRevisionV1(planText);
+      const claimAt = new Date().toISOString();
+      await patchTaskProgressStrictV1(folderUri, (current) =>
+        newlyChecked.reduce(
+          (next, { text: itemText, occurrence, nested }) =>
+            recordPlanItemClaimEvidenceV1(next, {
+              planRevision,
+              itemText,
+              itemOccurrence: occurrence,
+              itemNested: nested,
+              source: "implementation",
+              at: claimAt,
+              roundId,
+              planText: merged.content,
+            }),
+          current
+        )
+      );
+      await refreshPlanItemSettlementSnapshotV1(folderUri);
+    }
+    // Lines that did not tick anything (rejected for missing evidence, or an item the plan no longer
+    // names) are kept beside the plan, never wiped with the file. The whole file is kept with them:
+    // the evidence and notes under a tick are what a later round needs to bank it.
+    const bankedTexts = newlyChecked.map((item) => item.text);
+    const hasUnbanked = roundProgressText
+      .split(/\r?\n/)
+      .some((line) => /^\s*-\s*\[x\]/i.test(line) && !bankedTexts.some((text) => line.includes(text)));
+    if (hasUnbanked) {
+      await appendUnbankedRoundProgressV1(folderUri, roundProgressText, roundId);
+    }
+    await deletePath(roundProgressUri).catch(() => undefined);
+    return newlyChecked.length;
+  } catch {
+    return 0;
+  }
+}
+
+const UNBANKED_ROUND_PROGRESS_FILE_V1 = "round-progress-unbanked.md";
+
+/**
+ * Keeps a stopped round's `round-progress.md` whole (ticks, their evidence lines, headings and
+ * verification notes) beside the plan, once per distinct content.
+ */
+async function appendUnbankedRoundProgressV1(
+  folderUri: vscode.Uri,
+  roundProgressText: string,
+  roundId: string
+): Promise<void> {
+  const uri = vscode.Uri.joinPath(folderUri, UNBANKED_ROUND_PROGRESS_FILE_V1);
+  const existing = (await readTextIfExists(uri)) ?? "";
+  const body = roundProgressText.trim();
+  if (body.length === 0 || existing.includes(body)) {
+    return;
+  }
+  const header = existing.length === 0 ? "# Progress from stopped rounds that could not be merged\n\n" : "";
+  await writeTextFile(
+    uri,
+    `${existing}${header}## Round ${roundId} (kept ${new Date().toISOString()})\n\n${body}\n\n`
+  );
+}
+
+/**
+ * run1 Step 13: what the next round's dispatch does with a `round-progress.md` an earlier stopped round
+ * left behind. Its ticks are banked first (same checks as a report's); lines that could not be banked are
+ * moved aside, never deleted, so a stop's evidence of finished work survives until a human or a later
+ * round can use it. Best-effort: never blocks dispatch.
+ *
+ * @internal exported for testing
+ */
+export async function bankLeftoverRoundProgressBeforeDispatchV1(
+  folderUri: vscode.Uri,
+  roundId: string,
+  preRoundChecklistText?: string
+): Promise<void> {
+  try {
+    await keepStoppedRoundProgressV1(folderUri, roundId, preRoundChecklistText);
+    const roundProgressUri = vscode.Uri.joinPath(folderUri, "round-progress.md");
+    const left = await readTextIfExists(roundProgressUri);
+    if (left !== undefined && left.trim().length > 0) {
+      if (left.split(/\r?\n/).some((line) => /^\s*-\s*\[x\]/i.test(line))) {
+        await appendUnbankedRoundProgressV1(folderUri, left, roundId);
+      }
+    }
+    await deletePath(roundProgressUri).catch(() => undefined);
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * run1 Steps 8 and 11: what the round's settlement recorded, for its ledger row: the stop cause, the
+ * files its own stream named, and the files observed changing while it ran (not proven to be its own).
+ */
+function roundLedgerActivityFieldsV1(result: SettledRoundResultV1): {
+  attributedFiles?: readonly string[];
+  observedFiles?: readonly string[];
+  stopCause?: string;
+  processStartedAt?: string;
+  processEndedAt?: string;
+} {
+  const processStartMs = result.activityV1?.processStartedAtMs;
+  const processEndMs = result.activityV1?.processEndedAtMs;
+  return {
+    ...(processStartMs !== undefined && processEndMs !== undefined
+      ? {
+          processStartedAt: new Date(processStartMs).toISOString(),
+          processEndedAt: new Date(processEndMs).toISOString(),
+        }
+      : {}),
+    ...(result.activityV1 && result.activityV1.attributedFiles.length > 0
+      ? { attributedFiles: [...result.activityV1.attributedFiles] }
+      : {}),
+    ...(result.activityV1 && result.activityV1.observedFiles.length > 0
+      ? { observedFiles: [...result.activityV1.observedFiles] }
+      : {}),
+    ...(result.stopCauseV1 !== undefined ? { stopCause: result.stopCauseV1 } : {}),
+  };
+}
+
 /** @internal Shared terminal write for a failed implementation/edit result. */
 export async function terminalizeFailedImplementationRoundV1(
   folderUri: vscode.Uri,
   roundId: string,
-  result: {
-    readonly errorMessage?: string;
+  result: SettledRoundResultV1 & {
     readonly filesChanged: readonly string[];
-    readonly filesChangedUnknown?: boolean;
   },
   extraAttemptIds: readonly string[] = []
 ): Promise<void> {
@@ -5131,10 +5515,11 @@ export async function terminalizeFailedImplementationRoundV1(
     roundId,
     "failed",
     {
-      rejectionReason: result.errorMessage ?? "unknown error",
+      rejectionReason: settledFailureWordingV1(result) ?? "unknown error",
       ...(result.filesChangedUnknown
         ? { filesChangedUnknown: true }
         : { filesChanged: [...result.filesChanged] }),
+      ...roundLedgerActivityFieldsV1(result),
     },
     {
       taskFolderUri: folderUri,
@@ -5153,21 +5538,104 @@ export async function terminalizeFailedImplementationRoundV1(
 export async function closeUnsettledReviewRowV1(
   folderUri: vscode.Uri,
   reviewAttemptId: string,
-  thrownReason: string | undefined
-): Promise<void> {
-  try {
-    await terminalizeRoundV1(
-      reviewAttemptId,
-      "failed",
-      {
-        rejectionReason: formatProviderErrorV1(thrownReason ?? "", { maxChars: 300, keepInternalCodes: true }) ??
-          "the review dispatch ended before an outcome was recorded",
-      },
-      { taskFolderUri: folderUri }
-    );
-  } catch {
-    // Best-effort: the original error (if any) is already propagating.
+  thrownReason: string | undefined,
+  lockExhausted?: {
+    readonly stage: TaskStage;
+    readonly stepName: string;
+    readonly retry: RetryActionV1;
+    /** Waits between the extra attempts at the close; tests pass none. */
+    readonly retryDelaysMs?: readonly number[];
+    readonly deps?: RoundLostToStateLockDepsV1;
+  },
+  /**
+   * run1 Step 23: for a failure that is not a held lease. When closing the row fails too, the "_Ended:" line
+   * is posted anyway so the round never disappears silently, and the row is left to the orphan sweep.
+   */
+  closeFailureFallback?: {
+    readonly stage: TaskStage;
+    readonly stepName: string;
+    readonly appendEndedLine?: RoundLostToStateLockDepsV1["appendEndedLine"];
   }
+): Promise<void> {
+  // run1 Steps 22 and 23: when the round was lost because another window held a task-state lease past
+  // the bounded wait, the close is tried again (the other window's write is short), the reason says so in
+  // plain words, and whatever happens the owner gets the "_Ended:" line and a card with "Retry now".
+  let rowClosed = false;
+  let closeFailed = false;
+  try {
+    const close = () =>
+      terminalizeRoundV1(
+        reviewAttemptId,
+        "failed",
+        {
+          rejectionReason: lockExhausted
+            ? `${lockExhausted.stepName} stopped: ${STATE_LOCK_EXHAUSTED_CAUSE_V1}`
+            : formatProviderErrorV1(thrownReason ?? "", { maxChars: 300, keepInternalCodes: true }) ??
+              "the review dispatch ended before an outcome was recorded",
+        },
+        { taskFolderUri: folderUri }
+      );
+    const closed = await (lockExhausted
+      ? retryWhileStateLockHeldV1(close, { delaysMs: lockExhausted.retryDelaysMs ?? [5_000] })
+      : close());
+    rowClosed = closed.ok;
+    // A row that was already terminal had its own ending recorded and told; nothing was lost here.
+    if (lockExhausted && closed.ok && closed.alreadyTerminal) {
+      return;
+    }
+    closeFailed = !closed.ok && closed.reason === "writeFailed";
+  } catch {
+    // Best-effort: the original error (if any) is already propagating. A row that could not be closed
+    // is left to the orphan sweep, and the owner is told below.
+    closeFailed = true;
+  }
+  if (closeFailed && !lockExhausted && closeFailureFallback) {
+    const reason =
+      formatProviderErrorV1(thrownReason ?? "", { maxChars: 300, keepInternalCodes: false }) ??
+      "the review ended before an outcome was recorded";
+    try {
+      await (closeFailureFallback.appendEndedLine ?? defaultRoundLostToStateLockDepsV1().appendEndedLine)(
+        folderUri.fsPath,
+        closeFailureFallback.stage,
+        `_Ended: ${closeFailureFallback.stepName} — failed — ${reason}_`
+      );
+    } catch {
+      // Nothing left to try; the thrown error still propagates to the caller.
+    }
+  }
+  if (lockExhausted) {
+    await reportRoundLostToStateLockV1(
+      {
+        taskFolderPath: folderUri.fsPath,
+        stage: lockExhausted.stage,
+        stepName: lockExhausted.stepName,
+        rowClosed,
+        retry: lockExhausted.retry,
+      },
+      lockExhausted.deps ?? defaultRoundLostToStateLockDepsV1()
+    );
+  }
+}
+
+function defaultRoundLostToStateLockDepsV1(): RoundLostToStateLockDepsV1 {
+  return {
+    appendEndedLine: async (taskFolderPath, stage, text) => {
+      await appendChatMessageV1(taskFolderPath, {
+        role: "assistant",
+        text,
+        stage,
+        at: new Date().toISOString(),
+        kind: "outcome",
+      });
+    },
+    postCard: (input, target) => postWorkflowDecisionV1(input, target),
+    notify: (message, retry, taskLabel) =>
+      NotificationRouter.showWarning(`${taskLabel} — ${message}`, undefined, undefined, undefined, {
+        command: retry.command,
+        title: "Retry now",
+        args: retry.args,
+      }),
+  };
 }
 
 /** @internal exported for testing (item 2 / Step 55: the rejectionReason a
@@ -5192,7 +5660,7 @@ export async function terminalizeUnclosedReviewRoundV1(
       ...(ctx.identityAttachmentDegraded
         ? { identityAttachmentDegraded: ctx.identityAttachmentDegraded }
         : {}),
-      ...(terminalState === "failed" ? { rejectionReason: describeTaskActionFailureV1(outcome) } : {}),
+      ...(terminalState === "failed" ? reviewFailureLedgerOutcomeV1(outcome) : {}),
     };
     // bugs3 Step 3: the coordinator's own attempts first, then every attempt
     // the outcome itself names (an exhausted chain's invoked candidates), so a
@@ -6816,7 +7284,7 @@ async function routeReviewOutcomeV1(
     recordStageActionTerminalOutcomeV1(folderUri.fsPath, {
       kind: "failed",
       actionLabel: STAGE_DISPLAY_NAMES[targetStage] ?? targetStage,
-      reason: describeTaskActionFailureV1(outcome),
+      reason: describeReviewFailureV1(outcome).reason,
       operationId: operation?.id,
     });
     // Every remaining outcome (failed, malformedResult, unavailable,
@@ -6837,7 +7305,7 @@ async function routeReviewOutcomeV1(
     // pack, and this handler receives no prompt to log anyway (unlike
     // generatePlanWithAI, which has ctx.prompt in scope).
     NotificationRouter.showError(
-      `${STAGE_DISPLAY_NAMES[targetStage]} failed: ${describeTaskActionFailureV1(outcome)}. ` +
+      `${STAGE_DISPLAY_NAMES[targetStage]} failed: ${describeReviewFailureV1(outcome).reason}. ` +
         "The run log under runs/ records this settlement."
     );
   }
@@ -8162,6 +8630,9 @@ export async function runReviewForFolder(
     // pack can consider open editors, and it is shared by fresh, Resume and
     // Fast Forward review entry points through this dispatch function.
     if (IMPL_REVIEW_STAGES_V1.includes(targetStage)) {
+      // run1 Step 22: the scope is written to task state before the round's claim, so a lease another window
+      // holds past the wait would end the review with no row, no line and no card. It is reported instead.
+      try {
       if (!taskProgress) {
         await writeRunLog(
           folderUri,
@@ -8337,6 +8808,25 @@ export async function runReviewForFolder(
             at: new Date().toISOString(),
           }).catch(() => undefined);
         }
+      }
+      } catch (scopeError) {
+        if (!isStateLockExhaustedErrorV1(scopeError)) {
+          throw scopeError;
+        }
+        const stepName = stepOutcomeNameV1("review", STAGE_DISPLAY_NAMES[targetStage]);
+        options.operation?.settleAs("failed", `${stepName} stopped: ${STATE_LOCK_EXHAUSTED_CAUSE_V1}`);
+        await reportRoundLostToStateLockV1(
+          {
+            taskFolderPath: folderUri.fsPath,
+            stage: targetStage,
+            stepName,
+            rowClosed: false,
+            beforeAnyWork: true,
+            retry: { command: "vs-code-ai-helper.resumeAndRerunReview", args: [{ taskFolderPath: folderUri.fsPath }] },
+          },
+          defaultRoundLostToStateLockDepsV1()
+        );
+        return;
       }
     }
     // RC3 item 10 (Step 6): Publish runs after both implementation reviews,
@@ -8872,7 +9362,9 @@ export async function runReviewForFolder(
   // error, cancellation), gated on this attempt still being current so a
   // late failure from a superseded attempt can never clobber a newer one's
   // marking or its completed review.
-  const inProgressMarking = await beginInProgressReviewMarkingV1(reviewUri);
+  // run1 Step 23: the marking is taken INSIDE the `try` below, so a throw from it (a state lock held,
+  // a failed write) still reaches the `finally` that closes the claimed round's ledger row.
+  let inProgressMarking: InProgressReviewMarkingV1 | undefined;
   let reviewSucceeded = false;
   let reviewRejected = false;
   // Round-ledger settlement: `handleReviewOutcomeV1` (and the explicit "no
@@ -8882,7 +9374,10 @@ export async function runReviewForFolder(
   // window's orphan sweep; the `finally` below now closes it as failed.
   let roundSettled = false;
   let thrownReason: string | undefined;
+  let thrownLockExhausted = false;
+  let restoreFailure: Error | undefined;
   try {
+    inProgressMarking = await beginInProgressReviewMarkingV1(reviewUri);
     assertLegacyAiRouteAllowedV0("review.v1");
 
     let prompt = await renderPromptTemplate(extensionUri, templateFile, variables);
@@ -9136,7 +9631,19 @@ export async function runReviewForFolder(
     // alongside the coordinator's own `console.warn`. See
     // `attachCoordinatorIdentityToRoundTrackingDegradationV1`'s doc comment.
     let identityAttachmentDegradedForOutcome: RoundLedgerOutcomeV1["identityAttachmentDegraded"];
-    reportStageRunningV1(options.operation, stageToken);
+    // run1 Step 19: the running row says where we are: the Publish review comes before Commit and Push,
+    // and a code or plan review comes before an Apply Review or the next stage.
+    const reviewRound = getFastForwardRunStateV1(folderUri.fsPath)?.attemptNumber;
+    options.operation?.reportActivity(
+      currentStage === "publish"
+        ? publishReviewWhereLineV1()
+        : reviewStageWhereLineV1({
+            stageName: STAGE_DISPLAY_NAMES[currentStage] ?? currentStage,
+            step: "review",
+            ...(reviewRound !== undefined ? { round: reviewRound } : {}),
+          }),
+      { stageToken }
+    );
     const outcome = await coordinator.executeAction({
       actionKey: REVIEW_ACTION_KEY_V1,
       taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
@@ -9261,6 +9768,7 @@ export async function runReviewForFolder(
     }
   } catch (error) {
     thrownReason = error instanceof Error ? error.message : String(error);
+    thrownLockExhausted = isStateLockExhaustedErrorV1(error);
     if (isExtensionFolderRemovedErrorV1(error)) {
       NotificationRouter.showError(
         `${notificationTaskDisplayNameV1(runReviewForFolderProgress?.displayName, folderUri.fsPath)} — ${STAGE_DISPLAY_NAMES[targetStage]} was not started. ${error.message}`
@@ -9271,15 +9779,45 @@ export async function runReviewForFolder(
     }
     throw error;
   } finally {
-    if (reviewRejected) {
-      await restoreRejectedReviewArtifactV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
-    } else if (!reviewSucceeded) {
-      await revertInProgressReviewMarkingV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
+    // The restore or revert writes task state too. When it cannot (a lease held past the wait) it must not
+    // keep the round's row from closing below, so it is best-effort; the thrown error still propagates.
+    try {
+      if (inProgressMarking === undefined) {
+        // The marking itself threw: nothing was rewritten, so there is nothing to restore.
+      } else if (reviewRejected) {
+        await restoreRejectedReviewArtifactV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
+      } else if (!reviewSucceeded) {
+        await revertInProgressReviewMarkingV1(folderUri, reviewUri, reviewAttemptId, inProgressMarking);
+      }
+    } catch (restoreError) {
+      // A throw from `finally` would replace the round's own error and skip the row close below, so a
+      // restore failure other than a lease that stayed held is rethrown after the block.
+      if (isStateLockExhaustedErrorV1(restoreError)) {
+        thrownLockExhausted = true;
+      } else if (!thrownLockExhausted) {
+        restoreFailure = restoreError instanceof Error ? restoreError : new Error(String(restoreError));
+        thrownReason ??= restoreFailure.message;
+      }
     }
     if (!roundSettled) {
-      await closeUnsettledReviewRowV1(folderUri, reviewAttemptId, thrownReason);
+      await closeUnsettledReviewRowV1(
+        folderUri,
+        reviewAttemptId,
+        thrownReason,
+        thrownLockExhausted
+          ? {
+              stage: targetStage,
+              stepName: stepOutcomeNameV1("review", STAGE_DISPLAY_NAMES[targetStage]),
+              retry: { command: "vs-code-ai-helper.resumeAndRerunReview", args: [{ taskFolderPath: folderUri.fsPath }] },
+            }
+          : undefined,
+        { stage: targetStage, stepName: stepOutcomeNameV1("review", STAGE_DISPLAY_NAMES[targetStage]) }
+      );
     }
     void clearRoundLiveV1(reviewAttemptId);
+  }
+  if (restoreFailure !== undefined) {
+    throw restoreFailure;
   }
   }, targetStage);
 }
@@ -10684,7 +11222,7 @@ export async function applyReviewWithAI(
       lockKey,
       { parent: op, label: stepNameV1("apply-review"), stage: "plan", kind: "apply-review", cancellable: true, refusedWhenFalse: true },
       async (fixOp) => {
-        fixOp.reportActivity(stepProgressLabelV1("apply-review"));
+        fixOp.reportActivity(reviewStepActivityLineV1(resolved.folderUri.fsPath, stage, "apply-review"));
         const fixResult = await coordinator.executeAction({
           actionKey: APPLY_REVIEW_ACTION_KEY_V1,
           taskBinding: { taskBindingId: verifiedBindingId, chatDocumentId },
@@ -10744,7 +11282,9 @@ export async function applyReviewWithAI(
       } = {
         dispatched: false,
       };
-      await runTrackedOperation(
+      // run1 Step 27: Fast Forward ends at this round boundary to run an answer held for the owner, so the
+      // chained re-review (a same-stage round) is not started first.
+      if (!skipChainedReReviewForHeldAnswerV1(resolved.folderUri.fsPath)) await runTrackedOperation(
         lockKey,
         { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
         // See the impl-review branch above: anchor the deferred auto-advance
@@ -10754,7 +11294,7 @@ export async function applyReviewWithAI(
         // silently refused as busy.
         async (reReviewOp) => {
           // RC6 item 1: the re-review row reports what it is doing too.
-          reReviewOp.reportActivity(stepProgressLabelV1("re-review"));
+          reReviewOp.reportActivity(reviewStepActivityLineV1(resolved.folderUri.fsPath, stage, "re-review"));
           await runReviewForFolder(
             extensionUri,
             resolved.folderUri,
@@ -10877,7 +11417,7 @@ export async function applyReviewWithAI(
         recordStageActionTerminalOutcomeV1(resolved.folderUri.fsPath, {
           kind: "failed",
           actionLabel: "Apply Review",
-          reason: describeTaskActionFailureV1(outcome),
+          reason: describeReviewFailureV1(outcome).reason,
           operationId: op.id,
         });
       }
@@ -10885,7 +11425,9 @@ export async function applyReviewWithAI(
         await terminalizeRoundV1(
           roundId,
           terminalState,
-          terminalState === "failed" ? { rejectionReason: describeTaskActionFailureV1(outcome) } : undefined,
+          terminalState === "failed"
+            ? reviewFailureLedgerOutcomeV1(outcome)
+            : undefined,
           {
             taskFolderUri: resolved.folderUri,
             synthesizeIfMissing: () => ({ roundId, stage, mode: "apply-review" }),
@@ -12134,6 +12676,23 @@ export async function fastForwardReviewWithAI(
     }
     return false;
   };
+  // run1 Step 27: an owner answer held while this run went on runs at the next round boundary, ahead of
+  // another same-stage round. The loop ends there, its claim is released, and the held answer is carried
+  // out by the deferred-run waiter once the task is free.
+  let ffYieldedToHeldAnswerV1: { readonly label: string } | undefined;
+  const ffShouldYieldToHeldAnswerV1 = (): boolean => {
+    if (ffYieldedToHeldAnswerV1) {
+      return true;
+    }
+    const held = openWorkflowDecisionStoreV1()
+      ?.listWithPendingDeferredAnswer(resolved.folderUri.fsPath)
+      .find((candidate) => shouldFastForwardYieldToHeldAnswerV1(candidate.deferredAnswer));
+    if (!held) {
+      return false;
+    }
+    ffYieldedToHeldAnswerV1 = { label: held.deferredAnswer?.optionLabel ?? "answer" };
+    return true;
+  };
   const resilience = getResilienceSettings();
 
   // Set once isPaused has ridden through this run's own escalation (2a):
@@ -12226,7 +12785,7 @@ export async function fastForwardReviewWithAI(
           stopAtScore: configuredStopLevel,
           token: linked.token,
           apply: async () => {
-            if (await ffStageHasLeftV1()) {
+            if ((await ffStageHasLeftV1()) || ffShouldYieldToHeldAnswerV1()) {
               return;
             }
             attemptNumber += 1;
@@ -12311,6 +12870,8 @@ export async function fastForwardReviewWithAI(
             }
             const escalation = fresh.escalation;
             if (
+              // run1 Step 28: the owner's own Pause is never ridden through, whatever escalation is on the task.
+              fresh.ownerPausedAt !== undefined ||
               !isFreshEscalationForRideThroughV1(escalation, lastRiddenThroughEscalationAt) ||
               !shouldRideThroughEscalationV1({
                 survivesEscalationSetting: resilience.fastForwardSurvivesEscalation,
@@ -12469,7 +13030,11 @@ export async function fastForwardReviewWithAI(
               isBlockingDecisionV1
             );
           },
-          cleanReviewNeverApplies: IMPL_REVIEW_STAGES.includes(targetStage),
+          // run1 Step 32: a clean review never starts a polish Apply Review on plan-review stages either.
+          // Plan-review stages have no unbuilt implementation steps to build, so open plan items never
+          // turn a clean plan review into a build mandate.
+          cleanReviewNeverApplies: IMPL_REVIEW_STAGES.includes(targetStage) || PLAN_REVIEW_STAGES.includes(targetStage),
+          cleanReviewIgnoresPlanItems: PLAN_REVIEW_STAGES.includes(targetStage),
           // review1 Step 34: a clean review whose only open items are provisional test items is closed by Ensemble
           // running the project's checks once (no model round, never twice in a run), then one card for the rest.
           closeEvidenceGap: async ({ score }) => {
@@ -12584,7 +13149,7 @@ export async function fastForwardReviewWithAI(
           baselineReviewer: baselineHistoryEntry?.reviewer,
           baselineTaskFixableCount: baselineHistoryEntry?.taskFixableCount,
           review: async () => {
-            if (await ffStageHasLeftV1() || ffPreflightRefusedV1) {
+            if ((await ffStageHasLeftV1()) || ffPreflightRefusedV1 || ffShouldYieldToHeldAnswerV1()) {
               return null;
             }
             // Disk, not the editor buffer: `previousContent` is seeded from the
@@ -12704,6 +13269,17 @@ export async function fastForwardReviewWithAI(
   // The run finished — if it rode through its own escalation, re-assert the
   // pause that escalation originally asserted before reporting the outcome.
   await reassertDeferredEscalationPause();
+  if (ffYieldedToHeldAnswerV1) {
+    const yieldedLine = describeFastForwardYieldedToHeldAnswerV1(ffYieldedToHeldAnswerV1.label);
+    recordOperationTerminalOutcomeV1(op.id, { state: "stopped", reason: yieldedLine });
+    await chatViewProvider
+      ?.append("assistant", yieldedLine, targetStage, {
+        canonicalId: resolved.folderUri.fsPath,
+        taskFolderPath: resolved.folderUri.fsPath,
+      })
+      .catch(() => undefined);
+    return;
+  }
   if (ffStageLeftForV1) {
     // The task left the review's stage during the run — hand over to the
     // follow-up run for the new stage rather than reporting a stall.
@@ -12951,9 +13527,21 @@ export async function fastForwardReviewWithAI(
     // Anyway for the publish stage, matching those siblings: a user who
     // decides the escalation is acceptable must have the same one-click
     // recovery, not have to find Commit and Push manually.
+    // The owner's pause is on disk (written by Pause in whichever window took the click), so a pause
+    // pressed in a viewer window is recognised here too; the in-memory record covers the same host.
+    const pausedOnDiskV1 = await readTaskProgressAdvisoryV1(resolved.folderUri).catch(() => undefined);
+    const ownerPausedAtMsV1 =
+      pausedOnDiskV1?.status === "paused" && pausedOnDiskV1.ownerPausedAt !== undefined
+        ? Date.parse(pausedOnDiskV1.ownerPausedAt)
+        : Number.NaN;
     NotificationRouter.showWarning(
-      `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the task was paused for review — ` +
-        "see the notification above for why, and resume the task once you've decided how to proceed." +
+      // run1 Step 31: when the owner pressed Pause, say so, instead of pointing at a notification
+      // that does not exist.
+      ((Number.isFinite(ownerPausedAtMsV1) && ownerPausedAtMsV1 >= ffRunStartedAtV1) ||
+      wasPausedByOwnerSinceV1(resolved.folderUri.fsPath, ffRunStartedAtV1)
+        ? `Fast Forward stopped because you paused the task (after ${outcome.attempts} attempt(s)). Resume the task when you want to carry on.`
+        : `Fast Forward Review stopped after ${outcome.attempts} attempt(s): the task was paused for review — ` +
+          "see the notification above for why, and resume the task once you've decided how to proceed.") +
         (targetStage === "publish" ? " Publish manually once you're satisfied, or use Publish Anyway from Commit and Push." : ""),
       undefined,
       undefined,
@@ -15590,7 +16178,9 @@ async function executeImplementationRun(
   // `.catch` rather than an inline `try`: `reviewActionsStageActivity.test.ts`
   // locates the dispatch `try` block as the FIRST `try` after this function's
   // start, so an earlier one here would shadow it.
-  await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md")).catch(() => undefined);
+  // run1 Step 13: a stopped round's ticks are banked first (through the same checks as a report's), and
+  // lines that cannot be banked are moved aside, so this clean-up never wipes finished work's evidence.
+  await bankLeftoverRoundProgressBeforeDispatchV1(folderUri, "earlier-stopped-round");
 
   // Allocated once, before dispatch, so the run log and the prompt manifest
   // (Part 2 step 7) can be correlated by this id rather than by parsing the
@@ -16040,6 +16630,26 @@ async function executeImplementationRun(
     return false;
   }
 
+  // run1 Steps 8 to 10: the runner's one settlement already counted a round whose model had answered, but whose
+  // process had to be stopped (it never exited, or a limit came after its report), as completed with that answer,
+  // before any failure handling could run. The report then goes through the same shape and checklist checks as
+  // any other, so an unusable one still owes a continuation. Here the owner is only told what happened.
+  if (result.status === "completed" && result.endOfTurnStopV1 === true) {
+    options.parentOperation?.report?.(
+      "The model finished its report but did not exit, so Ensemble stopped it and is using that report."
+    );
+    try {
+      await appendChatMessageV1(folderUri.fsPath, {
+        role: "assistant",
+        text: "_The model didn't exit after its report; Ensemble stopped it and used that report._",
+        stage: postRunReviewStage,
+        at: new Date().toISOString(),
+      });
+    } catch {
+      // The note is best-effort; the report itself is what matters.
+    }
+  }
+
   // review1 Step 49: a completed diagnostic round has its own completion: the diagnosis file, not the editing report
   // contract. Without this, a compliant diagnosis (a file plus a short summary) is rejected for lacking `## Files
   // Changed` and `## Verification`, and report correction or implementation recovery replaces the owner's card.
@@ -16246,7 +16856,7 @@ async function executeImplementationRun(
         (result.filesChangedUnknown
           ? "left the tree state unenumerable"
           : `changed ${result.filesChanged.length} file(s)`) +
-        " — its report was rejected and the delta quarantined";
+        " — its report was rejected and the changed files are kept for the next round";
     } else if (!result.summaryIsSynthetic) {
       // The gate enforces the contract run-implementation.md imposes on a
       // model. A runner-synthesized summary never went through that prompt
@@ -16438,7 +17048,15 @@ async function executeImplementationRun(
   // `externallyTerminated` trigger so the mode selector (Part 2) never
   // picks summary-only for it, and the run log records the true cause
   // distinctly from a provider-reported deferred/cut-short round.
-  const timedOutRound = result.status === "failed" && result.timedOut === true;
+  // run1 Step 8: the cause the runner's one settlement recorded decides this too. An Ensemble stop
+  // (backstop, idle, repeat) owes the same recovery whether or not the legacy timeout fields were set.
+  const settledStopCauseV1 = result.status === "failed" ? result.stopCauseV1 : undefined;
+  const timedOutRound =
+    result.status === "failed" &&
+    (result.timedOut === true ||
+      settledStopCauseV1 === "ensembleBackstop" ||
+      settledStopCauseV1 === "ensembleIdleStop" ||
+      settledStopCauseV1 === "ensembleRepeatStop");
   if (result.storedModelId) {
     options.parentOperation?.setModel?.(result.storedModelId);
   }
@@ -16511,7 +17129,7 @@ async function executeImplementationRun(
       reason:
         summaryIssue ??
         incompleteRound?.reason ??
-        result.errorMessage ??
+        settledFailureWordingV1(result) ??
         `${result.timeoutReason === "inactivity" ? "produced no output and was" : "timed out and was"} stopped before returning a final response`,
       // Every summary-gate path is a NORMAL termination — the provider
       // returned a final response, however unusable. Externally-killed
@@ -16523,6 +17141,7 @@ async function executeImplementationRun(
       ...(summaryOnlyViolation ? { escalatedFromSummaryOnly: true } : {}),
       filesChanged: result.filesChanged,
       filesChangedUnknown: result.filesChangedUnknown === true,
+      ...roundLedgerActivityFieldsV1(result),
       postRunReviewStage,
       parentOperation: options.parentOperation,
       operationId: options.parentOperation?.id,
@@ -16675,8 +17294,12 @@ async function executeImplementationRun(
   }${
     timedOutRound && recovery
       ? `\n\n## Externally terminated — recovery scheduled\n\nThis round did not return a final response (${
-          result.timeoutReason === "inactivity" ? "inactivity watchdog" : "wall-clock timeout"
-        }): ${recovery.sourceAttemptId ? recovery.sourceAttemptId : ""}.\n\n` +
+          settledStopCauseV1 === "ensembleRepeatStop"
+            ? "repeat stop"
+            : settledStopCauseV1 === "ensembleIdleStop" || result.timeoutReason === "inactivity"
+              ? "inactivity watchdog"
+              : "wall-clock timeout"
+        }):${recovery.sourceAttemptId ? recovery.sourceAttemptId : ""}.\n\n` +
         `Recovery record: \`${recovery.sourceAttemptId}\` (${
           recovery.capReached
             ? "continuation budget exhausted — human decision needed"
@@ -16789,7 +17412,10 @@ async function executeImplementationRun(
     // which of those paths the round's own report did not claim, so
     // ledger-based scope reconstruction never adopts a concurrent owner edit.
     const ledgerFilesOutcomeV1 = (): RoundLedgerOutcomeV1 => {
-      if (completedResult.filesChangedUnknown) return { filesChangedUnknown: true };
+      // run1 Step 15: the completed row carries what the round's own stream named, what only
+      // changed in the workspace while it ran, and the recorded stop cause, as a failed row does.
+      const activityFields = roundLedgerActivityFieldsV1(completedResult);
+      if (completedResult.filesChangedUnknown) return { filesChangedUnknown: true, ...activityFields };
       const { unattributed } = resolveCompletedRoundAttributionV1({
         summary,
         planChecklist,
@@ -16800,6 +17426,7 @@ async function executeImplementationRun(
       return {
         filesChanged: [...completedResult.filesChanged],
         ...(unattributed.length > 0 ? { unattributedFiles: unattributed } : {}),
+        ...activityFields,
       };
     };
     // Filled in below, only for a runner-synthesized round with a plan
@@ -17213,13 +17840,9 @@ async function executeImplementationRun(
       // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): an incomplete
       // round is never banked as completed, so any ticks it appended to its
       // in-round bookkeeping file were never accepted as real progress
-      // either — clear it here so the display-only merge does not keep
-      // showing them as live percentage after this round.
-      try {
-        await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
-      } catch {
-        // best-effort — see comment above.
-      }
+      // either. run1 Step 13: a stop never wipes the evidence of finished work, so its lines go through
+      // the same checks as a report's ticks; the file is removed only once they are banked.
+      await keepStoppedRoundProgressV1(folderUri, implRoundId, preRoundChecklistText);
       await safeOpenTextDocument(logUri, "implementation run log", folderUri);
       return false;
     }
@@ -18338,7 +18961,7 @@ async function executeImplementationRun(
         // paused, waiting on user" state — see beginImplementationRecoveryV1.
         const recoveryLine = recovery
           ? recovery.capReached
-            ? "Automated recovery has stopped: the continuation budget is exhausted, and nothing will " +
+            ? `${describeEnsembleRetriesGaveUpV1(MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1)} Nothing will ` +
               'retry it automatically. Review the run log for what the round actually changed, then use ' +
               '"Discard this owed continuation" (offered on the next refused action) to clear it by hand.'
             : `A continuation implementation round (${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}) has been scheduled to produce them.`
@@ -18602,7 +19225,7 @@ async function executeImplementationRun(
       await withdrawWorkflowDecisionsByKeyV1(
         { taskFolderPath: folderUri.fsPath, canonicalId: normalizePath(folderUri.fsPath) },
         "restoreRejectedImplementationRound",
-        "the round's quarantined changes have already been resolved (reviewed, continued, or restored)"
+        "the round's changed files have already been dealt with (reviewed, continued, or restored)"
       );
     }
 
@@ -18746,7 +19369,7 @@ async function executeImplementationRun(
         ? `⚠️ This round's report was rejected (${summaryIssue}).` +
           (recovery
             ? recovery.capReached
-              ? " Automated recovery has stopped: the continuation budget is exhausted, and nothing will retry it automatically."
+              ? ` ${describeEnsembleRetriesGaveUpV1(MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1)} Nothing will retry it automatically.`
               : ` A continuation implementation round (${recovery.continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${recovery.mode}) has been scheduled to produce a usable report.`
             : "")
         : undefined;
@@ -19127,7 +19750,10 @@ async function executeImplementationRun(
     await terminalizeRoundV1(
       implRoundId,
       "cancelled",
-      result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] },
+      {
+        ...(result.filesChangedUnknown ? { filesChangedUnknown: true } : { filesChanged: [...result.filesChanged] }),
+        ...roundLedgerActivityFieldsV1(result),
+      },
       {
         taskFolderUri: folderUri,
         ...(implExtraAttemptIds.length ? { extraAttemptIds: implExtraAttemptIds } : {}),
@@ -19144,12 +19770,10 @@ async function executeImplementationRun(
     // bookkeeping file — without this, ticks it appended before
     // cancellation would keep merging into the displayed percentage as if
     // they were still live. Best-effort: a delete failure must never affect
-    // the cancellation outcome.
-    try {
-      await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
-    } catch {
-      // best-effort — see comment above.
-    }
+    // the cancellation outcome. run1 Step 13: a Cancel keeps what the round did, so its ticks are
+    // banked through the same checks as a report's (and what cannot be banked is kept whole beside
+    // the plan) instead of being deleted.
+    await bankLeftoverRoundProgressBeforeDispatchV1(folderUri, implRoundId, preRoundChecklistText);
     return false;
   } else {
     // Part 7: an externally-terminated round (wall-clock/inactivity
@@ -19161,17 +19785,20 @@ async function executeImplementationRun(
     if (result.timedOut === true && recovery) {
       await recovery.finishDispatch();
     } else {
+      // run1 Step 8: the one recorded outcome words the stage outcome, the operation, the claim
+      // release, the ledger row and the notification below.
+      const settledFailureText = settledFailureWordingV1(result) ?? "Implementation failed";
       recordStageActionTerminalOutcomeV1(folderUri.fsPath, {
         kind: "failed",
         actionLabel: "Implementation",
-        reason: result.errorMessage ?? "Implementation failed",
+        reason: settledFailureText,
         operationId: options.parentOperation?.id,
       });
-      options.parentOperation?.settleAs("failed", result.errorMessage ?? "Implementation failed");
+      options.parentOperation?.settleAs("failed", settledFailureText);
       await releaseImplRecoveryClaimV1(folderUri, {
         failedProvider: result.providerLabel ?? result.runnerId,
         failedModel: result.storedModelId,
-        reason: result.errorMessage ?? "Implementation failed",
+        reason: settledFailureText,
         operationId: options.parentOperation?.id,
         attemptId: implRoundId,
       });
@@ -19183,22 +19810,16 @@ async function executeImplementationRun(
       // `beginImplementationRecoveryV1` is the other writer and handles the
       // timed-out / recovery-owed rounds above.
       await terminalizeFailedImplementationRoundV1(folderUri, implRoundId, result, implExtraAttemptIds);
-      NotificationRouter.showError(
-        `Implementation failed: ${result.errorMessage ?? "unknown error"}`
-      );
+      NotificationRouter.showError(`Implementation failed: ${settledFailureText}`);
     }
     // RC1 item 6 (round-progress.md lifecycle, f3 Part 10): an ordinary
     // failed round (including a watchdog-terminated one) never reaches
     // acceptance either, so its bookkeeping file must be cleared here for
     // the same reason as the cancelled branch above — otherwise its ticks
     // would keep inflating the displayed percentage until some later round
-    // happened to overwrite them. Best-effort: a delete failure must never
-    // affect the failure outcome.
-    try {
-      await deletePath(vscode.Uri.joinPath(folderUri, "round-progress.md"));
-    } catch {
-      // best-effort — see comment above.
-    }
+    // happened to overwrite them. run1 Step 13: a stop keeps what it did, so its ticks are merged
+    // through the same checks as a report's, and the file is removed only once they are banked.
+    await keepStoppedRoundProgressV1(folderUri, implRoundId, preRoundChecklistText);
     return false;
   }
   }, postRunReviewStage).then(
@@ -19221,7 +19842,8 @@ async function executeImplementationRun(
           folderUri,
           claimedImplRoundId,
           errorMsg,
-          options.parentOperation?.id
+          options.parentOperation?.id,
+          isStateLockExhaustedErrorV1(error) && !lockLossAlreadyToldV1.has(error as object)
         );
       }
       throw error;
@@ -20078,7 +20700,7 @@ export async function runImplementationWithAI(
         );
         NotificationRouter.showWarning(
           `The round was not started because the stage's review could not be rendered into its prompt: ${reconstructionError ?? "unknown reason"} ` +
-            "Any pending changes remain quarantined; restore the missing artifact and retry."
+            "Any changed files are kept for the next round; restore the missing artifact and retry."
         );
         return false;
       }
@@ -20633,12 +21255,13 @@ export async function applyReviewEditWithAI(
       } = {
         dispatched: false,
       };
-      await runTrackedOperation(
+      // run1 Step 27: as in the plan branch, a held owner answer runs ahead of the chained same-stage re-review.
+      if (!skipChainedReReviewForHeldAnswerV1(resolved.folderUri.fsPath)) await runTrackedOperation(
         lockKey,
         { parent: op, label: stepNameV1("re-review"), stage, kind: "review", cancellable: true },
         async (reReviewOp) => {
           // RC6 item 1: the re-review row reports what it is doing too.
-          reReviewOp.reportActivity(stepProgressLabelV1("re-review"));
+          reReviewOp.reportActivity(reviewStepActivityLineV1(resolved.folderUri.fsPath, stage, "re-review"));
           await runReviewForFolder(
             extensionUri,
             resolved.folderUri,
@@ -21887,6 +22510,23 @@ export async function resumeReviewInteractionV1(
       return { ok: false, reason: `Resume did not settle the interaction: ${describeResumeNotSettledV1(outcome)}`, coordinatorOutcome: outcome };
     }
     return { ok: true, settlement, coordinatorOutcome: outcome };
+  } catch (error) {
+    // run1 Step 23: a throw after the claim never leaves the round's row open or the owner uninformed.
+    // The close is idempotent, so a row the outcome handling already settled is untouched.
+    await closeUnsettledReviewRowV1(
+      taskFolderUri,
+      reviewAttemptId,
+      error instanceof Error ? error.message : String(error),
+      isStateLockExhaustedErrorV1(error)
+        ? {
+            stage: targetStage,
+            stepName: stepOutcomeNameV1("review", STAGE_DISPLAY_NAMES[targetStage]),
+            retry: { command: "vs-code-ai-helper.resumeAndRerunReview", args: [{ taskFolderPath: taskFolderUri.fsPath }] },
+          }
+        : undefined,
+      { stage: targetStage, stepName: stepOutcomeNameV1("review", STAGE_DISPLAY_NAMES[targetStage]) }
+    );
+    throw error;
   } finally {
     void clearRoundLiveV1(reviewAttemptId);
   }

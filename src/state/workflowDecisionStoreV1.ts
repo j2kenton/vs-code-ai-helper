@@ -7,6 +7,7 @@ import {
   WorkflowDecisionCompletionReasonV1,
   WorkflowDecisionAutoContinueV1,
   WorkflowDecisionDeferredAnswerV1,
+  HeldAnswerStateV1,
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
 } from "../types/workflowDecisionV1";
@@ -529,8 +530,14 @@ export class WorkflowDecisionStoreV1 {
           "would start another action beside it. Choose it again when that ends.",
       };
     }
+    // run1 Step 28: choosing the card again is the owner's go-ahead for an answer that was waiting for them (or
+    // uncertain after a restart). That record is spent, so it is not left attached to the new resolution.
+    const spentHeld =
+      answerable.deferredAnswer?.kind === "heldOption" &&
+      (answerable.deferredAnswer.heldState === "waitingForOwner" || answerable.deferredAnswer.heldState === "uncertain");
+    const { deferredAnswer: _spentAnswer, ...answerableRest } = answerable;
     const resolved: WorkflowDecisionV1 = {
-      ...answerable,
+      ...(spentHeld ? answerableRest : answerable),
       state: "resolved",
       resolvedOptionId: optionId,
       resolvedAt: new Date().toISOString(),
@@ -548,11 +555,21 @@ export class WorkflowDecisionStoreV1 {
    * the click and the dispatch — bugs3 Step 2). Only the matching resolution
    * is undone; a decision already settled any other way is left alone.
    */
-  async reopenResolved(decisionId: string, optionId: string): Promise<boolean> {
-    return serializeDecisionWriteV1(this.state, () => this.reopenResolvedLockedV1(decisionId, optionId));
+  async reopenResolved(
+    decisionId: string,
+    optionId: string,
+    options?: { readonly keepHeldAnswer?: boolean }
+  ): Promise<boolean> {
+    return serializeDecisionWriteV1(this.state, () =>
+      this.reopenResolvedLockedV1(decisionId, optionId, options?.keepHeldAnswer === true)
+    );
   }
 
-  private async reopenResolvedLockedV1(decisionId: string, optionId: string): Promise<boolean> {
+  private async reopenResolvedLockedV1(
+    decisionId: string,
+    optionId: string,
+    keepHeldAnswer: boolean
+  ): Promise<boolean> {
     const existing = this.all();
     const index = existing.findIndex((decision) => decision.decisionId === decisionId);
     const decision = index === -1 ? undefined : existing[index]!;
@@ -560,9 +577,15 @@ export class WorkflowDecisionStoreV1 {
       return false;
     }
     // A kept answer that could not be carried out is not kept: the card is back for a fresh choice.
-    const { resolvedOptionId: _optionId, resolvedAt: _resolvedAt, deferredAnswer: _kept, ...rest } = decision;
+    // run1 Steps 26 and 28: a held answer waiting for the owner, or one a restart left uncertain, stays on the
+    // decision as a durable record while its card is back. Nothing runs it by itself from there.
+    const { resolvedOptionId: _optionId, resolvedAt: _resolvedAt, deferredAnswer: kept, ...rest } = decision;
+    const keep =
+      keepHeldAnswer &&
+      kept?.kind === "heldOption" &&
+      (kept.heldState === "waitingForOwner" || kept.heldState === "uncertain");
     const next = [...existing];
-    next[index] = { ...rest, state: "pending" };
+    next[index] = { ...rest, state: "pending", ...(keep ? { deferredAnswer: kept } : {}) };
     await this.saveAll(next);
     return true;
   }
@@ -679,6 +702,38 @@ export class WorkflowDecisionStoreV1 {
         ? { ...rest, deferredAnswer: { ...kept, carriedOutAt: new Date().toISOString() } }
         : rest;
       await this.saveAll(next);
+    });
+  }
+
+  /**
+   * run1 Step 26: moves a held option answer from `expected` to a new state in one serialized read-and-write,
+   * so two callers racing for the swap cannot both win. Returns the answer as written, or undefined when the
+   * decision is gone, holds no held option answer, or the answer is no longer in the `expected` state.
+   */
+  async swapHeldAnswerState(
+    decisionId: string,
+    expected: HeldAnswerStateV1,
+    patch: Partial<Pick<WorkflowDecisionDeferredAnswerV1, "dispatchId" | "runNowRequestedAt" | "commandStartedAt">> & {
+      readonly heldState: HeldAnswerStateV1;
+    }
+  ): Promise<WorkflowDecisionDeferredAnswerV1 | undefined> {
+    return serializeDecisionWriteV1(this.state, async () => {
+      const existing = this.all();
+      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
+      const current = index === -1 ? undefined : existing[index]!;
+      const answer = current?.deferredAnswer;
+      if (!current || !answer || answer.kind !== "heldOption" || answer.heldState !== expected) {
+        return undefined;
+      }
+      const written: WorkflowDecisionDeferredAnswerV1 = {
+        ...answer,
+        ...patch,
+        ...(patch.heldState === "ran" || patch.heldState === "dropped" ? { carriedOutAt: new Date().toISOString() } : {}),
+      };
+      const next = [...existing];
+      next[index] = { ...current, deferredAnswer: written };
+      await this.saveAll(next);
+      return written;
     });
   }
 

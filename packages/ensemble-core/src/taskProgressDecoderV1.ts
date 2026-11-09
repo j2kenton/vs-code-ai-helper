@@ -194,6 +194,8 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "quotaParkRecord",
   "nextActor",
   "stageReviewPasses",
+  "notedForeignEdits",
+  "ownerPausedAt",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -2067,6 +2069,18 @@ function validateQuotaParkRecord(value: unknown): string | undefined {
   return undefined;
 }
 
+function validateNotedForeignEdits(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > 100) {
+    return "notedForeignEdits must be an array of at most 100 entries";
+  }
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > 400) {
+      return "notedForeignEdits entries must be bounded non-empty strings";
+    }
+  }
+  return undefined;
+}
+
 function validateStageReviewPasses(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "stageReviewPasses must be a per-stage object map";
@@ -2902,6 +2916,21 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.stageReviewPasses = value as TaskProgress["stageReviewPasses"];
+        break;
+      }
+      case "notedForeignEdits": {
+        const error = validateNotedForeignEdits(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.notedForeignEdits = value as string[];
+        break;
+      }
+      case "ownerPausedAt": {
+        if (typeof value !== "string" || value.length === 0 || value.length > 64 || Number.isNaN(Date.parse(value))) {
+          return recovery("invalidFieldValue", "ownerPausedAt must be an ISO time string");
+        }
+        draft.ownerPausedAt = value;
         break;
       }
     }

@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { after, test } from "node:test";
-import { withTaskLock, withMetaRootLock } from "../state/taskStateStore";
+import { withTaskLock, withMetaRootLock, setStateLeaseWaitForTestsV1 } from "../state/taskStateStore";
+import { PrimarySessionLock, PrimarySessionLockHeldError } from "../state/primarySessionLock";
 import { safeRemoveDir } from "./testFsUtils";
 
 // Regression coverage for a review finding: task activation
@@ -96,5 +97,63 @@ void test(
     await opMeta;
     await opTask;
     assert.equal(ranWhileHeld, true);
+  }
+);
+
+// run1 Steps 21-22: a lease held by ANOTHER host (a lease file with another session id) is waited for,
+// not failed on. This is bugs6 item 24: the owner's window held the workspace leases for a moment while
+// it created a task, and the runner's round hit the lease and ended with no record.
+void test(
+  "a task write waits for a workspace lease another host holds, then runs, and a task created meanwhile exists",
+  async () => {
+    const tasksDir = path.join(TEST_ROOT, ".ensemble", "tasks-foreign-host");
+    const taskA = path.join(tasksDir, "taskA");
+    const taskB = path.join(tasksDir, "taskB");
+    fs.mkdirSync(taskA, { recursive: true });
+    // "Host B" holds the meta lease while it creates and renames task B.
+    const hostB = new PrimarySessionLock(path.join(tasksDir, ".ensemble-meta.lock"));
+    const releaseHostB = await hostB.acquire();
+    setStateLeaseWaitForTestsV1([20, 20, 20, 20, 20, 20, 20, 20, 20, 20]);
+    try {
+      let ran = false;
+      const hostA = withTaskLock(taskA, () => {
+        ran = true;
+        return Promise.resolve();
+      });
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      assert.equal(ran, false, "host A waits while host B holds the lease");
+      fs.mkdirSync(taskB, { recursive: true });
+      fs.renameSync(taskB, `${taskB}-renamed`);
+      await releaseHostB();
+      await hostA;
+      assert.equal(ran, true);
+      assert.ok(fs.existsSync(`${taskB}-renamed`));
+    } finally {
+      setStateLeaseWaitForTestsV1();
+    }
+  }
+);
+
+void test(
+  "a task write whose wait for a held lease runs out throws the typed held error and holds nothing",
+  async () => {
+    const tasksDir = path.join(TEST_ROOT, ".ensemble", "tasks-foreign-host-exhausted");
+    const taskA = path.join(tasksDir, "taskA");
+    fs.mkdirSync(taskA, { recursive: true });
+    const hostB = new PrimarySessionLock(path.join(tasksDir, ".ensemble-meta.lock"));
+    const releaseHostB = await hostB.acquire();
+    setStateLeaseWaitForTestsV1([5, 5]);
+    try {
+      await assert.rejects(
+        withTaskLock(taskA, () => Promise.resolve()),
+        (error: unknown) => error instanceof PrimarySessionLockHeldError
+      );
+      // Nothing the failed attempt took is left behind.
+      assert.equal(fs.existsSync(path.join(tasksDir, "..", ".ensemble-session.lock")), false);
+      assert.equal(fs.existsSync(path.join(taskA, ".ensemble-task.lock")), false);
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      await releaseHostB();
+    }
   }
 );

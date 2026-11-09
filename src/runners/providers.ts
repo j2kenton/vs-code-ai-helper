@@ -182,6 +182,12 @@ export interface CliConversationResumeDefinition {
    * be recovered by continuing the conversation it just persisted.
    */
   errorMarkers: readonly string[];
+  /**
+   * Wordings that only identify the cut-off when ALL fragments of one group appear in the
+   * diagnostic ("print timeout after" alone is too loose to trust). Matched case-insensitively,
+   * in addition to `errorMarkers`.
+   */
+  errorMarkerGroups?: readonly (readonly string[])[];
   /** Follow-up prompt sent when continuing that conversation. */
   continuationPrompt: string;
 }
@@ -1163,13 +1169,13 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
     textModeResponseContractV1: "repurposed-interactive-flow",
     buildArgs(mode, model, context): string[] {
       const parsedModel = parseClaudeCliModelSelection(model);
-      // Edit mode keeps the original plain "text" output-format, unchanged —
-      // only text (read-only, summary-extraction) mode moves to stream-json
-      // below. Edit-mode runs are captured for their WORKSPACE FILE changes,
-      // not for a parsed summary string, so there is nothing for a
-      // structured event stream to buy there, and touching it would be an
-      // unrelated behavior change outside this fix's scope.
-      const args = ["-p", "--output-format", mode === "edit" ? "text" : "stream-json"];
+      // run1 Step 7: edit mode streams too. Plain "text" printed the model's words only when the
+      // process exited, so a round stopped after it had written its report (bugs6 item 14: the
+      // 18:09:34 report, lost when the CLI never exited) had no words to keep. stream-json
+      // delivers every message as it is written, so a stopped run keeps its final text, and the
+      // terminal `result` event gives a structural success/error signal. `--verbose` is
+      // required alongside `-p --output-format stream-json`.
+      const args = ["-p", "--output-format", "stream-json", "--verbose"];
       if (mode === "edit") {
         // Allow file edits in the workspace without per-edit prompts;
         // anything beyond edits (e.g. arbitrary shell) stays denied.
@@ -1200,7 +1206,6 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
         // NEEDS-TOOLCHAIN: neither flag combination nor the resulting event
         // shape has been confirmed against a live `claude` CLI invocation —
         // see the doc comment on ClaudeCliEnvelope in cliAgentRunner.ts.
-        args.push("--verbose");
         // Text mode must stay read-only no matter what the invoking
         // workspace's own .claude/settings.json permits: omitting this flag
         // falls back to "default" permission mode, which still honors any
@@ -1487,6 +1492,12 @@ export const CLI_PROVIDERS: readonly CliProviderDefinition[] = [
       // 2026-07-29. This is agy's own --print timeout, not Ensemble's outer
       // process timeout.
       errorMarkers: ["error: timeout waiting for response"],
+      // agy 1.4.x words the same 55-minute cut-off differently (bugs6 item 5, 1.4.12:
+      // "[agy] print timeout after 55m0s with turn in progress; returning partial output").
+      errorMarkerGroups: [
+        ["print timeout after", "turn in progress"],
+        ["print timeout after", "returning partial output"],
+      ],
       continuationPrompt:
         "Continue the same task from where the previous response timed out. " +
         "Inspect the current workspace state and your existing changes first, then finish " +

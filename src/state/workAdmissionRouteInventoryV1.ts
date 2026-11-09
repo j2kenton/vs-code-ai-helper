@@ -115,6 +115,15 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   clearNotificationsSearch: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
   clearNotifications: { kind: "notWatchdogSusceptible", reason: "UI state only" },
   cancelOperation: { kind: "notWatchdogSusceptible", reason: "cancels in-flight work; never starts a provider round itself" },
+  waitOnOperation: { kind: "notWatchdogSusceptible", reason: "hides a no-activity warning for another warning period; starts, stops and changes nothing" },
+  runHeldAnswerNow: {
+    kind: "delegatesDynamically",
+    evidence:
+      "src/views/chatView.ts — runHeldAnswerNowV1 re-arms the owner's held answer through holdOptionUntilTaskFreeV1 " +
+      "(dispatched through the task's work admission, so a Pause or Cancel wins) and cancels the running round; the " +
+      "command the held answer then runs is itself one of the already-classified commands in this table",
+  },
+  dropHeldAnswer: { kind: "notWatchdogSusceptible", reason: "marks a held answer dropped and says so in the chat; dispatches no provider round" },
   runNotificationAction: {
     kind: "delegatesDynamically",
     evidence:

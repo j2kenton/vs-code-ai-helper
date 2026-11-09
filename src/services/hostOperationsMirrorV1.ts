@@ -2,6 +2,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { writeMirrorSnapshotV1 } from "./hostMirrorWriteV1";
+import type { ProofOfLifeV1 } from "../utils/proofOfLifeV1";
+import type { HeldAnswerRowInfoV1 } from "../utils/heldAnswerLifecycleV1";
 
 /**
  * What the runner is doing right now, visible in every viewer window
@@ -53,6 +55,10 @@ export interface MirroredOperationV1 {
   readonly exclusive?: boolean;
   readonly cancellable?: boolean;
   readonly resultTargetUri?: string;
+  /** run1 Step 16: the runner's evidence the round is alive, shown on the viewer's row as the runner's own. */
+  readonly proofOfLifeV1?: ProofOfLifeV1;
+  /** run1 Step 30: the owner answer the runner holds for this task, on its root operation, for the viewer's row. */
+  readonly heldAnswerV1?: HeldAnswerRowInfoV1;
 }
 
 /**

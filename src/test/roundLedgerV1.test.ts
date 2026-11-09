@@ -51,6 +51,8 @@ import {
   terminalizeRoundV1,
 } from "../utils/roundLedgerV1";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
+import { PrimarySessionLock, PrimarySessionLockHeldError } from "../state/primarySessionLock";
+import { setStateLeaseWaitForTestsV1 } from "../state/taskStateStore";
 import { advancePauseFenceGenerationV1, readOrInitPauseFenceGenerationV1 } from "../state/workAdmissionV1";
 import { readChatHistory } from "../utils/chatHistoryStore";
 import {
@@ -59,10 +61,13 @@ import {
 import {
   claimReviewAttempt,
   claimReviewAttemptWithLiveLeaseV1,
+  closeImplementationRoundFailureV1,
   closeRoundRowIfDispatchThrowsV1,
   closeUnsettledReviewRowV1,
   finalizeReviewOutcomeV1,
   terminalizeFailedImplementationRoundV1,
+  keepStoppedRoundProgressV1,
+  bankLeftoverRoundProgressBeforeDispatchV1,
   handleReviewOutcomeV1,
   handleReviewRoutingOutcome,
   ReviewOutcomeContextV1,
@@ -2124,6 +2129,36 @@ void describe("claimReviewAttemptWithLiveLeaseV1 (A1 architectural blocker, 2026
     }
   });
 
+  // run1 Step 22: the wait for the state lease runs out BEFORE the claim, so there is no ledger row. The
+  // error still reaches the caller, the lease is cleared, and the owner is told what happened.
+  void it("a claim whose wait for the state lease runs out clears its lease and posts the _Ended: line naming the cause", async () => {
+    const fakeContext = installFakeExtensionContextV1();
+    const fsBridge = installFsBridge();
+    const wsStub = installWorkspaceFoldersStub();
+    const hostB = new PrimarySessionLock(path.join(REAL_ROOT, "plans", ".ensemble-meta.lock"));
+    const releaseHostB = await hostB.acquire();
+    setStateLeaseWaitForTestsV1([5, 5]);
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("claim_lock_exhausted_before_row");
+      await assert.rejects(
+        claimReviewAttemptWithLiveLeaseV1(folderUri, "lock-exhausted-attempt", "impl-high-review"),
+        (error: unknown) => error instanceof PrimarySessionLockHeldError
+      );
+      assert.deepEqual(listLiveRoundLeaseIdsV1(), [], "the liveness lease is cleared");
+      const history = await readChatHistory(folderPath, folderPath);
+      assert.ok(
+        history.some((m) => /another window was updating task state for more than 30 s/.test(m.text)),
+        "the owner's chat has the line that names the cause"
+      );
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      await releaseHostB();
+      wsStub.restore();
+      fsBridge.restore();
+      fakeContext.restore();
+    }
+  });
+
   void it("clears the lease immediately when the claim is refused (task paused), rather than leaking it for the full TTL", async () => {
     const fakeContext = installFakeExtensionContextV1();
     const fsBridge = installFsBridge();
@@ -3590,6 +3625,168 @@ void describe("review dispatch row settlement (post-1.0 fixes, Step 4)", () => {
     }
   });
 
+  // run1 Steps 22-23: the close itself needs the task-state lease. While another host holds it past the wait,
+  // the owner is still told: the line names the cause and Retry now is offered. Once it frees up, the row closes.
+  void it("a review row that cannot get the state lease after the wait: the line names the cause and Retry now is offered", async () => {
+    const fsBridge = installFsBridge();
+    const hostB = new PrimarySessionLock(path.join(REAL_ROOT, "plans", ".ensemble-meta.lock"));
+    const releaseHostB = await hostB.acquire();
+    setStateLeaseWaitForTestsV1([5, 5]);
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("review_lock_exhausted_row");
+      const lines: string[] = [];
+      const cards: Array<{ options: Array<{ label: string }> }> = [];
+      const notes: string[] = [];
+      await closeUnsettledReviewRowV1(folderUri, "round-open-1", "Another Ensemble session is currently updating task state.", {
+        stage: "impl-high-review",
+        stepName: "Review (High-Level Code Review)",
+        retry: { command: "vs-code-ai-helper.resumeAndRerunReview", args: [{ taskFolderPath: folderPath }] },
+        retryDelaysMs: [5],
+        deps: {
+          appendEndedLine: (_f, _s, text) => {
+            lines.push(text);
+            return Promise.resolve();
+          },
+          postCard: (card) => {
+            cards.push(card as unknown as { options: Array<{ label: string }> });
+            return Promise.resolve({});
+          },
+          notify: (message) => {
+            notes.push(message);
+          },
+        },
+      });
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.[0]?.state, "open", "the write could not happen; the orphan sweep will close the row");
+      assert.equal(lines.length, 1);
+      assert.match(lines[0] ?? "", /another window was updating task state for more than 30 s/);
+      assert.equal(cards[0]?.options[0]?.label, "Retry now");
+      assert.equal(notes.length, 1, "no ledger line behind the card, so a notification carries Retry now too");
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      await releaseHostB();
+      fsBridge.restore();
+    }
+  });
+
+  void it("a review row whose state lease frees up during the extra attempt closes with the plain cause, and posts one card", async () => {
+    const fsBridge = installFsBridge();
+    const hostB = new PrimarySessionLock(path.join(REAL_ROOT, "plans", ".ensemble-meta.lock"));
+    const releaseHostB = await hostB.acquire();
+    setStateLeaseWaitForTestsV1([5, 5]);
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("review_lock_exhausted_then_free");
+      const lines: string[] = [];
+      let cards = 0;
+      let notes = 0;
+      const closing = closeUnsettledReviewRowV1(folderUri, "round-open-1", "Another Ensemble session is currently updating task state.", {
+        stage: "impl-high-review",
+        stepName: "Review (High-Level Code Review)",
+        retry: { command: "vs-code-ai-helper.resumeAndRerunReview", args: [{ taskFolderPath: folderPath }] },
+        retryDelaysMs: [80],
+        deps: {
+          appendEndedLine: (_f, _s, text) => {
+            lines.push(text);
+            return Promise.resolve();
+          },
+          postCard: () => {
+            cards += 1;
+            return Promise.resolve({});
+          },
+          notify: () => {
+            notes += 1;
+          },
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      await releaseHostB();
+      await closing;
+      const raw = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      assert.equal(raw.roundLedger?.[0]?.state, "failed");
+      assert.match(raw.roundLedger?.[0]?.outcome?.rejectionReason ?? "", /another window was updating task state for more than 30 s/);
+      assert.equal(lines.length, 0, "the closed row posts its own ended line");
+      assert.equal(cards, 1);
+      assert.equal(notes, 0);
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      fsBridge.restore();
+    }
+  });
+
+  // run1 Step 23: a failure that is NOT a held lease, followed by a close that fails, still says so.
+  void it("a different failure whose row close also fails still posts the _Ended: line with the failure's reason", async () => {
+    const fsBridge = installFsBridge();
+    const hostB = new PrimarySessionLock(path.join(REAL_ROOT, "plans", ".ensemble-meta.lock"));
+    const releaseHostB = await hostB.acquire();
+    setStateLeaseWaitForTestsV1([5, 5]);
+    try {
+      const { folderUri } = makeTaskFolder("review_other_failure_close_fails");
+      const lines: string[] = [];
+      await closeUnsettledReviewRowV1(
+        folderUri,
+        "round-open-1",
+        "prompt rendering failed after claim",
+        undefined,
+        {
+          stage: "impl-high-review",
+          stepName: "Review (High-Level Code Review)",
+          appendEndedLine: (_f, _s, text) => {
+            lines.push(text);
+            return Promise.resolve();
+          },
+        }
+      );
+      assert.equal(lines.length, 1, "the owner is told even though the row could not be closed");
+      assert.match(lines[0] ?? "", /^_Ended: Review \(High-Level Code Review\) — failed — .*prompt rendering failed after claim/);
+      assert.doesNotMatch(lines[0] ?? "", /updating task state for more than 30 s/, "the cause is the real one, not the lease");
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      await releaseHostB();
+      fsBridge.restore();
+    }
+  });
+
+  // run1 Step 22: the implementation boundary is reached after the provider ran, so its lock-loss card
+  // must say the edits are still in the working tree and never "nothing was changed".
+  void it("an implementation round lost to a held lease late says its changes are kept, never that nothing changed", async () => {
+    const fsBridge = installFsBridge();
+    const hostB = new PrimarySessionLock(path.join(REAL_ROOT, "plans", ".ensemble-meta.lock"));
+    const releaseHostB = await hostB.acquire();
+    setStateLeaseWaitForTestsV1([5, 5]);
+    try {
+      const { folderUri } = makeTaskFolder("impl_lock_exhausted_late");
+      const lines: string[] = [];
+      const cards: Array<{ options: Array<{ label: string; consequence: string }> }> = [];
+      const notes: string[] = [];
+      await closeImplementationRoundFailureV1(folderUri, "impl-round-open-1", "Another Ensemble session is currently updating task state.", undefined, {
+        stage: "impl",
+        retryDelaysMs: [5],
+        deps: {
+          appendEndedLine: (_f, _s, text) => {
+            lines.push(text);
+            return Promise.resolve();
+          },
+          postCard: (card) => {
+            cards.push(card as unknown as { options: Array<{ label: string; consequence: string }> });
+            return Promise.resolve({});
+          },
+          notify: (message) => {
+            notes.push(message);
+          },
+        },
+      });
+      assert.match(lines[0] ?? "", /another window was updating task state for more than 30 s/);
+      assert.equal(cards[0]?.options[0]?.label, "Retry now");
+      const said = [cards[0]?.options[0]?.consequence ?? "", ...notes].join(" ");
+      assert.doesNotMatch(said, /Nothing was changed|never got as far as changing/);
+      assert.match(said, /still in the working tree/);
+    } finally {
+      setStateLeaseWaitForTestsV1();
+      await releaseHostB();
+      fsBridge.restore();
+    }
+  });
+
   void it("terminalizes an open review row even when run-log persistence rejects", async () => {
     const fsBridge = installFsBridge();
     try {
@@ -3652,6 +3849,178 @@ void describe("review dispatch row settlement (post-1.0 fixes, Step 4)", () => {
       const row = resolveRoundV1(settled, roundId);
       assert.equal(row?.state, "failed");
       assert.match(row?.outcome?.rejectionReason ?? "", /stalePreflight: target changed after preflight/);
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("run1 Step 8: the failed row, its reason and its _Ended: line read the cause the settlement recorded", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("settled_cause_row");
+      const { roundId } = await claimImplementationRoundLedgerV1(folderUri, "settled-cause-round", "impl", "implementation");
+
+      await terminalizeFailedImplementationRoundV1(folderUri, roundId, {
+        // The runner's raw message, as before: it must not be what the row says.
+        errorMessage: "Claude Code CLI hit the 240-minute wall-clock limit, hit a usage limit",
+        stopCauseV1: "ensembleBackstop",
+        providerLabel: "Claude Code",
+        filesChanged: ["src/a.ts", "src/b.ts", "src/c.ts"],
+        activityV1: {
+          workedMs: 4 * 60 * 60_000,
+          attributedFiles: ["src/a.ts", "src/b.ts"],
+          observedFiles: ["src/c.ts"],
+        },
+      });
+
+      const settled = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const row = resolveRoundV1(settled, roundId);
+      assert.equal(row?.state, "failed");
+      const reason = row?.outcome?.rejectionReason ?? "";
+      assert.match(reason, /Ensemble stops a round after/);
+      assert.doesNotMatch(reason, /usage limit/i);
+      assert.match(reason, /changed 2 files/);
+      assert.match(reason, /1 file changed in the workspace while it ran/);
+      assert.equal(row?.outcome?.stopCause, "ensembleBackstop");
+      assert.deepEqual(row?.outcome?.attributedFiles, ["src/a.ts", "src/b.ts"]);
+      assert.deepEqual(row?.outcome?.observedFiles, ["src/c.ts"]);
+      const ended = formatRoundOutcomeMessageV1(row);
+      assert.match(ended, /Ensemble stops a round after/);
+      assert.equal(
+        (ended.match(/while it ran/g) ?? []).length,
+        1,
+        "the observed files are said once on the _Ended: line"
+      );
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("run1 Step 11: a ledger row lists observed files apart, as not proven to be the round's", () => {
+    const entry = makeBaseEntry({
+      state: "failed",
+      endedAt: "2026-01-01T01:00:00.000Z",
+      outcome: { filesChanged: ["x.ts"], observedFiles: ["x.ts", "y.ts"] },
+    });
+    const text = formatRoundOutcomeMessageV1(entry);
+    assert.match(text, /2 files changed in the workspace while it ran, not proven to be this round's/);
+  });
+
+  void it("run1 Step 13: a stopped round keeps the ticks it wrote in round-progress.md, with evidence", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("stopped_round_keeps_ticks");
+      const plan = [
+        "# Plan",
+        "<!-- ensemble:implementation-checklist -->",
+        "- [ ] Add the settlement helper in src/a.ts",
+        "- [ ] Add the wording helper in src/b.ts",
+        "- [ ] Wire the row in src/c.ts",
+        "",
+      ].join("\n");
+      fs.writeFileSync(path.join(folderPath, "plan-final.md"), plan, "utf8");
+      fs.writeFileSync(
+        path.join(folderPath, "round-progress.md"),
+        [
+          "- [x] Add the settlement helper in src/a.ts",
+          "- [x] Add the wording helper in src/b.ts",
+          "",
+        ].join("\n"),
+        "utf8"
+      );
+      const { roundId } = await claimImplementationRoundLedgerV1(folderUri, "stopped-ticks-round", "impl", "implementation");
+
+      const kept = await keepStoppedRoundProgressV1(folderUri, roundId);
+
+      assert.equal(kept, 2, "both ticks are kept");
+      const merged = fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8");
+      assert.match(merged, /- \[x\] Add the settlement helper in src\/a\.ts/);
+      assert.match(merged, /- \[x\] Add the wording helper in src\/b\.ts/);
+      assert.match(merged, /- \[ \] Wire the row in src\/c\.ts/, "an item the round did not tick stays open");
+      const settled = JSON.parse(fs.readFileSync(path.join(folderPath, "task-progress.json"), "utf8")) as TaskProgress;
+      const claimed = (settled.planItemEvidence ?? []).filter((record) =>
+        record.claims.some((claim) => claim.roundId === roundId)
+      );
+      assert.equal(claimed.length, 2, "each tick is recorded as the round's claim, provisional until a review verifies it");
+      assert.equal(fs.existsSync(path.join(folderPath, "round-progress.md")), false, "banked ticks no longer need the file");
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("run1 Step 13: round-progress.md is left in place when its lines tick nothing", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("stopped_round_nothing_to_merge");
+      fs.writeFileSync(
+        path.join(folderPath, "plan-final.md"),
+        "# Plan\n<!-- ensemble:implementation-checklist -->\n- [ ] Only item\n",
+        "utf8"
+      );
+      fs.writeFileSync(path.join(folderPath, "round-progress.md"), "- [x] An item the plan does not have\n", "utf8");
+      const kept = await keepStoppedRoundProgressV1(folderUri, "some-round");
+      assert.equal(kept, 0);
+      assert.equal(fs.existsSync(path.join(folderPath, "round-progress.md")), true, "nothing was banked, so nothing is wiped");
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("run1 Step 13: a partial merge keeps the lines it could not bank, and the next dispatch never wipes them", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("stopped_round_partial_merge");
+      fs.writeFileSync(
+        path.join(folderPath, "plan-final.md"),
+        "# Plan\n<!-- ensemble:implementation-checklist -->\n- [ ] Add the helper in src/a.ts\n- [ ] Wire it in src/b.ts\n",
+        "utf8"
+      );
+      fs.writeFileSync(
+        path.join(folderPath, "round-progress.md"),
+        "- [x] Add the helper in src/a.ts\n  - evidence: src/a.ts:12\n- [x] An item the plan does not have\n  - evidence: src/z.ts:3 and the test that covers it\n",
+        "utf8"
+      );
+      const kept = await keepStoppedRoundProgressV1(folderUri, "partial-round");
+      assert.equal(kept, 1);
+      assert.equal(fs.existsSync(path.join(folderPath, "round-progress.md")), false);
+      const unbanked = fs.readFileSync(path.join(folderPath, "round-progress-unbanked.md"), "utf8");
+      assert.match(unbanked, /An item the plan does not have/);
+      assert.match(unbanked, /evidence: src\/z\.ts:3 and the test that covers it/, "the evidence under an unbanked tick is kept");
+
+      // A file that could not be merged at all is moved aside by the next dispatch, not deleted.
+      fs.writeFileSync(
+        path.join(folderPath, "round-progress.md"),
+        "- [x] Another unknown item\n  - evidence: src/q.ts:9\n",
+        "utf8"
+      );
+      await bankLeftoverRoundProgressBeforeDispatchV1(folderUri, "next-round");
+      assert.equal(fs.existsSync(path.join(folderPath, "round-progress.md")), false);
+      const moved = fs.readFileSync(path.join(folderPath, "round-progress-unbanked.md"), "utf8");
+      assert.match(moved, /Another unknown item/);
+      assert.match(moved, /evidence: src\/q\.ts:9/, "the evidence line moves aside with its tick");
+    } finally {
+      fsBridge.restore();
+    }
+  });
+
+  void it("run1 Step 13: a cancelled round's ticks are banked, not deleted", async () => {
+    const fsBridge = installFsBridge();
+    try {
+      const { folderPath, folderUri } = makeTaskFolder("cancelled_round_banks_ticks");
+      fs.writeFileSync(
+        path.join(folderPath, "plan-final.md"),
+        "# Plan\n<!-- ensemble:implementation-checklist -->\n- [ ] Add the helper in src/a.ts\n- [ ] Wire it in src/b.ts\n",
+        "utf8"
+      );
+      fs.writeFileSync(
+        path.join(folderPath, "round-progress.md"),
+        "- [x] Add the helper in src/a.ts\n  - evidence: src/a.ts:12\n",
+        "utf8"
+      );
+      // The cancelled-round branch of the implementation dispatch calls this.
+      await bankLeftoverRoundProgressBeforeDispatchV1(folderUri, "cancelled-round");
+      assert.match(fs.readFileSync(path.join(folderPath, "plan-final.md"), "utf8"), /- \[x\] Add the helper in src\/a\.ts/);
+      assert.equal(fs.existsSync(path.join(folderPath, "round-progress.md")), false);
     } finally {
       fsBridge.restore();
     }

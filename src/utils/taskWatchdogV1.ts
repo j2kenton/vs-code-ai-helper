@@ -498,7 +498,7 @@ export const STALLED_ACTIVE_TASK_PAUSE_REASON_V1 =
  * clears `implRecovery`, so resuming does not instantly re-trap the task. */
 export const UNRECOVERABLE_RECOVERY_PAUSE_REASON_V1 =
   "Watchdog: a recovery continuation for this task was dispatched but never finalized, and its " +
-  "record has no source round or quarantined file set left to safely re-arm. Cleared so resuming " +
+  "record has no source round or set of changed files kept for the next round left to safely re-arm. Cleared so resuming " +
   "does not immediately re-trap the task; review the run log for what the round actually changed " +
   "before resuming.";
 

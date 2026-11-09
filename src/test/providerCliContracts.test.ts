@@ -204,6 +204,11 @@ void describe("provider CLI contracts", () => {
     assert.deepStrictEqual(antigravity.conversationResume?.errorMarkers, [
       "error: timeout waiting for response",
     ]);
+    // run1 Step 4: agy 1.4.x's wording of the same 55-minute cut-off.
+    assert.deepStrictEqual(antigravity.conversationResume?.errorMarkerGroups, [
+      ["print timeout after", "turn in progress"],
+      ["print timeout after", "returning partial output"],
+    ]);
 
     // promptTransport: "file" is a contract with the caller — cliAgentRunner
     // always writes the prompt to disk and supplies its path before calling
@@ -931,14 +936,14 @@ void describe("provider CLI contracts", () => {
       "8192",
     ]);
 
-    // Edit mode is untouched: it keeps the original plain "text" format,
-    // since edit-mode runs are captured for their workspace file changes,
-    // not a parsed summary string.
+    // run1 Step 7: edit mode streams too, so a round stopped after it wrote its report keeps
+    // the words it had written.
     const editArgs = claude.buildArgs("edit", "sonnet@high");
     assert.deepStrictEqual(editArgs, [
       "-p",
       "--output-format",
-      "text",
+      "stream-json",
+      "--verbose",
       "--permission-mode",
       "acceptEdits",
       "--model",
@@ -952,10 +957,11 @@ void describe("provider CLI contracts", () => {
     const allowedArgs = claude.buildArgs("edit", "sonnet@high", {
       allowedShellCommands: ["pnpm run test", "pnpm run lint"],
     });
-    assert.deepStrictEqual(allowedArgs.slice(0, 7), [
+    assert.deepStrictEqual(allowedArgs.slice(0, 8), [
       "-p",
       "--output-format",
-      "text",
+      "stream-json",
+      "--verbose",
       "--permission-mode",
       "acceptEdits",
       "--allowedTools",

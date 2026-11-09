@@ -420,3 +420,81 @@ void describe("review1 item 4 replay: an Accepted Non-Goals edit makes the old r
     assert.match(source, /startReviewInputsChangedV1 \|\|/);
   });
 });
+
+void describe("run1 Step 15: recovery advice reads what the round provably did and why it stopped", () => {
+  const rowWith = (
+    id: string,
+    state: RoundLedgerEntryV1["state"],
+    outcome: NonNullable<RoundLedgerEntryV1["outcome"]>
+  ): Pick<RoundLedgerEntryV1, "roundId" | "stage" | "state" | "outcome"> => ({ roundId: id, stage: "impl-high-review", state, outcome });
+
+  void it("an Ensemble stop is a cut-off, never a provider error, whatever its wording says", () => {
+    const idle = classifyRoundEndingV1("failed", "Ensemble stopped the round: no reply from the model for 20 minutes.", at(0), "ensembleIdleStop");
+    assert.equal(idle.kind, "cut-off");
+    assert.equal(classifyRoundEndingV1("failed", "anything", at(0), "providerTimeCap").kind, "cut-off");
+    assert.equal(classifyRoundEndingV1("failed", "anything", at(0), "providerQuota").kind, "quota");
+  });
+
+  void it("a round stopped while its own stream shows it changing files is progress, not another failure", () => {
+    const watched = recordRoundEndedInWatchV1(
+      baseProgress(),
+      rowWith("r1", "failed", { rejectionReason: "Ensemble stops a round after 4 hours.", stopCause: "ensembleBackstop", attributedFiles: ["a.ts", "b.ts"] }),
+      { automatic: true, now: at(10) }
+    ).progressWatch;
+    assert.equal(watched?.consecutiveFailedAutoRounds, 0);
+    assert.equal(watched?.autoRoundsSinceProgress, 0);
+    assert.match(watched?.lastProgressWhat ?? "", /changed 2 files/);
+  });
+
+  void it("files that only changed in the workspace while the round ran are never progress", () => {
+    const watched = recordRoundEndedInWatchV1(
+      baseProgress(),
+      rowWith("r1", "failed", { rejectionReason: "Ensemble stopped the round: no reply.", stopCause: "ensembleIdleStop", observedFiles: ["a.ts", "b.ts", "c.ts"] }),
+      { automatic: true, now: at(10) }
+    ).progressWatch;
+    assert.equal(watched?.consecutiveFailedAutoRounds, 1);
+    assert.equal(watched?.endings[0]?.kind, "cut-off");
+    assert.equal(watched?.endings[0]?.attributedFileCount, undefined);
+  });
+
+  void it("time limits and quiet stops never support switching the model; a model repeating itself twice does", () => {
+    const ending = (stopCause: string, model = MODEL) =>
+      ({ at: at(0).toISOString(), kind: "cut-off", automatic: true, stopCause, model }) as const;
+    assert.equal(endingsAreRepeatedProviderFailuresV1([ending("ensembleIdleStop"), ending("providerTimeCap"), ending("ensembleBackstop")]), false);
+    assert.equal(endingsAreRepeatedProviderFailuresV1([ending("ensembleRepeatStop")]), false);
+    assert.equal(endingsAreRepeatedProviderFailuresV1([ending("ensembleRepeatStop"), ending("ensembleRepeatStop")]), true);
+    assert.equal(endingsAreRepeatedProviderFailuresV1([ending("ensembleRepeatStop"), ending("ensembleRepeatStop", "other-model")]), false);
+  });
+
+  void it("generic failures and vanished processes never support switching the model; limits and sign-in failures do", () => {
+    const failed = (stopCause: string | undefined, kind: "provider-error" | "cut-off" | "quota" = "provider-error") =>
+      ({ at: at(0).toISOString(), kind, automatic: true, model: MODEL, ...(stopCause !== undefined ? { stopCause } : {}) }) as const;
+    assert.equal(endingsAreRepeatedProviderFailuresV1([failed(undefined), failed(undefined)]), false, "two generic failures");
+    assert.equal(endingsAreRepeatedProviderFailuresV1([failed("generic"), failed("providerError")]), false);
+    assert.equal(endingsAreRepeatedProviderFailuresV1([failed("processEnded", "cut-off"), failed("processEnded", "cut-off")]), false, "a vanished process");
+    assert.equal(endingsAreRepeatedProviderFailuresV1([failed("signIn"), failed("signIn")]), true);
+    assert.equal(endingsAreRepeatedProviderFailuresV1([failed("providerUsageLimit", "quota"), failed("providerQuota", "quota")]), true);
+    assert.equal(endingsAreRepeatedProviderFailuresV1([failed(undefined, "quota"), failed(undefined, "quota")]), true);
+  });
+
+  void it("a completed round whose stream named files is progress, and the completed ledger row carries them", () => {
+    const watched = recordRoundEndedInWatchV1(
+      baseProgress(),
+      rowWith("r1", "completed", { filesChanged: ["a.ts"], attributedFiles: ["a.ts"], observedFiles: ["x.ts"] }),
+      { automatic: true, now: at(10) }
+    ).progressWatch;
+    assert.equal(watched?.autoRoundsSinceProgress, 0);
+    assert.match(watched?.lastProgressWhat ?? "", /changed 1 file and finished/);
+    const reviewActionsSource = fs.readFileSync(path.join(__dirname, "..", "..", "src", "commands", "reviewActions.ts"), "utf8");
+    assert.match(reviewActionsSource, /const activityFields = roundLedgerActivityFieldsV1\(completedResult\)/);
+  });
+
+  void it("the card tells a model that repeated itself apart from one that went quiet", () => {
+    const text = describeRoundEndingsV1([
+      { at: at(0).toISOString(), kind: "cut-off", automatic: true, stopCause: "ensembleRepeatStop" },
+      { at: at(1).toISOString(), kind: "cut-off", automatic: true, stopCause: "ensembleIdleStop" },
+    ]);
+    assert.match(text, /1 stopped because the model kept repeating itself/);
+    assert.match(text, /1 stopped with no reply from the model/);
+  });
+});

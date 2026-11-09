@@ -10,6 +10,10 @@ import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { REVIEW_TARGETS } from "../utils/reviewReadiness";
 import { describeOperationModelSegmentV1 } from "../utils/operationModelSegmentV1";
 import { recordStageActionTerminalOutcomeV1 } from "../utils/stageActionRefusalV1";
+import type { ProofOfLifeV1 } from "../utils/proofOfLifeV1";
+import { describeHeldAnswerRowInfoV1, type HeldAnswerRowInfoV1 } from "../utils/heldAnswerLifecycleV1";
+import { describeRunningRowEvidenceV1 } from "../utils/runningRowEvidenceV1";
+import { getResilienceSettings, RESILIENCE_DEFAULTS } from "../config/settings";
 
 export const STATUS_VIEW_ID = "vs-code-ai-helper.statusView";
 
@@ -91,7 +95,20 @@ export interface StatusOperationNode {
   /** Elapsed-time origin for `activity`; falls back to `startedAt` when absent. */
   readonly activityStartedAt?: number;
   readonly startedAt: number;
+  /**
+   * run1 Step 18: the round's proof of life (process, last output, last provable action), carried
+   * from the operation registry, or mirrored from the runner for a viewer window.
+   */
+  readonly proofOfLifeV1?: ProofOfLifeV1;
+  /** run1 Step 30: the owner answer held for this task, with the Run it now / Drop it buttons. */
+  readonly heldAnswerV1?: HeldAnswerRowInfoV1;
 }
+
+/** run1 Step 30: appended to a row's `contextValue` while an owner answer is held for its task. */
+export const OPERATION_HELD_CONTEXT_SUFFIX_V1 = "-held";
+
+/** `contextValue` of a cancellable row whose round shows no sign of life: it also offers Wait. */
+export const OPERATION_STUCK_CONTEXT_VALUE_V1 = "ensemble-operation-cancellable-stuck";
 
 /** Live elapsed-time display: seconds below one minute, `Xm Ys` below one
  * hour, `Xh Ym` from then on — matches the in-flight-activity worked
@@ -104,6 +121,12 @@ export function formatElapsedForDisplay(originMs: number, now: number = Date.now
   if (hours > 0) {return `${hours}h ${minutes}m`;}
   if (minutes > 0) {return `${minutes}m ${seconds}s`;}
   return `${seconds}s`;
+}
+
+/** "06:02": the clock time an operation started, in the viewer's local time. */
+function formatStartClockV1(startedAt: number): string {
+  const date = new Date(startedAt);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 export type StatusTreeNode = StatusEntry | StatusOperationNode;
@@ -248,6 +271,24 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       this.refresh();
       this.ensureTicking();
     });
+  }
+
+  /** Operations whose no-activity warning the owner hid with Wait, until the given time. */
+  private readonly warningHiddenUntil = new Map<string, number>();
+
+  /** `ensemble.resilience.noActivityWarningMinutes`; the default when settings can't be read. */
+  protected noActivityWarningMinutes(): number {
+    try {
+      return getResilienceSettings().noActivityWarningMinutes;
+    } catch {
+      return RESILIENCE_DEFAULTS.noActivityWarningMinutes;
+    }
+  }
+
+  /** The Wait button: hide this row's no-activity warning for another warning period. Nothing is stopped. */
+  waitOnOperation(operationId: string, now: number = Date.now()): void {
+    this.warningHiddenUntil.set(operationId, now + this.noActivityWarningMinutes() * 60_000);
+    this.refresh();
   }
 
   /** Starts the 1s elapsed-time tick while any root operation is live, and
@@ -457,11 +498,27 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         element.detail ?? element.activity ?? (element.waitingForUser ? "waiting for you" : "running");
       const elapsedOrigin = element.activityStartedAt ?? element.startedAt;
       const elapsedSegment = formatElapsedForDisplay(elapsedOrigin);
+      // run1 Step 18: proof of life. The last-activity line and the no-activity warning come from the
+      // round's own evidence only (output and what it provably did), never from files other windows
+      // changed; those appear in the tooltip as not proven to be this round's.
+      const evidence = describeRunningRowEvidenceV1({
+        proof: element.proofOfLifeV1,
+        startedAt: element.startedAt,
+        now: Date.now(),
+        warningMinutes: this.noActivityWarningMinutes(),
+        waitingForUser: element.waitingForUser,
+        ...(this.warningHiddenUntil.get(element.id) !== undefined
+          ? { warningHiddenUntil: this.warningHiddenUntil.get(element.id)! }
+          : {}),
+      });
       item.description = [
         stageLabel,
         activitySegment,
         describeOperationModelSegmentV1({ modelId: element.modelId, activity: element.activity, detail: element.detail }),
+        `started ${formatStartClockV1(element.startedAt)}`,
         elapsedSegment,
+        evidence.warning ?? evidence.activityLine,
+        element.heldAnswerV1 !== undefined ? describeHeldAnswerRowInfoV1(element.heldAnswerV1) : undefined,
       ]
         .filter((segment): segment is string => segment !== undefined && segment.length > 0)
         .join(" · ");
@@ -472,8 +529,18 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       // Cancellable operations get an inline stop button via the
       // view/item/context menu contribution keyed on this contextValue.
       item.contextValue = element.cancellable
-        ? "ensemble-operation-cancellable"
+        ? `${evidence.stuck ? OPERATION_STUCK_CONTEXT_VALUE_V1 : "ensemble-operation-cancellable"}${
+            element.heldAnswerV1 !== undefined ? OPERATION_HELD_CONTEXT_SUFFIX_V1 : ""
+          }`
         : "ensemble-operation";
+      if (evidence.warning !== undefined || evidence.activityLine !== undefined || evidence.tooltipLines.length > 0) {
+        item.tooltip = [
+          `${label}${stageLabel ? ` · ${stageLabel}` : ""}`,
+          ...(evidence.warning !== undefined ? [evidence.warning] : []),
+          ...(evidence.activityLine !== undefined ? [evidence.activityLine] : []),
+          ...evidence.tooltipLines,
+        ].join("\n");
+      }
       return item;
     }
 
@@ -622,6 +689,8 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
         activity: op.activity,
         activityStartedAt: op.activityStartedAt,
         startedAt: op.startedAt,
+        proofOfLifeV1: op.proofOfLifeV1,
+        heldAnswerV1: taskOperations.heldAnswerForTaskV1(op.key),
       })).map((fresh): StatusOperationNode => {
         // Reuse the row object the tree already holds, updated in place.
         const cached = this.operationNodeCache.get(fresh.id);
@@ -634,6 +703,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       for (const id of [...this.operationNodeCache.keys()]) {
         if (!runningNodes.some((node) => node.id === id)) {
           this.operationNodeCache.delete(id);
+          this.warningHiddenUntil.delete(id);
         }
       }
       return [...runningNodes, ...this.filteredEntries()];

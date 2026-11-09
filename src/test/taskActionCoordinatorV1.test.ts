@@ -5452,9 +5452,13 @@ void describe("taskActionCoordinatorV1 — item 2 / Step 55: cancellation termin
         path.join(__dirname, "..", "..", "src", "commands", "reviewActions.ts"),
         "utf8"
       );
-      assert.match(src, /rejectionReason: describeTaskActionFailureV1\(outcome\)/);
+      // run1 Step 8: the ledger reason and the notification go through `describeReviewFailureV1`, which
+      // words the combined failure with `describeTaskActionFailureV1` and only rewords Ensemble's own stops.
+      assert.match(src, /\.\.\.\(terminalState === "failed" \? reviewFailureLedgerOutcomeV1\(outcome\)/);
+      assert.match(src, /rejectionReason: worded\.reason/);
+      assert.match(src, /const text = describeTaskActionFailureV1\(outcome\);/);
       assert.match(src, /describeTaskActionOutcomeForLogV1\(\s*outcome,\s*STAGE_ARTIFACT_FILENAMES/);
-      assert.match(src, /failed: \$\{describeTaskActionFailureV1\(outcome\)\}\. [`"]/);
+      assert.match(src, /failed: \$\{describeReviewFailureV1\(outcome\)\.reason\}\. [`"]/);
     });
 
     void it("with primary at usage limit and Copilot returning malformed result, Claude is tried next without restarting at primary", async () => {

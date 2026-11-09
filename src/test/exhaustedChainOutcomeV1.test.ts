@@ -188,3 +188,25 @@ void describe("automation command outcome report (bugs3 Step 3)", () => {
     assert.equal(takeAutomationCommandOutcomeV1("/a")?.reason, "r");
   });
 });
+
+void describe("run1 plain words: the recovery step says 'usage limit' only when the provider's own text does", () => {
+  const quotaCandidate = (reason: string) => ({
+    storedModelId: "kimi-cli:kimi-code/k3.1-pro@max",
+    providerLabel: "Kimi Code CLI",
+    runnerId: "kimi-cli",
+    reason,
+    deferredFailureKind: "quota" as const,
+    attemptIds: ["attempt-kimi"],
+  });
+
+  void it("a quota failure whose text names no usage limit is told as a quota or rate limit", () => {
+    const recovery = describeChainRecoveryV1([quotaCandidate("429 Too Many Requests")], "plan");
+    assert.match(recovery, /wait for the quota or rate limit to reset/);
+    assert.doesNotMatch(recovery, /usage limit/);
+  });
+
+  void it("a failure that says usage limit keeps the words the provider used", () => {
+    const recovery = describeChainRecoveryV1([quotaCandidate("429 You reached your 5-hour usage limit")], "plan");
+    assert.match(recovery, /wait for the usage limit to reset/);
+  });
+});

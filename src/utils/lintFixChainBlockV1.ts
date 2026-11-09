@@ -5,6 +5,7 @@
  * recommended move is a different Publish model, never a re-run of known-failing checks.
  */
 import { formatProviderErrorV1 } from "./providerErrorFormatterV1";
+import { describeProviderLimitPhraseV1 } from "./roundStopCauseV1";
 import { isAuthenticationFailure, isPaymentRequiredFailureV1, isQuotaError } from "./quota";
 import type { ChainAttemptV1 } from "./stopBehaviourV1";
 
@@ -74,7 +75,7 @@ function readFixChainFailureFromTextV1(errorMessage: string | undefined): FixCha
   }
   // The headline names the primary's provider and its own failure ("X hit a usage limit: ..."). It is the
   // primary's outcome unless a record below already names that provider's model (the same attempt, said twice).
-  const headline = /^(?:AI final fixes failed: )?(.+?) hit a usage limit(?:: ((?:(?!Backup |The stage's primary ).)*))?/.exec(raw);
+  const headline = /^(?:AI final fixes failed: )?(.+?) hit a (?:usage|quota or rate) limit(?:: ((?:(?!Backup |The stage's primary ).)*))?/.exec(raw);
   const headlineLabel = headline?.[1]?.trim();
   if (
     headlineLabel !== undefined &&
@@ -106,7 +107,8 @@ function describeTriedOutcomeV1(reason: string): string {
     case "payment-required":
       return `payment required${resetClause}`;
     case "quota":
-      return `usage limit${resetClause}`;
+      // "usage limit" only when the provider's own text says so (the shared stop wording decides).
+      return `${describeProviderLimitPhraseV1(reason)}${resetClause}`;
     case "auth":
       return "sign-in failed";
     default:

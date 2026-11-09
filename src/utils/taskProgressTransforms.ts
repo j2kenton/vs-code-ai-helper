@@ -576,6 +576,8 @@ export function updateTaskStatus(
   return {
     ...progress,
     status,
+    // run1 Step 31: who paused is retired by any move away from paused, like the pause reason.
+    ...(status !== "paused" && progress.ownerPausedAt !== undefined ? { ownerPausedAt: undefined } : {}),
     // A workflow-imposed pause reason describes the CURRENT paused state
     // only — any transition away from paused (resume, completion, archive)
     // retires it, or a long-resolved "no provider available" banner would

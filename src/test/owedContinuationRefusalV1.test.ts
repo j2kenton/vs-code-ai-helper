@@ -97,7 +97,7 @@ void describe("describeOwedContinuationRefusalV1 — the refusal explainer's req
       ["src/a.ts", "src/b.ts", "src/c.ts"],
       0
     );
-    assert.match(message, /3 file\(s\) are quarantined/);
+    assert.match(message, /The 3 changed files are kept for the next round/);
     assert.match(message, /- src\/a\.ts/);
     assert.match(message, /- src\/b\.ts/);
     assert.match(message, /- src\/c\.ts/);
@@ -105,7 +105,7 @@ void describe("describeOwedContinuationRefusalV1 — the refusal explainer's req
 
   void it("omits the file list when nothing is quarantined and the change set is not recorded unknown", () => {
     const message = describeOwedContinuationRefusalV1(makeRecord(), [], 0);
-    assert.doesNotMatch(message, /quarantined/);
+    assert.doesNotMatch(message, /kept for the next round/);
   });
 
   void it("renders an explicit unknown when nothing is quarantined but filesChangedUnknown is set", () => {
@@ -114,7 +114,7 @@ void describe("describeOwedContinuationRefusalV1 — the refusal explainer's req
       [],
       0
     );
-    assert.match(message, /could not be enumerated \(recorded as unknown\)/);
+    assert.match(message, /could not be listed/);
   });
 
   void it("a dispatched record states retrying cannot help, and does not claim the sweep never re-fires it", () => {
@@ -163,8 +163,9 @@ void describe("describeOwedContinuationRefusalV1 — the refusal explainer's req
     );
     assert.doesNotMatch(message, /queued and will be retried automatically/);
     assert.doesNotMatch(message, /no action is needed from you/);
-    assert.match(message, /continuation budget is exhausted/);
-    assert.match(message, /retrying this action will not help either/);
+    assert.match(message, /Ensemble tried 3 times by itself to finish this round and has stopped trying/);
+    assert.doesNotMatch(message, /budget/i);
+    assert.match(message, /retrying this action will not help either/i);
     // v1 fixes 2, item 15: "rerun the implementation manually" is a remedy
     // this very record refuses — the message must name the action that
     // actually clears it (discard) instead, and say plainly that rerunning
@@ -330,7 +331,7 @@ void describe("showTaskBusyWarning — reads a real implRecovery record and surf
       await showTaskBusyWarning(FOLDER.fsPath);
       const message = surface.entries[0]?.message ?? "";
       assert.match(message, /A continuation round is owed for this task/);
-      assert.match(message, /2 file\(s\) are quarantined/);
+      assert.match(message, /The 2 changed files are kept for the next round/);
       assert.match(message, /- src\/foo\.ts/);
       assert.match(message, /retrying this action will not/i);
     } finally {

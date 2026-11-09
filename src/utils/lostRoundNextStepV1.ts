@@ -14,6 +14,7 @@ import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import type { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from "../types/workflowDecisionV1";
 import { formatProviderErrorV1 } from "./providerErrorFormatterV1";
 import { classifyRoundEndingV1 } from "./taskProgressWatchV1";
+import { describeProviderLimitPhraseV1 } from "./roundStopCauseV1";
 
 const LOST_STATES: ReadonlySet<string> = new Set(["failed", "rejected", "interrupted", "quota-blocked"]);
 const EDITING_MODES: ReadonlySet<string> = new Set(["implementation", "apply-review", "continuation"]);
@@ -24,6 +25,10 @@ export interface LostEditingRoundV1 {
   readonly state: RoundLedgerEntryV1["state"];
   /** The failure text the ledger recorded, when there is one. */
   readonly failure?: string;
+  /** run1 Step 15: the cause the round's settlement recorded, when it recorded one. */
+  readonly stopCause?: string;
+  /** run1 Step 15: files the round's own stream shows it changed (never files it could not prove). */
+  readonly attributedFileCount?: number;
   readonly stage: TaskStage;
   /** The Fast Forward run the round belonged to (its counters when it opened), from the round's ledger row. */
   readonly fastForwardRun?: { readonly attemptNumber: number; readonly maxAttempts: number };
@@ -56,15 +61,38 @@ export function findContinuableLostEditingRoundV1(
     state: last.state,
     stage,
     ...(last.outcome?.rejectionReason !== undefined ? { failure: last.outcome.rejectionReason } : {}),
+    ...(last.outcome?.stopCause !== undefined ? { stopCause: last.outcome.stopCause } : {}),
+    ...((last.outcome?.attributedFiles?.length ?? 0) > 0 ? { attributedFileCount: last.outcome?.attributedFiles?.length ?? 0 } : {}),
     ...(last.fastForwardRunV1 ? { fastForwardRun: last.fastForwardRunV1 } : {}),
     fastForwardKnown: last.fastForwardRunV1 !== undefined || last.fastForwardStampedV1 === true,
   };
 }
 
-/** A failure that will repeat on the same model: a time limit, a usage limit or a sign-in problem. */
-export function failureWillRepeatV1(state: RoundLedgerEntryV1["state"], failure: string | undefined): boolean {
-  const kind = classifyRoundEndingV1(state, failure).kind;
-  if (kind === "cut-off" || kind === "quota") return true;
+/** Stops that name nothing wrong with the model: Ensemble's own, a provider's per-turn cap, and a lone repeat stop. */
+const NOT_A_REPEATING_STOP_V1: ReadonlySet<string> = new Set([
+  "ensembleBackstop",
+  "ensembleIdleStop",
+  "ensembleEndOfTurn",
+  "ensembleRepeatStop",
+  "providerTimeCap",
+  "processEnded",
+]);
+
+/** A failure that will repeat on the same model: a usage limit or a sign-in problem (see below for time limits). */
+export function failureWillRepeatV1(
+  state: RoundLedgerEntryV1["state"],
+  failure: string | undefined,
+  stopCause?: string,
+  attributedFileCount = 0
+): boolean {
+  // run1 Step 15: Ensemble's own stops (time limit, quiet stretch, a turn that did not exit, one repeat stop) and
+  // a provider's per-turn time cap say nothing about the model, so they never recommend another one. A round
+  // that was stopped while its own stream shows it changing files was making progress: continue from the
+  // working tree. Only a provider limit or a sign-in failure is a failure that will repeat.
+  if (stopCause !== undefined && NOT_A_REPEATING_STOP_V1.has(stopCause)) return false;
+  const kind = classifyRoundEndingV1(state, failure, new Date(), stopCause).kind;
+  if (kind === "cut-off" && attributedFileCount > 0) return false;
+  if (kind === "cut-off" || kind === "quota") return kind === "quota" || stopCause === undefined;
   return /\b(sign(?:ed)?[- ]?in|log(?:ged)?[- ]?in|authenticat|unauthori[sz]ed|401|403|expired token|api key)\b/i.test(failure ?? "");
 }
 
@@ -103,7 +131,17 @@ function failureSentence(lost: LostEditingRoundV1): string {
   const what =
     lost.mode === "apply-review" ? "Apply Review" : lost.mode === "continuation" ? "continuation round" : "Implementation round";
   const how =
-    lost.state === "interrupted" ? "was interrupted" : lost.state === "quota-blocked" ? "hit a usage limit" : lost.state === "rejected" ? "ended with a rejected report" : "failed";
+    lost.state === "interrupted"
+      ? "was interrupted"
+      : lost.state === "quota-blocked"
+        ? // A limit is named only when the provider's own text is on record; "usage limit" only when that text
+          // says so (the shared stop wording decides). With no text, nothing claims a limit.
+          lost.failure !== undefined && lost.failure.trim() !== ""
+          ? `hit a ${describeProviderLimitPhraseV1(lost.failure)}`
+          : "was stopped by the provider (no reason was recorded)"
+        : lost.state === "rejected"
+          ? "ended with a rejected report"
+          : "failed";
   return `The ${what} ${how}${readable ? `: ${readable}` : ""}. Its edits are kept in the working tree.`;
 }
 
@@ -115,7 +153,12 @@ export function buildLostEditingRoundCardPartsV1(input: LostRoundCardInputV1): {
 } {
   const stageName = STAGE_DISPLAY_NAMES[input.stage] ?? input.stage;
   const taskArg = { taskFolderPath: input.taskFolderPath };
-  const repeats = failureWillRepeatV1(input.lost.state, input.lost.failure);
+  const repeats = failureWillRepeatV1(
+    input.lost.state,
+    input.lost.failure,
+    input.lost.stopCause,
+    input.lost.attributedFileCount ?? 0
+  );
   const others = input.chainModels.filter((model) => model !== input.lostModel);
   const options: WorkflowDecisionOptionV1[] = [];
 

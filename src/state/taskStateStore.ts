@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as vscode from "vscode";
 import { writeAtomic } from "./writeAtomic";
-import { PrimarySessionLock } from "./primarySessionLock";
+import { PrimarySessionLock, PrimarySessionLockHeldError } from "./primarySessionLock";
 import * as path from "path";
 
 // Commands issued from one extension host can overlap (for example, a second
@@ -53,20 +53,69 @@ function metaLocksForTasksRoot(tasksRoot: string): PrimarySessionLock[] {
   ];
 }
 
+/**
+ * run1 Steps 21-22 audit: what the leases guard.
+ *  - The session lease (`.ensemble-session.lock`) and meta lease (`.ensemble-meta.lock`) are shared by
+ *    every task under one meta root. They serialise activation (which pauses every OTHER active task by
+ *    writing their progress files WITHOUT those tasks' own locks) and task creation (the "no active task
+ *    exists" check plus the new task's first status write) against every ordinary task write.
+ *  - The task lease (`.ensemble-task.lock`) guards one task's own files.
+ * A write that touches one task's non-status fields does not need the workspace-wide leases for its own
+ * sake, but dropping them would let it race activation's unlocked write to the same file, so they stay.
+ * What changes instead: a lease held by another host is WAITED for, not failed on. Leases are held for
+ * milliseconds and renewed, so the wait is normally a fraction of a second; it is bounded
+ * ({@link STATE_LEASE_WAIT_DELAYS_MS_V1}, about 30 s) and everything already taken is released before
+ * each wait, so two hosts can never hold one lease each and wait on the other's.
+ */
+export const STATE_LEASE_WAIT_DELAYS_MS_V1: readonly number[] = [
+  100, 200, 400, 800, 1_000, 1_500, 2_000, 3_000, 4_000, 5_000, 6_000, 6_000,
+];
+let leaseWaitDelaysMs: readonly number[] = STATE_LEASE_WAIT_DELAYS_MS_V1;
+let leaseWaitSleep: (ms: number) => Promise<void> = (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Tests only: shorten the wait for a held lease. Pass no argument to restore the defaults. */
+export function setStateLeaseWaitForTestsV1(delaysMs?: readonly number[], sleep?: (ms: number) => Promise<void>): void {
+  leaseWaitDelaysMs = delaysMs ?? STATE_LEASE_WAIT_DELAYS_MS_V1;
+  leaseWaitSleep = sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+}
+
+/**
+ * Take every lease in order, waiting (bounded) while another host holds one. On a held lease, the ones
+ * already taken are released before the wait. Throws `PrimarySessionLockHeldError` when the wait runs out.
+ */
+async function acquireLeasesWithWait(
+  locksFor: () => PrimarySessionLock[]
+): Promise<Array<() => Promise<void>>> {
+  for (let attempt = 0; ; attempt += 1) {
+    const releases: Array<() => Promise<void>> = [];
+    try {
+      for (const lock of locksFor()) {
+        releases.push(await lock.acquire());
+      }
+      return releases;
+    } catch (error) {
+      for (const release of releases.reverse()) {
+        await release();
+      }
+      const delay = leaseWaitDelaysMs[attempt];
+      if (!(error instanceof PrimarySessionLockHeldError) || delay === undefined) {
+        throw error;
+      }
+      await leaseWaitSleep(delay);
+    }
+  }
+}
+
 export async function withTaskLock<T>(taskFolderPath: string, operation: () => Promise<T>): Promise<T> {
   const tasksRoot = path.join(taskFolderPath, "..");
   return withLocalMutationQueue(tasksRoot, async () => {
     // Mutations always acquire the shared session, meta-root, then task lease.
     // Keeping this order fixed prevents activation and task writes deadlocking.
-    const locks = [
+    const releases = await acquireLeasesWithWait(() => [
       ...metaLocksForTasksRoot(tasksRoot),
       new PrimarySessionLock(path.join(taskFolderPath, ".ensemble-task.lock")),
-    ];
-    const releases: Array<() => Promise<void>> = [];
+    ]);
     try {
-      for (const lock of locks) {
-        releases.push(await lock.acquire());
-      }
       return await operation();
     } finally {
       for (const release of releases.reverse()) {
@@ -89,12 +138,8 @@ export async function withTaskLock<T>(taskFolderPath: string, operation: () => P
  */
 export async function withMetaRootLock<T>(tasksRoot: string, operation: () => Promise<T>): Promise<T> {
   return withLocalMutationQueue(tasksRoot, async () => {
-    const locks = metaLocksForTasksRoot(tasksRoot);
-    const releases: Array<() => Promise<void>> = [];
+    const releases = await acquireLeasesWithWait(() => metaLocksForTasksRoot(tasksRoot));
     try {
-      for (const lock of locks) {
-        releases.push(await lock.acquire());
-      }
       return await operation();
     } finally {
       for (const release of releases.reverse()) {

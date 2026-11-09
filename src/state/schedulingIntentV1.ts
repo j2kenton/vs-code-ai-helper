@@ -188,7 +188,7 @@ export function deriveOwedContinuationRecordV1(
 function buildRetryingOwedTriggerV1(owed: OwedContinuationRecordV1): string {
   const filesClause =
     owed.quarantinedFiles.length > 0
-      ? ` (${owed.quarantinedFiles.length} file(s) quarantined behind it: ${owed.quarantinedFiles.join(", ")})`
+      ? ` (${owed.quarantinedFiles.length} changed file(s) kept for it: ${owed.quarantinedFiles.join(", ")})`
       : "";
   return `owed implementation continuation is queued and will be retried automatically${filesClause}`;
 }
@@ -466,7 +466,7 @@ export function describeSchedulingPostureV1(posture: SchedulingPostureV1): Hando
         : "It will not re-fire automatically.";
       const filesDetail =
         posture.quarantinedFiles.length > 0
-          ? `${posture.quarantinedFiles.length} file(s) are quarantined behind it: ${posture.quarantinedFiles.join(", ")}. `
+          ? `${posture.quarantinedFiles.length} changed file(s) are kept for it: ${posture.quarantinedFiles.join(", ")}. `
           : "";
       return {
         reason: posture.blocker,

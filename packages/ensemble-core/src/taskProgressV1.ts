@@ -308,6 +308,11 @@ export interface TaskProgress {
    * transition. See the extension's copy for the full state-machine
    * commentary. */
   stageReviewPasses?: Partial<Record<TaskStage, number>>;
+  /** Mirror of `src/types/taskProgress.ts` (run1 Step 25): other tasks' `task.md` edits already
+   * said once on a round end line, as `<task folder>:<sha256>`. Bounded to the latest 100. */
+  notedForeignEdits?: string[];
+  /** Mirror of `src/types/taskProgress.ts` (run1 Step 31): when the OWNER paused the task (ISO time). */
+  ownerPausedAt?: string;
 }
 
 /** One artifact deliberately accepted as absent by a human completion override. */

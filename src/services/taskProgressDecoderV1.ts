@@ -193,6 +193,8 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "quotaParkRecord",
   "nextActor",
   "stageReviewPasses",
+  "notedForeignEdits",
+  "ownerPausedAt",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -1362,10 +1364,47 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
     "reviewerChallengedNonGoal",
     "taskMdSizeBand",
     "identityAttachmentDegraded",
+    // run1 Steps 8, 11 and 25: what the round's single settlement recorded.
+    "attributedFiles",
+    "observedFiles",
+    "stopCause",
+    "candidateStopCauses",
+    "processStartedAt",
+    "processEndedAt",
   ]);
   for (const key of Object.keys(value)) {
     if (!allowed.has(key)) {
       return `roundLedger entry outcome has an unknown property ${JSON.stringify(key)}`;
+    }
+  }
+  for (const key of ["attributedFiles", "observedFiles"] as const) {
+    if (value[key] !== undefined) {
+      if (!Array.isArray(value[key]) || value[key].length > MAX_IMPL_REVIEW_FILES) {
+        return `roundLedger entry outcome ${key} must be a bounded array`;
+      }
+      for (const entry of value[key] as unknown[]) {
+        if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_PATH_LENGTH) {
+          return `roundLedger entry outcome ${key} entries must be bounded non-empty strings`;
+        }
+      }
+    }
+  }
+  if (value["stopCause"] !== undefined && (typeof value["stopCause"] !== "string" || value["stopCause"].length > 64)) {
+    return "roundLedger entry outcome stopCause must be a bounded string";
+  }
+  if (value["candidateStopCauses"] !== undefined) {
+    if (!Array.isArray(value["candidateStopCauses"]) || value["candidateStopCauses"].length > MAX_ROUND_LEDGER_ATTEMPT_IDS) {
+      return "roundLedger entry outcome candidateStopCauses must be a bounded array";
+    }
+    for (const entry of value["candidateStopCauses"] as unknown[]) {
+      if (typeof entry !== "string" || entry.length > 64) {
+        return "roundLedger entry outcome candidateStopCauses entries must be bounded strings";
+      }
+    }
+  }
+  for (const key of ["processStartedAt", "processEndedAt"] as const) {
+    if (value[key] !== undefined && (typeof value[key] !== "string" || value[key].length === 0 || value[key].length > 64)) {
+      return `roundLedger entry outcome ${key} must be a bounded non-empty string`;
     }
   }
   if (value["filesChanged"] !== undefined) {
@@ -1542,6 +1581,7 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
       "checklistRevisionAdopted",
       "fastForwardRunV1",
       "fastForwardStampedV1",
+      "heldDispatchId",
     ]);
     for (const key of Object.keys(entry)) {
       if (!allowed.has(key)) {
@@ -1626,6 +1666,14 @@ function validateRoundLedger(value: unknown, family: TaskProgressFamilyV1): stri
     }
     if (entry["fastForwardStampedV1"] !== undefined && entry["fastForwardStampedV1"] !== true) {
       return "roundLedger entry fastForwardStampedV1 must be true when present";
+    }
+    if (
+      entry["heldDispatchId"] !== undefined &&
+      (typeof entry["heldDispatchId"] !== "string" ||
+        entry["heldDispatchId"].length === 0 ||
+        entry["heldDispatchId"].length > MAX_ID_LENGTH)
+    ) {
+      return "roundLedger entry heldDispatchId must be a bounded non-empty string when present";
     }
     if (entry["fastForwardRunV1"] !== undefined) {
       const ff = entry["fastForwardRunV1"];
@@ -1741,13 +1789,16 @@ function validateProgressWatch(value: unknown): string | undefined {
   if (!Array.isArray(endings) || endings.length > MAX_PROGRESS_WATCH_ENDINGS_V1) return "progressWatch.endings must be a bounded array";
   for (const ending of endings as unknown[]) {
     if (!isPlainObject(ending) ||
-        Object.keys(ending).some((key) => !["at", "kind", "automatic", "roundId", "stage", "model", "quotaResetAt"].includes(key)) ||
+        Object.keys(ending).some((key) => !["at", "kind", "automatic", "roundId", "stage", "model", "quotaResetAt", "stopCause", "attributedFileCount"].includes(key)) ||
         !boundedString(ending["at"], 64) || !(PROGRESS_WATCH_ENDING_KINDS_V1 as readonly string[]).includes(String(ending["kind"])) ||
         typeof ending["automatic"] !== "boolean" ||
         (ending["roundId"] !== undefined && !boundedString(ending["roundId"], MAX_ID_LENGTH)) ||
         (ending["stage"] !== undefined && typeof ending["stage"] !== "string") ||
         (ending["model"] !== undefined && !boundedString(ending["model"], 300)) ||
-        (ending["quotaResetAt"] !== undefined && !boundedString(ending["quotaResetAt"], 64))) {
+        (ending["quotaResetAt"] !== undefined && !boundedString(ending["quotaResetAt"], 64)) ||
+        (ending["stopCause"] !== undefined && !boundedString(ending["stopCause"], 64)) ||
+        (ending["attributedFileCount"] !== undefined &&
+          (typeof ending["attributedFileCount"] !== "number" || !Number.isInteger(ending["attributedFileCount"]) || ending["attributedFileCount"] < 0))) {
       return "progressWatch.endings entry has an invalid field";
     }
   }
@@ -2269,6 +2320,18 @@ function validateFallbackStageStringMap(name: string, value: unknown, maxLen = M
     }
     if (typeof entry !== "string" || entry.length === 0 || entry.length > maxLen) {
       return `${name}[${JSON.stringify(key)}] must be a bounded non-empty string`;
+    }
+  }
+  return undefined;
+}
+
+function validateNotedForeignEdits(value: unknown): string | undefined {
+  if (!Array.isArray(value) || value.length > 100) {
+    return "notedForeignEdits must be an array of at most 100 entries";
+  }
+  for (const entry of value) {
+    if (typeof entry !== "string" || entry.length === 0 || entry.length > 400) {
+      return "notedForeignEdits entries must be bounded non-empty strings";
     }
   }
   return undefined;
@@ -3072,6 +3135,21 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", error);
         }
         draft.stageReviewPasses = value as TaskProgress["stageReviewPasses"];
+        break;
+      }
+      case "notedForeignEdits": {
+        const error = validateNotedForeignEdits(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.notedForeignEdits = value as string[];
+        break;
+      }
+      case "ownerPausedAt": {
+        if (typeof value !== "string" || value.length === 0 || value.length > 64 || Number.isNaN(Date.parse(value))) {
+          return recovery("invalidFieldValue", "ownerPausedAt must be an ISO time string");
+        }
+        draft.ownerPausedAt = value;
         break;
       }
     }

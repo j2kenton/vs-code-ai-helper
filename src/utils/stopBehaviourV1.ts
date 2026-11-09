@@ -34,6 +34,9 @@
  * reset is near enough to schedule an automatic resume for) or merely alert.
  */
 
+import { classifyRoundStopV1, describeStopLeadV1, type RoundStopCauseV1 } from "./roundStopCauseV1";
+import { isQuotaError } from "./quota";
+
 export type MidRoundFailureKindV1 =
   | "quota"
   | "temporarily-unavailable"
@@ -198,6 +201,11 @@ export type MidRoundStopOutcomeV1 =
       readonly remedyText: string;
       /** The failure was a provider "at capacity" reply, not a usage limit. */
       readonly capacity?: boolean;
+      /**
+       * run1 Step 5: what stopped the round, so the headline says "usage limit" only when the
+       * provider's own output did. When absent it is read from the error text.
+       */
+      readonly cause?: RoundStopCauseV1;
     }
   | {
       readonly kind: "handedToBackup";
@@ -240,7 +248,10 @@ function hitDescriptionV1(
 ): string {
   return outcome.capacity
     ? `${providerLabel}: the model was at capacity (a temporary overload at OpenAI)`
-    : `${providerLabel} hit ${outcome.failureKind ?? "a"} failure`;
+    : describeStopLeadV1(
+        classifyRoundStopV1({ ...(outcome.failureKind ? { failureKind: outcome.failureKind } : {}) }),
+        providerLabel
+      );
 }
 
 function normalizedReasonV1(text: string): string {
@@ -390,9 +401,16 @@ export function describeMidRoundOutcomeV1(
     case "backupsExhausted":
       return (
         (outcome.capacity
-          ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)`
-          : `${primaryProviderLabel} hit a usage limit`) +
-        (errorMessage ? `: ${errorMessage}` : "") +
+          ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)${errorMessage ? `: ${errorMessage}` : ""}`
+          : describeStopLeadV1(
+              outcome.cause ??
+                classifyRoundStopV1({
+                  failureKind: isQuotaError(errorMessage) ? "quota" : "generic",
+                  ...(errorMessage ? { errorMessage } : {}),
+                }),
+              primaryProviderLabel,
+              errorMessage
+            )) +
         ". " +
         distinctBackupRecordsV1(outcome.backups, errorMessage, primaryProviderLabel, headlineModelLabel).map(describeBackupRecordV1).join(" ") +
         ` ${outcome.remedyText}`
@@ -402,13 +420,13 @@ export function describeMidRoundOutcomeV1(
         `Hit ${outcome.limitLabel} on ${primaryProviderLabel}` +
         (errorMessage ? ` (${errorMessage})` : "") +
         `. This round already changed ${outcome.filesChangedCount} file(s), so Ensemble handed the work ` +
-        `to ${outcome.backupLabel} in inspect-and-complete mode — the primary's own edits are kept and ` +
-        "quarantined, and the backup inspects what landed and finishes the round from there, rather than " +
+        `to ${outcome.backupLabel} in inspect-and-complete mode — the primary's own edits are kept in the ` +
+        "working tree, and the backup inspects what landed and finishes the round from there, rather than " +
         "starting over on a half-edited tree."
       );
     case "notCascadeEligible":
       return (
-        `${primaryProviderLabel} hit ${outcome.failureKind ?? "a"} failure` +
+        hitDescriptionV1(primaryProviderLabel, { failureKind: outcome.failureKind }) +
         (errorMessage ? ` (${errorMessage})` : "") +
         ". Ensemble does not automatically retry this kind of failure against a backup model — it is " +
         "not a quota, rate-limit, outage or entitlement block that switching models would be expected " +

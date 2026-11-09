@@ -53,7 +53,8 @@ void describe("readFixChainFailureV1", () => {
         "Backup a@high was tried and failed: Individual quota reached."
     );
     assert.deepEqual(mixed.triedOutcomes, [
-      { label: "a@high", outcome: "usage limit, resets in 1h13m30s" },
+      // The provider's own text says "quota reached", so the card says quota, not "usage limit".
+      { label: "a@high", outcome: "quota or rate limit, resets in 1h13m30s" },
       { label: "b@high", outcome: "sign-in failed" },
     ]);
   });
@@ -64,7 +65,7 @@ void describe("readFixChainFailureV1", () => {
         "Backup devpass-code llmgateway-devpass/claude-sonnet-5-5@high was tried and failed: HTTP 402 payment required: add credits."
     );
     assert.deepEqual(withPrimary.triedOutcomes, [
-      { label: "Antigravity CLI", outcome: "usage limit, resets in 1h13m30s" },
+      { label: "Antigravity CLI", outcome: "quota or rate limit, resets in 1h13m30s" },
       { label: "devpass-code llmgateway-devpass/claude-sonnet-5-5@high", outcome: "payment required" },
     ]);
     // The captured text's headline provider is the same attempt as the backup record below it: listed once.
@@ -143,7 +144,7 @@ void describe("structured primary-inclusive attempt list (bugs4 item 31 / plan i
     );
     const reading = readFixChainFailureV1("a message with no per-model sentences at all", attempts);
     assert.deepEqual(reading.triedOutcomes, [
-      { label: "Antigravity CLI claude-sonnet-5-5-high", outcome: "usage limit, resets in 1h13m30s" },
+      { label: "Antigravity CLI claude-sonnet-5-5-high", outcome: "quota or rate limit, resets in 1h13m30s" },
       { label: "devpass-code llmgateway-devpass/claude-sonnet-5-5@high", outcome: "payment required" },
     ]);
     assert.deepEqual(reading.disabledBackups, ["gpt-6.1-terra@high"]);

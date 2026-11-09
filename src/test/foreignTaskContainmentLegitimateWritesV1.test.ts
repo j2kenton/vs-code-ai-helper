@@ -90,9 +90,9 @@ void describe("foreign-folder containment: legitimate writes are not misplacemen
     const result = await containForeignTaskArtifactChangesV1(changes, taskA, { isConcurrentForeignUpdate: true });
     assert.equal(result.chatNotices.length, 1);
     const notice = result.chatNotices[0]!;
-    assert.match(notice, /'task\.md' in another task's folder/);
-    assert.match(notice, /changed at \d{4}-\d{2}-\d{2}T/);
-    assert.doesNotMatch(notice, /both copies|choose which copy|compare/i);
+    // run1 Step 25: one short line naming the task, saying nothing needs doing.
+    assert.equal(notice, "2026-10-28_task_1 was edited outside this round; nothing needs doing.");
+    assert.doesNotMatch(notice, /both copies|choose which copy|compare|move it into/i);
     assert.equal(fs.readFileSync(path.join(taskB, "task.md"), "utf8").includes("A new finding"), true, "the file is left exactly as edited");
   });
 

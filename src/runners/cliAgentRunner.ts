@@ -57,7 +57,21 @@ import {
   LEGACY_IMPLEMENTATION_FILENAME,
 } from "../types/taskProgress";
 import { looksLikeGeneratedImplementationSummary } from "../utils/implementationArtifactResolver";
-import { killProcessTree, sanitizedCliEnv } from "../utils/cliProcessUtils";
+import {
+  killProcessTree,
+  processGroupAliveV1,
+  sanitizedCliEnv,
+  stopLeftoverProcessGroupV1,
+  stopProcessTreeConfirmedV1,
+} from "../utils/cliProcessUtils";
+import { decideRoundSettlementV1, type RoundSettlementV1, type RoundSignalV1 } from "../utils/roundSettlementV1";
+import { classifyRoundStopV1, describeRoundStopV1, type RoundStopKindV1 } from "../utils/roundStopCauseV1";
+import { stopCauseOfTransportEvidenceV1 } from "../utils/settledRoundWordingV1";
+import { localEditorSaveAtV1 } from "../utils/localEditorSavesV1";
+import { isRoundIdleV1, RoundActivityFeedV1 } from "../utils/roundActivityFeedV1";
+import { ProofOfLifeReporterV1 } from "../utils/proofOfLifeV1";
+import { PROCESS_PROBE_INTERVAL_MS_V1, ProcessProbeV1 } from "../utils/processProbeV1";
+import { isViewerHostV1 } from "../state/hostRoleV1";
 import { readPackageScripts, runExplicitCheck } from "../utils/completionLint";
 import { resolveRoundShellCommandsV1 } from "../utils/roundShellAllowlistV1";
 import { prioritizeImplementationTypeCheckDiagnosticsV1 } from "../utils/implementationTypeCheckHandOffV1";
@@ -97,10 +111,73 @@ const RESERVED_ROOT_ARTIFACT_NAMES: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Hard cap on a single CLI run. Runs are also cancellable from the progress
- * notification; this only guards against a hung process left behind.
+ * run1 Step 12: the far-off backstop on a single CLI run (`ensemble.resilience.roundBackstopHours`,
+ * 4 hours by default). A round that is busy is never stopped for its length; the idle and repeat
+ * stops catch a stuck one far sooner. This only guards against a process somehow still alive long
+ * after it should have ended. Runs are also cancellable from the progress notification.
  */
-const RUN_TIMEOUT_MS = 60 * 60 * 1000;
+function roundBackstopMsV1(): number {
+  return getResilienceSettings().roundBackstopHours * 60 * 60 * 1000;
+}
+
+/**
+ * run1 Step 10: how long a headless Claude edit round may take to exit after its terminal
+ * successful `result` event. The model's turn is over at that event; a process that is still
+ * alive after this long is waiting on something it started (a background `sleep`, a Monitor that
+ * wakes the session again to repeat its report, bugs6 item 14) and is stopped, with its whole
+ * process tree, so the round ends within about a minute of its answer.
+ */
+export const END_OF_TURN_EXIT_GRACE_MS_V1 = 30_000;
+
+/** Mutable only so a test can shorten the grace for a real process; production never writes it. */
+export const endOfTurnGraceForTestsV1: { ms: number } = { ms: END_OF_TURN_EXIT_GRACE_MS_V1 };
+
+/**
+ * True when one stream-json line is a terminal, SUCCESSFUL `result` event: the model's turn
+ * ended normally. An error result (`is_error`) or a non-success subtype is a failure to be
+ * classified, never a completion.
+ */
+export function isSuccessfulClaudeResultLineV1(line: string): boolean {
+  if (!line.includes('"type"') || !line.includes('"result"')) {
+    return false;
+  }
+  try {
+    const event = JSON.parse(line) as { type?: unknown; subtype?: unknown; is_error?: unknown };
+    return event.type === "result" && event.is_error !== true && event.subtype === "success";
+  } catch {
+    return false;
+  }
+}
+
+/** True when one stream-json line is a terminal `result` event that is not a success (an error result). */
+export function isErrorClaudeResultLineV1(line: string): boolean {
+  if (!line.includes('"type"') || !line.includes('"result"')) {
+    return false;
+  }
+  try {
+    const event = JSON.parse(line) as { type?: unknown };
+    return event.type === "result" && !isSuccessfulClaudeResultLineV1(line);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The first terminal `result` event in a stream-json text decides how the model's turn ended:
+ * "success", "error", or undefined while there is none. Works on every line, including a final
+ * line the CLI never terminated with a newline.
+ */
+export function firstTerminalClaudeResultV1(text: string): "success" | "error" | undefined {
+  for (const line of text.split(/\r?\n/)) {
+    if (isSuccessfulClaudeResultLineV1(line)) {
+      return "success";
+    }
+    if (isErrorClaudeResultLineV1(line)) {
+      return "error";
+    }
+  }
+  return undefined;
+}
 
 /**
  * Cache of PATH lookups so availability checks (which run on every model
@@ -267,7 +344,7 @@ export function analyzeCliEventStream(stdoutRaw: string): CliEditEventEvidence {
  * Built from the same event stream `analyzeCliEventStream` reads.
  * @internal exported for testing
  */
-export function describeCliSessionProgressV1(stdoutRaw: string): string {
+export function describeCliSessionProgressV1(stdoutRaw: string, lastOutputAt?: Date): string {
   const { events } = parseJsonLineEvents(stdoutRaw);
   if (events.length === 0) {
     const bytes = Buffer.byteLength(stdoutRaw, "utf8");
@@ -275,10 +352,52 @@ export function describeCliSessionProgressV1(stdoutRaw: string): string {
       ? "It had written nothing before it was stopped."
       : `It had written ${bytes} byte(s) of output before it was stopped.`;
   }
+  // run1 Step 9: when the session has text, say what is known about it. A report that was
+  // written is said as such ("wrote a report at 18:09 but didn't exit"), never as "nothing".
+  const messages = claudeCliAssistantTexts(events as ClaudeCliEnvelope[]);
+  const at = lastOutputAt ? ` at ${formatClockHhMmV1(lastOutputAt)}` : "";
+  if (messages.some(claudeCliTextHasReportSections)) {
+    return `It wrote a report${at} but did not exit.`;
+  }
+  if (messages.length > 0) {
+    return `It wrote ${messages.length} message${messages.length === 1 ? "" : "s"}${lastOutputAt ? `, the last at ${formatClockHhMmV1(lastOutputAt)}` : ""}, but no report, before it was stopped.`;
+  }
   const toolEvents = events.filter((event) =>
     TOOL_OR_EDIT_EVENT_PATTERN.test(JSON.stringify(event))
   ).length;
   return `It had emitted ${events.length} event(s), ${toolEvents} of them tool or edit activity, before it was stopped.`;
+}
+
+/**
+ * The complete report in a stopped run's stream, if the model had written one. Streams that are
+ * not Claude Code's carry no per-message text here, so they have none to recover.
+ * @internal exported for testing
+ */
+export function recoveredReportOfStreamV1(def: CliProviderDefinition, stdoutRaw: string): string | undefined {
+  if (def.structuredEventStream !== "claude") {
+    return undefined;
+  }
+  const text = extractClaudeCliFinalOutput(stdoutRaw);
+  return text !== CLAUDE_CLI_NO_TEXT_REPLY_PLACEHOLDER && claudeCliTextHasReportSections(text) ? text : undefined;
+}
+
+function formatClockHhMmV1(at: Date): string {
+  return `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+}
+
+/** The text of every assistant message in a Claude Code event stream, in order. */
+function claudeCliAssistantTexts(events: readonly ClaudeCliEnvelope[]): string[] {
+  const texts: string[] = [];
+  for (const event of events) {
+    if (event.type !== "assistant") {
+      continue;
+    }
+    const text = claudeCliAssistantMessageText(event);
+    if (text !== undefined && text.trim().length > 0) {
+      texts.push(text);
+    }
+  }
+  return texts;
 }
 
 export interface EditRetryDecision {
@@ -382,6 +501,41 @@ export interface CliExecResult {
    * transport exit).
    */
   providerCapacity?: boolean;
+  /**
+   * run1 Step 4: the provider's own turn cap ended this turn (agy's 55-minute print timeout, in
+   * either wording). Not a quota and not Ensemble's limit; the round is continued from the
+   * working tree, and if retries run out it is reported as a time cap, never a usage limit.
+   */
+  providerTimeCapV1?: boolean;
+  /**
+   * run1 Step 9: the complete report (it has the required sections) the model had already
+   * written when Ensemble had to stop the process. Set only on a stopped run.
+   */
+  recoveredReportV1?: string;
+  /**
+   * run1 Step 10: the round was completed at the end of the model's turn, but the process had not
+   * exited, so Ensemble stopped it (and its children). The run log says so.
+   */
+  endOfTurnStopV1?: boolean;
+  /**
+   * run1 Step 8: the cause the round's one settlement decision recorded. Set on a round Ensemble
+   * stopped, the owner cancelled, or whose provider ended it with an error result; the stop wording,
+   * the ledger row and the card all read this instead of re-deriving the cause from message text.
+   */
+  stopCauseV1?: RoundStopKindV1;
+  /**
+   * run1 Step 11: what this process provably did, read from the round's activity feed when it
+   * settled. `attributedFiles` are files the round's own stream named; `observedFiles` changed in
+   * the workspace while it ran without proof they were this round's.
+   */
+  activityV1?: {
+    workedMs: number;
+    attributedFiles: readonly string[];
+    observedFiles: readonly string[];
+    /** run1 Step 25: when this process ran (epoch ms), the window other windows' changes are judged against. */
+    processStartedAtMs?: number;
+    processEndedAtMs?: number;
+  };
   /**
    * Event-stream evidence captured for timed-out runs. Deliberately NOT
    * populated for transport drops: a truncated stream would look like a clean
@@ -718,6 +872,43 @@ export function isCliTextModeSummaryOnlyCapableV1(def: CliProviderDefinition): b
 }
 
 /**
+ * Whether `text` carries one of the provider's own "this turn was cut off, continue it"
+ * wordings: a plain marker, or every fragment of one marker group (run1 Step 4: agy 1.4.x's
+ * "print timeout after 55m0s with turn in progress; returning partial output").
+ * @internal exported for testing
+ */
+export function matchesConversationResumeMarkerV1(def: CliProviderDefinition, text: string): boolean {
+  const resume = def.conversationResume;
+  if (!resume) {
+    return false;
+  }
+  const normalized = text.toLowerCase();
+  return (
+    resume.errorMarkers.some((marker) => normalized.includes(marker.toLowerCase())) ||
+    (resume.errorMarkerGroups ?? []).some(
+      (group) => group.length > 0 && group.every((fragment) => normalized.includes(fragment.toLowerCase()))
+    )
+  );
+}
+
+/** agy's own print-mode turn cap, in either wording (1.4.x "print timeout after 55m0s…"). */
+const PROVIDER_TIME_CAP_TEXT_V1 = /print timeout after|timeout waiting for response/i;
+
+export function isProviderTimeCapTextV1(text: string): boolean {
+  return PROVIDER_TIME_CAP_TEXT_V1.test(text);
+}
+
+/** The provider's cap in minutes when its message states one ("print timeout after 55m0s"), else undefined. */
+export function providerTimeCapMinutesV1(text: string): number | undefined {
+  const match = /print timeout after\s+(?:(\d+)h)?(?:(\d+)m)?/i.exec(text);
+  if (!match) {
+    return undefined;
+  }
+  const minutes = Number(match[1] ?? 0) * 60 + Number(match[2] ?? 0);
+  return minutes > 0 ? minutes : undefined;
+}
+
+/**
  * Promote a mid-stream transport drop from "generic" (terminal at both backup
  * cascade gates) to "temporarily-unavailable" (cascade-eligible) — but only
  * where doing so is actually safe. See the guards below for what "safe"
@@ -760,11 +951,7 @@ function applyTransportTransience(
   if (mode === "edit" && def.id === "codex-cli" && isProviderCapacityError(friendly.diagnosticText)) {
     return { ...result, failureKind: "temporarily-unavailable", providerCapacity: true };
   }
-  const normalizedDiagnostic = friendly.diagnosticText.toLowerCase();
-  const canResumeConversation =
-    def.conversationResume?.errorMarkers.some((marker) =>
-      normalizedDiagnostic.includes(marker.toLowerCase())
-    ) === true;
+  const canResumeConversation = matchesConversationResumeMarkerV1(def, friendly.diagnosticText);
   if (canResumeConversation) {
     // Keep failureKind generic. A temporarily-unavailable classification is
     // eligible for the backup cascade, but a resumable run may already have
@@ -774,6 +961,7 @@ function applyTransportTransience(
       ...result,
       transient: true,
       resumeConversation: true,
+      ...(isProviderTimeCapTextV1(friendly.diagnosticText) ? { providerTimeCapV1: true } : {}),
     };
   }
   // Edit-mode runs may have already written partial changes. The same-model
@@ -1716,11 +1904,21 @@ function extractClaudeCliFinalOutput(
 
   let sawRecognizedEvent = false;
   let finalText: string | undefined;
-  let lastCompleteReport: string | undefined;
+  let firstCompleteReport: string | undefined;
+  let terminalResultText: string | undefined;
   for (const rawEvent of parsed.events) {
     const event = rawEvent as ClaudeCliEnvelope;
     if (typeof event.type === "string") {
       sawRecognizedEvent = true;
+    }
+    // run1 Step 7: the first SUCCESSFUL `result` event ends the model's turn and carries its answer.
+    // Whatever follows it is a wake-up the session did not need (a Monitor expiring and the model
+    // posting its report again, bugs6 item 14), so it never replaces the answer already given.
+    if (event.type === "result" && event.is_error !== true && event.subtype === "success") {
+      if (typeof event.result === "string" && event.result.trim().length > 0) {
+        terminalResultText = event.result;
+      }
+      break;
     }
     if (event.type !== "assistant") {
       continue;
@@ -1728,21 +1926,29 @@ function extractClaudeCliFinalOutput(
     const text = claudeCliAssistantMessageText(event);
     if (text !== undefined) {
       finalText = text;
-      if (claudeCliTextHasReportSections(text)) {
-        lastCompleteReport = text;
+      // The FIRST complete report is the one kept: a stopped stream whose monitors woke the session
+      // again repeats the whole report (bugs6 item 14), and the repeat must never replace it.
+      if (firstCompleteReport === undefined && claudeCliTextHasReportSections(text)) {
+        firstCompleteReport = text;
       }
     }
   }
-  // bugs4 item 23: a background-task notification can arrive after the summary, and Claude Code's
-  // reply to it ("that is the monitor I already reported") becomes the final message. A complete
-  // summary followed by a short afterthought is not a cut-short round: keep the last message that
-  // carries the required sections whenever the final one does not.
+  // bugs4 item 23 and run1 Step 7: a background-task notification or a Monitor wake-up can arrive
+  // after the summary, and the model's reply to it (a short afterthought, or the whole report
+  // posted again) becomes the final message. A complete summary followed by either is not a new
+  // answer: the first message that carries the required sections is kept over whatever follows.
+  if (firstCompleteReport !== undefined) {
+    finalText = firstCompleteReport;
+  }
+  // The terminal result's own text is the model's answer when it is the report, or when no message
+  // carried one; a message that held the complete report earlier is kept over a short result text.
   if (
-    lastCompleteReport !== undefined &&
-    finalText !== undefined &&
-    !claudeCliTextHasReportSections(finalText)
+    terminalResultText !== undefined &&
+    (claudeCliTextHasReportSections(terminalResultText) ||
+      finalText === undefined ||
+      !claudeCliTextHasReportSections(finalText))
   ) {
-    finalText = lastCompleteReport;
+    finalText = terminalResultText;
   }
 
   // Same rationale as extractCodexFinalOutput/extractKimiFinalOutput: an
@@ -1803,6 +2009,16 @@ function extractClaudeCliStructuredDiagnostics(
 
   for (const rawEvent of events) {
     const event = rawEvent as ClaudeCliEnvelope;
+    // A top-level `error` event carries its text in `message` (or `error`). Edit rounds stream
+    // JSON lines now (run1 Step 7), so a failure the CLI reports this way is read here instead
+    // of arriving as the plain prose the old text mode scanned.
+    if (event.type === "error") {
+      const raw = rawEvent as { message?: unknown; error?: unknown };
+      const errorText =
+        typeof raw.message === "string" ? raw.message : typeof raw.error === "string" ? raw.error : undefined;
+      collected.push(errorText ?? JSON.stringify(rawEvent));
+      continue;
+    }
     if (event.type !== "result" && event.type !== "system") {
       continue;
     }
@@ -1847,30 +2063,21 @@ function extractClaudeCliStructuredDiagnostics(
 }
 
 /**
- * claude-cli's structured stream is TEXT-MODE ONLY: its buildArgs emits
- * `--output-format stream-json` for text mode but keeps edit mode on plain
- * `--output-format text` (see providers.ts — edit-mode runs are captured for
- * their workspace file changes, not a parsed summary string). The
- * `structuredEventStream: "claude"` tag on the provider definition, however,
- * is mode-blind, and every other carrier of that field emits structured
- * output in ALL modes. Left unscoped, an edit-mode claude failure would be
- * routed through the structured extractors, whose markerScanText includes
- * every non-JSON stdout line — i.e. the model's own free-form prose — and
- * would be scanned by isAuthenticationFailure wholesale, the exact
- * false-positive hazard the opaque-text bucket in toFriendlyError exists to
- * avoid (and a change to edit-mode failure classification, which the plan
- * requires untouched). Strip the tag for claude edit-mode invocations so
- * normalizeCliOutput and toFriendlyError see the same opaque-text provider
- * shape they saw before claude's text mode moved to stream-json. Every other
- * provider (and claude text mode) passes through unchanged.
+ * The definition the extractors (normalizeCliOutput, toFriendlyError) see for a run.
+ *
+ * Until run1 Step 7, claude-cli's structured stream was TEXT-MODE ONLY: edit mode ran plain
+ * `--output-format text`, and this function stripped the `structuredEventStream: "claude"` tag
+ * for edit runs so prose stdout was never scanned as structured events. Edit mode now runs
+ * `stream-json` as well (a stopped run keeps the words it had written), so every mode's stdout
+ * is JSON lines and the tag applies everywhere.
  */
 function effectiveStructuredStreamDefV1(
   def: CliProviderDefinition,
-  mode: CliRunMode
+  _mode: CliRunMode
 ): CliProviderDefinition {
-  if (def.structuredEventStream === "claude" && mode === "edit") {
-    return { ...def, structuredEventStream: undefined };
-  }
+  // run1 Step 7: claude edit mode now runs `--output-format stream-json` too, so its stdout is
+  // JSON lines in every mode and the structured extractors apply to it. Kept as the single seam
+  // between a definition and the extractors in case a provider's stream becomes mode-specific.
   return def;
 }
 
@@ -2576,7 +2783,35 @@ export function createCliTextTransportV1(options: {
             // since structured providers buffer everything until close and
             // never call onProgress mid-run — this transport has no other
             // activity signal.
-            let lastActivityAt = Date.now();
+            // run1 Step 12: the idle stop below reads the round's activity feed, as the editing runner's
+            // does, instead of a raw byte timestamp. A text round only reads the workspace, so the feed
+            // sees contact (output bytes) and the round's own tool events, never file changes.
+            const textStartedAtMs = Date.now();
+            const textFeed = new RoundActivityFeedV1({
+              streaming: structuredStream,
+              ...(def.structuredEventStream !== undefined ? { provider: def.structuredEventStream } : {}),
+            });
+            let textLineRemainder = "";
+            // run1 Steps 16 and 17: a review round carries proof of life on the task's running row and is
+            // probed on the owning host, as the editing runner's rounds are. Built once the child has a
+            // pid (below); torn down by the one settlement.
+            let textProofReporter: ProofOfLifeReporterV1 | undefined;
+            let textProofHandle: ReturnType<typeof setInterval> | undefined;
+            let textProbe: ProcessProbeV1 | undefined;
+            let textProbeHandle: ReturnType<typeof setInterval> | undefined;
+            const stopTextLivenessV1 = (outcome: {
+              readonly status: "completed" | "failed" | "cancelled";
+              readonly cause?: RoundStopKindV1;
+            }): void => {
+              if (textProofHandle) {
+                clearInterval(textProofHandle);
+              }
+              textProbe?.stop();
+              if (textProbeHandle) {
+                clearInterval(textProbeHandle);
+              }
+              textProofReporter?.markSettled(outcome);
+            };
 
             let child: cp.ChildProcess;
             // bugs3 Step 6: a stdin provider's prompt rides in as a regular-file
@@ -2657,6 +2892,12 @@ export function createCliTextTransportV1(options: {
               if (inactivityCheckHandle) {
                 clearInterval(inactivityCheckHandle);
               }
+              const terminalCause =
+                exit.kind === "transportFailure" ? stopCauseOfTransportEvidenceV1(exit.code) : undefined;
+              stopTextLivenessV1({
+                status: exit.kind === "callerCancelled" || exit.kind === "providerCancelled" ? "cancelled" : "failed",
+                ...(terminalCause !== undefined ? { cause: terminalCause } : {}),
+              });
               cancellationListener.dispose();
               // Awaits pendingRecordSettlement (a no-op when nothing is
               // pending) before resolving, so a still-in-flight process
@@ -2672,24 +2913,89 @@ export function createCliTextTransportV1(options: {
             // Re-signals on every unconfirmed wait; never settles on an
             // unconfirmed pid — a CLI that will not die keeps the lock held,
             // which the stale-lock takeover is the way out of.
+            // run1 Step 8: a Claude stream whose first terminal `result` event is a success has
+            // already delivered the model's answer, whatever the process does afterwards.
+            const textStreamSucceeded = (): boolean =>
+              def.structuredEventStream === "claude" &&
+              firstTerminalClaudeResultV1(Buffer.concat(rawEventChunks).toString("utf8")) === "success";
             const terminateThenFinish = (exit: AgentTransportExitV1): void => {
               if (settled || terminating) {
                 return;
               }
               terminating = true;
+              // Snapshot taken before the stop starts: only a success received BEFORE the stop (a
+              // cancel, a watchdog) counts; the stop itself drops later output.
+              const succeededBeforeStop = textStreamSucceeded();
               void (async (): Promise<void> => {
-                const pid = child.pid;
-                let exited = childExited || pid === undefined;
-                while (!exited && !settled) {
-                  killProcessTree(child);
-                  exited =
-                    childExited ||
-                    (await Promise.race([
-                      childExitedPromise.then(() => true),
-                      waitForPidToExitV1(pid as number),
-                    ]));
+                // run1 Step 8: the whole process tree is stopped and confirmed within a fixed bound
+                // (SIGTERM, then SIGKILL), the same as the editing runner. An unbounded wait here
+                // could hold the caller's admission open forever; an unconfirmed tree instead fails
+                // the attempt and says which process to stop (a cancel stays a cancel).
+                const stopped = await stopProcessTreeConfirmedV1(child);
+                if (child.pid !== undefined && !childExited) {
+                  await Promise.race([childExitedPromise, new Promise<void>((resolveWait) => setTimeout(resolveWait, 2_000))]);
+                }
+                if (!stopped.gone && exit.kind !== "callerCancelled") {
+                  finishTerminal({
+                    kind: "transportFailure",
+                    code: "cliProcessNotConfirmedStopped",
+                    detail:
+                      `${def.label}'s process${child.pid !== undefined ? ` (pid ${child.pid})` : ""} could not be confirmed stopped; ` +
+                      `it may still be running. Stop it yourself${child.pid !== undefined ? ` (for example \`kill -9 -${child.pid}\`)` : ""} before starting another round.`,
+                  });
+                  return;
+                }
+                // run1 Step 8: the same one decision as the editing runner, asked once the process is
+                // confirmed gone. A finished answer survives a Cancel or a watchdog stop that arrives
+                // after it; a Cancel pressed during a watchdog's stop wins over that watchdog.
+                const stopWatchdog: "ensembleBackstop" | "ensembleIdleStop" | "ensembleRepeatStop" | undefined =
+                  exit.kind === "transportFailure"
+                    ? exit.code === "cliRunTimeout"
+                      ? "ensembleBackstop"
+                      : exit.code === "cliRunInactivityTimeout"
+                        ? "ensembleIdleStop"
+                        : exit.code === "cliRunRepeatStop"
+                          ? "ensembleRepeatStop"
+                          : undefined
+                    : undefined;
+                if (exit.kind === "callerCancelled" || stopWatchdog !== undefined) {
+                  const stopDecision = decideRoundSettlementV1([
+                    ...(succeededBeforeStop ? [{ kind: "resultSuccess" } as const] : []),
+                    ...(exit.kind === "callerCancelled" || cancelled ? [{ kind: "ownerCancel" } as const] : []),
+                    ...(stopWatchdog !== undefined ? [{ kind: "ensembleStop", cause: stopWatchdog } as const] : []),
+                  ]);
+                  if (stopDecision.outcome === "completed") {
+                    settleTextExit(0, true);
+                    return;
+                  }
+                  if (stopDecision.outcome === "cancelled") {
+                    finishTerminal({ kind: "callerCancelled" });
+                    return;
+                  }
                 }
                 finishTerminal(exit);
+              })();
+            };
+
+            // run1 Step 8: an ordinary exit (success or failure) can leave a descendant running in the
+            // child's process group. It is stopped and confirmed before the attempt settles, through
+            // the same single settlement point as every other ending here.
+            const settleOrdinaryExitAfterTreeStopped = (settle: () => void): void => {
+              terminating = true;
+              void (async (): Promise<void> => {
+                const gone = await stopLeftoverProcessGroupV1(child);
+                if (!gone) {
+                  finishTerminal({
+                    kind: "transportFailure",
+                    code: "cliProcessNotConfirmedStopped",
+                    detail:
+                      `${def.label} exited but something it started could not be confirmed stopped` +
+                      `${child.pid !== undefined ? ` (process group ${child.pid})` : ""}; it may still be running. ` +
+                      `Stop it yourself${child.pid !== undefined ? ` (for example \`kill -9 -${child.pid}\`)` : ""} before starting another round.`,
+                  });
+                  return;
+                }
+                settle();
               })();
             };
             const finishTextCompleted = (normalized: string): void => {
@@ -2701,6 +3007,7 @@ export function createCliTextTransportV1(options: {
               if (inactivityCheckHandle) {
                 clearInterval(inactivityCheckHandle);
               }
+              stopTextLivenessV1({ status: "completed" });
               cancellationListener.dispose();
               // See finishTerminal's matching comment: waits for any pending
               // process-record write/abandonment to become durable first.
@@ -2718,10 +3025,10 @@ export function createCliTextTransportV1(options: {
                 kind: "transportFailure",
                 code: "cliRunTimeout",
                 detail:
-                  `no exit after ${Math.round(RUN_TIMEOUT_MS / 60_000)}m wall clock; ` +
+                  `no exit after ${Math.round(roundBackstopMsV1() / 60_000)}m wall clock; ` +
                   `stderr ${stderr.totalByteLength} byte(s)`,
               });
-            }, RUN_TIMEOUT_MS);
+            }, roundBackstopMsV1());
 
             // Part 7 inactivity watchdog: mirrors execCliAgent's — kills a
             // process producing zero bytes long before the flat wall-clock cap,
@@ -2730,13 +3037,28 @@ export function createCliTextTransportV1(options: {
             // apart from a genuinely long-running one. 0 disables it.
             const inactivityLimitMinutes = getResilienceSettings().inactivityTimeoutMinutes;
             const inactivityLimitMs = inactivityLimitMinutes * 60_000;
-            const inactivityCheckHandle =
-              inactivityLimitMinutes > 0
+            // run1 Step 12: only a provider whose output streams events gets an idle stop; one that
+            // prints nothing until it finishes is bounded by the backstop alone.
+            // The repeat stop (the same message three times, the same tool call five times in a row)
+            // also reads the feed, and applies to a streaming provider whether or not the idle stop is on.
+            const inactivityCheckHandle = structuredStream
                 ? setInterval(() => {
-                    if (settled) {
+                    if (settled || terminating) {
                       return;
                     }
-                    if (Date.now() - lastActivityAt >= inactivityLimitMs) {
+                    const textRepeat = textFeed.repeatStop();
+                    if (textRepeat !== undefined) {
+                      terminateThenFinish({
+                        kind: "transportFailure",
+                        code: "cliRunRepeatStop",
+                        detail: `the model kept repeating itself: ${textRepeat.what}`,
+                      });
+                      return;
+                    }
+                    if (
+                      inactivityLimitMinutes > 0 &&
+                      isRoundIdleV1(textFeed, textStartedAtMs, Date.now(), inactivityLimitMs, structuredStream)
+                    ) {
                       const stderr = capture.stderrSummary();
                       terminateThenFinish({
                         kind: "transportFailure",
@@ -2751,10 +3073,12 @@ export function createCliTextTransportV1(options: {
                 : undefined;
 
             const cancellationListener = request.cancellationToken.onCancellationRequested(() => {
+              // Recorded even while another stop is in flight: the decision gives the owner's Cancel
+              // precedence over Ensemble's own stops.
+              cancelled = true;
               if (terminating) {
                 return;
               }
-              cancelled = true;
               // Cancel ends the operation: the attempt settles (and the
               // caller's lock is released) only once the child is confirmed gone.
               terminateThenFinish({ kind: "callerCancelled" });
@@ -2845,9 +3169,16 @@ export function createCliTextTransportV1(options: {
             });
 
             child.stdout?.on("data", (chunk: Buffer) => {
-              lastActivityAt = Date.now();
+              textFeed.recordContact();
               if (settled || terminating) {
                 return;
+              }
+              if (structuredStream) {
+                const textLines = (textLineRemainder + chunk.toString("utf8")).split(/\r?\n/);
+                textLineRemainder = textLines.pop() ?? "";
+                for (const textLine of textLines) {
+                  textFeed.recordStreamLine(textLine);
+                }
               }
               // Fed unconditionally (independent of the size guard below) so
               // a failure diagnosis always has the most recent bounded tail,
@@ -2873,7 +3204,7 @@ export function createCliTextTransportV1(options: {
               rawEventChunks.push(Buffer.from(chunk));
             });
             child.stderr?.on("data", (chunk: Buffer) => {
-              lastActivityAt = Date.now();
+              textFeed.recordContact();
               capture.handleStderr(chunk);
             });
 
@@ -2882,6 +3213,8 @@ export function createCliTextTransportV1(options: {
               // signal `terminateThenFinish` waits on.
               childExited = true;
               resolveChildExited?.();
+              // run1 Step 16: the row stops saying the process is there the moment it exits.
+              textProofReporter?.markProcessEnded();
               if (terminating) {
                 return;
               }
@@ -2889,7 +3222,30 @@ export function createCliTextTransportV1(options: {
                 finishTerminal({ kind: "callerCancelled" });
                 return;
               }
-              if (code === 0) {
+              // A successful `result` event followed by a non-zero exit is still a completed round.
+              settleOrdinaryExitAfterTreeStopped(() => {
+                const succeeded = textStreamSucceeded();
+                // A Cancel pressed while the leftover process group was being stopped is recorded by
+                // the cancellation listener but cannot start a second stop; it joins the decision
+                // here, so it wins over an ordinary exit unless a successful result already arrived.
+                if (cancelled) {
+                  const cleanupDecision = decideRoundSettlementV1([
+                    ...(succeeded ? [{ kind: "resultSuccess" } as const] : []),
+                    { kind: "ownerCancel" } as const,
+                  ]);
+                  if (cleanupDecision.outcome === "cancelled") {
+                    finishTerminal({ kind: "callerCancelled" });
+                    return;
+                  }
+                  settleTextExit(0, true);
+                  return;
+                }
+                settleTextExit(code, code !== 0 && succeeded);
+              });
+            });
+
+            const settleTextExit = (code: number | null, successfulResult = false): void => {
+              if (code === 0 || successfulResult) {
                 if (!settled) {
                   // Unwrap the model's final text from the buffered raw
                   // stream with the provider's own event-stream extractor —
@@ -2909,6 +3265,38 @@ export function createCliTextTransportV1(options: {
                   // see extractOpencodeFinalOutput's own doc comment.
                   const rawStdout = Buffer.concat(rawEventChunks).toString("utf8");
                   rawEventChunks.length = 0;
+                  // run1 Step 8: the same one decision as the editing runner. A Claude stream whose
+                  // first terminal `result` is an error is a failure whatever the exit code says, even
+                  // when assistant reply text came before it; it is never delivered as the reply.
+                  const textDecision = decideRoundSettlementV1([
+                    ...(successfulResult ? [{ kind: "resultSuccess" } as const] : []),
+                    ...(def.structuredEventStream === "claude" && firstTerminalClaudeResultV1(rawStdout) === "error"
+                      ? [{ kind: "resultError" } as const]
+                      : []),
+                    { kind: "processEnded", exit: { code, hasOutput: rawStdout.length > 0 } },
+                  ]);
+                  if (textDecision.outcome === "failed" && textDecision.cause === "providerError") {
+                    const tail = diagnosisTail.snapshot();
+                    const friendlyError = toFriendlyError(
+                      def,
+                      model,
+                      code,
+                      capture.stderrDiagnosisTail(),
+                      tail,
+                      parseJsonLineEvents(tail)
+                    );
+                    finishTerminal({
+                      kind: "transportFailure",
+                      code: "cliErrorResult",
+                      detail:
+                        boundedTransportDetailV1(friendlyError.diagnosticText, 1000) ??
+                        `${def.label} ended its turn with an error result`,
+                      ...(def.id === "codex-cli" && isProviderCapacityError(friendlyError.diagnosticText)
+                        ? { providerCapacity: true }
+                        : {}),
+                    });
+                    return;
+                  }
                   const normalized = structuredStream
                     ? normalizeCliOutput(def, rawStdout, undefined, true)
                     : rawStdout;
@@ -3035,7 +3423,56 @@ export function createCliTextTransportV1(options: {
                   ? { providerCapacity: true }
                   : {}),
               });
-            });
+            };
+
+            // run1 Steps 16 and 17 for a review round: push proof of life to the task's running row
+            // (at most every 2 s) and, on the host that owns the process, ask the OS every 5 s whether it
+            // is still there. A process that is gone with nothing settling the round for 10 s ends it
+            // through this transport's own settlement (cause `processEnded`), after the leftover process
+            // group is stopped and confirmed; a successful result already received still wins.
+            if (child.pid !== undefined) {
+              const textReportsTaskPath = recordingTarget?.taskFolderPath;
+              if (textReportsTaskPath !== undefined) {
+                textProofReporter = new ProofOfLifeReporterV1(
+                  textFeed,
+                  (proof) => {
+                    taskOperations.reportProofOfLifeForTask(textReportsTaskPath, proof);
+                  },
+                  { reportsOnlyAtEnd: !structuredStream }
+                );
+                textProofReporter.setProcess(child.pid);
+                textProofHandle = setInterval(() => textProofReporter?.tick(), 2_000);
+                textProofHandle.unref?.();
+              }
+              textProbe = new ProcessProbeV1({
+                pid: child.pid,
+                ownsProcess: !isViewerHostV1(),
+                canSettle: () => !settled && !terminating,
+                onGone: () => textProofReporter?.markProcessEnded(),
+                onSettle: () => {
+                  if (settled || terminating) {
+                    return;
+                  }
+                  settleOrdinaryExitAfterTreeStopped(() => {
+                    if (textStreamSucceeded()) {
+                      settleTextExit(0, true);
+                      return;
+                    }
+                    if (cancelled) {
+                      finishTerminal({ kind: "callerCancelled" });
+                      return;
+                    }
+                    finishTerminal({
+                      kind: "transportFailure",
+                      code: "cliProcessEnded",
+                      detail: `${def.label}'s process ended without giving a result`,
+                    });
+                  });
+                },
+              });
+              textProbeHandle = setInterval(() => textProbe?.check(), PROCESS_PROBE_INTERVAL_MS_V1);
+              textProbeHandle.unref?.();
+            }
 
             if (promptTransport === "stdin" && stdinSource?.writeToChildStdin === true) {
               child.stdin?.on("error", () => {
@@ -3595,35 +4032,6 @@ async function recordSpawnedCliProcessV1(
   });
 }
 
-/**
- * Poll until `pid` no longer exists (ESRCH), or `timeoutMs` elapses. Used
- * only to confirm a just-signalled process has actually exited before
- * resolving execCliAgent's promise — the caller's admission lock is
- * released in an unconditional `finally` keyed off that resolution (see
- * reviewActions.ts), so resolving the instant a kill signal is SENT rather
- * than CONFIRMED would let the next action start while this pid may still
- * be running and editing the workspace unrecorded — exactly the
- * architectural gap a review flagged in the post-spawn record-failure path.
- * Any errno other than ESRCH (e.g. EPERM) still means the pid exists, so it
- * is never treated as exited.
- */
-async function waitForPidToExitV1(pid: number, timeoutMs = 5000, intervalMs = 100): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    try {
-      process.kill(pid, 0);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
-        return true;
-      }
-    }
-    if (Date.now() >= deadline) {
-      return false;
-    }
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-  }
-}
-
 
 type ExecCliAgentOptionsV1 = Parameters<typeof execCliAgentProcessV1>[0];
 
@@ -3947,7 +4355,6 @@ async function execCliAgentProcessV1(options: {
 
   return new Promise<CliExecResult>((resolve) => {
     let settled = false;
-    let cancelled = false;
     // Set true the instant the post-spawn record-failure recovery path
     // begins killing the child, BEFORE killProcessTree is called, so the
     // ordinary child.on("close") listener below defers to recovery's own
@@ -4002,6 +4409,46 @@ async function execCliAgentProcessV1(options: {
     // inactivity watchdog below. Seeded to spawn time so a process that
     // never produces a single byte still gets caught.
     let lastActivityAt = Date.now();
+    const startedAtMs = lastActivityAt;
+    // run1 Steps 11 and 12: the one activity feed this round has. It counts only what the round
+    // provably did, so the idle and repeat stops below read it and never raw file events.
+    const streamingProvider = def.structuredEventStream !== undefined;
+    const activityFeed = new RoundActivityFeedV1({
+      streaming: streamingProvider,
+      ...(def.structuredEventStream !== undefined ? { provider: def.structuredEventStream } : {}),
+      localEditorSaveAt: localEditorSaveAtV1,
+      workspaceRoot: cwd,
+      ...(taskFolderPath !== undefined ? { roundProgressPath: nodePath.join(taskFolderPath, "round-progress.md") } : {}),
+    });
+    // run1 Step 16: this round's proof of life, pushed to the task's running row at most every 2 s.
+    const proofOfLifeReporter =
+      taskFolderPath !== undefined
+        ? new ProofOfLifeReporterV1(
+            activityFeed,
+            (proof) => {
+              taskOperations.reportProofOfLifeForTask(taskFolderPath, proof);
+            },
+            { reportsOnlyAtEnd: !streamingProvider }
+          )
+        : undefined;
+    const proofOfLifeHandle =
+      proofOfLifeReporter !== undefined ? setInterval(() => proofOfLifeReporter.tick(), 2_000) : undefined;
+    proofOfLifeHandle?.unref?.();
+    // run1 Step 17: the owning host asks the OS every 5 s whether the process is still there.
+    let processProbeHandle: ReturnType<typeof setInterval> | undefined;
+    let processProbe: ProcessProbeV1 | undefined;
+    let activityLineRemainder = "";
+    const feedStdoutV1 = (decoded: string): void => {
+      activityFeed.recordContact();
+      if (!streamingProvider) {
+        return;
+      }
+      const lines = (activityLineRemainder + decoded).split(/\r?\n/);
+      activityLineRemainder = lines.pop() ?? "";
+      for (const line of lines) {
+        activityFeed.recordStreamLine(line);
+      }
+    };
 
     // shell:true is the default so Windows resolves .cmd/.ps1 shims from
     // npm/pnpm global installs. With shell:true, Node's own spawn joins
@@ -4059,6 +4506,16 @@ async function execCliAgentProcessV1(options: {
       stdinSource?.dispose();
       if (child.pid !== undefined) {
         options.onSpawnedV1?.({ pid: child.pid, spawnedAtMs: Date.now() });
+        proofOfLifeReporter?.setProcess(child.pid);
+        processProbe = new ProcessProbeV1({
+          pid: child.pid,
+          ownsProcess: !isViewerHostV1(),
+          canSettle: () => !settled && !recordFailureRecovering && !terminationInProgress,
+          onGone: () => proofOfLifeReporter?.markProcessEnded(),
+          onSettle: () => settleProcessGoneV1(),
+        });
+        processProbeHandle = setInterval(() => processProbe?.check(), PROCESS_PROBE_INTERVAL_MS_V1);
+        processProbeHandle.unref?.();
       }
     } catch (error) {
       stdinSource?.dispose();
@@ -4132,30 +4589,17 @@ async function execCliAgentProcessV1(options: {
         // the race to finish() with a generic provider error while this
         // recovery is still confirming termination.
         recordFailureRecovering = true;
-        killProcessTree(child);
         // Do NOT resolve the instant the kill signal is sent: the caller's
         // admission lock is released in an unconditional `finally` keyed
         // off this run's promise settling (reviewActions.ts), so settling
         // here before termination is confirmed would let the next action
         // start while this pid may still be alive and editing the
-        // workspace unrecorded — the exact gap a review flagged. Keep
-        // polling (never settling `failed` on an unconfirmed pid) until
-        // termination is actually confirmed, surfacing each retry through
-        // onProgress so a long wait is never silent.
-        let exited: boolean = childExited;
-        while (!exited && !settled) {
-          onProgress?.(
-            `Waiting for pid ${recordedPid} to stop after a process-record failure...`.substring(0, 80)
-          );
-          // Race the authoritative close-event promise against the pid poll:
-          // whichever confirms exit first wins, so a close that fires between
-          // poll ticks is acted on immediately rather than after the poll's
-          // own interval/timeout elapses.
-          exited = childExited || await Promise.race([
-            childExitedPromiseV1.then(() => true),
-            waitForPidToExitV1(recordedPid),
-          ]);
-        }
+        // workspace unrecorded. run1 Step 8: the wait is BOUNDED and covers
+        // the whole process group (SIGTERM, then SIGKILL), so a process that
+        // ignores the signal cannot hold the round open forever; when the
+        // stop still cannot be confirmed the outcome says so plainly.
+        onProgress?.(`Stopping pid ${recordedPid} after a process-record failure...`.substring(0, 80));
+        const recoveryStop = await stopProcessTreeConfirmedV1(child);
         if (settled) {
           return;
         }
@@ -4165,24 +4609,179 @@ async function execCliAgentProcessV1(options: {
             output: stdout,
             errorMessage:
               `Could not record the ${cliDisplayLabel(def)} CLI process (pid ${recordedPid}) next to this round's lock, ` +
-              "so it was stopped before it could keep editing the workspace unrecorded.",
+              (recoveryStop.gone
+                ? "so it was stopped before it could keep editing the workspace unrecorded."
+                : "and Ensemble could not confirm it stopped; it may still be running and editing the workspace. Stop it yourself (for example `kill -9 " +
+                  `${recordedPid}\`) before starting another round.`),
           })
         );
       });
     }
+
+    // run1 Step 10: set when a headless Claude edit round's terminal successful `result` event
+    // arrives. Starts the exit grace; an exit inside it (even a non-zero one) settles the round as
+    // completed, and the grace running out stops the process tree and settles it as completed.
+    let successfulResultSeen = false;
+    let errorResultSeen = false;
+    let endOfTurnHandle: ReturnType<typeof setTimeout> | undefined;
+    let stdoutLineRemainder = "";
+
+    // run1 Step 8: every way this round can end is a signal collected here. Once the process is
+    // confirmed gone, `decideRoundSettlementV1` is asked ONCE what the outcome is, so the order in
+    // which signals arrive no longer decides it (a Cancel during the exit grace cannot discard a
+    // finished report; a time limit cannot beat the owner's Cancel).
+    const settlementSignals: RoundSignalV1[] = [];
+    // What an Ensemble stop (time limit, idle) reports if it ends up deciding a failure.
+    let ensembleStopFailureV1: (() => CliExecResult) | undefined;
+
+    const outcomeOfSettlementV1 = (decision: RoundSettlementV1): CliExecResult => {
+      if (decision.outcome === "cancelled") {
+        return { status: "cancelled", output: stdout, stopCauseV1: "ownerCancel" };
+      }
+      if (decision.outcome === "completed") {
+        const base = {
+          status: "completed" as const,
+          rawOutput: stdout,
+          sessionId: sessionIdOfRun(),
+          ...(decision.stoppedByEnsemble ? { endOfTurnStopV1: true } : {}),
+          ...(decision.cause !== undefined ? { stopCauseV1: decision.cause } : {}),
+        };
+        if (decision.via === "recoveredReport" && decision.text !== undefined) {
+          return { ...base, output: decision.text, recoveredReportV1: decision.text };
+        }
+        const parsed = parseJsonLineEvents(stdout);
+        return { ...base, output: normalizeCliOutput(effectiveStructuredStreamDefV1(def, mode), stdout, parsed) };
+      }
+      if (
+        ensembleStopFailureV1 !== undefined &&
+        (decision.cause === "ensembleBackstop" || decision.cause === "ensembleIdleStop" || decision.cause === "ensembleRepeatStop")
+      ) {
+        return ensembleStopFailureV1();
+      }
+      return {
+        ...classifyCliFailure({
+          status: "failed",
+          output: stdout,
+          errorMessage: `${cliDisplayLabel(def)} CLI was stopped before it finished. ${describeCliSessionProgressV1(stdout, new Date(lastActivityAt))}`,
+        }),
+        stopCauseV1: decision.cause,
+      };
+    };
+
+    // The first signal that needs the process stopped starts this; later signals only add to the
+    // list and wait. It stops the WHOLE process tree and confirms it within a fixed bound
+    // (SIGTERM, then SIGKILL), then hands the single decided outcome on.
+    const beginSettlement = (): void => {
+      if (recordFailureRecovering || terminationInProgress) {
+        return;
+      }
+      terminationInProgress = true;
+      void (async () => {
+        if (child.pid !== undefined && !childExited) {
+          onProgress?.(`Stopping pid ${child.pid} and its children...`.substring(0, 80));
+        }
+        const stopped = await stopProcessTreeConfirmedV1(child);
+        if (child.pid !== undefined && !childExited) {
+          // The group is gone; the close event follows as soon as the pipes drain. Bounded, so a
+          // pipe held open by something outside the group cannot hold the round open.
+          await Promise.race([childExitedPromiseV1, new Promise<void>((resolve) => setTimeout(resolve, 2_000))]);
+        }
+        finishAfterRecordingSettles(
+          withUnconfirmedStopV1(outcomeOfSettlementV1(decideRoundSettlementV1(settlementSignals)), stopped.gone)
+        );
+      })();
+    };
+
+    // run1 Step 8: an outcome is never handed on as if the round's process were gone when Ensemble
+    // could not confirm it. Releasing the task's admission with a live descendant could let it keep
+    // editing under the next round, so the round fails and says which process to stop. A cancel
+    // stays a cancel (the owner asked for it); what was learned still goes to the run log.
+    const withUnconfirmedStopV1 = (result: CliExecResult, treeGone: boolean): CliExecResult => {
+      if (treeGone || result.status === "cancelled") {
+        return result;
+      }
+      const pid = child.pid;
+      return {
+        ...classifyCliFailure({
+          status: "failed",
+          output: result.output,
+          rawOutput: stdout,
+          sessionId: sessionIdOfRun(),
+          errorMessage:
+            `${cliDisplayLabel(def)} CLI's process${pid !== undefined ? ` (pid ${pid})` : ""} could not be confirmed stopped; it may still be running and editing the workspace. ` +
+            `Stop it yourself${pid !== undefined ? ` (for example \`kill -9 -${pid}\`)` : ""} before starting another round.`,
+        }),
+        stopCauseV1: "processNotConfirmedStopped",
+      };
+    };
+
+    // run1 Step 8: every failed outcome carries the cause the settlement named, so the wording, the
+    // ledger row and the card read it instead of re-deriving it from message text.
+    const withRecordedCauseV1 = (result: CliExecResult, processEnded: boolean): CliExecResult => {
+      if (result.status !== "failed" || result.stopCauseV1 !== undefined) {
+        return result;
+      }
+      return {
+        ...result,
+        stopCauseV1: classifyRoundStopV1({
+          status: "failed",
+          ...(result.failureKind ? { failureKind: result.failureKind } : {}),
+          ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+          ...(result.authFailure === true ? { authFailure: true } : {}),
+          ...(result.providerCapacity === true ? { providerCapacity: true } : {}),
+          ...(result.timeoutReason ? { timeoutReason: result.timeoutReason } : {}),
+          ...(result.providerTimeCapV1 === true ? { providerTimeCap: true } : {}),
+          ...(processEnded ? { processEnded: true } : {}),
+        }).kind,
+      };
+    };
+
+    // An ordinary exit leaves the process GROUP behind when the model started something that
+    // outlives it (a background `sleep`, a Monitor). It is stopped and confirmed here, so no outcome
+    // is handed on while a descendant can still edit the workspace. True when nothing is left.
+    const stopLeftoverTreeV1 = async (): Promise<boolean> => {
+      if (child.pid !== undefined && processGroupAliveV1(child.pid)) {
+        onProgress?.(`Stopping what pid ${child.pid} left running...`.substring(0, 80));
+      }
+      return stopLeftoverProcessGroupV1(child);
+    };
 
     const finish = (result: CliExecResult): void => {
       if (settled) {
         return;
       }
       settled = true;
+      if (endOfTurnHandle) {
+        clearTimeout(endOfTurnHandle);
+      }
       clearTimeout(timeoutHandle);
       if (inactivityCheckHandle) {
         clearInterval(inactivityCheckHandle);
       }
+      if (proofOfLifeHandle) {
+        clearInterval(proofOfLifeHandle);
+      }
+      processProbe?.stop();
+      if (processProbeHandle) {
+        clearInterval(processProbeHandle);
+      }
+      // The one settlement's outcome goes on the row at once, so it stops saying "running".
+      proofOfLifeReporter?.markSettled({
+        status: result.status,
+        ...(result.stopCauseV1 !== undefined ? { cause: result.stopCauseV1 } : {}),
+      });
       cancellationListener.dispose();
       cleanupPromptFile();
-      resolve(result);
+      resolve({
+        ...result,
+        activityV1: {
+          workedMs: Math.max(0, Date.now() - startedAtMs),
+          attributedFiles: activityFeed.attributedFiles(),
+          observedFiles: activityFeed.observedFiles(),
+          processStartedAtMs: startedAtMs,
+          processEndedAtMs: Date.now(),
+        },
+      });
     };
 
     // Cancellation, the watchdogs, and the child 'error' handler all call
@@ -4220,7 +4819,13 @@ async function execCliAgentProcessV1(options: {
           ? extractCodexSessionIdV1(stdout)
           : undefined;
 
-    const emitTimeout = (baseMessage: string, timeoutReason: "wall-clock" | "inactivity"): void => {
+    const emitTimeout = (
+      baseMessage: string,
+      timeoutReason: "wall-clock" | "inactivity",
+      stopCause: "ensembleBackstop" | "ensembleIdleStop" | "ensembleRepeatStop" = timeoutReason === "wall-clock"
+        ? "ensembleBackstop"
+        : "ensembleIdleStop"
+    ): void => {
       // Once post-spawn record-failure recovery, or cancellation, has taken
       // over settlement, a watchdog must not settle first (or kill/settle
       // at all): whichever path owns settlement needs to confirm
@@ -4237,9 +4842,15 @@ async function execCliAgentProcessV1(options: {
       // reopen while the provider may still be alive and editing the
       // workspace unrecorded -- the same gap a review flagged for
       // cancellation, which applies equally here.
-      terminationInProgress = true;
-      killProcessTree(child);
-      const message = `${baseMessage} ${describeCliSessionProgressV1(stdout)}`;
+      const message = `${baseMessage} ${describeCliSessionProgressV1(stdout, new Date(lastActivityAt))}`;
+      // run1 Steps 8 and 9: a report the model had already written is kept, not thrown away with the
+      // process. It is recovered here, inside the one settlement, so the round counts as completed
+      // before any failure handling (terminalisation, a scheduled continuation) can see it.
+      const recoveredReportV1 = recoveredReportOfStreamV1(def, stdout);
+      settlementSignals.push({ kind: "ensembleStop", cause: stopCause });
+      if (recoveredReportV1 !== undefined) {
+        settlementSignals.push({ kind: "recoveredReport", text: recoveredReportV1 });
+      }
       // Edit-mode timeouts are always promoted: edit mode has its OWN
       // separate, stricter retry gate downstream that refuses to act on this
       // promotion for any provider — Cline/Antigravity included — except via
@@ -4253,23 +4864,7 @@ async function execCliAgentProcessV1(options: {
       const resumeConversation = def.conversationResume !== undefined;
       const promoteForRetry =
         mode === "edit" || isTextModeGuaranteedReadOnly(def) || resumeConversation;
-      void (async () => {
-        if (child.pid !== undefined) {
-          let exited = childExited;
-          while (!exited && !settled) {
-            onProgress?.(
-              `Waiting for pid ${child.pid} to stop after a timeout...`.substring(0, 80)
-            );
-            // See the matching comment on the record-failure recovery path:
-            // race the close-event promise against the poll so confirmed
-            // exit is acted on immediately, not on the poll's own cadence.
-            exited = childExited || await Promise.race([
-              childExitedPromiseV1.then(() => true),
-              waitForPidToExitV1(child.pid),
-            ]);
-          }
-        }
-        finishAfterRecordingSettles({
+      ensembleStopFailureV1 = (): CliExecResult => ({
           ...classifyCliFailure({
             status: "failed",
             output: stdout,
@@ -4306,38 +4901,75 @@ async function execCliAgentProcessV1(options: {
           // retry-evidence input for edit-capable runs.
           editEvidence: analyzeCliEventStream(stdout),
           timeoutReason,
+          stopCauseV1: stopCause,
           // Pin the session this run created, so a resume continues THIS
           // conversation rather than whatever ran last in the directory.
           ...(sessionIdOfRun() !== undefined ? { sessionId: sessionIdOfRun() } : {}),
         });
-      })();
+      beginSettlement();
     };
 
+    const backstopMs = roundBackstopMsV1();
     const timeoutHandle = setTimeout(() => {
       emitTimeout(
-        `${cliDisplayLabel(def)} CLI hit the ${RUN_TIMEOUT_MS / 60000}-minute wall-clock limit and was stopped while still running — the provider did not report an error.`,
+        `${cliDisplayLabel(def)} CLI hit the ${backstopMs / 60000}-minute wall-clock limit and was stopped while still running — the provider did not report an error.`,
         "wall-clock"
       );
-    }, RUN_TIMEOUT_MS);
+    }, backstopMs);
 
-    // Part 7 inactivity watchdog: unlike the flat wall-clock cap above, this
-    // kills a process that has produced no stdout/stderr bytes at all for
-    // ensemble.resilience.inactivityTimeoutMinutes, so a wedged process is
-    // caught long before the 60-minute wall clock. 0 disables it. Checked on
-    // a short fixed interval (well under the minimum nonzero limit of one
-    // minute) rather than a single setTimeout re-armed per byte, so the
-    // check logic stays simple and independent of how chatty the stream is.
+    // run1 Step 12: stop a round when it is stuck, not when it is busy. Every 15 s the round's
+    // activity feed is read (never raw file events): the workspace is scanned and each change is
+    // attributed (or not) by the feed; a streaming provider with no contact and no progress of its
+    // own for the idle time is stopped as idle; a round repeating itself is stopped as a repeat.
+    // A provider that prints nothing until it finishes gets no idle stop, only the backstop.
     const inactivityLimitMinutes = getResilienceSettings().inactivityTimeoutMinutes;
     const inactivityLimitMs = inactivityLimitMinutes * 60_000;
+    const scanWorkspace = mode === "edit" && taskFolderPath !== undefined;
+    let previousScan: Map<string, string> | undefined;
+    let scanning = false;
+    const scanWorkspaceOnce = async (): Promise<void> => {
+      if (scanning) {
+        return;
+      }
+      scanning = true;
+      try {
+        const roundProgressPath = nodePath.join(taskFolderPath ?? "", "round-progress.md");
+        const current = await gitDirtyMtimeSnapshotV1(cwd, roundProgressPath);
+        if (current === undefined || settled) {
+          return;
+        }
+        if (previousScan !== undefined) {
+          activityFeed.recordFileChanges(changedPathsSince(previousScan, current));
+        }
+        previousScan = current;
+      } finally {
+        scanning = false;
+      }
+    };
     const inactivityCheckHandle =
-      inactivityLimitMinutes > 0
+      streamingProvider || scanWorkspace
         ? setInterval(() => {
             if (settled) {
               return;
             }
-            if (Date.now() - lastActivityAt >= inactivityLimitMs) {
+            if (scanWorkspace) {
+              void scanWorkspaceOnce().catch(() => undefined);
+            }
+            if (!streamingProvider) {
+              return;
+            }
+            const repeat = activityFeed.repeatStop();
+            if (repeat !== undefined) {
               emitTimeout(
-                `${cliDisplayLabel(def)} CLI produced no output for ${inactivityLimitMinutes} minute(s) and was stopped by the inactivity watchdog (for example, a command it started may still be running in the background) — the provider did not report an error.`,
+                `${cliDisplayLabel(def)} CLI was repeating itself (${repeat.what}) with no new work in between and was stopped by Ensemble — the provider did not report an error.`,
+                "inactivity",
+                "ensembleRepeatStop"
+              );
+              return;
+            }
+            if (isRoundIdleV1(activityFeed, startedAtMs, Date.now(), inactivityLimitMs, true)) {
+              emitTimeout(
+                `${cliDisplayLabel(def)} CLI showed no output and did nothing of its own for ${inactivityLimitMinutes} minute(s) and was stopped as idle by Ensemble (for example, a command it started may still be running in the background) — the provider did not report an error.`,
                 "inactivity"
               );
             }
@@ -4345,6 +4977,11 @@ async function execCliAgentProcessV1(options: {
         : undefined;
 
     const cancellationListener = token.onCancellationRequested(() => {
+      // run1 Step 8: the owner's Cancel is a signal like any other. It is recorded even when another
+      // settlement is already stopping the process (a time limit, the end-of-turn grace), so the one
+      // decision, once the process is confirmed gone, sees it; a successful result already received
+      // still wins over it.
+      settlementSignals.push({ kind: "ownerCancel" });
       // See the matching guard in emitTimeout above: once recovery owns
       // settlement, cancellation must not settle (or kill) ahead of it —
       // recovery's own bounded wait is what proves the recorded process is
@@ -4352,7 +4989,6 @@ async function execCliAgentProcessV1(options: {
       if (recordFailureRecovering || terminationInProgress) {
         return;
       }
-      cancelled = true;
       // Own settlement from here, exactly like post-spawn record-failure
       // recovery does above: block the ordinary child.on("close") listener,
       // emitTimeout, and child.on("error") from racing this to finish()
@@ -4366,26 +5002,7 @@ async function execCliAgentProcessV1(options: {
       // finishAfterRecordingSettles's own recordingPromise callback below,
       // so setting it here made this very call suppress itself and never
       // settle -- a regression a later review caught.
-      terminationInProgress = true;
-      killProcessTree(child);
-      void (async () => {
-        if (child.pid !== undefined) {
-          let exited = childExited;
-          while (!exited && !settled) {
-            onProgress?.(
-              `Waiting for pid ${child.pid} to stop after Cancel...`.substring(0, 80)
-            );
-            // See the matching comment on the record-failure recovery path:
-            // race the close-event promise against the poll so confirmed
-            // exit is acted on immediately, not on the poll's own cadence.
-            exited = childExited || await Promise.race([
-              childExitedPromiseV1.then(() => true),
-              waitForPidToExitV1(child.pid),
-            ]);
-          }
-        }
-        finishAfterRecordingSettles({ status: "cancelled", output: stdout });
-      })();
+      beginSettlement();
     });
 
     child.on("error", (error) => {
@@ -4410,9 +5027,50 @@ async function execCliAgentProcessV1(options: {
       }));
     });
 
+    // run1 Step 10: the end of a headless Claude edit round's turn. The first successful `result`
+    // event starts the exit grace; when it runs out the process is still alive on something the
+    // model left running, so the whole tree is stopped and the round settles as completed with
+    // the model's own answer. Only Claude edit rounds stream a terminal `result` we trust here.
+    const watchForEndOfTurn = (text: string): void => {
+      if (mode !== "edit" || def.structuredEventStream !== "claude" || successfulResultSeen) {
+        return;
+      }
+      const lines = (stdoutLineRemainder + text).split(/\r?\n/);
+      stdoutLineRemainder = lines.pop() ?? "";
+      noteTerminalResultV1(firstTerminalClaudeResultV1(lines.join("\n")));
+    };
+
+    // The model's turn ended with this terminal result (the FIRST one in the stream decides; what
+    // follows is a wake-up and never changes it). An error result is a failure to be classified,
+    // whatever the exit code turns out to be, and never starts the exit grace.
+    const noteTerminalResultV1 = (first: "success" | "error" | undefined): void => {
+      if (first === undefined || successfulResultSeen || errorResultSeen) {
+        return;
+      }
+      if (first === "error") {
+        errorResultSeen = true;
+        settlementSignals.push({ kind: "resultError" });
+        return;
+      }
+      // Recorded as the pending result: it does not settle the round by itself. The process exiting
+      // inside the grace, or the grace running out, settles it as completed with this result.
+      successfulResultSeen = true;
+      settlementSignals.push({ kind: "resultSuccess" });
+      endOfTurnHandle = setTimeout(() => {
+        if (settled || childExited || recordFailureRecovering || terminationInProgress) {
+          return;
+        }
+        settlementSignals.push({ kind: "ensembleStop", cause: "ensembleEndOfTurn" });
+        beginSettlement();
+      }, endOfTurnGraceForTestsV1.ms);
+    };
+
     child.stdout?.on("data", (chunk: Buffer) => {
       lastActivityAt = Date.now();
-      stdout += chunk.toString("utf8");
+      const decoded = chunk.toString("utf8");
+      feedStdoutV1(decoded);
+      watchForEndOfTurn(decoded);
+      stdout += decoded;
       const lastLine = stdout.trimEnd().split(/\r?\n/).pop();
       if (lastLine && onProgress) {
         onProgress(lastLine.substring(0, 80));
@@ -4421,6 +5079,7 @@ async function execCliAgentProcessV1(options: {
 
     child.stderr?.on("data", (chunk: Buffer) => {
       lastActivityAt = Date.now();
+      activityFeed.recordContact();
       stderr += chunk.toString("utf8");
     });
 
@@ -4431,6 +5090,8 @@ async function execCliAgentProcessV1(options: {
       // that the wait loops in those paths check instead of relying
       // solely on process.kill(pid, 0) polling.
       childExited = true;
+      // run1 Step 16: the row stops saying the process is there the moment it exits.
+      proofOfLifeReporter?.markProcessEnded();
       resolveChildExitedV1?.();
       // The post-spawn record-failure recovery path (above), or
       // cancellation, owns settlement once it starts: it needs to confirm
@@ -4440,14 +5101,51 @@ async function execCliAgentProcessV1(options: {
       if (recordFailureRecovering || terminationInProgress) {
         return;
       }
-      if (cancelled) {
-        finishAfterRecordingSettles({ status: "cancelled", output: stdout, rawOutput: stdout, sessionId: sessionIdOfRun() });
+      // run1 Step 8: an ordinary exit owns settlement from here, like every other ending. What the
+      // process left running in its group (a background `sleep`, a Monitor) is stopped and confirmed
+      // BEFORE the outcome is handed on, and the outcome comes from the same one decision.
+      terminationInProgress = true;
+      void (async () => {
+        const treeGone = await stopLeftoverTreeV1();
+        settleOrdinaryExitV1(code, treeGone);
+      })();
+    });
+
+    // run1 Step 17: the probe saw the process gone and nothing settled the round within 10 s (the
+    // exit event never came, for example because something it started still holds its output open).
+    // It goes through the same one decision as an ordinary exit, with no exit code: the process
+    // ended without a result, and a report already written is still recovered by the decision.
+    const settleProcessGoneV1 = (): void => {
+      if (settled || recordFailureRecovering || terminationInProgress) {
         return;
       }
+      terminationInProgress = true;
+      void (async () => {
+        const treeGone = await stopLeftoverTreeV1();
+        settleOrdinaryExitV1(null, treeGone);
+      })();
+    };
 
-      // claude-cli's structured stream applies to text mode only — its edit
-      // mode still runs plain `--output-format text`, so its stdout must be
-      // handled through the opaque-text path, exactly as before Step 16. See
+    const settleOrdinaryExitV1 = (code: number | null, treeGone: boolean): void => {
+      const finishOrdinary = (result: CliExecResult, processEndedWithoutOutput = false): void =>
+        finishAfterRecordingSettles(
+          withUnconfirmedStopV1(withRecordedCauseV1(result, processEndedWithoutOutput), treeGone)
+        );
+
+      // The terminal result in the stream decides how the turn ended, for every Claude stream (a
+      // text-mode review as much as an edit round), including a final line the CLI never ended with
+      // a newline. An error result with exit 0 is a failure, never a finished round.
+      if (def.structuredEventStream === "claude") {
+        const first = firstTerminalClaudeResultV1(stdout);
+        if (mode === "edit" || first === "error") {
+          noteTerminalResultV1(first);
+          if (endOfTurnHandle !== undefined) {
+            // The process is already gone: the exit-grace timer has nothing left to do.
+            clearTimeout(endOfTurnHandle);
+          }
+        }
+      }
+      // claude-cli streams in edit mode too since run1 Step 7; see
       // effectiveStructuredStreamDefV1's doc comment.
       const effectiveDef = effectiveStructuredStreamDefV1(def, mode);
       // Parsed once and shared with toFriendlyError below (both call sites):
@@ -4461,25 +5159,66 @@ async function execCliAgentProcessV1(options: {
         : undefined;
       const output = normalizeCliOutput(effectiveDef, stdout, sharedParsedEvents);
 
-      if (code !== 0) {
+      // run1 Step 8: the decision, asked once, after the process and its group are gone, decides
+      // whether this round completed, failed or was cancelled; everything below only describes it.
+      // A Cancel that arrived before a successful result wins; a result already received wins over a
+      // Cancel that came after it; a terminal error result is a failure whatever the exit code says
+      // (the CLI can report one and still exit 0); a non-zero exit after a successful result (a hook
+      // failing on the way out, a signal) does not undo it.
+      const providerCutOff = matchesConversationResumeMarkerV1(effectiveDef, stderr);
+      const decision = decideRoundSettlementV1([
+        ...settlementSignals,
+        { kind: "processEnded", exit: { code, hasOutput: output.length > 0, providerCutOff } },
+      ]);
+      if (decision.outcome === "cancelled") {
+        finishOrdinary({
+          status: "cancelled",
+          output: stdout,
+          rawOutput: stdout,
+          sessionId: sessionIdOfRun(),
+          stopCauseV1: "ownerCancel",
+        });
+        return;
+      }
+      if (decision.outcome === "completed" && output.length > 0) {
+        finishOrdinary({
+          status: "completed",
+          output,
+          rawOutput: stdout,
+          sessionId: sessionIdOfRun(),
+          ...(decision.cause !== undefined ? { stopCauseV1: decision.cause } : {}),
+        });
+        return;
+      }
+      // The decision named the cause where only it can know (the provider's own cut-off, an error
+      // result); every other failure keeps the cause classified from the provider's diagnostics.
+      const decidedCauseV1 =
+        decision.outcome === "failed" && (decision.cause === "providerTimeCap" || decision.cause === "providerError")
+          ? ({ stopCauseV1: decision.cause } as const)
+          : {};
+
+      if (code !== 0 || errorResultSeen) {
         const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents);
-        finishAfterRecordingSettles(applyTransportTransience(
-          classifyCliFailure({
-            status: "failed",
-            output,
-            rawOutput: stdout,
-            sessionId: sessionIdOfRun(),
-            errorMessage: friendly.message,
-            // Captured pre-hint so the backup-cascade gate never re-reads our
-            // own login hint as evidence of the auth failure that produced it.
-            authFailure: friendly.authFailure,
-            authDiagnosticText: friendly.diagnosticText,
-            structuredQuotaSignal: friendly.quotaSignal,
-          }),
-          friendly,
-          mode,
-          effectiveDef
-        ));
+        finishOrdinary({
+          ...applyTransportTransience(
+            classifyCliFailure({
+              status: "failed",
+              output,
+              rawOutput: stdout,
+              sessionId: sessionIdOfRun(),
+              errorMessage: friendly.message,
+              // Captured pre-hint so the backup-cascade gate never re-reads our
+              // own login hint as evidence of the auth failure that produced it.
+              authFailure: friendly.authFailure,
+              authDiagnosticText: friendly.diagnosticText,
+              structuredQuotaSignal: friendly.quotaSignal,
+            }),
+            friendly,
+            mode,
+            effectiveDef
+          ),
+          ...decidedCauseV1,
+        });
         return;
       }
 
@@ -4510,7 +5249,7 @@ async function execCliAgentProcessV1(options: {
               : ""
         }`.trim();
         const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents, emptyDetail);
-        finishAfterRecordingSettles(applyTransportTransience(
+        finishOrdinary(applyTransportTransience(
           classifyCliFailure({
             status: "failed",
             output,
@@ -4524,19 +5263,56 @@ async function execCliAgentProcessV1(options: {
           friendly,
           mode,
           effectiveDef
-        ));
+        ), true);
         return;
       }
 
-      // Routed through finishAfterRecordingSettles, not finish() directly:
-      // an ordinary successful exit can still race a still-pending
-      // post-spawn process-record write (or its abandonment fallback above)
-      // to settlement. Settling here first would release the caller's
-      // admission lock before that write is durable — the exact crash
-      // window a review flagged (this close handler was the one settle
-      // path that bypassed the wrapper every other exit path already uses).
-      finishAfterRecordingSettles({ status: "completed", output, rawOutput: stdout, sessionId: sessionIdOfRun() });
-    });
+      // run1 Step 4: a provider that cuts its own turn short can still exit 0 with the
+      // partial output it had. Its stderr names the cut-off (never stdout: that is model
+      // prose), and the round is then not complete: it continues through the same-conversation
+      // resume instead of being counted done.
+      if (providerCutOff) {
+        const cutOffStderr = stripKnownBenignCliNoiseV1(stderr);
+        const cutOffDetail = `${cliDisplayLabel(def)} CLI ended its turn early with partial output. ${truncateCliDetail(cutOffStderr.filtered, 4).trim()}`.trim();
+        const friendly = toFriendlyError(effectiveDef, model, code, stderr, stdout, sharedParsedEvents, cutOffDetail);
+        finishOrdinary({
+          ...applyTransportTransience(
+            classifyCliFailure({
+              status: "failed",
+              output,
+              rawOutput: stdout,
+              sessionId: sessionIdOfRun(),
+              errorMessage: friendly.message,
+              authFailure: friendly.authFailure,
+              authDiagnosticText: friendly.diagnosticText,
+              structuredQuotaSignal: friendly.quotaSignal,
+            }),
+            friendly,
+            mode,
+            effectiveDef
+          ),
+          ...decidedCauseV1,
+        });
+        return;
+      }
+
+      // Not reachable while the decision above is the authority (a completed decision with output
+      // returned, and every failed one is described by a branch above). Kept as a defensive
+      // failure so nothing here can hand on a completion the decision did not make.
+      finishOrdinary(
+        {
+          ...classifyCliFailure({
+            status: "failed",
+            output,
+            rawOutput: stdout,
+            sessionId: sessionIdOfRun(),
+            errorMessage: `${cliDisplayLabel(def)} CLI ended without a result Ensemble could accept.`,
+          }),
+          stopCauseV1: "processEnded",
+        },
+        true
+      );
+    };
 
     if (promptTransport === "stdin" && stdinSource?.writeToChildStdin === true) {
       child.stdin?.on("error", () => {
@@ -4798,6 +5574,40 @@ async function gitStatusSnapshot(
 }
 
 /**
+ * run1 Step 11: a cheap fingerprint of the workspace for the round's 15 s scan: git status plus the
+ * modified time of each dirty path (no hashing, so a large dirty tree costs one git call and a few
+ * stats). The round's own `round-progress.md` is added by modified time, because it lives under
+ * `.ensemble/` where git may not report it. Undefined when git is unavailable.
+ */
+async function gitDirtyMtimeSnapshotV1(cwd: string, roundProgressPath: string): Promise<GitSnapshot | undefined> {
+  const statusOutput = await execGit(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (statusOutput === undefined) {
+    return undefined;
+  }
+  const snapshot: GitSnapshot = new Map();
+  const stamp = async (relativePath: string, statusCode: string): Promise<void> => {
+    let modified = "gone";
+    try {
+      modified = String((await nodeFs.promises.stat(nodePath.join(cwd, relativePath))).mtimeMs);
+    } catch {
+      // A path git lists that is already gone is still a change worth noting.
+    }
+    snapshot.set(relativePath, `${statusCode}:${modified}`);
+  };
+  await Promise.all(parseGitStatusEntries(statusOutput).map(({ statusCode, path }) => stamp(path, statusCode)));
+  const progressRelative = nodePath.relative(cwd, roundProgressPath);
+  if (!progressRelative.startsWith("..") && !snapshot.has(progressRelative)) {
+    try {
+      const modified = (await nodeFs.promises.stat(roundProgressPath)).mtimeMs;
+      snapshot.set(progressRelative, `file:${modified}`);
+    } catch {
+      // No round-progress file yet.
+    }
+  }
+  return snapshot;
+}
+
+/**
  * Run a git command and return trimmed stdout, or undefined if git is
  * unavailable, the directory isn't a repository, or the command errors.
  */
@@ -4869,17 +5679,41 @@ function toCliImplementationRunResult(
   filesChanged: string[],
   filesChangedUnknown: boolean,
   requireFileChange = true,
-  noChangeCompletionIsSuccess = false
+  noChangeCompletionIsSuccess = false,
+  roundActivity?: NonNullable<ImplementationRunResult["activityV1"]>
 ): ImplementationRunResult {
+  // run1 Step 8: the cause the round's one settlement recorded, and whether Ensemble had to stop a
+  // process that had already answered, travel with the result instead of being re-derived.
+  const settlementFieldsV1 = {
+    ...(result.stopCauseV1 !== undefined ? { stopCauseV1: result.stopCauseV1 } : {}),
+    ...(result.endOfTurnStopV1 === true ? { endOfTurnStopV1: true } : {}),
+    ...(roundActivity !== undefined ? { activityV1: roundActivity } : {}),
+  };
   if (result.status === "cancelled") {
-    return { status: "cancelled", filesChanged, filesChangedUnknown };
+    return { status: "cancelled", filesChanged, filesChangedUnknown, ...settlementFieldsV1 };
   }
   if (result.status === "failed") {
     return {
+      ...settlementFieldsV1,
       status: "failed",
       filesChanged,
       filesChangedUnknown,
-      errorMessage: result.errorMessage,
+      errorMessage:
+        // run1 Step 4: the provider's own turn cap, with the continuations used up, is said as
+        // what it is, with what happened to the edits; the raw CLI text stays in the run log.
+        result.providerTimeCapV1 === true
+          ? describeRoundStopV1(
+              { kind: "providerTimeCap" },
+              {
+                providerLabel: def.label,
+                ...(providerTimeCapMinutesV1(result.errorMessage ?? "") !== undefined
+                  ? { providerCapMinutes: providerTimeCapMinutesV1(result.errorMessage ?? "")! }
+                  : {}),
+                ...(filesChangedUnknown ? {} : { unattributedFilesChanged: filesChanged.length }),
+                nextStep: "the next step continues from them",
+              }
+            )
+          : result.errorMessage,
       failureKind: result.failureKind,
       // Carried so the backup-cascade gate can consult the provider's own
       // pre-hint verdict instead of regexing errorMessage, which by this point
@@ -4892,6 +5726,7 @@ function toCliImplementationRunResult(
       timedOut: result.timeoutReason !== undefined,
       timeoutReason: result.timeoutReason,
       ...(result.providerCapacity === true ? { providerCapacity: true } : {}),
+      ...(result.providerTimeCapV1 === true ? { providerTimeCapV1: true } : {}),
       ...(result.promptNotDeliveredV1 === true ? { promptNotDeliveredV1: true } : {}),
     };
   }
@@ -4906,6 +5741,7 @@ function toCliImplementationRunResult(
       filesChanged,
       filesChangedUnknown,
       summary: result.output || undefined,
+      ...settlementFieldsV1,
     };
   }
   if (requireFileChange && !filesChangedUnknown && filesChanged.length === 0) {
@@ -4931,6 +5767,7 @@ function toCliImplementationRunResult(
     filesChanged,
     filesChangedUnknown,
     summary: result.output || undefined,
+    ...settlementFieldsV1,
   };
 }
 
@@ -5131,7 +5968,33 @@ export async function runImplementationWithCli(options: {
   // this one, not from whatever HEAD is when the offer is later posted.
   const roundStartHead = (await execGit(cwd, ["rev-parse", "--verify", "-q", "HEAD"]))?.trim() || undefined;
 
-  let result = await execCliAgent({
+  // run1 Steps 8 and 11: what the round's attempts did, gathered across every attempt (a continuation
+  // is a new process with its own feed), so the one outcome the command layer reads can say how long
+  // the round worked and which files it provably changed, kept apart from files merely observed.
+  const activityTotalsV1: {
+    workedMs: number;
+    attributed: Set<string>;
+    observed: Set<string>;
+    startedAtMs?: number;
+    endedAtMs?: number;
+  } = { workedMs: 0, attributed: new Set<string>(), observed: new Set<string>() };
+  const execAndNoteActivityV1 = async (execOptions: ExecCliAgentOptionsV1): Promise<CliExecResult> => {
+    const attemptResult = await execCliAgent(execOptions);
+    if (attemptResult.activityV1) {
+      const { processStartedAtMs, processEndedAtMs } = attemptResult.activityV1;
+      if (processStartedAtMs !== undefined) {
+        activityTotalsV1.startedAtMs = Math.min(activityTotalsV1.startedAtMs ?? processStartedAtMs, processStartedAtMs);
+      }
+      if (processEndedAtMs !== undefined) {
+        activityTotalsV1.endedAtMs = Math.max(activityTotalsV1.endedAtMs ?? processEndedAtMs, processEndedAtMs);
+      }
+      activityTotalsV1.workedMs += attemptResult.activityV1.workedMs;
+      attemptResult.activityV1.attributedFiles.forEach((file) => activityTotalsV1.attributed.add(file));
+      attemptResult.activityV1.observedFiles.forEach((file) => activityTotalsV1.observed.add(file));
+    }
+    return attemptResult;
+  };
+  let result = await execAndNoteActivityV1({
     def,
     mode: "edit",
     model,
@@ -5184,7 +6047,7 @@ export async function runImplementationWithCli(options: {
     if (token.isCancellationRequested) {
       break;
     }
-    result = await execCliAgent({
+    result = await execAndNoteActivityV1({
       def,
       mode: "edit",
       model,
@@ -5259,7 +6122,18 @@ export async function runImplementationWithCli(options: {
       break;
     }
     onProgress(resumeConversation
-      ? `${def.label} response timed out; resuming the same conversation (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
+      ? result.providerTimeCapV1 === true
+        ? `${describeRoundStopV1(
+            { kind: "providerTimeCap" },
+            {
+              providerLabel: def.label,
+              continuing: true,
+              ...(providerTimeCapMinutesV1(result.errorMessage ?? "") !== undefined
+                ? { providerCapMinutes: providerTimeCapMinutesV1(result.errorMessage ?? "")! }
+                : {}),
+            }
+          )} Continuing the same conversation from the working tree (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
+        : `${def.label} response timed out; resuming the same conversation (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
       : `${def.label} timed out with no observed changes; retrying (attempt ${attempt + 1}/${CLI_RETRY_MAX_ATTEMPTS})...`
     );
     await retryDelay(token, retryDelayMs);
@@ -5271,7 +6145,7 @@ export async function runImplementationWithCli(options: {
     // reports an id must not lose the one an earlier attempt established, or
     // the resume silently degrades to "whatever ran last in this directory".
     lastKnownSessionId = result.sessionId ?? lastKnownSessionId;
-    result = await execCliAgent({
+    result = await execAndNoteActivityV1({
       def,
       mode: "edit",
       model,
@@ -5359,7 +6233,7 @@ export async function runImplementationWithCli(options: {
           `The following project check commands were executed on the host system because the sandbox restricted them:\n` +
           feedbackContent +
           `\nPlease inspect these check outcomes, make any remaining code edits required to fix the failures, and complete the task.`;
-        result = await execCliAgent({
+        result = await execAndNoteActivityV1({
           def,
           mode: "edit",
           model,
@@ -5450,7 +6324,14 @@ export async function runImplementationWithCli(options: {
     // next round. Only softens the zero-change failure for callers that
     // REQUIRE file changes (Run Implementation); requireFileChange:false
     // callers already treat no-change completions as success.
-    getResilienceSettings().nothingToFixRoutesToReview
+    getResilienceSettings().nothingToFixRoutesToReview,
+    {
+      workedMs: activityTotalsV1.workedMs,
+      attributedFiles: [...activityTotalsV1.attributed].sort(),
+      observedFiles: [...activityTotalsV1.observed].sort(),
+      ...(activityTotalsV1.startedAtMs !== undefined ? { processStartedAtMs: activityTotalsV1.startedAtMs } : {}),
+      ...(activityTotalsV1.endedAtMs !== undefined ? { processEndedAtMs: activityTotalsV1.endedAtMs } : {}),
+    }
   );
 
   // (2g) Only worth checking a round that actually left real, known edits —

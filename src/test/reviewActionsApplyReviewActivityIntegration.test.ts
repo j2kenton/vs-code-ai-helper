@@ -370,9 +370,9 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       controllable.resolveWith("# Plan\n\n1. Do the thing (revised).\n");
       await dispatchPromise;
 
-      assert.equal(
-        liveRowActivity,
-        "Applying review fixes…",
+      assert.match(
+        liveRowActivity ?? "",
+        /Apply Review; then a review$/,
         "the leaf (plan-fix) operation must report what it is doing before the provider call"
       );
       assert.equal(
@@ -475,9 +475,9 @@ void describe("applyReviewWithAI — real in-flight activity through the product
         }
       );
 
-      assert.equal(
-        liveRowActivitySeen,
-        "Applying review fixes…",
+      assert.match(
+        liveRowActivitySeen ?? "",
+        /Apply Review; then a review$/,
         "must be observably applying the review fixes before the transport failure"
       );
       assert.deepEqual(
@@ -909,8 +909,10 @@ void describe("applyReviewWithAI — real in-flight activity through the product
           assert.ok(planFixOp, "a child operation with kind 'apply-review' must exist during plan fix");
           assert.equal(planFixOp?.stage, "plan", "the plan-fix operation must have stage: 'plan'");
           assert.equal(planFixOp?.parentId, parentOpId, "the plan-fix operation must be parented to Fast Forward");
-          assert.equal(planFixOp?.activity, "Applying review fixes…", "the plan-fix child operation must report plan fix activity");
-          assert.equal(rootOpDuringApply?.activity, "Applying review fixes…", "the root operation must report plan fix activity");
+          // run1 Step 19: the row says where we are, not just that fixes are applied.
+          const applyWhere = "High-Level Review (Plan): Apply Review; then a review";
+          assert.equal(planFixOp?.activity, applyWhere, "the plan-fix child operation must report plan fix activity");
+          assert.equal(rootOpDuringApply?.activity, applyWhere, "the root operation must report plan fix activity");
 
           controllableApply.resolveWith("# Plan\n\n1. Do the thing (revised).\n");
 
@@ -922,11 +924,12 @@ void describe("applyReviewWithAI — real in-flight activity through the product
           assert.ok(reReviewOp, "a child operation for re-review must exist during re-review");
           assert.equal(reReviewOp?.stage, "plan-high-review", "the re-review child must be registered against the review stage");
           assert.ok(
-            reReviewOp?.activity === "running" || reReviewOp?.activity === "Re-running review…",
+            reReviewOp?.activity === "running" || /then Apply Review if it finds fixes/.test(reReviewOp?.activity ?? ""),
             "the re-review child operation must report re-review activity"
           );
           assert.ok(
-            rootOpDuringReReview?.activity === "running" || rootOpDuringReReview?.activity === "Re-running review…",
+            rootOpDuringReReview?.activity === "running" ||
+              /then Apply Review if it finds fixes/.test(rootOpDuringReReview?.activity ?? ""),
             "the root operation must report re-review activity"
           );
 
@@ -956,8 +959,8 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       assert.ok(planFixOpStandalone, "a child operation with kind 'apply-review' must exist during standalone plan fix");
       assert.equal(planFixOpStandalone?.stage, "plan", "the plan-fix operation must have stage: 'plan' in standalone mode");
       assert.equal(planFixOpStandalone?.parentId, rootOpDuringStandaloneApply?.id, "the plan-fix child operation must be parented to the root operation");
-      assert.equal(planFixOpStandalone?.activity, "Applying review fixes…", "the plan-fix child operation must report plan fix activity in standalone mode");
-      assert.equal(rootOpDuringStandaloneApply?.activity, "Applying review fixes…", "the root operation must report plan fix activity in standalone mode");
+      assert.equal(planFixOpStandalone?.activity, "High-Level Review (Plan): Apply Review; then a review", "the plan-fix child operation must report plan fix activity in standalone mode");
+      assert.equal(rootOpDuringStandaloneApply?.activity, "High-Level Review (Plan): Apply Review; then a review", "the root operation must report plan fix activity in standalone mode");
 
       standaloneApply.resolveWith("# Plan\n\n1. Do the thing (revised).\n");
 
@@ -971,7 +974,8 @@ void describe("applyReviewWithAI — real in-flight activity through the product
       assert.ok(reReviewOpStandalone, "a child operation for re-review must exist during re-review in standalone mode");
       assert.equal(reReviewOpStandalone?.stage, "plan-high-review", "the re-review child must be registered against the review stage in standalone mode");
       assert.ok(
-        reReviewOpStandalone?.activity === "running" || reReviewOpStandalone?.activity === "Re-running review…",
+        reReviewOpStandalone?.activity === "running" ||
+          /then Apply Review if it finds fixes/.test(reReviewOpStandalone?.activity ?? ""),
         "the re-review child operation must report re-review activity in standalone mode"
       );
 

@@ -39,6 +39,7 @@ import { resolveGlobalChatTargetOrDefaultV1 } from "../utils/globalChatTargetV1"
 import { ChatTarget } from "../views/chatView";
 import { TaskStage } from "../types/taskProgress";
 import type { UndeliveredEditScopeV1 } from "../utils/undeliveredPromptEditsRevertV1";
+import type { RoundStopKindV1 } from "../utils/roundStopCauseV1";
 
 /**
  * Reserved artifact filenames the implementation stage writes inside a task
@@ -661,6 +662,32 @@ export interface ImplementationRunResult {
    * Failure messages describe it as capacity, not a usage limit.
    */
   providerCapacity?: boolean;
+  /**
+   * run1 Step 4: the provider's own turn cap (agy's 55-minute print timeout) ended the turn
+   * and the continuations ran out. Named as a time limit, never as a usage limit.
+   */
+  providerTimeCapV1?: boolean;
+  /**
+   * run1 Steps 8 to 10: the model had answered (a successful result, or a complete report) but its
+   * process had not exited, so Ensemble stopped it with its children. The round is completed with
+   * that answer; the chat says so next to the round's end line.
+   */
+  endOfTurnStopV1?: boolean;
+  /** run1 Step 8: the cause the round's single settlement decision recorded. */
+  stopCauseV1?: RoundStopKindV1;
+  /**
+   * run1 Step 11: what the round provably did, from its activity feed. `attributedFiles` are files
+   * the round's own stream named; `observedFiles` changed in the workspace while it ran without
+   * proof they were this round's. Only CLI edit rounds set it.
+   */
+  activityV1?: {
+    workedMs: number;
+    attributedFiles: readonly string[];
+    observedFiles: readonly string[];
+    /** run1 Step 25: when the round's process ran (epoch ms). */
+    processStartedAtMs?: number;
+    processEndedAtMs?: number;
+  };
   /**
    * The provider's own authentication verdict, when the runner can produce
    * one, captured before any login hint was appended to errorMessage. CLI

@@ -106,6 +106,42 @@ export function hasOwnerOriginV1(): boolean {
   return ownerOrigin.getStore() === true;
 }
 
+/**
+ * run1 Step 26: the identity of a held owner answer being carried out. The dispatched command's work-admission
+ * claim and its round-ledger row record it, so a later activation can find the trace and tell whether the
+ * dispatch ran.
+ */
+/**
+ * run1 Step 28: the check a held dispatch makes while it holds the task's work-admission claim. The admission
+ * runs it once, right after the claim is taken and before the dispatched work starts: it re-reads the task's
+ * status and how its last run ended, and swaps the answer from held to dispatching. Pause commits through the
+ * same claim, so a pause and a held dispatch are always ordered. It returns a refusal (the admission lets go of
+ * the claim and reports it) or undefined to go ahead.
+ */
+export interface HeldDispatchGateV1 {
+  readonly run: () => Promise<string | undefined>;
+  /** Set by the admission once it has run the gate, so one dispatch is checked once. */
+  ran: boolean;
+}
+
+const heldDispatchId = new AsyncLocalStorage<{ readonly id: string; readonly gate?: HeldDispatchGateV1 }>();
+
+/** Run `body` as the dispatch of the held answer `dispatchId`. Scoped to this call tree. */
+export function runWithHeldDispatchIdV1<T>(dispatchId: string, body: () => T, gate?: HeldDispatchGateV1): T {
+  return heldDispatchId.run({ id: dispatchId, ...(gate ? { gate } : {}) }, body);
+}
+
+/** The held answer's dispatch id for this call tree, or undefined when it is not a held dispatch. */
+export function currentHeldDispatchIdV1(): string | undefined {
+  return heldDispatchId.getStore()?.id;
+}
+
+/** The held dispatch's check to run under the claim, or undefined when there is none (or it already ran). */
+export function currentHeldDispatchGateV1(): HeldDispatchGateV1 | undefined {
+  const gate = heldDispatchId.getStore()?.gate;
+  return gate !== undefined && !gate.ran ? gate : undefined;
+}
+
 /** Wrap an owner-facing entry point (command handler, webview message handler) so its call tree is owner-started. */
 export function asOwnerEntryPointV1<A extends unknown[], R>(handler: (...args: A) => R): (...args: A) => R {
   return (...args: A): R => runWithOwnerOriginV1(() => handler(...args));

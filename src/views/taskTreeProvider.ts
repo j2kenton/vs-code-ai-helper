@@ -453,7 +453,7 @@ export function describeOwedContinuationRowIndicatorV1(
     // automated recovery has stopped, so there is no "next attempt" time to
     // show — the task needs a human decision instead.
     return {
-      description: "Continuation owed — budget exhausted, needs your input",
+      description: "Continuation owed — Ensemble stopped trying, needs your input",
       iconId: "warning",
       colorId: "charts.red",
     };

@@ -1513,10 +1513,12 @@ void describe("round-progress.md lifecycle through the real implementation dispa
 
       await dispatchPromise;
 
+      // run1 Step 13: a failed round keeps the ticks it wrote. The file is removed only once its ticks are
+      // banked; this tick names no item of the plan, so nothing could be merged and the file stays.
       assert.equal(
         fs.existsSync(roundProgressPath),
-        false,
-        "an ordinary failed round must delete its in-round bookkeeping file — it never earned its ticks"
+        true,
+        "a failed round whose ticks could not be banked must keep round-progress.md, never wipe the evidence"
       );
     } finally {
       for (const p of patches.reverse()) { p.restore(); }

@@ -72,6 +72,12 @@ import {
   type BackupAttemptRecordV1,
 } from "../utils/stopBehaviourV1";
 import {
+  classifyRoundStopV1,
+  describeStopLeadV1,
+  type RoundStopCauseV1,
+  type RoundStopKindV1,
+} from "../utils/roundStopCauseV1";
+import {
   authFailureRescueNoteV1,
   crossProviderAuthCandidatesV1,
   SAME_SIGN_IN_HELD_BACK_REASON_V1,
@@ -144,6 +150,31 @@ type EffectiveProvider =
  * additionally opens the AI Models view; this one is the last line of
  * defense for paths that never went through a guarded command entry point.
  */
+/** run1 Step 5: the named cause of a failed implementation result (see roundStopCauseV1). */
+function stopCauseOfImplementationResultV1(result: {
+  readonly failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
+  readonly errorMessage?: string;
+  readonly authFailure?: boolean;
+  readonly providerCapacity?: boolean;
+  readonly timeoutReason?: "wall-clock" | "inactivity";
+  readonly timedOut?: boolean;
+  readonly providerTimeCapV1?: boolean;
+  /** The cause the runner's one settlement recorded; it is read, not re-derived from the text. */
+  readonly stopCauseV1?: RoundStopKindV1;
+}): RoundStopCauseV1 {
+  return classifyRoundStopV1({
+    status: "failed",
+    ...(result.stopCauseV1 ? { recordedCause: result.stopCauseV1 } : {}),
+    ...(result.failureKind ? { failureKind: result.failureKind } : {}),
+    ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+    ...(result.authFailure === true ? { authFailure: true } : {}),
+    ...(result.providerCapacity === true ? { providerCapacity: true } : {}),
+    ...(result.timeoutReason ? { timeoutReason: result.timeoutReason } : {}),
+    ...(result.timedOut === true ? { timedOut: true } : {}),
+    ...(result.providerTimeCapV1 === true ? { providerTimeCap: true } : {}),
+  });
+}
+
 function isModelProviderDisabled(modelId: string | undefined): boolean {
   // Copilot is not exempt: isProviderEnabled treats it as enabled unless the
   // user explicitly disables it in Provider Selection.
@@ -1515,12 +1546,17 @@ export async function runImplementationForModel(options: {
             ? { failure: { modelId: options.modelId, ...(result.errorMessage ? { reason: result.errorMessage } : {}) } }
             : {}
         );
+        // run1 Step 5: "usage limit" only when the provider's own output said so; any other
+        // cause (its own turn cap, Ensemble's time limit, a plain failure) keeps its own name.
+        const rescueCause = stopCauseOfImplementationResultV1(result);
         const rescueNote = authFailure
           ? authFailureRescueNoteV1(primaryProviderLabel, result.errorMessage, labelForBackup(backupModel))
           : (result.providerCapacity === true
               ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)`
-              : `${primaryProviderLabel} hit a usage limit`) +
-            (result.errorMessage ? ` (${result.errorMessage})` : "") +
+              : describeStopLeadV1(rescueCause, primaryProviderLabel)) +
+            (result.errorMessage && (result.providerCapacity === true || rescueCause.kind === "providerUsageLimit" || rescueCause.kind === "providerQuota" || rescueCause.kind === "providerPayment")
+              ? ` (${result.errorMessage})`
+              : "") +
             `; this round ran on ${labelForBackup(backupModel)}.`;
         // An earlier backup's own sign-in failure is part of the story too (bugs4 item 28).
         const rescueNoteWithBackupAuth =
@@ -1677,10 +1713,12 @@ export async function runImplementationForModel(options: {
           : result.failureKind === "payment-required"
             ? `an HTTP 402 payment requirement for ${options.modelId ?? "the configured model"} (add credits or choose a free model)`
           : result.timeoutReason === "inactivity"
-            ? "the inactivity watchdog (no output for too long)"
+            ? "Ensemble's own inactivity stop (no output for too long)"
             : result.timeoutReason === "wall-clock" || result.timedOut === true
-              ? "the wall-clock time limit"
-              : "the provider being temporarily unavailable";
+              ? "Ensemble's own time limit for a round"
+              : result.providerTimeCapV1 === true
+                ? "the provider's own time cap on a single turn"
+                : "the provider being temporarily unavailable";
     // Part 15 / item 7b: resolve (never dispatch) the first enabled backup
     // that is currently available, applying the SAME skip rules the clean-
     // tree cascade loop above applies (recent zero-file breaker, cross-
@@ -2201,6 +2239,7 @@ export async function runImplementationForModel(options: {
         : backupRecords.length > 0
           ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
               kind: "backupsExhausted",
+              cause: stopCauseOfImplementationResultV1(result),
               ...(result.providerCapacity === true ? { capacity: true } : {}),
               backups: backupRecords.map((record) =>
                 record.label === stagePrimaryLabelV1 ? { ...record, isPrimary: true } : record

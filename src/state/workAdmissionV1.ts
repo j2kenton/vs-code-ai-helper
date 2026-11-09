@@ -3,7 +3,15 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { ADMISSION_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
 import { resolveHostIdentityV1 } from "./hostIdentityV1";
-import { hasAutomaticOriginV1, hasOwnerOriginV1, hasPassedAutomaticGateV1 } from "./automationDispatchContextV1";
+import {
+  currentHeldDispatchGateV1,
+  currentHeldDispatchIdV1,
+  hasAutomaticOriginV1,
+  hasOwnerOriginV1,
+  hasPassedAutomaticGateV1,
+  runWithHeldDispatchIdV1,
+  type HeldDispatchGateV1,
+} from "./automationDispatchContextV1";
 import { evaluateProgressWatchV1, readAutomaticGateLimitsV1 } from "./progressWatchGateV1";
 import { readOtherProcessStartEpochMsV1, isProcessStartTimeMismatchV1 } from "./processStartTimeProbeV1";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
@@ -125,6 +133,8 @@ export interface WorkAdmissionClaimInfoV1 {
    * written before this field existed.
    */
   readonly origin?: "owner" | "automatic";
+  /** run1 Step 26: the dispatch id of the held owner answer that started this work, when one did. */
+  readonly heldDispatchId?: string;
 }
 
 export interface WorkAdmissionHandleV1 {
@@ -1547,6 +1557,33 @@ export function workAdmissionRenewalAgeMsV1(taskFolderPath: string, now = Date.n
 }
 
 /**
+ * run1 Step 26: what the task's admission markers show about a held-answer dispatch. `live` is a claim renewed
+ * within the likely-stale window, `stale` one that has not been; `claimCarriesDispatchId` says whether any marker
+ * was written under that dispatch id. Read-only, synchronous, and never throws.
+ */
+export function readAdmissionTraceForDispatchV1(
+  taskFolderPath: string,
+  dispatchId: string,
+  now = Date.now()
+): { readonly claim: "none" | "live" | "stale"; readonly claimCarriesDispatchId: boolean } {
+  let carries = false;
+  try {
+    for (const marker of listMarkersSyncV1(admissionDirV1(taskFolderPath))) {
+      if (readClaimInfoSyncV1(marker.filePath)?.heldDispatchId === dispatchId) {
+        carries = true;
+      }
+    }
+  } catch {
+    // An unreadable directory reads as no marker; the age check below says the same.
+  }
+  const age = workAdmissionRenewalAgeMsV1(taskFolderPath, now);
+  if (age === undefined) {
+    return { claim: "none", claimCarriesDispatchId: carries };
+  }
+  return { claim: age < WORK_ADMISSION_LIKELY_STALE_MS_V1 ? "live" : "stale", claimCarriesDispatchId: carries };
+}
+
+/**
  * Generous upper bound for every string field on a claim/marker record. This
  * module's own writer ({@link acquireWorkAdmissionCoreV1}) only ever produces
  * short, fixed-shape values — a UUID `claimId`/`ownerToken` suffix, a
@@ -2729,6 +2766,12 @@ export async function acquireWorkAdmissionV1(params: {
   readonly purpose: WorkAdmissionPurposeV1;
   readonly commandId: string;
 }): Promise<WorkAdmissionResultV1> {
+  // run1 Step 28: a held answer's dispatch owns the task's claim for its whole run. The command it dispatches
+  // joins that claim instead of racing it, whether or not the command takes admission of its own.
+  const ownedByDispatch = heldDispatchOwnedClaimV1(params.taskFolderPath, params.purpose);
+  if (ownedByDispatch !== undefined) {
+    return { outcome: "acquired", handle: createAdoptedViewV1(params.taskFolderPath, ownedByDispatch) };
+  }
   const ownerToken = `${process.pid.toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
   registerPendingIntentV1(params.taskFolderPath, ownerToken);
   try {
@@ -2736,6 +2779,68 @@ export async function acquireWorkAdmissionV1(params: {
   } finally {
     clearPendingIntentV1(params.taskFolderPath, ownerToken);
   }
+}
+
+/**
+ * run1 Step 28: the claim a held answer's dispatch took for its task, keyed by the dispatch id. Only the call
+ * tree of that dispatch (`currentHeldDispatchIdV1`) joins it, and only for work-starting `admission` claims, so
+ * Pause's own `pauseCommit` claim still queues behind it.
+ */
+const heldDispatchClaimsV1 = new Map<string, { readonly taskFolderPath: string; readonly handle: WorkAdmissionHandleV1 }>();
+
+function heldDispatchOwnedClaimV1(
+  taskFolderPath: string,
+  purpose: WorkAdmissionPurposeV1
+): WorkAdmissionHandleV1 | undefined {
+  if (purpose !== "admission") return undefined;
+  const dispatchId = currentHeldDispatchIdV1();
+  if (dispatchId === undefined) return undefined;
+  const owned = heldDispatchClaimsV1.get(dispatchId);
+  if (owned === undefined || owned.taskFolderPath !== taskFolderPath) return undefined;
+  // Still the task's live local handle: a claim that was released or displaced is never joined.
+  return localHandlesV1.get(taskFolderPath) === owned.handle ? owned.handle : undefined;
+}
+
+export type HeldDispatchUnderAdmissionV1<T> =
+  | { readonly kind: "refused"; readonly result: WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1 }
+  | { readonly kind: "ran"; readonly value: T };
+
+/**
+ * run1 Step 28: carry out a held answer's command under the task's work admission, always. The claim is taken
+ * here, before the command starts, and `gate` (the status re-read and the held-to-dispatching swap) runs once
+ * under it, ordered against Pause's `pauseCommit` claim. The claim carries `dispatchId`, stays alive with a
+ * heartbeat while `body` runs, and is released afterwards. A command that takes admission itself joins this
+ * claim; one that takes none is covered all the same. A refusal (busy, or the gate declining) starts nothing.
+ */
+export async function runHeldDispatchUnderAdmissionV1<T>(params: {
+  readonly taskFolderPath: string;
+  readonly dispatchId: string;
+  readonly commandId: string;
+  readonly gate: HeldDispatchGateV1;
+  readonly body: () => Promise<T>;
+}): Promise<HeldDispatchUnderAdmissionV1<T>> {
+  const { taskFolderPath, dispatchId, commandId, gate, body } = params;
+  return runWithHeldDispatchIdV1(
+    dispatchId,
+    async (): Promise<HeldDispatchUnderAdmissionV1<T>> => {
+      const acquired = await acquireWorkAdmissionV1({ taskFolderPath, purpose: "admission", commandId });
+      if (acquired.outcome !== "acquired") {
+        return { kind: "refused", result: acquired };
+      }
+      heldDispatchClaimsV1.set(dispatchId, { taskFolderPath, handle: acquired.handle });
+      const heartbeatTimer = setInterval(() => {
+        void acquired.handle.heartbeat();
+      }, WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
+      try {
+        return { kind: "ran", value: await body() };
+      } finally {
+        clearInterval(heartbeatTimer);
+        heldDispatchClaimsV1.delete(dispatchId);
+        await acquired.handle.release();
+      }
+    },
+    gate
+  );
 }
 
 async function acquireWorkAdmissionCoreV1(
@@ -2835,6 +2940,7 @@ async function acquireWorkAdmissionCoreV1(
     commandId,
     startedAt: new Date().toISOString(),
     origin,
+    ...(currentHeldDispatchIdV1() !== undefined ? { heldDispatchId: currentHeldDispatchIdV1() as string } : {}),
   };
   const claimPath = path.join(dir, CLAIM_FILENAME_V1);
 
@@ -3275,6 +3381,23 @@ async function acquireWorkAdmissionCoreV1(
 
   localHandlesV1.set(taskFolderPath, handle);
   localReleaseFinalizersV1.set(taskFolderPath, decrementHoldersAndMaybeUnlinkV1);
+  // run1 Step 28: a held owner answer is checked while it holds the claim, so Pause (which commits through the
+  // same claim) and the dispatch are ordered: the status is re-read, and the answer is swapped from held to
+  // dispatching, under the claim. A refusal gives the claim back and starts nothing.
+  const heldGate = purpose === "admission" ? currentHeldDispatchGateV1() : undefined;
+  if (heldGate !== undefined) {
+    heldGate.ran = true;
+    let refusal: string | undefined;
+    try {
+      refusal = await heldGate.run();
+    } catch (error) {
+      refusal = error instanceof Error ? error.message : String(error);
+    }
+    if (refusal !== undefined) {
+      await handle.release().catch(() => undefined);
+      return { outcome: "writeFailed", error: new Error(refusal) };
+    }
+  }
   return { outcome: "acquired", handle };
 }
 

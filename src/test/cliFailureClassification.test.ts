@@ -31,7 +31,13 @@
 import * as assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { __testOnly, createBoundedStdoutTailForDiagnosisV1 } from "../runners/cliAgentRunner";
+import {
+  __testOnly,
+  createBoundedStdoutTailForDiagnosisV1,
+  matchesConversationResumeMarkerV1,
+  providerTimeCapMinutesV1,
+} from "../runners/cliAgentRunner";
+import { classifyRoundStopV1, describeRoundStopV1 } from "../utils/roundStopCauseV1";
 import { CliProviderDefinition, getCliProvider } from "../runners/providers";
 import { classifyCliFailure, classifyFailure, isAuthenticationFailure, isModelEntitlementFailure, isQuotaError, isTransportError, parseQuotaResetV1 } from "../utils/quota";
 
@@ -1002,60 +1008,36 @@ void describe("toFriendlyError — claude-cli stream-json", () => {
 // isAuthenticationFailure — a change to edit-mode failure classification the
 // plan requires untouched. effectiveStructuredStreamDefV1 is the mode-scoped
 // seam execCliAgent applies before normalizeCliOutput/toFriendlyError.
-void describe("effectiveStructuredStreamDefV1 — claude edit mode keeps the opaque-text contract", () => {
+void describe("effectiveStructuredStreamDefV1 — claude edit mode streams since run1 Step 7", () => {
   const { effectiveStructuredStreamDefV1, normalizeCliOutput } = __testOnly;
 
-  void it("strips the claude structured tag for edit mode and leaves text mode untouched", () => {
-    const editDef = effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "edit");
-    assert.equal(editDef.structuredEventStream, undefined);
-    // Text mode is exactly the shipped definition, by identity — no cloning.
+  void it("keeps the structured tag in every mode", () => {
+    assert.equal(effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "edit"), CLAUDE_STRUCTURED_LIKE);
     assert.equal(effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "text"), CLAUDE_STRUCTURED_LIKE);
-    // Providers whose structured stream applies in every mode pass through
-    // untouched in edit mode too.
     assert.equal(effectiveStructuredStreamDefV1(CLINE_LIKE, "edit"), CLINE_LIKE);
     assert.equal(effectiveStructuredStreamDefV1(OPENCODE_LIKE, "edit"), OPENCODE_LIKE);
   });
 
-  void it("retains the prior opaque classification for a plain-text edit-mode failure mentioning auth terms", () => {
-    // Plain `--output-format text` stdout: the model narrates about a 403 it
-    // saw while working. "403"/"Forbidden" match isAuthenticationFailure's
-    // broad regex but none of claude-cli's own authErrorMarkers — so the
-    // OLD opaque-text contract (broad regex scans stderr ONLY; stdout gets
-    // just the narrow marker list) classifies this as NOT an auth failure.
-    const editModeStdout =
-      "I tried fetching the dashboard fixture and the server returned 403 Forbidden, " +
-      "so I stubbed the response instead and continued editing.";
-    const editDef = effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "edit");
-    const friendly = toFriendlyError(editDef, "sonnet", 1, "", editModeStdout);
+  /** A session shaped like 4003f046…: the report, then the same report posted again after each monitor wake-up. */
+  const REPORT = "## Files Changed\n- src/a.ts\n\n## Verification\n- unit suite passes: 8676 tests, 0 fail";
+  function assistantEvent(text: string): string {
+    return JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+  }
 
-    assert.equal(
-      friendly.authFailure,
-      false,
-      "edit-mode prose must not be fed to the broad auth regex — that is the pre-Step-16 opaque contract"
-    );
-    // No structured extractor ran, so no structural quota signal can exist.
-    assert.equal(friendly.quotaSignal, false);
-    // Sanity check on why this test has teeth: the SAME stdout through the
-    // unstripped structured def IS scanned wholesale (every prose line is
-    // "scan-safe") and false-positives as auth — the exact regression the
-    // mode scoping prevents.
-    const unscoped = toFriendlyError(CLAUDE_STRUCTURED_LIKE, "sonnet", 1, "", editModeStdout);
-    assert.equal(unscoped.authFailure, true);
+  void it("a killed run keeps the first complete report even after repeated afterthoughts", () => {
+    const stdout = [
+      JSON.stringify({ type: "system", subtype: "init" }),
+      assistantEvent(REPORT),
+      assistantEvent("That was another monitor timing out with no events."),
+      assistantEvent("That was another monitor timing out with no events. Here is the report again."),
+      assistantEvent("That was another monitor timing out with no events."),
+    ].join("\n");
+    assert.equal(normalizeCliOutput(CLAUDE_STRUCTURED_LIKE, stdout, undefined), REPORT);
   });
 
-  void it("normalizes edit-mode stdout as opaque text, not through the claude extractor", () => {
-    // A stray JSON line among prose: the claude extractor would treat it as a
-    // recognized event and reduce the output to the no-text-reply
-    // placeholder; the opaque path must return the stdout verbatim.
-    const editModeStdout = [
-      JSON.stringify({ type: "system", subtype: "init" }),
-      "Edited 3 files to address the review.",
-    ].join("\n");
-    const editDef = effectiveStructuredStreamDefV1(CLAUDE_STRUCTURED_LIKE, "edit");
-    assert.equal(
-      normalizeCliOutput(editDef, editModeStdout, undefined),
-      editModeStdout.trim()
-    );
+  void it("an assistant message written before the process was stopped is the final text", () => {
+    const stdout = [JSON.stringify({ type: "system", subtype: "init" }), assistantEvent("Edited 3 files.")].join("\n");
+    assert.equal(normalizeCliOutput(CLAUDE_STRUCTURED_LIKE, stdout, undefined), "Edited 3 files.");
   });
 });
 
@@ -1869,5 +1851,79 @@ void describe("sealed-transport quota diagnosis (2026-09-15 post-freeze findings
     const resetDate = new Date(resetAt);
     assert.ok(resetDate.getTime() > now.getTime(), "a 4:12 PM occurrence earlier than 11pm today must roll to tomorrow");
     assert.equal(resetDate.getHours(), 16);
+  });
+});
+
+/**
+ * run1 Step 4 (bugs6 item 5): agy 1.4.x ends a turn after 55 minutes with new wording. It is a
+ * time cap on one turn: the round continues, and it is never called a usage limit.
+ */
+void describe("run1 Step 4: agy's 55-minute turn cut-off", () => {
+  const AGY_1_4_12 =
+    "Antigravity CLI produced no output. [agy] print timeout after 55m0s with turn in progress; returning partial output.";
+  const antigravity = getCliProvider("antigravity-cli");
+
+  function promote(diagnostic: string) {
+    assert.ok(antigravity, "expected antigravity-cli provider definition");
+    return applyTransportTransience(
+      classifyFailed(diagnostic),
+      { message: diagnostic, authFailure: false, diagnosticText: diagnostic, retryableHint: false },
+      "edit",
+      antigravity
+    );
+  }
+
+  void it("a replay of the 1.4.12 message continues the round instead of failing it", () => {
+    const promoted = promote(AGY_1_4_12);
+    assert.equal(promoted.failureKind, "generic");
+    assert.equal(promoted.transient, true);
+    assert.equal(promoted.resumeConversation, true);
+    assert.equal(promoted.providerTimeCapV1, true);
+  });
+
+  void it("matches both 1.4.x phrasings and the older one, and nothing looser", () => {
+    assert.ok(antigravity);
+    assert.equal(matchesConversationResumeMarkerV1(antigravity, "[agy] print timeout after 55m0s with turn in progress"), true);
+    assert.equal(matchesConversationResumeMarkerV1(antigravity, "[agy] print timeout after 55m0s; returning partial output"), true);
+    assert.equal(matchesConversationResumeMarkerV1(antigravity, "Error: timeout waiting for response"), true);
+    assert.equal(matchesConversationResumeMarkerV1(antigravity, "print timeout after 55m0s"), false);
+    assert.equal(matchesConversationResumeMarkerV1(antigravity, "turn in progress; returning partial output"), false);
+    assert.equal(providerTimeCapMinutesV1(AGY_1_4_12), 55);
+  });
+
+  void it("a real usage limit (RC6) is still reported as a usage limit", () => {
+    const limit = "429 You've reached your 5-hour usage limit. Resets in 1h13m30s.";
+    const promoted = promote(limit);
+    assert.equal(promoted.failureKind, "quota");
+    assert.equal(promoted.resumeConversation, undefined);
+    const cause = classifyRoundStopV1({ failureKind: "quota", errorMessage: limit });
+    assert.equal(cause.kind, "providerUsageLimit");
+    assert.match(describeRoundStopV1(cause, { providerLabel: "Antigravity CLI" }), /usage limit/);
+  });
+
+  void it("a generic failure with no limit text never says usage limit", () => {
+    const generic = "Antigravity CLI failed: the connection was reset by the peer";
+    const promoted = promote(generic);
+    const cause = classifyRoundStopV1({ failureKind: promoted.failureKind, errorMessage: generic });
+    assert.equal(cause.kind, "generic");
+    assert.doesNotMatch(describeRoundStopV1(cause, { providerLabel: "Antigravity CLI" }), /usage limit|quota/i);
+  });
+
+  void it("the run that ran out of continuations says time cap, with the edits in the working tree", () => {
+    assert.ok(antigravity);
+    const result = promote(AGY_1_4_12);
+    const failed = __testOnly.toCliImplementationRunResult(
+      antigravity,
+      { ...result, status: "failed", output: "", errorMessage: AGY_1_4_12 },
+      Array.from({ length: 13 }, (_, i) => `src/f${i}.ts`),
+      false
+    );
+    assert.equal(failed.status, "failed");
+    assert.match(failed.errorMessage ?? "", /time cap of 55 minutes for a single turn/);
+    assert.match(failed.errorMessage ?? "", /13 files changed in the workspace while it ran/);
+    assert.match(failed.errorMessage ?? "", /edits are still in the working tree/);
+    assert.doesNotMatch(failed.errorMessage ?? "", /usage limit|quota/i);
+    assert.equal(failed.failureKind, "generic");
+    assert.equal(failed.providerTimeCapV1, true);
   });
 });

@@ -502,6 +502,10 @@ export interface ResilienceSettings {
    * stdout/stderr/raw-transport bytes for this many minutes, distinct from
    * the flat RUN_TIMEOUT_MS wall clock (0 disables the watchdog). */
   inactivityTimeoutMinutes: number;
+  /** run1 Step 12: a round that is still running after this many hours is stopped as a far-off safety net. */
+  roundBackstopHours: number;
+  /** run1 Step 18: the running row warns "no activity" after this many minutes without a sign of life. */
+  noActivityWarningMinutes: number;
   /** review1 Step 24: ask the owner after this many automatic rounds since the last progress (0 = off). */
   askOwnerAfterRounds: number;
   /** review1 Step 24: ask the owner after this many automatic rounds in a row that failed (0 = off). */
@@ -518,6 +522,8 @@ const RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY = "resilience.noProgressBreakerR
 const RESILIENCE_FALLBACK_PROVIDER_BREAKER_ROUNDS_KEY = "resilience.fallbackProviderBreakerRounds";
 const RESILIENCE_QUOTA_RESET_NEAR_THRESHOLD_HOURS_KEY = "resilience.quotaResetNearThresholdHours";
 const RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY = "resilience.inactivityTimeoutMinutes";
+const RESILIENCE_ROUND_BACKSTOP_HOURS_KEY = "resilience.roundBackstopHours";
+const RESILIENCE_NO_ACTIVITY_WARNING_MINUTES_KEY = "resilience.noActivityWarningMinutes";
 const RESILIENCE_ASK_OWNER_AFTER_ROUNDS_KEY = "resilience.askOwnerAfterRounds";
 const RESILIENCE_ASK_OWNER_AFTER_FAILED_ROUNDS_KEY = "resilience.askOwnerAfterFailedRounds";
 
@@ -564,14 +570,13 @@ export const RESILIENCE_DEFAULTS = {
   // means rerunning into the same known-broken candidate one extra round.
   fallbackProviderBreakerRounds: 2,
   quotaResetNearThresholdHours: 24,
-  // 0 = off. Shipped enabled at 15 on 2026-08-16 and disabled the same day:
-  // it fired 6 times in one afternoon, every one killing a healthy round that
-  // had simply gone quiet while editing a 7,865-line file, and caught zero
-  // wedged processes. For scale, the 60-minute wall clock has fired 9 times in
-  // 3,320 runs. Losing a round's work is worse than losing 45 minutes, so the
-  // default is biased against firing. See the setting's description in
-  // package.json, and the note at readInactivityTimeoutMinutes.
-  inactivityTimeoutMinutes: 0,
+  // 0 = off. Shipped enabled at 15 on 2026-08-16 (judged on output bytes alone) and disabled the
+  // same day: it killed healthy rounds that had gone quiet while editing a large file. run1 Step 12
+  // turns it back on at 20, for providers that stream events only, and judged on what the round
+  // provably did (its own tool and edit events, see roundActivityFeedV1), not on bytes alone.
+  inactivityTimeoutMinutes: 20,
+  roundBackstopHours: 4,
+  noActivityWarningMinutes: 10,
   askOwnerAfterRounds: 8,
   askOwnerAfterFailedRounds: 3,
 } as const;
@@ -628,6 +633,18 @@ function readInactivityTimeoutMinutes(key: string, fallback: number): number {
   return Math.max(0, Math.min(180, numeric));
 }
 
+function readRoundBackstopHours(key: string, fallback: number): number {
+  const value = readSetting<unknown>(key, fallback);
+  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.max(1, Math.min(48, numeric));
+}
+
+function readNoActivityWarningMinutes(key: string, fallback: number): number {
+  const value = readSetting<unknown>(key, fallback);
+  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.max(1, Math.min(240, numeric));
+}
+
 export function getResilienceSettings(): ResilienceSettings {
   return {
     fastForwardSurvivesEscalation:
@@ -674,6 +691,14 @@ export function getResilienceSettings(): ResilienceSettings {
     inactivityTimeoutMinutes: readInactivityTimeoutMinutes(
       RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY,
       RESILIENCE_DEFAULTS.inactivityTimeoutMinutes
+    ),
+    roundBackstopHours: readRoundBackstopHours(
+      RESILIENCE_ROUND_BACKSTOP_HOURS_KEY,
+      RESILIENCE_DEFAULTS.roundBackstopHours
+    ),
+    noActivityWarningMinutes: readNoActivityWarningMinutes(
+      RESILIENCE_NO_ACTIVITY_WARNING_MINUTES_KEY,
+      RESILIENCE_DEFAULTS.noActivityWarningMinutes
     ),
     askOwnerAfterRounds: readResilienceRounds(
       RESILIENCE_ASK_OWNER_AFTER_ROUNDS_KEY,

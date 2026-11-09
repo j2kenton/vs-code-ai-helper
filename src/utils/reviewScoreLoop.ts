@@ -291,6 +291,12 @@ export async function improveReviewScore(options: {
    */
   cleanReviewNeverApplies?: boolean;
   /**
+   * run1 Step 32: the plan's open items are irrelevant to whether a clean review is clean (a
+   * plan-review stage has nothing built yet to count). With this set a clean review takes the
+   * clean-review path at the first clean round, not after ZERO_FIXABLE_TERMINAL_ROUNDS of them.
+   */
+  cleanReviewIgnoresPlanItems?: boolean;
+  /**
    * bugs4 item 11: asked when a review had no task-fixable blockers but the plan still shows open
    * items (a build mandate). A string means the only hold is test evidence no editing round can
    * produce, so the run stops instead of dispatching an Apply Review that changes nothing.
@@ -446,7 +452,8 @@ export async function improveReviewScore(options: {
   // A clean review whose plan still has unbuilt steps is a build mandate, not
   // "nothing to act on": the Apply Review that follows is the one that builds
   // them. Only a clean review with a COMPLETE plan takes the clean-review hold.
-  let lastReviewPlanIncomplete = options.preLoopEvidence?.planIncomplete === true;
+  let lastReviewPlanIncomplete =
+    options.cleanReviewIgnoresPlanItems !== true && options.preLoopEvidence?.planIncomplete === true;
   let lastScore: number | null = options.baselineScore;
   // review1 Step 34: the evidence-only gap is tried once per run; a second automatic attempt never follows.
   let evidenceGapTried = false;
@@ -593,7 +600,8 @@ export async function improveReviewScore(options: {
           : raw;
     const score = round?.score ?? null;
     lastReviewWasClean = round?.zeroFixableEvidence === true;
-    lastReviewPlanIncomplete = isPlanIncomplete(round?.progress ?? null);
+    lastReviewPlanIncomplete =
+      options.cleanReviewIgnoresPlanItems !== true && isPlanIncomplete(round?.progress ?? null);
     lastScore = score ?? lastScore;
     if (score !== null) {
       best = Math.max(best ?? Number.NEGATIVE_INFINITY, score);

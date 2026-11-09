@@ -280,7 +280,7 @@ export class TaskStatusBar implements vscode.Disposable {
     const quarantinedFiles = taskToShow.progress.pendingImplReviewFiles ?? [];
     const quarantinedFilesLine =
       owedIndicator && quarantinedFiles.length > 0
-        ? `$(files) ${quarantinedFiles.length} file(s) quarantined behind it: ${escapeTooltipHtmlV1(quarantinedFiles.join(", "))}`
+        ? `$(files) ${quarantinedFiles.length} changed file(s) kept for the next round:${escapeTooltipHtmlV1(quarantinedFiles.join(", "))}`
         : undefined;
 
     // General scheduling posture (task item 11's five-value vocabulary:

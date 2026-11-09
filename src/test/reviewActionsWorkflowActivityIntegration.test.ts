@@ -387,7 +387,12 @@ void describe("runReviewForFolder — real in-flight activity through the produc
         }
       );
 
-      assert.equal(liveRowActivity, "running", "the real dispatch must have reported 'running' before the provider call");
+      // run1 Step 19: the running row says where we are, not a bare "running".
+      assert.match(
+        liveRowActivity ?? "",
+        /: review; then Apply Review if it finds fixes, or the next stage$/,
+        "the real dispatch must have reported where the review is before the provider call"
+      );
       assert.equal(
         liveRowModelId,
         "claude-cli:sonnet@high",
@@ -481,7 +486,11 @@ void describe("runReviewForFolder — real in-flight activity through the produc
         }
       );
 
-      assert.equal(liveRowActivitySeen, "running", "must be observably running before the transport failure");
+      assert.match(
+        liveRowActivitySeen ?? "",
+        /: review; then Apply Review if it finds fixes, or the next stage$/,
+        "must be observably running (run1 Step 19's where-are-we line) before the transport failure"
+      );
       assert.deepEqual(
         taskOperations.getTaskOperations(folderPath),
         [],
