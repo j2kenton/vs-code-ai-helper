@@ -1,6 +1,7 @@
 import { isViewerHostV1 } from "../state/hostRoleV1";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { STAGE_DISPLAY_NAMES } from "../types/taskProgress";
+import { decodeAnswersDecisionV1 } from "../utils/ownWordsAnswerV1";
 
 /**
  * In a VIEWER window (hostRoleV1.ts) the workflow's action buttons, tree
@@ -34,6 +35,7 @@ export const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set([
   "vs-code-ai-helper.applyLowLevelReviewChanges",
   "vs-code-ai-helper.applyCurrentStageAction",
   "vs-code-ai-helper.reviewCurrentTask",
+  "vs-code-ai-helper.widenReviewScopeToAllChanged",
   "vs-code-ai-helper.fastForwardCurrentTaskReview",
   "vs-code-ai-helper.nextStage",
   "vs-code-ai-helper.runPublishChecks",
@@ -77,6 +79,11 @@ export function decodeRelayedCommandArgV1(commandId: string, arg: unknown): Reco
   // a paused task under one id and never write or send it twice.
   if (typeof record.sendId === "string" && /^[0-9a-f]{32}$/.test(record.sendId)) {
     decoded.sendId = record.sendId;
+  }
+  // review2 Step 43: the own-words card this send answers; only two plain ids of a sane shape get through.
+  const answersDecision = decodeAnswersDecisionV1(record.answersDecision);
+  if (answersDecision !== undefined) {
+    decoded.answersDecision = answersDecision;
   }
   return decoded;
 }

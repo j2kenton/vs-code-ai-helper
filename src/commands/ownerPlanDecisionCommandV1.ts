@@ -21,8 +21,11 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { recordPlanItemOwnerDecisionV1 } from "../utils/taskProgressTransforms";
 import {
   appendAcceptedNonGoalV1,
+  cleanPlanItemTextV1,
   countTopLevelPlanItemsNamedV1,
   getPlanRevisionV1,
+  listPlanItemIdsV1,
+  normalizeChecklistItemTextV1,
   rewordChecklistItemV1,
   settleChecklistItemV1,
 } from "../utils/implementationChecklist";
@@ -43,6 +46,20 @@ import {
   findCardCoveringOwnerOnlyBlockersV1,
   ownerBlockerIdentityV1,
 } from "../utils/ownerCardCoverageV1";
+import { isPlanItemBlockerV1 } from "../utils/blockerWorkListV1";
+import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { OWN_WORDS_TYPE_HINT_V1, takeHandedOverOwnWordsTextV1 } from "../utils/ownWordsAnswerV1";
+import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
+import {
+  decideFollowUpRunV1,
+  describeHeldFollowUpRunV1,
+  heldWritesRemainingV1,
+  noteHeldWriteV1,
+  peekOwedRunV1,
+  releaseHeldWriteV1,
+  rememberOwedRunV1,
+  takeOwedRunV1,
+} from "../utils/ownerAnswerGroupV1";
 import {
   ParsedOwnerDecisionBlockV1,
   parseOwnerDecisionsNeededV1,
@@ -74,6 +91,12 @@ export interface RecordOwnerPlanDecisionArgV1 {
      * Required when `itemText` names more than one item; a text-only target that is ambiguous is refused.
      */
     readonly itemOccurrence?: number;
+    /** review2 Step 38: what an approved deviation did differently (one line); names exactly what was approved. */
+    readonly approvedChange?: string;
+    /** review2 Step 38: the gap the deviation states it leaves undone. Left open unless `gapAccepted`. */
+    readonly statedGap?: string;
+    /** review2 Step 38: the owner accepted the stated gap as well as the change. */
+    readonly gapAccepted?: true;
   };
   /** The chosen option keeps the plan as written: record the decision, but do not set the blocker aside. */
   readonly rejects?: boolean;
@@ -87,21 +110,68 @@ export interface RecordOwnerPlanDecisionArgV1 {
    * say whether those words settle it.
    */
   readonly ownWords?: true;
+  /**
+   * review2 Step 34 ("Settle it with a rule"): after the answer is recorded, exactly one Apply Review follows (not the
+   * review the plain own-words answer re-runs). The review's rule is the specification that round implements.
+   */
+  readonly thenApplyReview?: true;
 }
 
 const OWN_WORDS_OPTION_ID_V1 = "ownWords";
-const MAX_OWN_WORDS_LENGTH_V1 = 1000;
 
 export interface OwnerPlanDecisionPlanChangeV1 {
   /** The plan text after the change (unchanged when the plan could not be read). */
   readonly planText: string | undefined;
   /** Checklist items the decision excluded, as they now read. */
   readonly settledItems: readonly string[];
+  /** review2 Step 3: the issued id of each entry in `settledItems` (same index; `undefined` when none was found). */
+  readonly settledItemIds: readonly (string | undefined)[];
   /**
    * review1 Step 4: items the decision reworded (the old text and the new line as it now reads). A reword settles
    * nothing: the new wording is a new item for the review to check.
    */
   readonly rewordedItems: readonly { readonly previous: string; readonly current: string }[];
+}
+
+export interface DeviationApprovalScopeV1 {
+  /** What the owner approved, in words ("Approved the change: …"). */
+  readonly approved: string;
+  /** What stays open and is not approved (the stated gap), when the owner did not accept it. */
+  readonly stillOpen?: string;
+}
+
+/**
+ * review2 Step 38: exactly what an approval of a plan deviation covers. A card that stated a gap approves the change
+ * only, unless the owner also accepted the gap. Returns undefined for any other answer (and for an approval whose card
+ * recorded no change text), which keep the plain wording.
+ */
+export function deviationApprovalScopeV1(arg: RecordOwnerPlanDecisionArgV1): DeviationApprovalScopeV1 | undefined {
+  const action = arg.planAction;
+  if (arg.rejects || action?.kind !== "approveDeviation" || !action.approvedChange) {
+    return undefined;
+  }
+  const change = action.approvedChange.replace(/[.\s]+$/, "");
+  if (!action.statedGap) {
+    return { approved: `Approved the change: ${change}` };
+  }
+  const gap = action.statedGap.replace(/[.\s]+$/, "");
+  return action.gapAccepted
+    ? { approved: `Approved the change: ${change}. Accepted the gap: ${gap}` }
+    : { approved: `Approved the change only: ${change}`, stillOpen: gap };
+}
+
+/** The text recorded for an approval (task.md's answer, plan-final.md's note): what was approved, and what stays open. */
+function deviationApprovalTextV1(scope: DeviationApprovalScopeV1): string {
+  return scope.stillOpen !== undefined ? `${scope.approved}. Not approved, still open: ${scope.stillOpen}` : scope.approved;
+}
+
+/** The chat reply after an approval: what was recorded and, when a stated gap was not approved, what stays open. */
+export function deviationApprovalReplyV1(scope: DeviationApprovalScopeV1, blockerId: string, recordedInTask: boolean): string {
+  const open =
+    scope.stillOpen !== undefined
+      ? ` Still open: ${scope.stillOpen.replace(/[.\s]+$/, "")}. It stays a blocker for the next review unless you accept it or it is built.`
+      : "";
+  return `${scope.approved}.${open} Recorded for ${blockerId} in plan-final.md${recordedInTask ? " and task.md under Owner decisions" : ""}.`;
 }
 
 /** The review stages an owner decision is shown to: a round's own stage maps to both implementation reviews. */
@@ -147,10 +217,11 @@ export async function applyOwnerPlanDecisionToPlanV1(
   for (let attempt = 0; attempt < PLAN_WRITE_ATTEMPTS; attempt++) {
     const plan = await readTextIfExists(planUri);
     if (plan === undefined) {
-      return { planText: undefined, settledItems: [], rewordedItems: [] };
+      return { planText: undefined, settledItems: [], settledItemIds: [], rewordedItems: [] };
     }
     let next = plan;
     const settledItems: string[] = [];
+    const settledItemIds: (string | undefined)[] = [];
     const rewordedItems: { previous: string; current: string }[] = [];
     for (const itemText of targetItems) {
       if (arg.planAction?.kind === "reword" && arg.planAction.newText) {
@@ -168,17 +239,28 @@ export async function applyOwnerPlanDecisionToPlanV1(
         }
         continue;
       }
+      // review2 Step 3: the issued id of the copy about to be excluded (the first open top-level item with this
+      // text), read before the write, so the owner row is keyed to the item itself.
+      const targetKey = normalizeChecklistItemTextV1(cleanPlanItemTextV1(itemText));
+      const targetId = listPlanItemIdsV1(next).find(
+        (candidate) =>
+          !candidate.nested &&
+          !candidate.checked &&
+          !candidate.excluded &&
+          normalizeChecklistItemTextV1(cleanPlanItemTextV1(candidate.itemText)) === targetKey
+      )?.itemId;
       const settled = settleChecklistItemV1(next, itemText, "exclude", decisionNote);
       if (settled.settledItemText !== undefined) {
         next = settled.content;
         settledItems.push(settled.settledItemText);
+        settledItemIds.push(targetId);
       }
     }
     if (settledItems.length === 0 && rewordedItems.length === 0) {
       next = addOwnerDecisionSectionLineV1(next, ownerDecisionSectionLineV1(arg, decisionNote));
     }
     if (next === plan || (await writeTextFileIfUnchangedV1(planUri, plan, next))) {
-      return { planText: next, settledItems, rewordedItems };
+      return { planText: next, settledItems, settledItemIds, rewordedItems };
     }
   }
   throw new Error("plan-final.md kept changing while the owner decision was being recorded; choose the option again.");
@@ -223,7 +305,10 @@ async function recordNonGoalInPlanFileV1(planUri: vscode.Uri, arg: RecordOwnerPl
 export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecisionArgV1): Promise<void> {
   const folderUri = vscode.Uri.file(arg.taskFolderPath);
   const today = new Date().toISOString().slice(0, 10);
-  const decisionNote = arg.note ?? `Owner decision ${today}: ${arg.optionLabel}`;
+  // review2 Step 38: an approval names exactly what it covers, and what stays open.
+  const approval = deviationApprovalScopeV1(arg);
+  const approvalText = approval !== undefined ? deviationApprovalTextV1(approval) : undefined;
+  const decisionNote = arg.note ?? `Owner decision ${today}: ${approvalText ?? arg.optionLabel}`;
   const nowIso = new Date().toISOString();
 
   // review1 Step 40: the answer goes where reviews look for the owner's own words (task.md) before the plan cites it.
@@ -232,7 +317,9 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
     {
       blockerId: arg.blockerId,
       blockerText: arg.blockerText ?? arg.blockerId,
-      answer: arg.rejects && !arg.ownWords ? `${arg.optionLabel} (plan kept as written)` : arg.optionLabel,
+      answer:
+        approvalText ??
+        (arg.rejects && !arg.ownWords ? `${arg.optionLabel} (plan kept as written)` : arg.optionLabel),
     },
     today
   ).catch(() => false);
@@ -248,18 +335,24 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
 
   if (!arg.rejects) {
     // What the reviewer reads in `{{ownerDecisions}}`: the owner's answer, not only the blocker's id.
-    const description = `${arg.blockerId}: the owner chose "${arg.optionLabel}"`.slice(0, MAX_SUPERSESSION_DESCRIPTION_LENGTH);
+    const description = `${arg.blockerId}: ${
+      approvalText !== undefined
+        ? `the owner ${approvalText.charAt(0).toLowerCase()}${approvalText.slice(1)}`
+        : `the owner chose "${arg.optionLabel}"`
+    }`.slice(0, MAX_SUPERSESSION_DESCRIPTION_LENGTH);
     const revision = change.planText !== undefined ? getPlanRevisionV1(change.planText) : undefined;
     await patchTaskProgressStrictV1(
       folderUri,
       (progress: TaskProgress) => {
         let next = progress;
         if (revision !== undefined) {
-          for (const item of change.settledItems) {
+          for (const [index, item] of change.settledItems.entries()) {
+            const settledId = change.settledItemIds[index];
             next = recordPlanItemOwnerDecisionV1(next, {
               planRevision: revision,
               planText: change.planText,
               itemText: item,
+              ...(settledId !== undefined ? { itemId: settledId } : {}),
               at: nowIso,
               formId: `owner-decision:${arg.blockerId}`,
               decision: "exclude",
@@ -302,7 +395,9 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
   await refreshPlanItemSettlementSnapshotV1(folderUri, arg.stage);
 
   const taskRecordNote = recordedInTask ? " It is also recorded in task.md under Owner decisions." : "";
-  const outcome = `${arg.ownWords
+  const outcome = `${approval !== undefined
+    ? deviationApprovalReplyV1(approval, arg.blockerId, recordedInTask)
+    : arg.ownWords
     ? `Recorded your answer for ${arg.blockerId}${recordedInTask ? " in task.md under Owner decisions" : ""}. The plan is unchanged; the review reads your words and decides whether they settle the blocker.`
     : arg.rejects
     ? `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. The plan stays as written, and the next round builds it that way.`
@@ -330,15 +425,15 @@ export async function recordOwnerPlanDecisionV1(
 ): Promise<WorkflowDecisionCommandResultV1> {
   let arg = originalArg;
   if (arg.ownWords === true) {
-    // A clicked-here input: the owner types the answer. No text means nothing is recorded and the card comes back.
-    const typed = await vscode.window.showInputBox({
-      title: "Your answer",
-      prompt: `Answer in your own words. The review reads it from task.md. (${arg.blockerId})`,
-      ignoreFocusOut: true,
-    });
-    const text = typed?.replace(/\s+/g, " ").trim().slice(0, MAX_OWN_WORDS_LENGTH_V1);
+    // review2 Step 43: the owner types the answer in Chat With AI's message box (no pop-up); the chat send hands the
+    // text over just before this command runs. No text means nothing is recorded and the card comes back.
+    const text = takeHandedOverOwnWordsTextV1(arg.taskFolderPath, arg.blockerId);
     if (!text) {
-      return { outcome: "refused", message: "No answer was entered, so nothing was recorded. The question is open again.", reopenCard: true };
+      return {
+        outcome: "refused",
+        message: `No answer was typed, so nothing was recorded. The question is open again. ${OWN_WORDS_TYPE_HINT_V1}`,
+        reopenCard: true,
+      };
     }
     // Recorded as the owner's words; the blocker's standing and the plan are left to the review.
     arg = { ...arg, optionLabel: text, rejects: true };
@@ -359,9 +454,104 @@ export async function recordOwnerPlanDecisionV1(
   const deferred = hasLiveWorkAdmissionBestEffortV1(arg.taskFolderPath);
   const result = await recordOwnerPlanDecisionRecordOnlyV1(arg);
   if (result.outcome === "done" && !deferred) {
-    await startReReviewAfterOwnerDecisionV1(arg);
+    await followUpAfterOwnerAnswerV1(arg);
   }
   return result;
+}
+
+/** What the group-aware follow-up needs from the outside; the defaults are the real ones. */
+export interface OwnerFollowUpDepsV1 {
+  /** Other pending owner-plan cards (the round's group) at the answered card's stage. */
+  readonly openSiblings: (arg: RecordOwnerPlanDecisionArgV1) => number;
+  readonly start: (arg: RecordOwnerPlanDecisionArgV1) => Promise<boolean>;
+  readonly say: (arg: RecordOwnerPlanDecisionArgV1, text: string) => Promise<void>;
+  /** Post the "Run now" card for a held run. */
+  readonly offerRunNow: (arg: RecordOwnerPlanDecisionArgV1) => Promise<void>;
+  /** True when a review of the stage started after `sinceIso`, so a run owed from then has been overtaken. */
+  readonly reviewStartedSince: (arg: RecordOwnerPlanDecisionArgV1, sinceIso: string) => Promise<boolean>;
+}
+
+function openOwnerPlanSiblingsV1(arg: RecordOwnerPlanDecisionArgV1): number {
+  const own = `${OWNER_PLAN_DECISION_KEY_PREFIX_V1}${arg.blockerId}`;
+  return listPendingWorkflowDecisionsForTaskV1(normalizePath(arg.taskFolderPath)).filter(
+    (card) =>
+      card.stage === arg.stage && card.decisionKey.startsWith(OWNER_PLAN_DECISION_KEY_PREFIX_V1) && card.decisionKey !== own
+  ).length;
+}
+
+const DEFAULT_FOLLOW_UP_DEPS_V1: OwnerFollowUpDepsV1 = {
+  openSiblings: openOwnerPlanSiblingsV1,
+  start: (arg) => startReReviewAfterOwnerDecisionV1(arg),
+  say: async (arg, text) => {
+    await appendChatMessageV1(arg.taskFolderPath, {
+      role: "assistant",
+      text,
+      stage: arg.stage,
+      at: new Date().toISOString(),
+      kind: "outcome",
+    }).catch(() => undefined);
+  },
+  offerRunNow: async (arg) => {
+    await offerActionInChatV1({
+      taskFolderPath: arg.taskFolderPath,
+      actionLabel: "Run now",
+      command:
+        arg.thenApplyReview === true ? "vs-code-ai-helper.resumeAndApplyCurrentStageAction" : "vs-code-ai-helper.resumeAndRerunReview",
+      args:
+        arg.thenApplyReview === true
+          ? [{ taskFolderPath: arg.taskFolderPath }]
+          : [{ taskFolderPath: arg.taskFolderPath }, { skipUnchangedTreeGuardV1: true }],
+      noticeText: "Decisions from this round are still open, so the review your answer starts is waiting for them.",
+      actionConsequence: "Starts the review now. Decisions still open are not read by it.",
+      optional: true,
+      doNothingOption: { label: "Keep waiting", consequence: "Does nothing. The review starts once the other decisions are answered." },
+      recommend: { target: "none", reasoning: "Waiting lets the review read every answer; running now is your call." },
+    }).catch(() => undefined);
+  },
+  reviewStartedSince: async (arg, sinceIso) => {
+    const read = await readTaskProgressStrictV1(vscode.Uri.file(arg.taskFolderPath)).catch(() => undefined);
+    const history = read?.ok ? (read.decoded.progress.reviewScoreHistory ?? []) : [];
+    const latest = history.filter((entry) => entry.stage === arg.stage).at(-1);
+    return latest !== undefined && latest.at > sinceIso;
+  },
+};
+
+/**
+ * review2 Step 41: after an answer is recorded (and written), start the run it promises unless the round's other
+ * decisions are still open. The run is then held, the chat says how many are open and offers "Run now"; the last
+ * answer of the group starts it, so the run reads every answer and no earlier run reads half of them.
+ */
+export async function followUpAfterOwnerAnswerV1(
+  arg: RecordOwnerPlanDecisionArgV1,
+  deps: OwnerFollowUpDepsV1 = DEFAULT_FOLLOW_UP_DEPS_V1
+): Promise<boolean> {
+  const canonicalId = normalizePath(arg.taskFolderPath);
+  const startsRun = !((arg.rejects === true && arg.ownWords !== true) || arg.planAction?.kind === "approveDeviation");
+  const owed = peekOwedRunV1(canonicalId) as { readonly arg: RecordOwnerPlanDecisionArgV1; readonly at: string } | undefined;
+  const decision = decideFollowUpRunV1({
+    startsRun,
+    openSiblings: deps.openSiblings(arg),
+    heldWritesRemaining: heldWritesRemainingV1(canonicalId, arg.blockerId),
+    owedFromEarlier: owed !== undefined,
+  });
+  switch (decision.action) {
+    case "start":
+      takeOwedRunV1(canonicalId);
+      return deps.start(arg);
+    case "start-owed": {
+      const run = takeOwedRunV1(canonicalId) as { readonly arg: RecordOwnerPlanDecisionArgV1; readonly at: string };
+      // "Run now" (or any review) already ran since the answer was held: nothing is owed any more.
+      if (await deps.reviewStartedSince(run.arg, run.at)) return false;
+      return deps.start(run.arg);
+    }
+    case "hold":
+      rememberOwedRunV1(canonicalId, { arg, at: new Date().toISOString() });
+      await deps.say(arg, describeHeldFollowUpRunV1(decision.open));
+      await deps.offerRunNow(arg);
+      return false;
+    case "none":
+      return false;
+  }
 }
 
 /** The reword target `arg` names when it matches several top-level items and gives no occurrence; otherwise undefined. */
@@ -404,6 +594,14 @@ export async function startReReviewAfterOwnerDecisionV1(
     return false;
   }
   try {
+    if (arg.thenApplyReview === true) {
+      // One Apply Review, no re-review: the next review (which follows that round in the usual way) judges the fix
+      // against the recorded rule.
+      const started = await executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+        taskFolderPath: arg.taskFolderPath,
+      });
+      return started === true;
+    }
     const started = await executeCommand(
       "vs-code-ai-helper.resumeAndRerunReview",
       { taskFolderPath: arg.taskFolderPath },
@@ -440,12 +638,14 @@ async function recordOwnerPlanDecisionRecordOnlyV1(
       subscribeToTaskFree: (listener) => taskOperations.onDidEnd(() => listener()),
       carryOut: async () => {
         await withTaskLock(arg.taskFolderPath, () => executeOwnerPlanDecisionLockedV1(arg));
-        await startReReviewAfterOwnerDecisionV1(arg);
+        releaseHeldWriteV1(normalizePath(arg.taskFolderPath), arg.blockerId);
+        await followUpAfterOwnerAnswerV1(arg);
         return { kind: "done" };
       },
       report: () => Promise.resolve(),
     });
 
+    noteHeldWriteV1(normalizePath(arg.taskFolderPath), arg.blockerId);
     const heldText = `Your choice "${arg.optionLabel}" for ${arg.blockerId} is recorded. It is written to plan-final.md as soon as the running round ends.`;
     await appendChatMessageV1(arg.taskFolderPath, {
       role: "assistant",
@@ -484,6 +684,8 @@ export async function postOwnerPlanDecisionCardV1(options: {
   taskDisplayName?: string;
   /** review1 Step 37: identities of the blockers this card asks about (see `attributeBlockersToDecisionBlocksV1`). */
   blockerIdentities?: readonly string[];
+  /** review2 Step 41: what the round reported about the same step or plan item; its card is folded into this one. */
+  foldedRoundReports?: readonly string[];
 }): Promise<WorkflowDecisionV1 | undefined> {
   const { taskFolderPath, stage, block } = options;
   const canonicalId = normalizePath(taskFolderPath);
@@ -509,7 +711,10 @@ export async function postOwnerPlanDecisionCardV1(options: {
       answeredOptionIds: [...block.options.map((o) => o.id), OWN_WORDS_OPTION_ID_V1],
     },
     // Technical detail is labelled "Details", which the chat card renders behind a collapsed toggle.
-    evidence: block.technicalDetails ? [{ label: "Details", detail: block.technicalDetails }] : [],
+    evidence: [
+      ...(block.technicalDetails ? [{ label: "Details", detail: block.technicalDetails }] : []),
+      ...(options.foldedRoundReports ?? []).map((report) => ({ label: "Details", detail: `What the round reported: ${report}` })),
+    ],
     options: [
       ...block.options.map((opt) => ({
         optionId: opt.id,
@@ -547,8 +752,8 @@ export async function postOwnerPlanDecisionCardV1(options: {
         optionId: OWN_WORDS_OPTION_ID_V1,
         label: "Answer in my own words…",
         consequence:
-          "Asks for your answer here in the chat window, records it in task.md under Owner decisions, and re-runs the review " +
-          "to read it. The plan is not changed and the blocker is not set aside; the review decides whether your words settle it.",
+          "Type your answer in the message box below. It is recorded in task.md under Owner decisions, and the review runs " +
+          "again to read it. The plan is not changed and the blocker is not set aside; the review decides whether your words settle it.",
         resumeKind: "continue" as const,
         effect: {
           kind: "command" as const,
@@ -598,6 +803,11 @@ export async function postOwnerOnlyBlockersCardV1(options: {
    * and this card only takes the standing ones off its hands (the wording must not say Fast Forward stopped).
    */
   continuesWithOtherWork?: boolean;
+  /**
+   * review2 Step 42: how many fix rounds the task has run so far. A card Fast Forward carries past remembers "Not now"
+   * for this blocker set until a new round has run (the count changes), so the same card is not raised again at once.
+   */
+  fixRoundsRun?: number;
 }): Promise<WorkflowDecisionV1 | undefined> {
   const { taskFolderPath, stage, blockerDescriptions } = options;
   if (blockerDescriptions.length === 0) {
@@ -616,9 +826,14 @@ export async function postOwnerOnlyBlockersCardV1(options: {
   const fingerprint = createHash("sha256").update(blockerDescriptions.join("\n")).digest("hex").slice(0, 16);
   // review1 Step 38: "Tick or Exclude…" acts on plan-final.md's checklist, which does not exist at a plan stage.
   // There the way on is to record the decision in plan.md, so that is what the card offers and recommends.
+  // review2 Step 42: a tick or exclude is offered only when a listed blocker is about a plan item. Otherwise (a
+  // failing check, a defect) the owner's own words are the way on, so the review reads them.
+  const aboutPlanItem = blockerDescriptions.some((description) => isPlanItemBlockerV1({ description }));
   const canSettleItem = optionAppliesAtStageV1("settleChecklistItem", stage);
+  const offersTick = canSettleItem && aboutPlanItem;
+  const offersOwnWords = canSettleItem && !aboutPlanItem;
   const planFile = planFileNameForStageV1(stage);
-  const forwardOptionId = canSettleItem ? "settleItem" : "changePlan";
+  const forwardOptionId = offersTick ? "settleItem" : offersOwnWords ? OWN_WORDS_OPTION_ID_V1 : "changePlan";
   const cardInput: PostWorkflowDecisionInputV1 = {
     decisionKey: `ownerOnlyBlockers:${fingerprint}`,
     taskCanonicalId: canonicalId,
@@ -635,7 +850,32 @@ export async function postOwnerOnlyBlockersCardV1(options: {
       blockerDescriptions.map((d) => `“${d}”`).join("; "),
     evidence: [],
     options: [
-      canSettleItem
+      offersOwnWords
+        ? {
+            optionId: OWN_WORDS_OPTION_ID_V1,
+            label: "Answer in my own words…",
+            consequence:
+              "Records your answer in task.md under Owner decisions and re-runs the review to read it. " +
+              "The plan is not changed and the blocker is not set aside; the review decides whether your words settle it.",
+            resumeKind: "continue" as const,
+            effect: {
+              kind: "command" as const,
+              command: RECORD_OWNER_PLAN_DECISION_COMMAND_V1,
+              args: [
+                {
+                  taskFolderPath,
+                  stage,
+                  blockerId: blockerIdentities[0] ?? fingerprint,
+                  optionId: OWN_WORDS_OPTION_ID_V1,
+                  optionLabel: "Answer in my own words",
+                  ownWords: true,
+                  rawContentHash: fingerprint,
+                  blockerText: blockerDescriptions.join("; ").slice(0, 600),
+                } satisfies RecordOwnerPlanDecisionArgV1,
+              ],
+            },
+          }
+        : offersTick
         ? {
             optionId: "settleItem",
             label: "Tick or Exclude a Checklist Item…",
@@ -675,11 +915,28 @@ export async function postOwnerOnlyBlockersCardV1(options: {
       optionId: forwardOptionId,
       reasoning: "Only your answer changes the score; running another Apply Review against these would repeat the same result.",
     },
-    gating: {
-      holdsTaskPaused: false,
-      unblocksProgress: true,
-      detail: "the next review round",
-    },
+    // review2 Step 42: a card Fast Forward carries past never holds Fast Forward, so it is a notice with buttons, not
+    // a "Decision needed". "Not now" on it is remembered until another round has run (the fingerprint carries the
+    // round count), so the same card does not come straight back.
+    ...(options.continuesWithOtherWork
+      ? {
+          gating: {
+            holdsTaskPaused: false,
+            unblocksProgress: false,
+            detail: "Optional: Fast Forward carries on without it.",
+          },
+          suppressWhileAnswered: {
+            conditionFingerprint: `${fingerprint}:rounds=${options.fixRoundsRun ?? 0}`,
+            answeredOptionIds: ["notNow"],
+          },
+        }
+      : {
+          gating: {
+            holdsTaskPaused: false,
+            unblocksProgress: true,
+            detail: "the next review round",
+          },
+        }),
   };
   return postWorkflowDecisionV1(cardInput, { canonicalId, taskFolderPath, stage });
 }
@@ -709,11 +966,31 @@ function pendingOwnerPlanCardsV1(
   );
 }
 
-function cardNamesAnyStepV1(card: WorkflowDecisionV1, steps: ReadonlySet<number>): boolean {
-  if (steps.size === 0) return false;
-  for (const step of stepNumbersNamedV1(`${card.whatHappened}\n${card.whyUserNeeded}`)) {
-    if (steps.has(step)) return true;
+/** review2 Step 41: the plan-item ids (`[item:<id>]`) a piece of card text names. */
+function itemIdsNamedV1(text: string): ReadonlySet<string> {
+  const ids = new Set<string>();
+  for (const match of text.matchAll(/\[item:([0-9a-f]+)\]/gi)) {
+    ids.add(match[1]!.toLowerCase());
   }
+  return ids;
+}
+
+/** The step numbers and plan-item ids a card's text names; the review's card and the round's card match on either. */
+export interface NamedPlanReferencesV1 {
+  readonly steps: ReadonlySet<number>;
+  readonly itemIds: ReadonlySet<string>;
+}
+
+export function namedPlanReferencesV1(text: string): NamedPlanReferencesV1 {
+  return { steps: stepNumbersNamedV1(text), itemIds: itemIdsNamedV1(text) };
+}
+
+/** True when `card` names a step or a plan-item id that `references` names too. */
+function cardNamesAnyReferenceV1(card: WorkflowDecisionV1, references: NamedPlanReferencesV1): boolean {
+  if (references.steps.size === 0 && references.itemIds.size === 0) return false;
+  const named = namedPlanReferencesV1(`${card.whatHappened}\n${card.whyUserNeeded}`);
+  for (const step of named.steps) if (references.steps.has(step)) return true;
+  for (const id of named.itemIds) if (references.itemIds.has(id)) return true;
   return false;
 }
 
@@ -790,24 +1067,28 @@ export async function raiseOwnerDecisionCardsFromReviewV1(
   ).catch(() => undefined);
   const canonicalId = normalizePath(taskFolderPath);
   for (const block of blocks) {
+    // review2 Step 41: the round's card about the same step or plan item is folded into this one: it is withdrawn
+    // once this card is up, and its body (what the round reported) is carried on this card.
+    const references = namedPlanReferencesV1(`${block.problem}\n${block.planPurpose}\n${block.rawContent}`);
+    const folded = pendingOwnerPlanCardsV1(canonicalId, stage, "deviation").filter((card) =>
+      cardNamesAnyReferenceV1(card, references)
+    );
     const decision = await postOwnerPlanDecisionCardV1({
       taskFolderPath,
       stage,
       block,
       blockerIdentities: identitiesByBlock.get(block.id) ?? [],
+      foldedRoundReports: folded.map((card) => card.whatHappened),
     });
     if (decision) {
       posted.push(decision);
       // The review's card carries the review's options; the round's own card about the same step is folded in.
-      const steps = stepNumbersNamedV1(`${block.problem}\n${block.planPurpose}\n${block.rawContent}`);
-      for (const deviationCard of pendingOwnerPlanCardsV1(canonicalId, stage, "deviation")) {
-        if (cardNamesAnyStepV1(deviationCard, steps)) {
-          await withdrawWorkflowDecisionsByKeyV1(
-            { taskFolderPath, canonicalId },
-            deviationCard.decisionKey,
-            "the review raised a decision about the same step, so this one is answered there"
-          ).catch(() => undefined);
-        }
+      for (const deviationCard of folded) {
+        await withdrawWorkflowDecisionsByKeyV1(
+          { taskFolderPath, canonicalId },
+          deviationCard.decisionKey,
+          "the review raised a decision about the same step or plan item, so this one is answered there"
+        ).catch(() => undefined);
       }
     }
   }
@@ -837,8 +1118,8 @@ export async function raisePlanDeviationCardsV1(
   const canonicalId = normalizePath(taskFolderPath);
   const reviewCards = pendingOwnerPlanCardsV1(canonicalId, stage, "review");
   for (const deviation of deviations) {
-    const steps = stepNumbersNamedV1(`${deviation.planPurpose}\n${deviation.rawContent}`);
-    if (reviewCards.some((card) => cardNamesAnyStepV1(card, steps))) {
+    const references = namedPlanReferencesV1(`${deviation.planPurpose}\n${deviation.rawContent}`);
+    if (reviewCards.some((card) => cardNamesAnyReferenceV1(card, references))) {
       continue;
     }
     const decision = await postOwnerPlanDecisionCardV1({ taskFolderPath, stage, block: deviation });

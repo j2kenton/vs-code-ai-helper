@@ -56,6 +56,7 @@ import {
   PlanItemOwnerDecisionV1,
   PlanItemOwnerTestRunV1,
   QuotaParkRecordV1,
+  ReviewCoverageV1,
   ReviewRejectionEntry,
   ReviewScoreHistoryEntry,
   RoundLedgerEntryV1,
@@ -196,6 +197,7 @@ export const TASK_PROGRESS_PRODUCT_FIELD_NAMES_V1 = [
   "stageReviewPasses",
   "notedForeignEdits",
   "ownerPausedAt",
+  "reviewCoverage",
 ] as const satisfies readonly (keyof TaskProgress)[];
 
 type MissingProductFieldV1 = Exclude<
@@ -2081,6 +2083,46 @@ function validateNotedForeignEdits(value: unknown): string | undefined {
   return undefined;
 }
 
+/** review2 Step 17: the per-file review coverage record (mirror of the extension's validator). */
+const MAX_REVIEW_COVERAGE_FILES_V1 = 20000;
+function validateReviewCoverage(value: unknown): string | undefined {
+  if (!isPlainObject(value)) {
+    return "reviewCoverage must be an object";
+  }
+  if (Object.keys(value).some((key) => key !== "files" && key !== "changedFiles" && key !== "updatedAt")) {
+    return "reviewCoverage has an unknown field";
+  }
+  const files = value["files"];
+  const changed = value["changedFiles"];
+  if (!isPlainObject(files) || Object.keys(files).length > MAX_REVIEW_COVERAGE_FILES_V1) {
+    return "reviewCoverage.files must be a bounded object";
+  }
+  if (
+    !Array.isArray(changed) ||
+    changed.length > MAX_REVIEW_COVERAGE_FILES_V1 ||
+    changed.some((entry) => !boundedString(entry, MAX_PATH_LENGTH))
+  ) {
+    return "reviewCoverage.changedFiles must be a bounded array of paths";
+  }
+  if (!boundedString(value["updatedAt"], 64)) {
+    return "reviewCoverage.updatedAt must be a string";
+  }
+  for (const [file, entry] of Object.entries(files)) {
+    if (
+      file.length === 0 ||
+      file.length > MAX_PATH_LENGTH ||
+      !isPlainObject(entry) ||
+      Object.keys(entry).some((key) => key !== "hash" && key !== "runId" && key !== "stage") ||
+      !boundedString(entry["hash"], 128) ||
+      !boundedString(entry["runId"], 200) ||
+      !boundedString(entry["stage"], 64)
+    ) {
+      return "reviewCoverage.files has an invalid entry";
+    }
+  }
+  return undefined;
+}
+
 function validateStageReviewPasses(value: unknown): string | undefined {
   if (!isPlainObject(value)) {
     return "stageReviewPasses must be a per-stage object map";
@@ -2931,6 +2973,14 @@ export function decodeTaskProgressTextV1(
           return recovery("invalidFieldValue", "ownerPausedAt must be an ISO time string");
         }
         draft.ownerPausedAt = value;
+        break;
+      }
+      case "reviewCoverage": {
+        const error = validateReviewCoverage(value);
+        if (error !== undefined) {
+          return recovery("invalidFieldValue", error);
+        }
+        draft.reviewCoverage = value as ReviewCoverageV1;
         break;
       }
     }

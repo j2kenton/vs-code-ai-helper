@@ -11,6 +11,7 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { applyPlanRevisionPolicyV1 } from "../services/taskProgressFieldPolicyV1";
 import { markChecklistChangeProposalDiscardedV1 } from "../utils/taskProgressTransforms";
 import { snapshotPlanForRevisionV1 } from "../utils/implementationArtifactResolver";
+import { hasStepNumbersChangedV1 } from "../utils/implementationChecklist";
 import { enterStageV1, runStageEntryPostCommitV1 } from "../utils/stageTransition";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1, type PostWorkflowDecisionInputV1 } from "../utils/workflowDecisionDispatchV1";
 import { ChatTarget } from "../views/chatView";
@@ -75,7 +76,11 @@ export function buildChecklistChangeProposedDecisionInputV1(
       ? `adding ${added} item${added === 1 ? "" : "s"}`
       : proposal.kind === "removed"
         ? `removing ${dropped} item${dropped === 1 ? "" : "s"}`
-        : "renumbering the items";
+        : // review2 Step 7: "renumbering" only when a step number moved; an item set that lost some items and gained
+          // others of different wording is a replacement, and the card says so.
+          hasStepNumbersChangedV1(proposal.removedItems, proposal.proposedItems)
+          ? "renumbering the items"
+          : `replacing ${dropped} item${dropped === 1 ? "" : "s"} with ${added} differently worded one${added === 1 ? "" : "s"}`;
   const whatHappened =
     `A round tried to change plan-final.md's checklist by ${change}. A round never changes the checklist, so ` +
     "the checklist was put back exactly as it read at the start of the round; the plan on disk is unchanged." +

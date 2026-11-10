@@ -231,6 +231,11 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
     to: "runReviewWithAI",
     evidence: "src/commands/reviewCurrentTask.ts — resolves the current task and executes vs-code-ai-helper.runReviewWithAI",
   },
+  widenReviewScopeToAllChanged: {
+    kind: "delegatesTo",
+    to: "runReviewWithAI",
+    evidence: "src/commands/widenReviewScopeCurrentTaskV1.ts — adds the task's changed files to the review scope, then executes vs-code-ai-helper.runReviewWithAI via resolvePartialReviewScopeV1",
+  },
   fastForwardCurrentTaskReview: {
     kind: "delegatesTo",
     to: "fastForwardReviewWithAI",

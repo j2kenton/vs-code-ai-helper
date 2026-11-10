@@ -41,6 +41,8 @@ import {
 } from "../types/taskProgress";
 import { isMachineMaintainedArtifactPathV1 } from "./implReviewFileSelection";
 import {
+  cleanPlanItemTextV1,
+  findPlanItemHashEntryByIdV1,
   listPlanItemContentHashesV1,
   normalizeChecklistItemTextV1,
   planItemRowAppliesV1,
@@ -116,13 +118,23 @@ function resolvePlanItemIdentityV1(
   planText: string | undefined,
   itemText: string,
   occurrence: number | undefined,
-  nested = false
+  nested = false,
+  itemId?: string
 ): {
   readonly hash: string | undefined;
   readonly occurrence: number | undefined;
   readonly level: PlanItemLevelV1 | undefined;
 } {
   if (planText === undefined) return { hash: undefined, occurrence: undefined, level: undefined };
+  // review2 Step 3: an issued id names exactly one item, whatever its wording or how many copies share it.
+  const byId = itemId !== undefined ? findPlanItemHashEntryByIdV1(planText, itemId) : undefined;
+  if (byId !== undefined) {
+    return {
+      hash: byId.hash,
+      occurrence: byId.occurrence,
+      level: { nested: byId.nested, ambiguous: byId.sharesKeyAcrossLevels === true },
+    };
+  }
   const wanted = normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(itemText));
   const named = listPlanItemContentHashesV1(planText).filter((entry) => entry.annotationFreeKey === wanted);
   // The copy number counts among items of one level, so a nested claim names its level (review1 Step 9).
@@ -162,7 +174,7 @@ export function recordPlanItemClaimEvidenceV1<T extends TaskProgress>(
     readonly itemNested?: boolean;
   }
 ): T {
-  const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const itemKey = normalizeChecklistItemTextV1(cleanPlanItemTextV1(input.itemText));
   const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(
     input.planText,
     input.itemText,
@@ -195,7 +207,7 @@ export function recordPlanItemClaimEvidenceV1<T extends TaskProgress>(
     records.push({
       planRevision: input.planRevision,
       itemKey,
-      itemText: input.itemText.slice(0, 4000),
+      itemText: cleanPlanItemTextV1(input.itemText).slice(0, 4000),
       ...(itemContentHash !== undefined ? { itemContentHash } : {}),
       ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
       ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
@@ -209,7 +221,7 @@ export function recordPlanItemReviewerVerificationV1<T extends TaskProgress>(
   progress: T,
   input: { readonly planRevision: string; readonly itemText: string; readonly at: string; readonly roundId?: string; readonly evidence: string; readonly testReportRoundIds?: readonly string[]; readonly planText?: string; readonly itemOccurrence?: number; readonly itemNested?: boolean }
 ): T {
-  const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const itemKey = normalizeChecklistItemTextV1(cleanPlanItemTextV1(input.itemText));
   const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(input.planText, input.itemText, input.itemOccurrence, input.itemNested === true);
   const records = [...(progress.planItemEvidence ?? [])];
   const index = locateEvidenceRowV1(records, input.planRevision, itemKey, itemContentHash, itemOccurrence, level);
@@ -221,7 +233,7 @@ export function recordPlanItemReviewerVerificationV1<T extends TaskProgress>(
   };
   if (index < 0) {
     records.push({
-      planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000),
+      planRevision: input.planRevision, itemKey, itemText: cleanPlanItemTextV1(input.itemText).slice(0, 4000),
       ...(itemContentHash !== undefined ? { itemContentHash } : {}),
       ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
       ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
@@ -259,16 +271,25 @@ export function recordPlanItemOwnerDecisionV1<T extends TaskProgress>(
     readonly itemOccurrence?: number;
     /** True when `itemOccurrence` counts among nested items (a child), not top-level ones. */
     readonly itemNested?: boolean;
+    /**
+     * review2 Step 3: the issued id of the item the owner decided. When given, it picks the item (hash, copy and
+     * level) from `planText`, and is stored on the row, so a decision made on a card or form is keyed to the item
+     * itself and never to the wording the card displayed. `itemText` is stored with Ensemble's annotations removed.
+     */
+    readonly itemId?: string;
   }
 ): T {
-  const itemKey = normalizeChecklistItemTextV1(input.itemText);
-  const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(input.planText, input.itemText, input.itemOccurrence, input.itemNested === true);
+  const itemKey = normalizeChecklistItemTextV1(cleanPlanItemTextV1(input.itemText));
+  const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(input.planText, input.itemText, input.itemOccurrence, input.itemNested === true, input.itemId);
   const records = [...(progress.planItemOwnerDecisions ?? [])];
   if (records.some((row) => row.itemKey === itemKey && row.formId === input.formId && row.decision === input.decision &&
-      (itemContentHash === undefined ? row.planRevision === input.planRevision : row.itemContentHash === itemContentHash))) return progress;
+      (itemContentHash === undefined
+        ? row.planRevision === input.planRevision
+        : row.itemContentHash === itemContentHash && (row.itemOccurrence ?? 0) === (itemOccurrence ?? 0)))) return progress;
   const decision: PlanItemOwnerDecisionV1 = {
-    planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000),
+    planRevision: input.planRevision, itemKey, itemText: cleanPlanItemTextV1(input.itemText).slice(0, 4000),
     source: "owner", at: input.at, formId: input.formId, decision: input.decision,
+    ...(input.itemId !== undefined ? { itemId: input.itemId } : {}),
     ...(itemContentHash !== undefined ? { itemContentHash } : {}),
       ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
     ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
@@ -301,7 +322,7 @@ export function recordPlanItemOwnerTestRunV1<T extends TaskProgress>(
 ): T {
   const records = [...(progress.planItemOwnerTestRuns ?? [])];
   if (records.some((row) => row.formId === input.formId)) return progress;
-  const itemKeys = [...new Set(input.itemTexts.map(normalizeChecklistItemTextV1))].slice(0, 200);
+  const itemKeys = [...new Set(input.itemTexts.map((text) => normalizeChecklistItemTextV1(cleanPlanItemTextV1(text))))].slice(0, 200);
   if (itemKeys.length === 0) return progress;
   const itemContentHashes: Record<string, string> = {};
   const itemOccurrences: Record<string, number> = {};
@@ -310,7 +331,7 @@ export function recordPlanItemOwnerTestRunV1<T extends TaskProgress>(
       // The same first-copy rule as every other writer: a run recorded against an item's text covers that copy,
       // never the identical items beside it.
       const { hash, occurrence } = resolvePlanItemIdentityV1(input.planText, text, undefined);
-      const key = normalizeChecklistItemTextV1(text);
+      const key = normalizeChecklistItemTextV1(cleanPlanItemTextV1(text));
       if (hash !== undefined && itemContentHashes[key] === undefined) itemContentHashes[key] = hash;
       if (occurrence !== undefined && itemOccurrences[key] === undefined) itemOccurrences[key] = occurrence;
     }
@@ -337,13 +358,13 @@ export function recordPlanItemTestReportV1<T extends TaskProgress>(
   progress: T,
   input: { readonly planRevision: string; readonly itemText: string; readonly report: PlanItemTestReportV1; readonly planText?: string; readonly itemOccurrence?: number; readonly itemNested?: boolean }
 ): T {
-  const itemKey = normalizeChecklistItemTextV1(input.itemText);
+  const itemKey = normalizeChecklistItemTextV1(cleanPlanItemTextV1(input.itemText));
   const { hash: itemContentHash, occurrence: itemOccurrence, level } = resolvePlanItemIdentityV1(input.planText, input.itemText, input.itemOccurrence, input.itemNested === true);
   const records = [...(progress.planItemEvidence ?? [])];
   const index = locateEvidenceRowV1(records, input.planRevision, itemKey, itemContentHash, itemOccurrence, level);
   if (index < 0) {
     records.push({
-      planRevision: input.planRevision, itemKey, itemText: input.itemText.slice(0, 4000),
+      planRevision: input.planRevision, itemKey, itemText: cleanPlanItemTextV1(input.itemText).slice(0, 4000),
       ...(itemContentHash !== undefined ? { itemContentHash } : {}),
       ...(itemOccurrence !== undefined ? { itemOccurrence } : {}),
       ...(itemContentHash !== undefined && level !== undefined ? { itemNested: level.nested } : {}),
@@ -421,18 +442,43 @@ export function invalidatePlanItemEvidenceForChangedFilesV1<T extends TaskProgre
   return modified ? { ...progress, planItemEvidence } as T : progress;
 }
 
+/** How many rows that do not apply to the current plan are kept per item identity (review2 Step 8). */
+export const MAX_NON_APPLYING_EVIDENCE_ROWS_PER_ITEM_V1 = 3;
+
 /**
- * review1 Step 3: drops only the evidence rows whose item is gone from `planText` or whose content no longer
- * matches (reworded, or a nested child changed). A change elsewhere in the plan — an Owner Decisions note, a
- * typo fix in another item, an appended line — leaves every other row in place. Replaces the old wipe of
- * everything recorded at an earlier plan revision.
+ * The item's stable identity for the retention bound: its own text key, which copy of identical items it is, and
+ * its nesting level. Never the content hash: the hash is what changes when the item is edited.
+ */
+function evidenceRowIdentityV1(row: PlanItemEvidenceV1): string {
+  return `${row.itemKey}\u0000${row.itemOccurrence ?? ""}\u0000${row.itemNested === undefined ? "" : row.itemNested ? "n" : "t"}`;
+}
+
+/**
+ * review2 Step 8 (bugs6 item 12): evidence is never deleted because an item's text changed. A row whose item is
+ * gone from `planText` or whose content no longer matches (reworded, or a nested child added) is kept but ignored:
+ * every count goes through `planItemRowAppliesV1`, so it settles nothing while it does not apply, and it counts
+ * again once the plan matches its content hash again (a byte-for-byte revert). To bound file growth only the
+ * {@link MAX_NON_APPLYING_EVIDENCE_ROWS_PER_ITEM_V1} most recent non-applying rows are kept per item identity.
+ * A change elsewhere in the plan leaves every other row in place. Replaces review1 Step 3's removal of every
+ * row that did not apply.
  */
 export function prunePlanItemEvidenceForPlanV1<T extends TaskProgress>(progress: T, planText: string): T {
-  if (!progress.planItemEvidence?.length) return progress;
+  const rows = progress.planItemEvidence;
+  if (!rows?.length) return progress;
   const entries = listPlanItemContentHashesV1(planText);
   if (entries.length === 0) return progress;
-  const kept = progress.planItemEvidence.filter((row) => entries.some((entry) => planItemRowAppliesV1(row, entry)));
-  return kept.length === progress.planItemEvidence.length ? progress : { ...progress, planItemEvidence: kept } as T;
+  const keptNonApplying = new Map<string, number>();
+  const dropped = new Set<number>();
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index] as PlanItemEvidenceV1;
+    if (entries.some((entry) => planItemRowAppliesV1(row, entry))) continue;
+    const identity = evidenceRowIdentityV1(row);
+    const kept = keptNonApplying.get(identity) ?? 0;
+    if (kept >= MAX_NON_APPLYING_EVIDENCE_ROWS_PER_ITEM_V1) dropped.add(index);
+    else keptNonApplying.set(identity, kept + 1);
+  }
+  if (dropped.size === 0) return progress;
+  return { ...progress, planItemEvidence: rows.filter((_row, index) => !dropped.has(index)) } as T;
 }
 
 /** Invalidate test evidence only when a failed check names its acceptance test. */

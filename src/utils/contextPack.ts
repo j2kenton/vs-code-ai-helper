@@ -8,6 +8,7 @@ import {
   REVIEW_TASK_DESCRIPTION_MAX_CHARS_V1,
   IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS,
   isMachineMaintainedArtifactPathV1,
+  buildOverflowNativeReadStanzaV1,
   type LineRange,
   mapSourceToTestPath,
   parseUnifiedDiffHunkRangesV1,
@@ -672,7 +673,13 @@ export async function generateImplReviewContextPack(
    * review1 Step 59: compact the pack's own non-code sections (the tracked-file list that the contents section
    * repeats, and a long rejected-path list) before any code is cut. Files that are missing on disk stay listed.
    */
-  nonCodeCompact?: boolean
+  nonCodeCompact?: boolean,
+  /**
+   * review2 Step 21: for a reviewer that can open files, a file past the pack's TOTAL size limit gets a "read natively"
+   * entry (with its changed regions) instead of only a name under "omitted", and is not returned in `omittedRelPaths`.
+   * Off by default: a reviewer with no file access still needs the omitted list.
+   */
+  overflowReadNatively?: boolean
 ): Promise<{
   content: string;
   isFallback: boolean;
@@ -926,10 +933,34 @@ export async function generateImplReviewContextPack(
       maxTotalChars !== undefined ? { maxTotalChars } : undefined
     );
 
+    // review2 Step 21: overflow files become native-read entries for a reviewer that can open files.
+    const overflowEntries: Array<{ relPath: string; stanza: string }> = [];
+    if (overflowReadNatively === true) {
+      const byPath = new Map(inputsWithRanges.map((input) => [input.relPath, input]));
+      await Promise.all(
+        results
+          .filter((r) => r.content === null)
+          .map(async (o) => {
+            const input = byPath.get(o.relPath);
+            if (input?.content === undefined) {
+              return;
+            }
+            const ranges =
+              input.changedRanges ??
+              (repoRoot ? await computeChangedLineRangesForFileV1(repoRoot, o.relPath, baselineSha) : undefined);
+            overflowEntries.push({
+              relPath: o.relPath,
+              stanza: buildOverflowNativeReadStanzaV1(o.relPath, input.content, ranges),
+            });
+          })
+      );
+    }
+    const overflowByPath = new Map(overflowEntries.map((e) => [e.relPath, e.stanza]));
+
     const included = results.filter(
       (r): r is (typeof r) & { content: string | undefined } => r.content !== null
     );
-    const omitted = results.filter((r) => r.content === null);
+    const omitted = results.filter((r) => r.content === null && !overflowByPath.has(r.relPath));
 
     for (const result of included) {
       if (result.content === undefined) {
@@ -967,6 +998,24 @@ export async function generateImplReviewContextPack(
         lines.push(result.content);
         lines.push("```");
         lines.push("");
+      }
+    }
+
+    if (overflowEntries.length > 0) {
+      lines.push(
+        `_${overflowEntries.length} further tracked file(s) did not fit the pack's total size limit. They are in this review's ` +
+          "scope: read each one natively (you can open files), using the changed regions where given._"
+      );
+      lines.push("");
+      // Results order, not completion order, so the pack reads the same every time.
+      for (const r of results) {
+        const stanza = r.content === null ? overflowByPath.get(r.relPath) : undefined;
+        if (stanza !== undefined) {
+          lines.push(`### ${r.relPath} (over the total size limit — read natively)`);
+          lines.push("");
+          lines.push(stanza);
+          lines.push("");
+        }
       }
     }
 
@@ -1155,7 +1204,9 @@ export async function writeImplReviewContextPack(
   /** See `generateImplReviewContextPack`'s matching parameter. */
   taskDescriptionMaxChars?: number,
   /** See `generateImplReviewContextPack`'s matching parameter. */
-  nonCodeCompact?: boolean
+  nonCodeCompact?: boolean,
+  /** See `generateImplReviewContextPack`'s matching parameter. */
+  overflowReadNatively?: boolean
 ): Promise<{
   contextPackUri: vscode.Uri;
   isFallback: boolean;
@@ -1172,7 +1223,8 @@ export async function writeImplReviewContextPack(
       baselineSha,
       maxTotalChars,
       taskDescriptionMaxChars,
-      nonCodeCompact
+      nonCodeCompact,
+      overflowReadNatively
     );
   const contextPackUri = await writeContextPackContent(taskFolderUri, content);
   return { contextPackUri, isFallback, embeddedContentBytes, omittedRelPaths };

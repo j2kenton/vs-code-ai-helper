@@ -86,7 +86,26 @@ export function unproducibleTestEvidenceHoldV1(input: {
   readonly hasAllowedTestCommand: boolean;
   /** True when files changed since the round that reported the refusal. */
   readonly changedSinceRefusal?: boolean;
+  /**
+   * review2 Step 44: every unticked top-level item waits on test evidence (`openItemsAllWaitOnTestEvidenceV1`). Asked
+   * only after a clean review, so nothing is left to build; an Apply Review over such items has nothing to do.
+   */
+  readonly uncheckedAllWaitOnTestEvidence?: boolean;
 }): string | undefined {
+  if (input.uncheckedCount > 0 && input.uncheckedAllWaitOnTestEvidence === true) {
+    const count = input.uncheckedCount;
+    const items = `${count} open ${count === 1 ? "item waits" : "items wait"} only for a passing test report, and the review found nothing left to build`;
+    if (input.lastRoundTestsRefused && input.changedSinceRefusal !== true) {
+      return (
+        `${items}, and the last editing round's test commands were refused, so another round on the same provider cannot ` +
+        "produce that evidence. Allow the test command, run it yourself and record the run, or settle the items by decision"
+      );
+    }
+    return (
+      `${items}. A round cannot make a test report appear by editing. ` +
+      "Run the tests yourself and record the run, or settle the items by decision"
+    );
+  }
   if (input.uncheckedCount > 0 || input.provisional.length === 0) {
     return undefined;
   }
@@ -152,8 +171,10 @@ export function describeFastForwardHoldV1(hold: FastForwardHoldV1, stageName: st
       return (
         `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
         `Reviewing the same list again would repeat that, so no round was dispatched (${rounds}). ` +
-        "The way on is the decision card that follows: add the missing files, or accept the gap."
-      );
+        // review2 Step 27: the detail names the card's exact buttons when the gap is known, and never says "add the
+        // missing files" when none are missing from the list; without a gap record the card is simply the way on.
+        (/Choose on the card below/.test(hold.detail) ? "" : "The way on is the decision card that follows.")
+      ).trimEnd();
     case "progress-gate":
       return (
         `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +

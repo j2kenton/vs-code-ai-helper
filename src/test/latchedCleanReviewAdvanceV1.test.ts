@@ -265,8 +265,10 @@ void describe("RC8 item 4: a clean review advances while the checklist is flagge
     assert.match(card.whatHappened, /3 plan items are still open/);
     assert.match(card.whatHappened, /Item two/);
     assert.deepEqual(card.options.map((o) => o.label).sort(), ["Back to Implementation", "Move on"]);
-    // An open item asks for a build, so Back to Implementation is recommended.
-    assert.equal(card.recommendation.kind === "option" ? card.recommendation.optionId : undefined, "backToImplementation");
+    // review2 Step 7 (bugs6 item 26): the review is clean and names no unbuilt step, so a round has nothing to act on;
+    // Back to Implementation is not recommended, and the reason says why.
+    assert.equal(card.recommendation.kind === "option" ? card.recommendation.optionId : undefined, "moveOn");
+    assert.match(card.recommendation.kind === "option" ? card.recommendation.reasoning : "", /nothing to act on|test evidence|verification item/);
     const moveOn = card.options.find((o) => o.optionId === "moveOn")!;
     assert.equal(moveOn.effect.kind, "command");
     if (moveOn.effect.kind === "command") {

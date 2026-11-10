@@ -49,7 +49,7 @@ void describe("review1 Step 59/60: a file the size budget cut is not reviewed", 
     const source = readFileSync(join(__dirname, "..", "..", "src", "commands", "reviewActions.ts"), "utf8");
     const filter = source.indexOf("written.omittedRelPaths.map(");
     assert.ok(filter > 0, "the omitted files are read from the written pack");
-    const block = source.slice(filter, filter + 900);
+    const block = source.slice(filter, filter + 1600);
     assert.match(block, /scopeFiles: scopeGapInput\.scopeFiles\.filter\(/);
     assert.match(block, /partialScopeVariablesV1\(gap\.missing/);
   });

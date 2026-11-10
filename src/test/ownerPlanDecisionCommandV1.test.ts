@@ -397,6 +397,30 @@ void describe("bugs5 Step 23: the owner-decision command records the answer with
     assert.ok(task.startsWith("# Task\n\n## Task Description"), "the owner's own text is untouched");
   });
 
+  void it("review2 Step 34: a rule typed for 'Settle it with a rule' is written to task.md under Owner decisions with the blocker id, once", async () => {
+    patchReadFile();
+    const folder = makeTask("exec-task-md-rule", PLAN);
+    nodeFs.writeFileSync(nodePath.join(folder, "task.md"), "# Task\n\n## Task Description\n\nBuild it.\n", "utf8");
+    const arg = {
+      taskFolderPath: folder,
+      stage: "impl-low-review" as const,
+      blockerId: "b3-evidence-keyed-by-text",
+      optionId: "settleWithRule",
+      optionLabel: "an ambiguous reviewer entry verifies nothing",
+      ownWords: true as const,
+      rejects: true,
+      thenApplyReview: true as const,
+      blockerText: "A plan item's evidence settles a same-worded item at another level.",
+    };
+    await executeOwnerPlanDecisionLockedV1(arg);
+    await executeOwnerPlanDecisionLockedV1(arg);
+
+    const task = nodeFs.readFileSync(nodePath.join(folder, "task.md"), "utf8");
+    assert.strictEqual(task.match(/### \d{4}-\d{2}-\d{2} — b3-evidence-keyed-by-text/g)?.length, 1, "written once");
+    assert.ok(task.includes("Owner's answer: an ambiguous reviewer entry verifies nothing"));
+    assert.ok(task.includes("> A plan item's evidence settles a same-worded item at another level."));
+  });
+
   void it("review1 Step 40: at a plan stage the answer also becomes an Accepted Non-Goals entry in plan.md that cites task.md", async () => {
     patchReadFile();
     const folder = nodePath.join(ROOT, ".ensemble", "exec-plan-stage");

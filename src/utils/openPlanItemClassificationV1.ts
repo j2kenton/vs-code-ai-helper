@@ -21,6 +21,7 @@ import { isTestDependentChecklistItemV1, normalizeChecklistItemTextV1 } from "./
 
 export type OpenPlanItemCategoryV1 =
   | "refused-by-round"
+  | "claim-dropped"
   | "awaiting-test-report"
   | "verified-by-review-no-report"
   | "not-reached";
@@ -46,8 +47,16 @@ export interface ClassifyOpenPlanItemInputV1 {
    * built signal: without one a test-dependent item is not "waiting for a report".
    */
   readonly builtClaimedKeys?: ReadonlySet<string>;
+  /**
+   * review2 Step 11: normalized keys of items the round's report claimed done while also declaring no checklist
+   * change. Ensemble did not use those claims; the item is open because the report contradicted itself, which is
+   * a different fact from "the round never reached it".
+   */
+  readonly droppedClaimKeys?: ReadonlySet<string>;
 }
 
+const CLAIM_DROPPED_REASON_V1 =
+  "the round claimed it done, but its report also declared no checklist change, so the claim was not used";
 const AWAITING_TEST_REPORT_REASON_V1 =
   "waiting for a passing test report: no editing round has recorded one for this item";
 const VERIFIED_NO_REPORT_TEST_REASON_V1 =
@@ -75,6 +84,9 @@ export function classifyOpenPlanItemV1(input: ClassifyOpenPlanItemInputV1): Clas
       reason: testDependent ? VERIFIED_NO_REPORT_TEST_REASON_V1 : VERIFIED_NO_REPORT_REASON_V1,
     };
   }
+  if (input.droppedClaimKeys?.has(normalizeChecklistItemTextV1(input.itemText)) === true) {
+    return { itemText: input.itemText, category: "claim-dropped", testDependent, reason: CLAIM_DROPPED_REASON_V1 };
+  }
   const builtClaimed = input.builtClaimedKeys?.has(normalizeChecklistItemTextV1(input.itemText)) === true;
   if (testDependent && builtClaimed) {
     return {
@@ -87,10 +99,27 @@ export function classifyOpenPlanItemV1(input: ClassifyOpenPlanItemInputV1): Clas
   return { itemText: input.itemText, category: "not-reached", testDependent, reason: NOT_REACHED_REASON_V1 };
 }
 
+/**
+ * review2 Step 6: the newest editing round's run file among the names in a task's `runs/` folder (for example
+ * `161-claude-cli-impl.md`), as `runs/<name>`. Reviews, scope rebuilds and backups do not count: only
+ * `<number>-<provider>-impl.md` files are editing rounds. `undefined` when there is none.
+ */
+export function pickLatestEditingRunFileV1(fileNames: readonly string[]): string | undefined {
+  let best: { readonly seq: number; readonly name: string } | undefined;
+  for (const name of fileNames) {
+    const match = /^(\d+)-[^/\\]*-impl\.md$/.exec(name);
+    if (!match) continue;
+    const seq = Number(match[1]);
+    if (!best || seq > best.seq) best = { seq, name };
+  }
+  return best ? `runs/${best.name}` : undefined;
+}
+
 export function classifyOpenPlanItemsV1(
   items: readonly { readonly itemText: string; readonly reason: string }[],
   reviewVerifiedKeys?: ReadonlySet<string>,
-  builtClaimedKeys?: ReadonlySet<string>
+  builtClaimedKeys?: ReadonlySet<string>,
+  droppedClaimKeys?: ReadonlySet<string>
 ): ClassifiedOpenPlanItemV1[] {
   return items.map((item) =>
     classifyOpenPlanItemV1({
@@ -98,11 +127,13 @@ export function classifyOpenPlanItemsV1(
       roundReason: item.reason,
       ...(reviewVerifiedKeys ? { reviewVerifiedKeys } : {}),
       ...(builtClaimedKeys ? { builtClaimedKeys } : {}),
+      ...(droppedClaimKeys ? { droppedClaimKeys } : {}),
     })
   );
 }
 
 const CATEGORY_HEADINGS_V1: Readonly<Record<OpenPlanItemCategoryV1, string>> = {
+  "claim-dropped": "The round's report contradicted itself",
   "refused-by-round": "The round could not build these",
   "awaiting-test-report": "Waiting for a passing test report",
   "verified-by-review-no-report": "Verified built by the review",
@@ -111,6 +142,7 @@ const CATEGORY_HEADINGS_V1: Readonly<Record<OpenPlanItemCategoryV1, string>> = {
 
 const CATEGORY_ORDER_V1: readonly OpenPlanItemCategoryV1[] = [
   "refused-by-round",
+  "claim-dropped",
   "not-reached",
   "awaiting-test-report",
   "verified-by-review-no-report",

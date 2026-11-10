@@ -19,6 +19,7 @@
  */
 import type { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeTaskActionFailureV1 } from "./taskActionOutcomeTextV1";
+import { describeRefusalReasonV1 } from "./refusalGuidanceV1";
 import { claimTerminalLineV1, ledgerOwnsTerminalLineV1, reserveLedgerTerminalLineV1 } from "./terminalLineEmitterV1";
 
 export type EndedOperationStateV1 =
@@ -37,6 +38,8 @@ export interface TrackedOperationV1 {
 
 export interface EndedOperationV1 extends TrackedOperationV1 {
   readonly state: string;
+  /** The operation's kind; a refused review always gets a stated reason and next click (review2 Step 13). */
+  readonly kind?: string;
   /** Why the operation settled the way it did, when its owner said. */
   readonly endReasonV1?: string;
   readonly cancelReasonV1?: string;
@@ -175,7 +178,11 @@ export class OperationEndedLineTrackerV1 {
     // that failed under it is what actually happened.
     const carried = this.inherited.get(operation.id);
     this.inherited.delete(operation.id);
-    const effective = own.state === "succeeded" && carried ? carried : own;
+    const carriedOrOwn = own.state === "succeeded" && carried ? carried : own;
+    const effective: SettledOutcomeV1 =
+      carriedOrOwn.state === "refused"
+        ? { state: "refused", reason: describeRefusalReasonV1(carriedOrOwn.reason, operation.kind) }
+        : carriedOrOwn;
     const parent = operation.parentId !== undefined ? this.registered.get(operation.parentId) : undefined;
     if (parent !== undefined && parent.label === operation.label && !this.emitted.has(parent.id)) {
       if (effective.state !== "succeeded" && !this.inherited.has(parent.id)) {

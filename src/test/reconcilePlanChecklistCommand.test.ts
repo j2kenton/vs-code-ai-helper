@@ -37,6 +37,7 @@ import {
   autoClearUnreliableChecklistLatchAfterReviewV1,
   applyReconciliationReviewVerifiedTicksConfirmedV1,
   applyReconciliationReviewVerifiedTicksV1,
+  describeSkippedOfferedItemsLineV1,
   linkManualChecksToBlockerConfirmedV1,
   postReconcilePlanChecklistDecisionV1,
   reconcilePlanChecklist,
@@ -55,7 +56,7 @@ import { TaskInventory } from "../state/taskInventory";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { taskOperations } from "../utils/taskOperations";
 import { TaskProgress } from "../types/taskProgress";
-import { getPlanRevisionV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
+import { getPlanRevisionV1, listPlanItemIdsV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import {
   StatusSurface,
   deactivateNotificationRouter,
@@ -713,6 +714,58 @@ void describe("applyReconciliationReviewVerifiedTicksV1 / applyReconciliationRev
         true,
         "applying candidate ticks must not by itself clear checklistProgressUnreliable"
       );
+    } finally {
+      fs.restore();
+      workspace.restore();
+    }
+  });
+
+  void it("applies by issued id: a card that offered the first of two identical items never ticks the second (review2 Step 2)", async () => {
+    const plan = [
+      "<!-- ensemble:implementation-checklist -->",
+      "",
+      "- [ ] Wire the completeness gate",
+      "- [ ] Wire the completeness gate",
+      "",
+    ].join("\n");
+    const { folder } = makeTask("apply-recon-duplicate-ids", { latched: true, plan });
+    const ids = listPlanItemIdsV1(plan).map((entry) => entry.itemId);
+    assert.equal(ids.length, 2);
+    assert.notEqual(ids[0], ids[1], "same wording, different issued ids");
+    // A newer review now verifies only the SECOND item; the card being confirmed offered only the first.
+    nodeFs.writeFileSync(
+      nodePath.join(folder, "impl-high-review.md"),
+      `<!-- verified-complete:start -->\n- [item:${ids[1]}] Wire the completeness gate\n<!-- verified-complete:end -->\n`,
+      "utf8"
+    );
+    const workspace = installWorkspaceFolders();
+    const fs = installRealFs();
+    try {
+      const result = await applyReconciliationReviewVerifiedTicksV1(
+        vscode.Uri.file(folder),
+        ["Wire the completeness gate"],
+        [ids[0]!]
+      );
+      assert.equal(result.kind, "noCandidates");
+      assert.deepEqual(result.skipped, [
+        { item: "Wire the completeness gate", itemId: ids[0], reason: "notOpenOrVerified" },
+      ]);
+      assert.equal(
+        nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8"),
+        plan,
+        "neither identical item is ticked by an answer for the other"
+      );
+      assert.match(describeSkippedOfferedItemsLineV1(result.skipped), new RegExp(`\\[item:${ids[0]}\\]`));
+      // The card that did offer the second item applies exactly that one.
+      const applied = await applyReconciliationReviewVerifiedTicksV1(
+        vscode.Uri.file(folder),
+        ["Wire the completeness gate"],
+        [ids[1]!]
+      );
+      assert.deepEqual(applied, { kind: "applied", count: 1 });
+      const after = nodeFs.readFileSync(nodePath.join(folder, "plan-final.md"), "utf8");
+      assert.equal(after.match(/- \[x\] Wire the completeness gate/g)?.length, 1);
+      assert.equal(after.match(/- \[ \] Wire the completeness gate/g)?.length, 1);
     } finally {
       fs.restore();
       workspace.restore();

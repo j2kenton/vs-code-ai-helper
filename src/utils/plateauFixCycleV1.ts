@@ -40,6 +40,11 @@ function isRealFixRound(row: RoundLedgerEntryV1): boolean {
   return (files !== undefined && files.length > 0) || row.outcome?.filesChangedUnknown === true;
 }
 
+/** How many real fix rounds (Implementation, Apply Review, continuation) the ledger records for the task. */
+export function countRealFixRoundsV1(ledger: readonly RoundLedgerEntryV1[] | undefined): number {
+  return (ledger ?? []).filter(isRealFixRound).length;
+}
+
 function fixRoundBetween(
   fixRows: readonly RoundLedgerEntryV1[],
   afterIso: string,

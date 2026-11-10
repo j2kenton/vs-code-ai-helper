@@ -107,6 +107,47 @@ export function declaresNoChecklistChangeV1(response: string): boolean {
   );
 }
 
+/** Done claims a report made under its own no-checklist-change marker that left their items open (review2 Step 11). */
+export interface DroppedDoneClaimsV1 {
+  /** Each claimed item that is still open after the round's merge, as the plan words it. */
+  readonly itemTexts: readonly string[];
+}
+
+/**
+ * review2 Step 11 (bugs6 item 25): a report that declares `<!-- ensemble:no-checklist-change -->` and also claims
+ * items done contradicts itself. Which of its claims did the round's merge leave unused: the claimed items that are
+ * still open in `planAfterMerge`? `[]` when the report does not declare the marker. A claim that did tick its item is
+ * not listed: it was used, and the report's note that it applied the claims already covers it.
+ */
+export function listDroppedDoneClaimsUnderNoChangeMarkerV1(
+  summary: string,
+  planBeforeMerge: string,
+  planAfterMerge: string
+): DroppedDoneClaimsV1 {
+  const own = splitSummaryAtEchoV1(summary, planBeforeMerge).own;
+  if (!declaresNoChecklistChangeV1(own)) return { itemTexts: [] };
+  const claims = collectRetroactiveTickClaimsV1(own, collectChecklistItemKeysV1(planBeforeMerge));
+  const open = new Map<string, string>();
+  for (const item of itemsInLatestRendering(planAfterMerge)) {
+    if (!item.checked && !item.excluded) open.set(normalizeChecklistItemTextV1(item.text), unescapeChecklistItemTextV1(item.text));
+  }
+  const dropped: string[] = [];
+  for (const claim of claims) {
+    const planText = open.get(normalizeChecklistItemTextV1(claim.itemText));
+    if (planText !== undefined && !dropped.includes(planText)) dropped.push(planText);
+  }
+  return { itemTexts: dropped };
+}
+
+/** The sentence that names the contradiction, for the run log, the notification and the card. */
+export function describeNoChangeMarkerContradictionV1(dropped: DroppedDoneClaimsV1): string {
+  const n = dropped.itemTexts.length;
+  return (
+    `The round's report contradicted itself: it declared no checklist change, but it also claimed ${n} item${n === 1 ? "" : "s"} ` +
+    `done. ${n === 1 ? "That claim was" : "Those claims were"} not used, so ${n === 1 ? "the item is" : "the items are"} still open.`
+  );
+}
+
 /**
  * One blocker an implementer round declined to act on, recorded under its own
  * `## Remaining Blockers` section — RC2 item 7's contract (rule 7 of
@@ -482,6 +523,28 @@ export function stripPlanItemAnnotationsV1(text: string): string {
     .replace(/\s+— (?:Checked|Excluded by you): [\s\S]*$/, "")
     .replace(/\s+— Owner decision \d{4}-\d{2}-\d{2}: [\s\S]*$/, "")
     .replace(/\s+— narrowed \(reviewer-verified\): [\s\S]*$/, "");
+}
+
+/**
+ * review2 Step 4: the one way an item's text becomes the text a stored row (evidence, owner decision, test run)
+ * records and keys on: Ensemble's own annotations are removed (a card's `— Checked: …` display note, a settle
+ * note, an exclusion marker), so display text never reaches progress or plan writes.
+ */
+export function cleanPlanItemTextV1(text: string): string {
+  return stripPlanItemAnnotationsV1(text).trim();
+}
+
+/**
+ * review2 Step 3: the hash entry of the item `itemId` names in `planText`'s latest rendering, or `undefined` when
+ * the plan holds no item with that issued id. The id list and the hash list walk the same rendering, so an index
+ * names the same item in both.
+ */
+export function findPlanItemHashEntryByIdV1(planText: string, itemId: string): PlanItemHashEntryV1 | undefined {
+  const ids = listPlanItemIdsV1(planText);
+  const hashes = listPlanItemContentHashesV1(planText);
+  if (ids.length !== hashes.length) return undefined;
+  const index = ids.findIndex((entry) => entry.itemId === itemId);
+  return index === -1 ? undefined : hashes[index];
 }
 
 /**
@@ -1746,6 +1809,16 @@ export type ApplyOpenPlanItemsFormResultV1 =
        * plan line is not rewritten; the caller records the owner's tick so the gate settles the item.
        */
       readonly confirmedTicked: readonly string[];
+      /**
+       * review2 Step 3: every item the owner settled in this submission (a written tick, a confirmed existing tick,
+       * an exclusion) with its issued id and its own clean text — never the text the plan line carries after the
+       * `— Checked: …` / `— Excluded by you: …` note was appended. The owner decisions are keyed from this.
+       */
+      readonly decided: readonly {
+        readonly itemId: string;
+        readonly itemText: string;
+        readonly decision: "tick" | "exclude";
+      }[];
       readonly skipped: readonly OpenPlanItemsFormSkippedV1[];
     }
   | {
@@ -1806,6 +1879,7 @@ export function applyOpenPlanItemsFormV1(
   const excludedWritten: string[] = [];
   const excludedItems: AcceptedNonGoalItemV1[] = [];
   const confirmedTicked: string[] = [];
+  const decided: { itemId: string; itemText: string; decision: "tick" | "exclude" }[] = [];
   const skipped: OpenPlanItemsFormSkippedV1[] = [];
   for (const answer of answers) {
     if (answer.choice === "leave") {
@@ -1823,6 +1897,7 @@ export function applyOpenPlanItemsFormV1(
     if (current.ticked && answer.choice === "tick" && confirmableIds.has(answer.itemId)) {
       // Ticked already but not settled by a review: the owner's "tick" confirms it without touching the line.
       confirmedTicked.push(current.itemText);
+      decided.push({ itemId: answer.itemId, itemText: cleanPlanItemTextV1(current.itemText), decision: "tick" });
       continue;
     }
     if (current.settled) {
@@ -1854,6 +1929,7 @@ export function applyOpenPlanItemsFormV1(
       continue;
     }
     content = next;
+    decided.push({ itemId: answer.itemId, itemText: cleanPlanItemTextV1(settledItemText), decision: mode });
     if (mode === "tick") {
       ticked.push(settledItemText);
       tickedWritten.push(writtenItemText ?? settledItemText);
@@ -1873,6 +1949,7 @@ export function applyOpenPlanItemsFormV1(
     tickedWritten,
     excludedWritten,
     confirmedTicked,
+    decided,
     skipped,
   };
 }
@@ -2794,6 +2871,17 @@ export function countOpenOwnerHandOffsV1(planOfRecord: string): number {
 }
 
 /**
+ * review2 Step 44: true when the plan has open work and every open top-level item waits on test evidence (an item
+ * that requires tests). Owner hand-offs are excluded items, so they are not counted as open work here. No round can
+ * build any of these items by editing; a zero-change round over them has nothing to do, and a clean review does not
+ * mean the checklist is under-recorded.
+ */
+export function openItemsAllWaitOnTestEvidenceV1(planOfRecord: string): boolean {
+  const open = itemsInLatestRendering(planOfRecord).filter((item) => !item.nested && !item.checked && !item.excluded);
+  return open.length > 0 && open.every((item) => isTestDependentChecklistItemV1(item.text));
+}
+
+/**
  * bugs4 item 30: true when an indented, non-checkbox line under a checklist
  * item carries the exclusion marker for that item: the marker alone on its own
  * line (optionally as a bullet, or wrapped in backticks), or following text on
@@ -3255,6 +3343,57 @@ export interface OwnerDecisionRowV1 {
   readonly itemOccurrence?: number;
   /** review1 (review fix): the nesting level the decision was recorded for. */
   readonly itemNested?: boolean;
+  /** review2 Step 3: the issued id of the item the owner decided (absent on a row written before ids were stored). */
+  readonly itemId?: string;
+  /** The item's text as the row recorded it; read only to resolve a row that has no id. */
+  readonly itemText?: string;
+}
+
+/**
+ * review2 Steps 5 and 8: how stored owner decisions apply to a plan.
+ *
+ * - A row with an issued id (`byId`) applies to the item that id names, whatever else in the plan changed since.
+ * - A row without an id but with a content hash and copy number (`byContent`) applies to that copy, as before.
+ * - A legacy row with neither is read by its wording after annotation stripping, and only when exactly one item of
+ *   the plan carries that wording. A row that names several items is `unresolved`: it settles none of them and is
+ *   reported, because an owner's tick must never land on a same-worded item the owner did not mean.
+ * - A row that names nothing in the plan is dropped without a report: its item is gone.
+ */
+export function resolveOwnerDecisionRowsV1<R extends OwnerDecisionRowV1>(
+  planOfRecord: string,
+  rows: readonly R[]
+): { readonly byId: readonly R[]; readonly byContent: readonly R[]; readonly unresolved: readonly R[] } {
+  const entries = listPlanItemContentHashesV1(planOfRecord);
+  const byId: R[] = [];
+  const byContent: R[] = [];
+  const unresolved: R[] = [];
+  for (const row of rows) {
+    if (row.itemId !== undefined) {
+      byId.push(row);
+      continue;
+    }
+    if (row.itemContentHash !== undefined && row.itemOccurrence !== undefined) {
+      byContent.push(row);
+      continue;
+    }
+    const wanted = normalizeChecklistItemTextV1(cleanPlanItemTextV1(row.itemText ?? row.itemKey));
+    const matching = entries.filter(
+      (entry) =>
+        (row.itemContentHash !== undefined ? entry.hash === row.itemContentHash : entry.annotationFreeKey === wanted) &&
+        rowLevelAppliesV1(row.itemNested, entry)
+    );
+    if (matching.length === 1) byContent.push(row);
+    else if (matching.length > 1) unresolved.push(row);
+  }
+  return { byId, byContent, unresolved };
+}
+
+/** The owner rows (any decision) that name several same-worded items and so settle none (review2 Step 5). */
+export function listUnresolvedLegacyOwnerDecisionsV1<R extends OwnerDecisionRowV1>(
+  planOfRecord: string,
+  rows: readonly R[]
+): readonly R[] {
+  return resolveOwnerDecisionRowsV1(planOfRecord, rows).unresolved;
 }
 
 /**
@@ -3284,10 +3423,24 @@ function settlementByItemV1(
 }[] {
   const entries = listPlanItemContentHashesV1(planOfRecord);
   const evidenceFor = indexPlanItemRowsV1(itemEvidence);
-  const ownerFor = indexPlanItemRowsV1(ownerDecisions.filter((row) => row.decision === "tick"));
+  // review2 Steps 5 and 8: a row with an issued id applies to the item that id names (across plan revisions); a
+  // legacy row applies only when it names exactly one item.
+  const ownerRows = resolveOwnerDecisionRowsV1(
+    planOfRecord,
+    ownerDecisions.filter((row) => row.decision === "tick")
+  );
+  const ownerFor = indexPlanItemRowsV1(ownerRows.byContent);
+  const entryIds = listPlanItemIdsV1(planOfRecord);
+  const idOfEntry = (entry: PlanItemHashEntryV1): string | undefined =>
+    entryIds.length === entries.length ? entryIds[entries.indexOf(entry)]?.itemId : undefined;
+  const ownerIds = new Set(ownerRows.byId.map((row) => row.itemId));
   const verifiedOf = (entry: PlanItemHashEntryV1): boolean =>
     evidenceFor(entry).some((row) => (row.verifications?.length ?? 0) > 0);
-  const ownerOf = (entry: PlanItemHashEntryV1): boolean => ownerFor(entry).length > 0;
+  const ownerOf = (entry: PlanItemHashEntryV1): boolean => {
+    if (ownerFor(entry).length > 0) return true;
+    const id = idOfEntry(entry);
+    return id !== undefined && ownerIds.has(id);
+  };
   const result: ReturnType<typeof settlementByItemV1> = [];
   for (let i = 0; i < entries.length; i++) {
     const entry = entries[i]!;
@@ -3757,6 +3910,76 @@ export function collectChecklistItemKeysV1(content: string): ReadonlySet<string>
   );
 }
 
+/**
+ * review2 Step 6: the key an item is compared under when asking whether a round changed the item SET. Ensemble's own
+ * notes (`— Checked: …`, `— Excluded by you: …`) and markers are not part of what the item says, so an owner's tick
+ * or exclusion made while the round ran never reads as a dropped and an added item.
+ */
+function itemSetKeyV1(text: string): string {
+  return normalizeChecklistItemTextV1(stripPlanItemAnnotationsV1(text));
+}
+
+const STEP_LABEL_RE = /^\s*(?:\*\*)?Step\s+(\d+)(?:\*\*)?\s*[:.—–-]?\s*/i;
+
+/**
+ * review2 Step 7: did a change to the item set move step numbers? True when some dropped item and some added item
+ * carry the same wording after their `Step N` label is removed, under different numbers. Only then is the change a
+ * renumbering; any other add-plus-drop is a rewording or a replacement and must be called that.
+ */
+export function hasStepNumbersChangedV1(removedItems: readonly string[], addedItems: readonly string[]): boolean {
+  const split = (text: string): { readonly step: string; readonly rest: string } | undefined => {
+    const match = STEP_LABEL_RE.exec(text);
+    return match ? { step: match[1]!, rest: itemSetKeyV1(text.slice(match[0].length)) } : undefined;
+  };
+  const added = addedItems.map(split).filter((entry): entry is { step: string; rest: string } => entry !== undefined);
+  return removedItems
+    .map(split)
+    .some((gone) => gone !== undefined && added.some((entry) => entry.rest === gone.rest && entry.step !== gone.step));
+}
+
+/**
+ * review2 Step 6: `restoredText` (the plan as it read at round start) with the line of each owner-settled item taken
+ * from `currentText`, so putting the item set back never reverts what the owner ticked, excluded or noted while the
+ * round ran. Items are paired by issued id (a settled item keeps the id it had while open). Returns `restoredText`
+ * unchanged when the two renderings cannot be paired line by line.
+ */
+export function carryOwnerSettledLinesV1(
+  restoredText: string,
+  currentText: string,
+  ownerItemIds: ReadonlySet<string>
+): string {
+  if (ownerItemIds.size === 0) return restoredText;
+  const itemLines = (text: string): { readonly region: ReturnType<typeof walkLinesV1>; readonly indexes: number[]; readonly prefix: string } => {
+    const scoped = scopeToLatestChecklistV1(text);
+    const region = walkLinesV1(scoped.region);
+    const indexes: number[] = [];
+    region.forEach((line, index) => {
+      if (!line.fenced && ANY_ITEM_LINE.test(line.text)) indexes.push(index);
+    });
+    return { region, indexes, prefix: scoped.prefix };
+  };
+  const current = itemLines(currentText);
+  const restored = itemLines(restoredText);
+  const currentIds = listPlanItemIdsV1(currentText);
+  const restoredIds = listPlanItemIdsV1(restoredText);
+  // The id lists cover the same items as the item lines (a summary boundary can cut the list short, never extend it).
+  if (currentIds.length > current.indexes.length || restoredIds.length > restored.indexes.length) return restoredText;
+  const replacements = new Map<string, string>();
+  currentIds.forEach((entry, k) => {
+    if (ownerItemIds.has(entry.itemId)) replacements.set(entry.itemId, current.region[current.indexes[k]!]!.raw);
+  });
+  if (replacements.size === 0) return restoredText;
+  const out = restored.region.map((line) => line.raw);
+  restoredIds.forEach((entry, k) => {
+    const raw = replacements.get(entry.itemId);
+    if (raw === undefined) return;
+    const at = restored.indexes[k]!;
+    // Keep the restored line's own ending so a last line without one never joins the next.
+    out[at] = raw.replace(/\r?\n$/, "") + (/\r?\n$/.exec(out[at]!)?.[0] ?? "");
+  });
+  return restored.prefix + out.join("");
+}
+
 /** Result of {@link detectChecklistItemSetMutationV1}: the item texts a round
  * added and/or dropped, exactly as they read in each side's own rendering. */
 export interface ChecklistItemSetMutationV1 {
@@ -3823,13 +4046,13 @@ export function detectChecklistItemSetMutationV1(
   const afterAll = itemsInLatestRendering(afterContent);
   const beforeItems = beforeAll.filter((item) => !item.nested);
   const afterItems = afterAll.filter((item) => !item.nested);
-  const beforeKeys = new Set(beforeItems.map((item) => normalizeChecklistItemTextV1(item.text)));
-  const afterKeys = new Set(afterItems.map((item) => normalizeChecklistItemTextV1(item.text)));
+  const beforeKeys = new Set(beforeItems.map((item) => itemSetKeyV1(item.text)));
+  const afterKeys = new Set(afterItems.map((item) => itemSetKeyV1(item.text)));
 
   const addedItems: string[] = [];
   const seenAdded = new Set<string>();
   for (const item of afterItems) {
-    const key = normalizeChecklistItemTextV1(item.text);
+    const key = itemSetKeyV1(item.text);
     if (!beforeKeys.has(key) && !seenAdded.has(key)) {
       seenAdded.add(key);
       addedItems.push(item.text);
@@ -3838,7 +4061,7 @@ export function detectChecklistItemSetMutationV1(
   const removedItems: string[] = [];
   const seenRemoved = new Set<string>();
   for (const item of beforeItems) {
-    const key = normalizeChecklistItemTextV1(item.text);
+    const key = itemSetKeyV1(item.text);
     if (!afterKeys.has(key) && !seenRemoved.has(key)) {
       seenRemoved.add(key);
       removedItems.push(item.text);
@@ -3855,7 +4078,7 @@ export function detectChecklistItemSetMutationV1(
     let currentParentKey: string | undefined;
     for (const item of items) {
       if (!item.nested) {
-        currentParentKey = normalizeChecklistItemTextV1(item.text);
+        currentParentKey = itemSetKeyV1(item.text);
       } else if (currentParentKey !== undefined) {
         pairs.push({
           parentKey: currentParentKey,
@@ -3869,7 +4092,7 @@ export function detectChecklistItemSetMutationV1(
   };
   const afterChildKeysByParent = new Map<string, Set<string>>();
   for (const pair of pairWithParent(afterAll)) {
-    const key = normalizeChecklistItemTextV1(pair.text);
+    const key = itemSetKeyV1(pair.text);
     const set = afterChildKeysByParent.get(pair.parentKey) ?? new Set<string>();
     set.add(key);
     afterChildKeysByParent.set(pair.parentKey, set);
@@ -3879,7 +4102,7 @@ export function detectChecklistItemSetMutationV1(
     if (!afterKeys.has(pair.parentKey)) {
       continue; // Parent itself was dropped — already caught above.
     }
-    const key = normalizeChecklistItemTextV1(pair.text);
+    const key = itemSetKeyV1(pair.text);
     const stillPresent = afterChildKeysByParent.get(pair.parentKey)?.has(key) ?? false;
     if (!stillPresent && !seenRemovedNested.has(key)) {
       seenRemovedNested.add(key);
@@ -4267,7 +4490,20 @@ export function diagnoseApplicablePassingTestReportForItemV1(
   for (let i = checklistHeading.line + 1; i < checklistEnd; i++) {
     const line = lines[i];
     if (!line || line.fenced) continue;
-    const parsed = parsePlanItemChecklistLine(line.text, planItemKeys);
+    // review2: a report line that names its item by `[item:<id>]` (the form the ordered open-items list asks for)
+    // counts for the item that id issues, never for another item and never by the line's own wording.
+    const idPrefix = /^([ \t]*[-*][ \t]+)\[?item:([0-9a-f]{16})\]?/i.exec(line.text);
+    let lineText = line.text;
+    let idItemText: string | undefined;
+    if (idPrefix) {
+      const issued = listPlanItemIdsV1(planOfRecord).find((entry) => entry.itemId === idPrefix[2]!.toLowerCase());
+      if (!issued || normalizeChecklistItemTextV1(issued.itemText) !== wanted) continue;
+      idItemText = issued.itemText;
+      const rest = line.text.slice(idPrefix[0].length).trim();
+      lineText = rest.startsWith("—") ? `${idPrefix[1]}${issued.itemText} ${rest}` : `${idPrefix[1]}${rest}`;
+    }
+    const parsedLine = parsePlanItemChecklistLine(lineText, planItemKeys);
+    const parsed = parsedLine && idItemText !== undefined ? { ...parsedLine, itemText: idItemText } : parsedLine;
     if (parsed && parsed.status.toLowerCase().startsWith("done") &&
         normalizeChecklistItemTextV1(parsed.itemText) === wanted) {
       // review1 Step 14: the test files an entry lists in bullets nested under it ("— done — these tests exist and pass

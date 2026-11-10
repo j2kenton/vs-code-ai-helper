@@ -195,14 +195,17 @@ void describe("a verification stays valid while its item is unchanged (bugs6 ite
     assert.equal(describeSettlementDropForTooltipV1({ at: "t", items: [] }), undefined);
   });
 
-  void it("pruning drops only the rows of items that changed or are gone", () => {
+  void it("pruning keeps the rows of items that changed or are gone, ignored while they do not apply (review2 Step 8)", () => {
     const original = chat1Plan();
     let progress = { planItemEvidence: verifiedEvidence(original, true) } as unknown as TaskProgress;
     const noteOnly = prunePlanItemEvidenceForPlanV1(progress, chat1Plan(OWNER_NOTE));
     assert.equal(noteOnly.planItemEvidence?.length, 30);
     const reworded = rewordChecklistItemV1(original, "Step 5: built part 5", "Step 5: another", "").content;
     progress = prunePlanItemEvidenceForPlanV1(progress, reworded);
-    assert.equal(progress.planItemEvidence?.length, 29);
+    assert.equal(progress.planItemEvidence?.length, 30, "the reworded item's row is kept");
+    const entries = listPlanItemContentHashesV1(reworded);
+    const applying = (progress.planItemEvidence ?? []).filter((row) => entries.some((entry) => planItemRowAppliesV1(row, entry)));
+    assert.equal(applying.length, 29, "but it no longer applies to the reworded item");
   });
 
   void it("new rows carry the item's content hash and ignore the plan revision when re-recorded", () => {

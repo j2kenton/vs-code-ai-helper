@@ -10,8 +10,10 @@ import { getCanonicalImplementationUri } from "../utils/implementationArtifactRe
 import { readTextIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import {
   classifyUncheckedChecklistItemsV1,
+  cleanPlanItemTextV1,
   getPlanRevisionV1,
   listPlanItemContentHashesV1,
+  listPlanItemIdsV1,
   listProvisionalTickedItemsV1,
   normalizeChecklistItemTextV1,
   settleChecklistItemV1,
@@ -76,12 +78,22 @@ async function recordOwnerSettlementV1(
   taskFolderPath: string,
   plan: string,
   itemText: string,
-  decision: "tick" | "exclude"
+  decision: "tick" | "exclude",
+  /** review2 Step 3: the issued id of the item settled, so the row is keyed to the item and not to its wording. */
+  itemId?: string
 ): Promise<void> {
   const at = new Date().toISOString();
   const planRevision = getPlanRevisionV1(plan);
   await patchTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), (progress) =>
-    recordPlanItemOwnerDecisionV1(progress, { planRevision, planText: plan, itemText, at, formId: `settle:${at}`, decision })
+    recordPlanItemOwnerDecisionV1(progress, {
+      planRevision,
+      planText: plan,
+      itemText,
+      at,
+      formId: `settle:${at}`,
+      decision,
+      ...(itemId !== undefined ? { itemId } : {}),
+    })
   ).catch(() => undefined);
   // review1 Step 8: the owner's settlement changed the count, so the stored snapshot (and any "sent back" note on
   // the Tasks tooltip) follows it.
@@ -112,7 +124,10 @@ export async function applyOwnerTickToProvisionalItemV1(
   if (!provisional.some((item) => normalizeChecklistItemTextV1(item.text) === key)) {
     return { kind: "alreadySettled", itemText: entry.text };
   }
-  await recordOwnerSettlementV1(taskFolderPath, plan, entry.text, "tick");
+  const ids = listPlanItemIdsV1(plan);
+  const hashEntries = listPlanItemContentHashesV1(plan);
+  const settledId = ids.length === hashEntries.length ? ids[hashEntries.indexOf(entry)]?.itemId : undefined;
+  await recordOwnerSettlementV1(taskFolderPath, plan, entry.text, "tick", settledId);
   // review1 Step 31: if that was the last open item and the review is clean, say so at once.
   void postStageReadyCardIfReadyV1(taskFolderPath, "After your tick");
   return { kind: "ownerTickRecorded", itemText: entry.text };
@@ -140,11 +155,20 @@ export async function applySettleChecklistItemV1(
     // Not an unticked item: a ticked item still awaiting a check is settled by the owner's tick.
     return mode === "tick" ? applyOwnerTickToProvisionalItemV1(taskFolderPath, itemText) : { kind: "notFound" };
   }
+  // The id of the copy just settled (the first open top-level item with this text), read before the write.
+  const settledKey = normalizeChecklistItemTextV1(cleanPlanItemTextV1(settledItemText));
+  const settledId = listPlanItemIdsV1(plan).find(
+    (candidate) =>
+      !candidate.nested &&
+      !candidate.checked &&
+      !candidate.excluded &&
+      normalizeChecklistItemTextV1(cleanPlanItemTextV1(candidate.itemText)) === settledKey
+  )?.itemId;
   if (!(await writeTextFileIfUnchangedV1(planUri, plan, content))) {
     return { kind: "changedUnderneath" };
   }
-  // The text as written now carries the settle note; the owner row is keyed to the item's content, not the note.
-  await recordOwnerSettlementV1(taskFolderPath, content, settledItemText, mode);
+  // The text as written now carries the settle note; the owner row is keyed to the item's id, not the note.
+  await recordOwnerSettlementV1(taskFolderPath, content, settledItemText, mode, settledId);
   void postStageReadyCardIfReadyV1(taskFolderPath, mode === "tick" ? "After your tick" : "After your exclusion");
   return { kind: "settled", itemText: settledItemText };
 }

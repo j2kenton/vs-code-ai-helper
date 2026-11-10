@@ -184,6 +184,8 @@
     { "file": "src/commands/chooseAutomationLevelV1.ts", "snippet": "Ensemble could not change the automation level, so it left every setting as it was", "reason": "reports a failed workspace-wide automation-level change that was rolled back; it is not about any one task" },
     { "file": "src/commands/applyReviewerVerifiedTicks.ts", "snippet": "The task could not be found. Refresh the Tasks panel and try again.", "reason": "fires from `if (!resolved)` before any task is identified — there is no task to name" },
     { "file": "src/extension.ts", "snippet": "NotificationRouter.showWarning(summary)", "reason": "the text comes from recoverActivationCheckpoint, which already names the task folder it recovered or rolled back (e.g. `Recovered an interrupted task activation for \"<folder>\"`); the scanner cannot see inside the `summary` variable" },
+    { "file": "src/commands/chatWithStage.ts", "snippet": "The answer could not be matched to a task, so nothing was recorded.", "reason": "fires when the answer carries no task folder, before any task is identified — there is no task to name" },
+    { "file": "src/commands/widenReviewScopeCurrentTaskV1.ts", "snippet": "No active task found. Create or resume a task first.", "reason": "fires from `if (!resolved)` before any task is identified — there is no task to name" },
     { "file": "src/extension.ts", "snippet": "NotificationRouter.showWarning(STATE_LOCK_GIVE_UP_CHAT_TEXT_V1)", "reason": "fallback when the activation-time recovery gave up on the state lock and no chat card could be posted; it is about the whole workspace's task state, not one task" }
   ]
 }

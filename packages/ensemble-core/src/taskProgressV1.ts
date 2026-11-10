@@ -313,6 +313,22 @@ export interface TaskProgress {
   notedForeignEdits?: string[];
   /** Mirror of `src/types/taskProgress.ts` (run1 Step 31): when the OWNER paused the task (ISO time). */
   ownerPausedAt?: string;
+  /** Mirror of `src/types/taskProgress.ts` (review2 Step 17): the per-file review coverage record. */
+  reviewCoverage?: ReviewCoverageV1;
+}
+
+/** Mirror of `src/types/taskProgress.ts`: the content hash one review read a file at (review2 Step 17). */
+export interface ReviewCoverageEntryV1 {
+  hash: string;
+  runId: string;
+  stage: TaskStage;
+}
+
+/** Mirror of `src/types/taskProgress.ts`: the per-task review coverage record (review2 Step 17). */
+export interface ReviewCoverageV1 {
+  files: Record<string, ReviewCoverageEntryV1>;
+  changedFiles: string[];
+  updatedAt: string;
 }
 
 /** One artifact deliberately accepted as absent by a human completion override. */

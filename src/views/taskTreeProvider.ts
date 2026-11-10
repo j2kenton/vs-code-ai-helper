@@ -4,6 +4,7 @@ import * as fs from "fs";
 import {
   DEFAULT_HIDDEN_STATUSES,
   ImplRecoveryV1,
+  IMPL_REVIEW_STAGES,
   IMPLEMENTATION_FILENAME,
   isReviewStage,
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
@@ -14,6 +15,8 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
+import { readReviewCoverageSummaryForTreeV1 } from "../utils/reviewCoverageIoV1";
+import { appendReviewedLineV1, describeReviewedLineV1 } from "../utils/reviewCoverageV1";
 import { taskOperations, taskKey, hasActiveOperationTargetingStage } from "../utils/taskOperations";
 import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
@@ -850,7 +853,9 @@ export class StageNode extends vscode.TreeItem {
      * comment.
      */
     offerRunImplementationForUnusableSummary: boolean = false,
-    modelAttribution?: { readonly modelId: string; readonly providerLabel?: string; readonly providerId?: string; readonly fallbackReason?: string }
+    modelAttribution?: { readonly modelId: string; readonly providerLabel?: string; readonly providerId?: string; readonly fallbackReason?: string },
+    /** review2 Step 18: "Reviewed: N of M changed files" for the implementation review stages and Publish, or undefined. */
+    reviewedLine?: string
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -1115,6 +1120,10 @@ export class StageNode extends vscode.TreeItem {
     // to ignore the mark everywhere else. Nothing actionable is lost: the
     // inline "Review Pending Decision" BUTTON is not gated at all, so a
     // stranded decision on a finished task is still reachable and answerable.
+    // review2 Step 18: how much of the change a review has read, after the score and before any "needs your decision".
+    if (reviewedLine !== undefined) {
+      this.description = appendReviewedLineV1(this.description, reviewedLine);
+    }
     const taskStatusShowsDecisions = !isTaskStatusHiddenFromDecisionsV1(task.progress.status);
     if (pendingDecisionCount > 0 && !isRunning && taskStatusShowsDecisions) {
       this.iconPath = new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"));
@@ -1283,6 +1292,9 @@ export class StageNode extends vscode.TreeItem {
         "\n\nRuns Publish Checks, then the Publish review. \"Fix Linting & Code Errors\" (the wand) fixes what the " +
         "last Publish Checks reported, and does nothing if they passed or have not run. The separate Run Publish " +
         "Checks and Review with AI actions are in this row's right-click menu.";
+    }
+    if (reviewedLine !== undefined) {
+      tooltipStr += `\n\n${reviewedLine}. A file counts once a review read it in full at its current content.`;
     }
     this.tooltip = new vscode.MarkdownString(tooltipStr, true);
 
@@ -2367,6 +2379,17 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         ? { ...modelAttribution, ...(fallbackReason ? { fallbackReason } : {}) }
         : undefined;
 
+      // review2 Step 18: "Reviewed: N of M changed files" on the implementation review rows and Publish.
+      let reviewedLine: string | undefined;
+      if ((IMPL_REVIEW_STAGES.includes(stage) || stage === "publish") && status !== "outstanding") {
+        const coverageRoot = vscode.workspace.getWorkspaceFolder(task.folderUri)?.uri.fsPath;
+        const coverageSummary =
+          coverageRoot === undefined
+            ? undefined
+            : await readReviewCoverageSummaryForTreeV1(coverageRoot, task.progress).catch(() => undefined);
+        reviewedLine = coverageSummary === undefined ? undefined : describeReviewedLineV1(coverageSummary);
+      }
+
       nodes.push(
         new StageNode(
           task,
@@ -2387,7 +2410,8 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
             unresolvedInteractions
           ),
           offerRunImplementationOnThisStageRow,
-          completedModelAttribution
+          completedModelAttribution,
+          reviewedLine
         )
       );
     }

@@ -512,6 +512,11 @@
         "category": "Ensemble"
       },
       {
+        "command": "vs-code-ai-helper.widenReviewScopeToAllChanged",
+        "title": "Widen Review Scope to All Changed Files",
+        "category": "Ensemble"
+      },
+      {
         "command": "vs-code-ai-helper.fastForwardCurrentTaskReview",
         "title": "Fast Forward Current Task Review [Ctrl+Shift+Alt+F]",
         "category": "Ensemble"

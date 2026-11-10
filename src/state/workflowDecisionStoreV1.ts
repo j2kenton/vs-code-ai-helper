@@ -22,6 +22,7 @@ import {
   buildHeldTicksAnswerOptionsV1,
   carryDeferredAnswerOverV1,
   computeDeferredAnswerCarryOverV1,
+  offeredTickItemIdsOfV1,
   offeredTickItemsOfV1,
   type DeferredAnswerCarryOverV1,
 } from "../commands/verifiedTicksHeldOptionsV1";
@@ -350,7 +351,12 @@ export class WorkflowDecisionStoreV1 {
       const keptAnswer = existing[keepIndex]!.deferredAnswer;
       const carryOver =
         keptAnswer !== undefined && keptAnswer.kind === "applyAndDispatch"
-          ? computeDeferredAnswerCarryOverV1(keptAnswer.itemKeys, offeredTickItemsOfV1(created.decision))
+          ? computeDeferredAnswerCarryOverV1(
+              keptAnswer.itemKeys,
+              keptAnswer.itemIds,
+              offeredTickItemsOfV1(created.decision),
+              offeredTickItemIdsOfV1(created.decision)
+            )
           : undefined;
       const carriedAnswer =
         keptAnswer !== undefined && carryOver !== undefined

@@ -462,6 +462,31 @@ export function buildChangedRegionsStanzaV1(
   );
 }
 
+/** Most changed-region ranges an overflow stanza lists before it says "and N more". */
+const OVERFLOW_STANZA_MAX_RANGES_V1 = 8;
+
+/**
+ * review2 Step 21: the entry for a file the pack's TOTAL size limit left out, for a reviewer that can open files. It is a
+ * direction to read the real file natively (never a byte of its content), with the file's changed regions when a git
+ * baseline gave them. Short on purpose: many of these can follow one pack and must not eat the code budget again.
+ */
+export function buildOverflowNativeReadStanzaV1(
+  relPath: string,
+  content: string,
+  changedRanges: ReadonlyArray<LineRange> | undefined
+): string {
+  const byteSize = Buffer.byteLength(content, "utf8");
+  const head = `${relPath} (${byteSize.toLocaleString("en-US")} bytes) did not fit this pack's total size limit, so it is not embedded. Read it natively.`;
+  if (!changedRanges || changedRanges.length === 0) {
+    return head;
+  }
+  const totalLines = content.split("\n").length;
+  const merged = mergeAndExpandLineRangesV1(changedRanges, IMPL_REVIEW_CHANGED_REGION_CONTEXT_LINES, totalLines);
+  const shown = merged.slice(0, OVERFLOW_STANZA_MAX_RANGES_V1).map((r) => `lines ${r.start}-${r.end}`);
+  const more = merged.length - shown.length;
+  return `${head} Changed regions: ${shown.join(", ")}${more > 0 ? `, and ${more} more` : ""}.`;
+}
+
 /** Every way `applyContentCapsWithRegionsV1` can represent a file's content:
  *  - `whole`                    — the file's real, complete text.
  *  - `changed-regions-excerpt`  — a real excerpt: the file's actual text at

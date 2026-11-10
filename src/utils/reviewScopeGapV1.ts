@@ -128,7 +128,9 @@ export function formatMissingFilesSectionV1(gap: ReviewScopeGapV1): string {
   const more = ordered.length - listed.length;
   return (
     "## Changed files not in this review's scope\n\n" +
-    `${describeReviewedCountV1(gap)}. The ${gap.missing.length} files below changed in this task but are not part ` +
+    `${describeReviewedCountV1(gap)}. You were shown ${gap.productionReviewedCount} of ${gap.productionChangedCount} ` +
+    `production files; ${gap.missingProduction.length} are not in this pack. ` +
+    `The ${gap.missing.length} files below changed in this task but are not part ` +
     "of the scope you were given. State in your verdict that the review covers only part of the change, and do " +
     "not treat the absence of findings in them as a pass.\n\n" +
     listed.join("\n") +
@@ -141,7 +143,23 @@ export function formatMissingFilesSectionV1(gap: ReviewScopeGapV1): string {
  * One plain chat line for when the tracked set was used because the round history could not confirm a
  * complete list. `undefined` when nothing is missing.
  */
-export function describeTrackedScopeFallbackLineV1(trackedCount: number, gap: ReviewScopeGapV1): string | undefined {
+export function describeTrackedScopeFallbackLineV1(
+  trackedCount: number,
+  gap: ReviewScopeGapV1,
+  /**
+   * review2 Step 11: `git-baseline` when the list was read from git's diff against the task's baseline commit (plus
+   * untracked files) instead of the last tracked set. That list is the whole change, so the line says so and is
+   * written even when nothing is missing.
+   */
+  options?: { readonly source?: "git-baseline" }
+): string | undefined {
+  if (options?.source === "git-baseline") {
+    return (
+      "Review scope: the round history couldn't confirm a complete list, so the scope is every file changed since the task's " +
+      `baseline commit, plus untracked files (${trackedCount} files).` +
+      (gap.missing.length > 0 ? ` ${gap.missing.length} changed files are still not included.` : "")
+    );
+  }
   if (gap.missing.length === 0) {
     return undefined;
   }

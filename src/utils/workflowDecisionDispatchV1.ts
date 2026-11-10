@@ -667,9 +667,9 @@ function outcomeOfSettledDecisionV1(decision: WorkflowDecisionV1): AwaitedDecisi
 export async function withdrawWorkflowDecisionsByKeyV1(
   target: Pick<ChatTarget, "taskFolderPath" | "canonicalId">,
   decisionKey: string,
-  reason: string,
+  reasonOrFor: string | ((decision: WorkflowDecisionV1) => string),
   /** When given, only pending decisions it accepts are withdrawn (bugs4 item 13: stale open-items card). */
-  shouldWithdraw?: (decision: { readonly whatHappened: string }) => boolean
+  shouldWithdraw?: (decision: WorkflowDecisionV1) => boolean
 ): Promise<void> {
   const context = getExtensionContextV1();
   if (!context) {
@@ -680,6 +680,7 @@ export async function withdrawWorkflowDecisionsByKeyV1(
     .listPending(target.canonicalId)
     .filter((d) => d.decisionKey === decisionKey && (shouldWithdraw === undefined || shouldWithdraw(d)));
   for (const decision of matches) {
+    const reason = typeof reasonOrFor === "string" ? reasonOrFor : reasonOrFor(decision);
     try {
       const result = await store.withdraw(decision.decisionId, reason);
       if (result.kind === "withdrawn") {

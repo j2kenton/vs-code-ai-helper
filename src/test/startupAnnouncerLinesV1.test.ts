@@ -8,6 +8,8 @@ import {
   endedBeforeStartLineV1,
   isLivePublishChecksRunV1,
   startingLineV1,
+  STARTUP_ANNOUNCER_MAX_AGE_MS_V1,
+  startupAnnouncerExpiredV1,
   stillStartingLineV1,
 } from "../utils/startupAnnouncerLinesV1";
 import type { PublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
@@ -57,5 +59,15 @@ void describe("bugs5 Step 18: a live Publish Checks run is started", () => {
       isLivePublishChecksRunV1({ outcome: "interrupted", at: running.at, finishedCommands: [], unknownCommands: [] }, () => true),
       false
     );
+  });
+});
+
+void describe("review2 Step 42: a long-waiting announcer does not name its action for a later click", () => {
+  void it("expires after the maximum age, so a command awaited for hours cannot announce another start", () => {
+    const armed = Date.parse("2026-11-07T16:00:00.000Z");
+    assert.equal(startupAnnouncerExpiredV1(armed, armed + 60_000), false);
+    assert.equal(startupAnnouncerExpiredV1(armed, armed + STARTUP_ANNOUNCER_MAX_AGE_MS_V1), false);
+    // run1 2026-11-07: armed at 16:00, the owner clicked Start Fast Forward at 17:59.
+    assert.equal(startupAnnouncerExpiredV1(armed, Date.parse("2026-11-07T17:59:53.000Z")), true);
   });
 });

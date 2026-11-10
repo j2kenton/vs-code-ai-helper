@@ -532,6 +532,11 @@ export interface OpenPlanItemsFormItemV1 {
    * had settled it. "Tick" on it confirms the existing tick as an owner decision and writes no plan line.
    */
   readonly alreadyTicked?: boolean;
+  /**
+   * review2 Step 6: the round claimed this item done but its report contradicted itself, so the claim was not used.
+   * The item is not owner work: the form words its tick as accepting the round's claim, not "I did it".
+   */
+  readonly roundClaimDropped?: boolean;
 }
 
 export type OpenPlanItemsFormStateV1 = "open" | "applied" | "stale" | "dismissed";
@@ -1006,12 +1011,14 @@ export function decodeOpenPlanItemsFormsV1(raw: unknown): OpenPlanItemsFormV1[] 
         return undefined;
       }
       if (i.alreadyTicked !== undefined && typeof i.alreadyTicked !== "boolean") return undefined;
+      if (i.roundClaimDropped !== undefined && typeof i.roundClaimDropped !== "boolean") return undefined;
       items.push({
         itemId: i.itemId,
         itemText: i.itemText,
         occurrence: i.occurrence,
         reason: i.reason,
         ...(i.alreadyTicked === true ? { alreadyTicked: true } : {}),
+        ...(i.roundClaimDropped === true ? { roundClaimDropped: true } : {}),
       });
     }
     let resume: { attemptNumber: number; maxAttempts: number } | undefined;

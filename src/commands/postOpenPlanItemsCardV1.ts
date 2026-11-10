@@ -8,6 +8,7 @@ import {
   collectPlanItemReasonsV1,
   countOpenNestedChecklistItemsV1,
   indexPlanItemRowsV1,
+  listDroppedDoneClaimsUnderNoChangeMarkerV1,
   listPlanItemContentHashesV1,
   listOpenPlanItemRecordsV1,
   normalizeChecklistItemTextV1,
@@ -15,6 +16,7 @@ import {
 } from "../utils/implementationChecklist";
 import { computePlanItemCountsV1, describeOpenAndHandOffsFromCountsV1 } from "../utils/effectiveReviewProgress";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
+import { pickLatestEditingRunFileV1 } from "../utils/openPlanItemClassificationV1";
 import { detectTestsRefusedV1 } from "../utils/testsRefusedV1";
 import { optionAppliesAtStageV1 } from "../utils/optionAppliesAtStageV1";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
@@ -92,6 +94,21 @@ export async function postOpenPlanItemsCardV1(input: {
   for (const entry of listPlanItemContentHashesV1(planChecklist)) {
     if (claimsFor(entry).some((row) => row.claims.length > 0)) builtClaimedKeys.add(entry.key);
   }
+  // review2 Step 11: items the last round's report claimed done while also declaring no checklist change. They
+  // are open because the report contradicted itself, so the card says that instead of "not reached".
+  const droppedClaimKeys = new Set(
+    listDroppedDoneClaimsUnderNoChangeMarkerV1(input.roundSummary ?? lastEditingSummary ?? "", planChecklist, planChecklist)
+      .itemTexts.map((text) => normalizeChecklistItemTextV1(text))
+  );
+  const droppedClaimRunFile =
+    droppedClaimKeys.size > 0
+      ? pickLatestEditingRunFileV1(
+          (await vscode.workspace.fs.readDirectory(vscode.Uri.joinPath(folderUri, "runs")).then(
+            (entries) => entries.map(([name]) => name),
+            () => [] as string[]
+          ))
+        )
+      : undefined;
   // bugs4 Step 20: did the last editing round report its test commands refused? The newest
   // implementation summary says so; the card then points at the permission or tool setup
   // instead of recommending another round that would be refused the same way.
@@ -114,6 +131,8 @@ export async function postOpenPlanItemsCardV1(input: {
     })),
     reviewVerifiedKeys,
     builtClaimedKeys,
+    droppedClaimKeys,
+    ...(droppedClaimRunFile ? { droppedClaimRunFile } : {}),
     ...(openSummary ? { openSummary } : {}),
     openNestedItems: countOpenNestedChecklistItemsV1(planChecklist),
     createdAt: new Date().toISOString(),

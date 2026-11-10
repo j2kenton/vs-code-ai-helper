@@ -142,6 +142,10 @@ const INVENTORY: readonly InventoryRow[] = [
   // RC4 item 3: the narrowing card's two options (plateau card, `narrowing` present).
   { file: "utils/reviewEscalation.ts", optionId: "acceptNarrowing", occurrence: 0, resumeKind: "continue", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: the entry is appended once and the re-review is dispatched with skipUnchangedTreeGuard" },
   { file: "utils/reviewEscalation.ts", optionId: "keepItemOpen", occurrence: 0, resumeKind: "unpause", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: keepItemOpen dispatches nothing" },
+  // review2 Step 19: "Review the remaining N files" (plateau card, `coverage` with unreviewed files).
+  { file: "utils/reviewEscalation.ts", optionId: "reviewRemaining", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewCoverageV1.test.ts: the plateau card offers and recommends reviewing the remaining files, and the option adds exactly the unreviewed files" },
+  // review2 Step 34: "Settle it with a rule" (plateau card, a blocker whose fixes keep narrowing).
+  { file: "utils/reviewEscalation.ts", optionId: "settleWithRule", occurrence: 0, resumeKind: "continue", dispatchProof: "blockerRuleNarrowingV1.test.ts: the answer is followed by exactly one Apply Review and no re-review" },
   { file: "utils/reviewEscalation.ts", optionId: "moveOn", occurrence: 0, resumeKind: "continue", dispatchProof: "latchedCleanReviewAdvanceV1.test.ts: Move on dispatches resumeAndSetTaskStage to nextStage" },
   { file: "utils/reviewEscalation.ts", optionId: "backToImplementation", occurrence: 0, resumeKind: "continue", dispatchProof: "latchedCleanReviewAdvanceV1.test.ts: Back to Implementation dispatches resumeAndSetTaskStage to impl" },
   { file: "utils/reviewEscalation.ts", optionId: "backToImplementation", occurrence: 1, resumeKind: "continue", dispatchProof: "latchedCleanReviewAdvanceV1.test.ts: Back to Implementation dispatches resumeAndSetTaskStage to impl" },
@@ -384,6 +388,8 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("utils/reviewEscalation.ts", "applyReviewerVerifiedTicks", 0), { kind: "runtime-test", proofFiles: ["breakerCardRecommendationV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "acceptNarrowing", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepItemOpen", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "reviewRemaining", 0), { kind: "runtime-test", proofFiles: ["reviewCoverageV1.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "settleWithRule", 0), { kind: "runtime-test", proofFiles: ["blockerRuleNarrowingV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "moveOn", 0), { kind: "runtime-test", proofFiles: ["latchedCleanReviewAdvanceV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "backToImplementation", 0), { kind: "runtime-test", proofFiles: ["latchedCleanReviewAdvanceV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "backToImplementation", 1), { kind: "runtime-test", proofFiles: ["latchedCleanReviewAdvanceV1.test.ts"] }],

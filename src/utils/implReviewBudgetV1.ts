@@ -108,3 +108,56 @@ export function shrinkImplReviewCodeBudgetV1(
     codeBudgetChars - Math.ceil(overBytes / IMPL_REVIEW_BYTES_PER_CODE_CHAR_V1)
   );
 }
+
+/**
+ * review2 Step 29: the per-pass READ budget. It is separate from the code budget above, which only bounds the bytes
+ * embedded in `context-pack.md`. This one counts what the reviewer has to read for every file of a pass, whether the
+ * pack embeds it or the reviewer reads it natively: the changed regions of a modified file with their context lines,
+ * and the whole of a new file. Defaults come from review1's hand batches (about 52 files read in full), so its
+ * 202-file, ~23,000-line change splits into about four passes.
+ */
+export const IMPL_REVIEW_READ_MAX_LINES_V1 = 6000;
+
+/** The most files one review pass is given, however small they are. */
+export const IMPL_REVIEW_READ_MAX_FILES_V1 = 60;
+
+/** Unified-diff context lines around each changed region (git's default), counted into a modified file's read cost. */
+export const IMPL_REVIEW_READ_CONTEXT_LINES_V1 = 3;
+
+export interface ReviewReadLimitsV1 {
+  readonly maxLines: number;
+  readonly maxFiles: number;
+}
+
+export const DEFAULT_REVIEW_READ_LIMITS_V1: ReviewReadLimitsV1 = {
+  maxLines: IMPL_REVIEW_READ_MAX_LINES_V1,
+  maxFiles: IMPL_REVIEW_READ_MAX_FILES_V1,
+};
+
+/** How one changed file reaches the reviewer. */
+export type ReviewReadKindV1 = "new" | "modified" | "deleted";
+
+export interface ReviewReadMeasureV1 {
+  readonly kind: ReviewReadKindV1;
+  /** Lines in the file now (a new file's whole size). */
+  readonly totalLines: number;
+  /** Added plus removed lines of a modified file. */
+  readonly changedLines?: number;
+  /** Separate changed regions of a modified file. */
+  readonly hunks?: number;
+}
+
+/**
+ * Lines the reviewer must read for one file. A new file costs its whole length. A modified file costs its changed
+ * lines plus the context around each region, never more than the file itself. A deleted file costs one line (its
+ * name and the fact of the removal).
+ */
+export function readCostLinesV1(measure: ReviewReadMeasureV1): number {
+  if (measure.kind === "deleted") return 1;
+  const total = Math.max(0, Math.floor(measure.totalLines));
+  if (measure.kind === "new") return Math.max(1, total);
+  const changed = Math.max(0, Math.floor(measure.changedLines ?? 0));
+  const hunks = Math.max(changed > 0 ? 1 : 0, Math.floor(measure.hunks ?? 0));
+  const withContext = changed + hunks * 2 * IMPL_REVIEW_READ_CONTEXT_LINES_V1;
+  return Math.max(1, total > 0 ? Math.min(total, withContext) : withContext);
+}

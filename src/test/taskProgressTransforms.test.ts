@@ -124,7 +124,7 @@ void test("a truncated tested-source list conservatively invalidates on any late
   assert.deepEqual(updated.planItemEvidence?.[0]?.testReports, []);
 });
 
-void test("a plan change drops only the evidence of items that changed (review1 Step 3)", () => {
+void test("a plan change keeps every evidence row; only a changed item's row stops applying (review1 Step 3, review2 Step 8)", () => {
   const revision = "f".repeat(64);
   const plan = ["- [x] Step 6: Original acceptance", "- [x] Step 7: Untouched item"].join("\n");
   const record = (itemText: string, next: ReturnType<typeof makeProgress>) =>
@@ -137,8 +137,12 @@ void test("a plan change drops only the evidence of items that changed (review1 
   const withOwnerNote = prunePlanItemEvidenceForPlanV1(evidence, `${plan}\n\n## Owner Decisions\n\n- Owner decision 2026-11-03: Approve (owner-decision-1)\n`);
   assert.equal(withOwnerNote.planItemEvidence?.length, 2, "a note elsewhere in the plan drops nothing");
 
+  // review2 Step 8: a changed item's row is kept (ignored while it does not apply), never deleted.
   const reworded = prunePlanItemEvidenceForPlanV1(evidence, plan.replace("Original acceptance", "Revised acceptance"));
-  assert.deepEqual(reworded.planItemEvidence?.map((row) => row.itemText), ["Step 7: Untouched item"]);
+  assert.deepEqual(
+    reworded.planItemEvidence?.map((row) => row.itemText),
+    ["Step 6: Original acceptance", "Step 7: Untouched item"]
+  );
 });
 
 void test("Publish evidence invalidation requires an exact failing acceptance-test identity", () => {

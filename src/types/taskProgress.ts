@@ -757,6 +757,32 @@ export interface TaskProgress {
    * `paused`; an escalation's own pause never sets it.
    */
   ownerPausedAt?: string;
+  /**
+   * review2 Step 17 (additive): which changed files a review has read in full, and at which content. See
+   * `ReviewCoverageV1`. Preserved by every stage transition: a stage change does not unread a file.
+   */
+  reviewCoverage?: ReviewCoverageV1;
+}
+
+/** The content hash one review read a file at (review2 Step 17). */
+export interface ReviewCoverageEntryV1 {
+  /** Hash of the file's content when the review ended. */
+  hash: string;
+  /** The review run that read it (the review's attempt id). */
+  runId: string;
+  stage: TaskStage;
+}
+
+/**
+ * review2 Step 17: the per-task review coverage record. `files` holds, for each changed file, the hash it had when
+ * a review last read it in full (a file the reviewer declared it did not inspect is never entered). A file whose
+ * current hash differs from its recorded hash counts as unreviewed again. `changedFiles` is the change set the last
+ * review ran against, so "N of M" can be shown without recomputing the diff.
+ */
+export interface ReviewCoverageV1 {
+  files: Record<string, ReviewCoverageEntryV1>;
+  changedFiles: string[];
+  updatedAt: string;
 }
 
 /**
@@ -1498,6 +1524,11 @@ export interface PlanItemOwnerDecisionV1 {
   readonly itemOccurrence?: number;
   /** review1 (review fix): whether the decision was recorded for a nested child (`true`) or a top-level item. */
   readonly itemNested?: boolean;
+  /**
+   * review2 Step 3: the issued id (`[item:<id>]`) of the item the owner decided, when the card or form that took the
+   * decision offered one. `itemText` is the item's own text with Ensemble's display annotations removed.
+   */
+  readonly itemId?: string;
 }
 export const MAX_PLAN_ITEM_OWNER_DECISIONS = 1000;
 

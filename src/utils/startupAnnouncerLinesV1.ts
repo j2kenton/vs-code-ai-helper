@@ -11,6 +11,19 @@ export function startingLineV1(actionName: string): string {
   return `${actionName} is starting — wait here; progress appears below.`;
 }
 
+/**
+ * review2 Step 42: how long an announcer may keep watching for its action to start. A command that is awaited for
+ * hours (it was waiting on an input nobody answered) must not announce a LATER click's start under its own label:
+ * run1 2026-11-07 17:59 said "Answer in my own words… is starting" for the owner's Start Fast Forward, 2 hours after
+ * that option was chosen.
+ */
+export const STARTUP_ANNOUNCER_MAX_AGE_MS_V1 = 30 * 60_000;
+
+/** True once an announcer armed at `startedAtMs` is too old to speak for whatever starts now. */
+export function startupAnnouncerExpiredV1(startedAtMs: number, nowMs: number): boolean {
+  return nowMs - startedAtMs > STARTUP_ANNOUNCER_MAX_AGE_MS_V1;
+}
+
 /** Said once if the start takes longer than expected. */
 export function stillStartingLineV1(actionName: string, minutes: number): string {
   return `${actionName} is still starting (${Math.round(minutes * 10) / 10} min).`;

@@ -1737,6 +1737,12 @@ export interface ParsedOwnerDecisionOptionV1 {
     readonly newText?: string;
     /** review1 Step 4: which of several identically worded top-level items a `reword` is about (1-based). */
     readonly itemOccurrence?: number;
+    /** review2 Step 38: what the approved deviation did differently (a one-line lead), named in what is recorded. */
+    readonly approvedChange?: string;
+    /** review2 Step 38: the gap the deviation states it leaves undone; approving the change alone leaves it open. */
+    readonly statedGap?: string;
+    /** review2 Step 38: true only when the owner chose to accept the stated gap as well. */
+    readonly gapAccepted?: true;
   };
   /**
    * True when choosing this option keeps the plan as written (it starts "Reject", "Keep the plan", ...).
@@ -1861,6 +1867,14 @@ function splitOwnerDecisionBlocksV1(sectionBody: string): string[] {
     return [sectionBody];
   }
   return starts.map((start, i) => sectionBody.slice(start, starts[i + 1] ?? sectionBody.length).trim());
+}
+
+/** A `path/file.ext:123` (optionally `:123-140`) citation. */
+const CITES_FILE_LINE_RE = /[\w./\\-]+\.[A-Za-z]{1,5}:\d+/;
+
+/** An option that keeps the plan as the owner approved it (its label or id says so). */
+function isKeepThePlanOptionV1(option: ParsedOwnerDecisionOptionV1): boolean {
+  return /\bkeep\s+(?:the\s+)?plan\b|\bas\s+planned\b|\bfollow\s+the\s+plan\b|\bkeep-the-plan\b/i.test(`${option.label} ${option.id}`);
 }
 
 function parseOwnerDecisionOptionV1(
@@ -2017,6 +2031,22 @@ export function parseOwnerDecisionsNeededV1(content: string): readonly ParsedOwn
     if (!recommendation && markerRecommendedId) {
       recommendation = { optionId: markerRecommendedId, reason: "Marked as recommended by the reviewer." };
     }
+    // review2 Step 40: a recommendation to keep a round's departure from the plan must cite the file and line that
+    // show the claimed dependency or harm. One that cites none rests on the round's own claim, which nobody checked,
+    // so the card recommends "Keep the plan" (the owner already approved the plan) and says why.
+    if (recommendation) {
+      const keepPlan = options.find(isKeepThePlanOptionV1);
+      const recommendedId = recommendation.optionId;
+      const recommendedOption = options.find((o) => o.id === recommendedId);
+      const reasonText = `${recText} ${recommendation.reason} ${recommendedOption?.consequence ?? ""}`;
+      if (keepPlan && keepPlan.id !== recommendedId && !CITES_FILE_LINE_RE.test(reasonText)) {
+        recommendation = {
+          optionId: keepPlan.id,
+          reason:
+            "The reviewer recommended keeping the departure but cited no file and line for its reason, so that reason is the round's own claim and unchecked. Keeping the plan is recommended: the owner already approved it.",
+        };
+      }
+    }
 
     const technicalDetails = (fields.get("technical") ?? []).join("\n").trim();
     results.push({
@@ -2043,6 +2073,8 @@ export interface PlanDeviationContextV1 {
   readonly planOfRecord?: string;
   /** The latest review's text, used to say whether it already verified the departure. */
   readonly latestReviewText?: string;
+  /** task.md's `## Owner decisions` text: a bullet that only restates one of them raises no card (review2 Step 37). */
+  readonly ownerDecisionsText?: string;
 }
 
 /**
@@ -2263,6 +2295,206 @@ function deviationRecommendationV1(
   };
 }
 
+/** The text of task.md's `## Owner decisions` section (what a restated-decision bullet is compared with). */
+export function ownerDecisionsSectionTextV1(taskMd: string): string | undefined {
+  return ownerDecisionSectionV1(taskMd, "Owner decisions");
+}
+
+/** Words that mean a bullet really changes how something was built; a note about the plan never has them. */
+const DEVIATION_SUBSTITUTION_RE =
+  /\b(?:instead\s+of|rather\s+than|differently|replaces?|replaced|substitut\w*|skipp?(?:s|ed|ing)?|without|built\s+in\s+a\s+different|a\s+different\s+(?:place|file|way))\b/i;
+
+/** The first sentence (or the bold lead) of a deviation bullet. */
+function deviationLeadV1(raw: string): string {
+  const plain = raw.replace(/^[\s>\-–—•]+/, "");
+  const bold = /^\*\*([^*]+)\*\*/.exec(plain);
+  if (bold?.[1]) return bold[1].trim();
+  return (/^[^\n]*?[.!?](?=\s|$)/.exec(plain)?.[0] ?? plain.split("\n")[0] ?? "").trim();
+}
+
+/**
+ * review2 Step 37: why a deviation bullet raises no card, or undefined when it is a real departure. A note that a
+ * step was split as the plan says ("Step 47 is parser, routing and rubric only … the card is Step 48"), a progress
+ * report on planned work ("Step 8 is only partly built", "Step 14 is still required work. I did not start it"), and a
+ * remark that the build follows the plan are the round's summary, never a decision; unbuilt work stays open work.
+ */
+export function planDeviationNoCardReasonV1(raw: string): "step-split" | "progress" | "follows-plan" | undefined {
+  const text = raw.replace(/[*_`]/g, " ");
+  if (DEVIATION_SUBSTITUTION_RE.test(text)) return undefined;
+  const lead = deviationLeadV1(raw).replace(/[*_`]/g, "");
+  const leadStep = /\bsteps?\s+(\d+)(?!\d)/i.exec(lead);
+  if (/\b(?:follows?|matches|is\s+as)\s+the\s+plan\b|\bas\s+the\s+plan\s+(?:says|states|asks|describes)\b/i.test(text)) {
+    return "follows-plan";
+  }
+  const progressLead =
+    /\b(?:is|are)\s+(?:only\s+)?(?:partly|partially)\s+(?:built|done|finished|implemented)\b|\b(?:is|are)\s+still\s+(?:required|open|unbuilt|to\s+do)\b|\b(?:is|are)\s+not\s+(?:yet\s+)?(?:built|started|done|finished)\b|\bremains?\s+(?:unbuilt|open)\b/i;
+  if (leadStep && progressLead.test(lead)) return "progress";
+  if (/\bI\s+(?:did\s+not|didn't|have\s+not|haven't)\s+(?:start|begin|build)\b/i.test(text) && leadStep && !/\binstead\b/i.test(text)) {
+    return "progress";
+  }
+  if (leadStep && /\bonly\b|\bsplit\b|\bas\s+(?:the\s+)?plan(?:ned)?\b|\bdeferred\b/i.test(lead)) {
+    const other = [...text.matchAll(/\b(?:is|are|belongs?\s+to|comes?\s+(?:in|with)|left\s+(?:for|to)|in)\s+steps?\s+(\d+)(?!\d)/gi)].some(
+      (m) => m[1] !== leadStep[1]
+    );
+    if (other) return "step-split";
+  }
+  return undefined;
+}
+
+/** A sentence that only reports where the round recorded something, never part of what is being decided. */
+const DEVIATION_STATUS_SENTENCE_RE =
+  /\b(?:reported\s+under\s+verified\s+complete|rather\s+than\s+ticked|noted\s+in\s+the\s+(?:round'?s\s+)?summary|already\s+noted|recorded\s+in\s+the\s+(?:round'?s\s+)?(?:summary|checklist))\b/i;
+
+/** Splits a deviation's text into the body that belongs on its card and the status sentences that do not. */
+export function splitDeviationStatusSentencesV1(raw: string): { readonly body: string; readonly statusNotes: readonly string[] } {
+  const statusNotes: string[] = [];
+  const keptLines: string[] = [];
+  for (const line of raw.split("\n")) {
+    const sentences = line.split(/(?<=[.!?])\s+/);
+    const kept = sentences.filter((sentence) => {
+      if (DEVIATION_STATUS_SENTENCE_RE.test(sentence)) {
+        statusNotes.push(sentence.replace(/^[\s\-*]+/, "").trim());
+        return false;
+      }
+      return true;
+    });
+    if (kept.length > 0) keptLines.push(kept.join(" "));
+  }
+  return { body: keptLines.join("\n").trim(), statusNotes };
+}
+
+/**
+ * The separate decisions of a task.md `## Owner decisions` section: one per `### <date> — <id>` heading, or (when the
+ * section has no such headings) one per top-level bullet.
+ */
+function ownerDecisionEntriesV1(ownerDecisionsText: string): string[] {
+  const boundary = /(?:^|\n)#{3,}[ \t]/.test(ownerDecisionsText) ? /^#{3,}[ \t]/ : /^[-*][ \t]/;
+  const entries: string[] = [];
+  let current: string[] = [];
+  for (const line of ownerDecisionsText.split("\n")) {
+    if (boundary.test(line) && current.length > 0) {
+      entries.push(current.join("\n"));
+      current = [];
+    }
+    current.push(line);
+  }
+  if (current.length > 0) entries.push(current.join("\n"));
+  return entries.filter((entry) => entry.trim().length > 0);
+}
+
+/**
+ * review2 Step 37: a bullet that only restates a decision already recorded under task.md's `## Owner decisions`
+ * ("… is owner-approved. The wording is not re-litigated."). Returns the chat line, or undefined for a real
+ * deviation. It restates when it says the owner approved it AND the same step is named in a recorded decision (or
+ * the two share at least two distinctive words).
+ */
+export function restatedOwnerDecisionLineV1(raw: string, ownerDecisionsText: string | undefined): string | undefined {
+  if (ownerDecisionsText === undefined || ownerDecisionsText.trim().length === 0) return undefined;
+  const text = raw.replace(/[*_`]/g, " ");
+  if (!/\bowner[\s-]+approved\b|\bapproved\s+by\s+the\s+owner\b|\bnot\s+re-?litigated\b|\bper\s+(?:the\s+)?owner'?s?\s+decision\b/i.test(text)) {
+    return undefined;
+  }
+  const step = /\bsteps?\s+(\d+)(?!\d)/i.exec(text);
+  const terms = distinctiveTermsV1(text);
+  // The stamp comes from the decision the bullet restates, never from the newest entry of the section.
+  const entry = ownerDecisionEntriesV1(ownerDecisionsText).find((candidate) => {
+    if (step !== null && new RegExp(`\\bsteps?\\s+${step[1]}(?!\\d)`, "i").test(candidate)) return true;
+    let shared = 0;
+    const recorded = distinctiveTermsV1(candidate);
+    for (const term of terms) if (recorded.has(term)) shared += 1;
+    return shared >= 2;
+  });
+  if (entry === undefined) return undefined;
+  const when = /\b(\d{4}-\d{2}-\d{2})(?:[T\s]+(\d{2}:\d{2}))?/.exec(entry);
+  const stamp = when ? (when[2] ?? when[1]) : "earlier";
+  const one = deviationLeadV1(raw).replace(/[*_`]/g, "").replace(/[.\s]+$/, "");
+  const detail = /([^.!?\n]*\bowner[\s-]+approved[^.!?\n]*)/i.exec(text)?.[1]?.trim().replace(/\s+/g, " ");
+  return `Following your decision of ${stamp}: ${detail ?? one}`;
+}
+
+/**
+ * review2 Step 37: what a round's `## Plan deviations` section holds that is not a card: chat lines for bullets that
+ * restate an owner decision, and summary notes (progress notes, step-split notes, status sentences).
+ */
+export function planDeviationSideNotesV1(
+  content: string,
+  context: PlanDeviationContextV1 = {}
+): { readonly followingDecisionLines: readonly string[]; readonly summaryNotes: readonly string[] } {
+  const sectionBody = ownerDecisionSectionV1(content, "Plan deviations");
+  const followingDecisionLines: string[] = [];
+  const summaryNotes: string[] = [];
+  if (!sectionBody || /(?:^|\n)###+[ \t]/.test(sectionBody)) return { followingDecisionLines, summaryNotes };
+  for (const raw of splitTopLevelBulletsV1(sectionBody)) {
+    if (isNoneItemTextV1(raw) || STATUS_NOTE_ITEM_RE.test(raw)) continue;
+    const restated = restatedOwnerDecisionLineV1(raw, context.ownerDecisionsText);
+    if (restated !== undefined) {
+      followingDecisionLines.push(restated);
+      continue;
+    }
+    if (planDeviationNoCardReasonV1(raw) !== undefined) {
+      summaryNotes.push(raw.replace(/\s*\n\s*/g, " ").trim());
+      continue;
+    }
+    summaryNotes.push(...splitDeviationStatusSentencesV1(raw).statusNotes);
+  }
+  return { followingDecisionLines, summaryNotes };
+}
+
+/** The review's own blocker that names the same step or plan-item id as a deviation, if it holds one. */
+function reviewBlockerHoldingDeviationV1(raw: string, reviewText: string | undefined, planOfRecord: string | undefined): string | undefined {
+  if (reviewText === undefined) return undefined;
+  const step = stepNamedByDeviationV1(raw, planOfRecord);
+  const itemIds = [...raw.matchAll(/\bitem:([0-9a-f]{16})\b/gi)].map((m) => m[1]!.toLowerCase());
+  if (step === undefined && itemIds.length === 0) return undefined;
+  for (const blocker of parseReviewBlockersDetailed(reviewText).blockers) {
+    const description = blocker.description;
+    const namesStep = step !== undefined && new RegExp(`\\bsteps?\\s+${step}(?!\\d)`, "i").test(description);
+    const namesItem = itemIds.some((id) => description.toLowerCase().includes(`item:${id}`));
+    if (namesStep || namesItem) return description.replace(/\s+/g, " ").trim();
+  }
+  return undefined;
+}
+
+/** Words that mark a sentence of a deviation as work the round left undone, not as what it did differently. */
+const DEVIATION_GAP_SENTENCE_RE =
+  /\b(?:left\s+undone|not\s+done|still\s+open|remains?\s+(?:unbuilt|open|undone|uncovered|unchecked)|I\s+(?:did\s+not|didn't|have\s+not|haven't)\s+(?:touch|change|build|cover|handle|check|add)|(?:is|are)\s+not\s+(?:refused|covered|checked|handled|built|guarded)|only\s+checks?|only\s+covers?|not\s+covered)\b/i;
+
+/** A line that opens a statement of the gap ("Left undone: …", "Not done: …", "Gap: …"). */
+const DEVIATION_GAP_LABEL_RE = /^\s*(?:[-*]\s+)?(?:\*\*)?(?:left\s+undone|not\s+done|still\s+open|gap|the\s+gap)(?:\*\*)?\s*[:\-–—]/i;
+
+/**
+ * review2 Step 38 (bugs6 item 6): separates what a deviation did differently ("change") from the gap it says it leaves
+ * undone. Approving a card covers the change only; a stated gap is its own choice, or stays open work. Returns no
+ * `gap` when the text states none (or states nothing else).
+ */
+export function splitDeviationAndGapV1(raw: string): { readonly change: string; readonly gap?: string } {
+  const changeLines: string[] = [];
+  const gapParts: string[] = [];
+  for (const line of raw.split("\n")) {
+    if (DEVIATION_GAP_LABEL_RE.test(line)) {
+      gapParts.push(line.replace(DEVIATION_GAP_LABEL_RE, "").trim());
+      continue;
+    }
+    const kept: string[] = [];
+    for (const sentence of line.split(/(?<=[.!?])\s+/)) {
+      if (DEVIATION_GAP_SENTENCE_RE.test(sentence) && changeLines.length + kept.length > 0) {
+        gapParts.push(sentence.replace(/^[\s\-*]+/, "").trim());
+      } else {
+        kept.push(sentence);
+      }
+    }
+    if (kept.length > 0) changeLines.push(kept.join(" "));
+  }
+  const gap = gapParts.filter((part) => part.length > 0).join(" ").trim();
+  const change = changeLines.join("\n").trim();
+  return gap.length > 0 && change.length > 0 ? { change, gap } : { change: raw.trim() };
+}
+
+function oneLineV1(text: string, max: number): string {
+  const flat = text.replace(/[*_`]/g, "").replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
 export function parsePlanDeviationsV1(
   content: string,
   context: PlanDeviationContextV1 = {}
@@ -2300,6 +2532,14 @@ export function parsePlanDeviationsV1(
     if (isNoneItemTextV1(itemText.length > 0 ? itemText : raw) || STATUS_NOTE_ITEM_RE.test(raw)) {
       continue;
     }
+    // review2 Step 37: step-split and progress notes, remarks that the build follows the plan, and bullets that only
+    // restate a recorded owner decision are the round's summary or a chat line, never a card.
+    if (
+      planDeviationNoCardReasonV1(raw) !== undefined ||
+      restatedOwnerDecisionLineV1(raw, context.ownerDecisionsText) !== undefined
+    ) {
+      continue;
+    }
     const rawContentHash = createHash("sha256").update(raw.trim(), "utf8").digest("hex");
     // Keyed by content, not position: a different deviation in a later round is a different card.
     const id = `plan-deviation-${rawContentHash.slice(0, 8)}`;
@@ -2312,22 +2552,54 @@ export function parsePlanDeviationsV1(
       step !== undefined &&
       context.latestReviewText !== undefined &&
       reviewAffirmsStepVerifiedV1(context.latestReviewText, step, raw);
+    // review2 Step 39: a review that holds this step as a blocker has a view; the card says so and recommends Reject.
+    const holdingBlocker = reviewBlockerHoldingDeviationV1(raw, context.latestReviewText, context.planOfRecord);
     const reviewView = context.latestReviewText === undefined
       ? ""
-      : verifiedByReview
-        ? " The latest review already verified it."
-        : " The latest review has not verified it.";
+      : holdingBlocker !== undefined
+        ? ` The latest review holds this as a blocker: ${holdingBlocker.length > 240 ? `${holdingBlocker.slice(0, 237)}…` : holdingBlocker}`
+        : verifiedByReview
+          ? " The latest review already verified it."
+          : " The latest review has not verified it.";
+    // review2 Step 37: status sentences ("reported under Verified Complete rather than ticked") are not part of the
+    // question; they go to the round's summary.
+    const cardBody = splitDeviationStatusSentencesV1(raw.trim()).body || raw.trim();
+    // review2 Step 38: a stated gap is a second question. Approve covers the change only; accepting the gap is its own
+    // option, and otherwise the gap stays open work for the next round and review.
+    const { change, gap } = splitDeviationAndGapV1(cardBody);
+    const approvedChange = oneLineV1(deviationLeadV1(raw), 200);
+    const statedGap = gap !== undefined ? oneLineV1(gap, 300) : undefined;
     results.push({
       id,
       planPurpose: title,
-      problem: `${raw.trim()}${reviewView}`,
+      problem:
+        gap !== undefined ? `What was done differently: ${change}\nLeft undone: ${gap}${reviewView}` : `${cardBody}${reviewView}`,
       options: [
-        {
-          id: "approve-deviation",
-          label: "Approve plan deviation",
-          consequence: "Accepts this deviation and records owner approval in plan-final.md.",
-          planAction: { kind: "approveDeviation" },
-        },
+        gap === undefined || statedGap === undefined
+          ? {
+              id: "approve-deviation",
+              label: "Approve plan deviation",
+              consequence: "Accepts this deviation and records owner approval in plan-final.md.",
+              planAction: { kind: "approveDeviation", approvedChange },
+            }
+          : {
+              id: "approve-deviation",
+              label: "Approve the change only (the gap stays open)",
+              consequence:
+                "Approves what was done differently and nothing else. The gap named on the card is not approved: it stays open work, and the next review keeps it as a blocker.",
+              planAction: { kind: "approveDeviation", approvedChange, statedGap },
+            },
+        ...(gap !== undefined && statedGap !== undefined
+          ? [
+              {
+                id: "approve-deviation-accept-gap",
+                label: "Approve the change and accept the gap",
+                consequence:
+                  "Approves what was done differently and also accepts leaving the gap undone. Choose Reject, or answer in your own words, if the gap is still needed.",
+                planAction: { kind: "approveDeviation" as const, approvedChange, statedGap, gapAccepted: true as const },
+              },
+            ]
+          : []),
         {
           id: "reject-deviation",
           label: "Reject plan deviation",
@@ -2336,7 +2608,14 @@ export function parsePlanDeviationsV1(
           rejects: true,
         },
       ],
-      ...deviationRecommendationV1(raw, verifiedByReview, context.latestReviewText !== undefined),
+      ...(holdingBlocker !== undefined
+        ? {
+            recommendation: {
+              optionId: "reject-deviation",
+              reason: `The latest review holds this step as a blocker: ${holdingBlocker.length > 240 ? `${holdingBlocker.slice(0, 237)}…` : holdingBlocker} Rejecting keeps the plan as written.`,
+            },
+          }
+        : deviationRecommendationV1(raw, verifiedByReview, context.latestReviewText !== undefined)),
       rawContentHash,
       rawContent: raw.trim(),
     });

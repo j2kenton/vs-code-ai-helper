@@ -54,6 +54,7 @@ import {
   type ScopedItemListV1,
 } from "./deferredPlanScopeV1";
 import {
+  isTestDependentChecklistItemV1,
   listProvisionalTickedItemsV1,
   normalizeChecklistItemTextV1,
   resolveBlockerPlanReferencesV1,
@@ -62,6 +63,7 @@ import {
 } from "./implementationChecklist";
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
+import { detectNarrowedBlockerV1, type NarrowedBlockerV1 } from "./blockerRuleNarrowingV1";
 import * as path from "path";
 import {
   AGENT_CAN_GATHER_RE,
@@ -115,6 +117,8 @@ import { resolveReadOnlyDiagnosisAvailabilityV1 } from "./readOnlyDiagnosisAvail
 import { parseRecordedCompletionChecksEvidenceV1 } from "./completionLint";
 import { reviewInputsChangedSinceV1 } from "./reviewInputsChangedV1";
 import { advanceNeedsOpenItemsConfirmationV1, advanceOverOpenItemsLabelV1 } from "./advanceOverOpenItemsV1";
+import { describeReviewedLineV1, filesPhraseV1, type ReviewCoverageSummaryV1 } from "./reviewCoverageV1";
+import { readReviewCoverageSummaryV1 } from "./reviewCoverageIoV1";
 
 /** Minimal shape this module needs from ChatViewProvider — avoids importing
  * the view layer from a utils module (chatView.ts pulls in webview/vscode UI
@@ -854,6 +858,16 @@ export interface EscalationPlateauContextV1 {
   /** Deferrable, excluded owner checks offered the post-install move-on route. */
   readonly ownerChecksOwed?: readonly string[];
   /**
+   * review2 Steps 18-19: how much of the change a review has read, from the per-file coverage record. Shown as
+   * "Reviewed: N of M changed files"; when files are unreviewed the card offers "Review the remaining N files".
+   */
+  readonly coverage?: ReviewCoverageSummaryV1;
+  /**
+   * review2 Step 33: a blocker whose fixes have each closed part of it (see `detectNarrowedBlockerV1`). The card says
+   * the rule may be missing and offers "Settle it with a rule".
+   */
+  readonly narrowedBlockerRule?: NarrowedBlockerV1;
+  /**
    * RC4 item 3: set when a blocker asks the owner to narrow a plan item
    * (`findNarrowingBlockerV1`). Adds the item, the round's reason and its
    * evidence to the card, plus the "Accept this narrowing" / "Keep the item
@@ -1202,7 +1216,11 @@ export function buildEscalationDecisionV1(
       reviewAffirmsOpenItemsBuilt = false,
       unbuiltWorkReferences = [],
       ownerChecksOwed = [],
+      coverage,
+      narrowedBlockerRule,
     } = plateauContext;
+    // review2 Step 19: files no review has read at their current content.
+    const unreviewedCount = coverage ? coverage.changedCount - coverage.reviewedCount : 0;
     // bugs4 item 18: unbuilt work is among the task-fixable blockers and recent Apply Reviews closed
     // no open item, so another Apply Review is not the step that moves this task. Specific defects
     // are carried into the Implementation round's guidance or left to the review that follows.
@@ -1246,6 +1264,10 @@ export function buildEscalationDecisionV1(
       // Advance the requirement calls for.
       ...(planItemsOpen > 0 ? [buildBuildRemainingOptionV1(target.taskFolderPath, planItemsOpen, stage)] : []),
       buildPlateauKeepIteratingOptionV1(target.taskFolderPath, stageName, taskFixableCount, blockersCount, stage),
+      ...(coverage && unreviewedCount > 0 && IMPL_REVIEW_STAGES.includes(stage)
+        ? [buildReviewRemainingOptionV1(target.taskFolderPath, stage, coverage)]
+        : []),
+      ...(narrowedBlockerRule ? [buildSettleWithRuleOptionV1(target.taskFolderPath, stage, narrowedBlockerRule)] : []),
       // review1 Step 58: offered only when the review's inputs (task.md, plan.md, plan-final.md) changed since the
       // review, i.e. the owner made a change the review has not seen.
       ...(reviewInputsChanged === true
@@ -1415,7 +1437,19 @@ export function buildEscalationDecisionV1(
     // everywhere.
     const taskFixableCountLabel = `${taskFixableCount} of the ${blockersCount} remaining ` +
       `${blockersCount === 1 ? "blocker" : "blockers"}`;
-    const recommendation: WorkflowDecisionRecommendationV1 = hasSpecDefect
+    const recommendation: WorkflowDecisionRecommendationV1 =
+      // review2 Step 19: a stage with changed files no review has read recommends reading them. A spec defect or a
+      // narrowing is a decision for the owner first, so those keep their own recommendation.
+      unreviewedCount > 0 && !hasSpecDefect && !narrowing && IMPL_REVIEW_STAGES.includes(stage)
+      ? {
+          kind: "option",
+          optionId: "reviewRemaining",
+          reasoning:
+            `${coverage ? describeReviewedLineV1(coverage) : "Some changed files"}; ${unreviewedCount} ` +
+            `${unreviewedCount === 1 ? "file has" : "files have"} not been read by any review at its current ` +
+            "content, so a verdict here says nothing about them.",
+        }
+      : hasSpecDefect
       ? {
           kind: "option",
           optionId: "reconsiderRequirement",
@@ -1603,6 +1637,15 @@ export function buildEscalationDecisionV1(
       recommendation,
       evidence: [
         { label: "What clears this", detail: clearingNote },
+        ...(coverage ? [{ label: "Review coverage", detail: describeReviewedLineV1(coverage) }] : []),
+        ...(narrowedBlockerRule
+          ? [
+              {
+                label: "Pattern",
+                detail: `Two fixes have each closed part of this; the rule may be missing: ${narrowedBlockerRule.description.slice(0, 200)}`,
+              },
+            ]
+          : []),
         ...(verificationStall
           ? [
               {
@@ -1842,6 +1885,71 @@ export function buildEscalationDecisionV1(
  * that accurately via its own stage-eligibility message instead of silently
  * doing nothing.
  */
+/**
+ * review2 Step 19: "Review the remaining N files". Until batched review exists (Part 6) it adds the unreviewed files
+ * to the review's scope and runs one review through the partial-scope path; the label and record stay when Part 6
+ * makes it batched.
+ */
+function buildReviewRemainingOptionV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  coverage: ReviewCoverageSummaryV1
+): WorkflowDecisionOptionV1 {
+  const count = coverage.changedCount - coverage.reviewedCount;
+  return {
+    optionId: "reviewRemaining",
+    label: `Review the remaining ${filesPhraseV1(count)}`,
+    resumeKind: "continue",
+    consequence:
+      `Adds the ${filesPhraseV1(count)} no review has read at their current content to ${STAGE_DISPLAY_NAMES[stage]}'s ` +
+      "scope and runs the review. Its verdict then covers them.",
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.resolvePartialReviewScopeV1",
+      args: [{ taskFolderPath, stage, action: "addAndRereview", missingFiles: [...coverage.unreviewed], hash: "" }],
+    },
+  };
+}
+
+/**
+ * review2 Step 34: "Settle it with a rule". The answer goes through the own-words entry point (recorded in task.md under
+ * Owner decisions, naming the blocker), and exactly one Apply Review follows it (`thenApplyReview`), which treats the
+ * rule as the specification for that blocker. The next review judges the fix against it.
+ */
+function buildSettleWithRuleOptionV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  narrowed: NarrowedBlockerV1
+): WorkflowDecisionOptionV1 {
+  const subject = narrowed.description.slice(0, 120);
+  return {
+    optionId: "settleWithRule",
+    label: "Settle it with a rule",
+    resumeKind: "continue",
+    consequence:
+      `${narrowed.fixes} fixes have each closed part of "${subject}${narrowed.description.length > 120 ? "…" : ""}", so the ` +
+      "rule may be missing. Type the rule in the message box below; it is recorded in task.md under Owner decisions naming this " +
+      "blocker, then runs exactly one Apply Review that treats your rule as the specification. The next review judges the " +
+      "fix against it.",
+    effect: {
+      kind: "command",
+      command: "vs-code-ai-helper.recordOwnerPlanDecisionV1",
+      args: [
+        {
+          taskFolderPath,
+          stage,
+          blockerId: narrowed.blockerId,
+          optionId: "settleWithRule",
+          optionLabel: "Settle it with a rule",
+          ownWords: true,
+          thenApplyReview: true,
+          blockerText: narrowed.description,
+        },
+      ],
+    },
+  };
+}
+
 function buildPublishAnywayOptionV1(taskFolderPath: string): WorkflowDecisionOptionV1 {
   return {
     optionId: "publishAnyway",
@@ -2071,6 +2179,41 @@ export function isVerificationChecklistItemV1(itemText: string): boolean {
 }
 
 /**
+ * review2 Step 7 (bugs6 item 26): which exit the latched clean-review card recommends. "Back to Implementation" is
+ * recommended only when a round can act on the open items: the review did not say nothing is left to build, and at
+ * least one open item is build work (not a verification item, and not waiting on test evidence an editing round
+ * cannot produce). Otherwise the way on is to settle the items or move on, and the reason says why.
+ */
+export function latchedOpenItemsRecommendationV1(
+  open: { readonly items: readonly string[]; readonly total: number },
+  reviewSaysNothingLeftToBuild: boolean
+): { readonly kind: "option"; readonly optionId: "moveOn" | "backToImplementation"; readonly reasoning: string } {
+  const complete = open.items.length > 0 && open.items.length === open.total;
+  if (complete && open.items.every(isVerificationChecklistItemV1)) {
+    return { kind: "option", optionId: "moveOn", reasoning: "Every open item is a verification item, which a build round cannot complete." };
+  }
+  if (complete && open.items.every((item) => isVerificationChecklistItemV1(item) || isTestDependentChecklistItemV1(item))) {
+    return {
+      kind: "option",
+      optionId: "moveOn",
+      reasoning:
+        "Every open item is a verification item or waits on test evidence; an Implementation round cannot produce either. " +
+        "Settle them from the open-items card (tick, exclude, or record a test run) or move on.",
+    };
+  }
+  if (reviewSaysNothingLeftToBuild) {
+    return {
+      kind: "option",
+      optionId: "moveOn",
+      reasoning:
+        "The review is clean and names no plan step still to build, so another Implementation round would have nothing to act on. " +
+        "The open items need your tick or evidence: settle them from the open-items card, or move on.",
+    };
+  }
+  return { kind: "option", optionId: "backToImplementation", reasoning: "At least one open item asks for work to be built, and the review did not say otherwise." };
+}
+
+/**
  * Post-1.0 fixes, item 9: the card a latched (`checklistProgressUnreliable`),
  * clean review posts INSTEAD of advancing silently while plan items are still
  * open after the reviewer-verified ticks were applied.
@@ -2093,12 +2236,13 @@ export async function postLatchedOpenItemsDecisionV1(
    */
   carried?: { readonly deferred: ScopedItemListV1; readonly gated: ScopedItemListV1 },
   /** bugs4 item 30: the plan's "N open, of which M are owner hand-offs" line. */
-  openSummary?: string
+  openSummary?: string,
+  /** review2 Step 7: the review is clean and names no plan step still to build, so a round has nothing to act on. */
+  reviewSaysNothingLeftToBuild?: boolean
 ): Promise<boolean> {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStageName = STAGE_DISPLAY_NAMES[nextStage];
   const resumeFastForward = isFastForwardRunActiveV1(target.taskFolderPath);
-  const allVerification = open.items.length > 0 && open.items.length === open.total && open.items.every(isVerificationChecklistItemV1);
   const noun = open.total === 1 ? "plan item is" : "plan items are";
   const listed = open.items.map((item) => `- ${item}`).join("\n");
   const more = open.total > open.items.length ? `\n- …and ${open.total - open.items.length} more` : "";
@@ -2140,23 +2284,15 @@ export async function postLatchedOpenItemsDecisionV1(
       taskCanonicalId: target.canonicalId,
       stage,
       whatHappened:
-        `${stageName} is clean, but this task's plan checklist is flagged as behind and ${open.total} ${noun} still open${openSummary ? ` (plan-wide: ${openSummary})` : ""}:\n\n` +
+        // review2 Step 16: one word for the checklist's state across adjacent cards ("unreliable"), the one the
+        // latch-cleared line and the idle card use, so two cards a second apart never read as a contradiction.
+        `${stageName} is clean, but this task's plan checklist is flagged unreliable and ${open.total} ${noun} still open${openSummary ? ` (plan-wide: ${openSummary})` : ""}:\n\n` +
         `${listed}${more}${carriedSections}`,
       whyUserNeeded:
-        "A clean review no longer holds the stage while the checklist is flagged as behind, but moving on with plan items " +
+        "A clean review no longer holds the stage while the checklist is flagged unreliable, but moving on with plan items " +
         "still open should be your decision, not the default.",
       options,
-      recommendation: allVerification
-        ? {
-            kind: "option",
-            optionId: "moveOn",
-            reasoning: "Every open item is a verification item, which a build round cannot complete.",
-          }
-        : {
-            kind: "option",
-            optionId: "backToImplementation",
-            reasoning: "At least one open item asks for work to be built.",
-          },
+      recommendation: latchedOpenItemsRecommendationV1(open, reviewSaysNothingLeftToBuild === true),
       gating: {
         holdsTaskPaused: false,
         unblocksProgress: true,
@@ -2812,15 +2948,38 @@ async function postReviewPlateauDecisionV1(
   } catch {
     runProgressNote = undefined;
   }
+  // review2 Steps 18-19: how much of the change a review has read, for "Reviewed: N of M changed files".
+  let coverage: ReviewCoverageSummaryV1 | undefined;
+  if (IMPL_REVIEW_STAGES.includes(stage)) {
+    try {
+      const coverageRead = await readTaskProgressStrictV1(folderUri, {
+        expectedTaskFolder: path.basename(target.taskFolderPath),
+      });
+      const coverageRoot = vscode.workspace.getWorkspaceFolder(folderUri)?.uri.fsPath;
+      coverage =
+        coverageRead.ok && coverageRoot !== undefined
+          ? await readReviewCoverageSummaryV1(coverageRoot, coverageRead.decoded.progress)
+          : undefined;
+    } catch {
+      coverage = undefined;
+    }
+  }
   let applyReviewRoundsClosedNone = 0;
   let provisionalTicks = 0;
   let reviewAffirmsOpenItemsBuilt = false;
+  let narrowedBlockerRule: NarrowedBlockerV1 | undefined;
   try {
     const progressForMotion = await readTaskProgressStrictV1(folderUri, {
       expectedTaskFolder: path.basename(target.taskFolderPath),
     });
     if (progressForMotion.ok && !isPlanReviewStage(stage)) {
       const motion = progressForMotion.decoded.progress;
+      // review2 Step 33: a blocker whose fixes keep closing one path and missing the next may need a rule the plan never stated.
+      narrowedBlockerRule = detectNarrowedBlockerV1({
+        stage,
+        history: motion.reviewScoreHistory ?? [],
+        ledger: motion.roundLedger,
+      });
       applyReviewRoundsClosedNone = applyReviewRoundsClosedNoneV1({
         stage,
         ledger: motion.roundLedger,
@@ -2965,6 +3124,8 @@ async function postReviewPlateauDecisionV1(
       reviewAffirmsOpenItemsBuilt,
       unbuiltWorkReferences,
       ownerChecksOwed,
+      ...(coverage ? { coverage } : {}),
+      ...(narrowedBlockerRule ? { narrowedBlockerRule } : {}),
       ...(narrowing ? { narrowing } : {}),
     }),
     // review1 Step 37: which blockers this card asks about, so the Fast Forward stop card can tell it covers them.

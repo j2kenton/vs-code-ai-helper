@@ -7,8 +7,13 @@ import {
   type PlanItemSettlementSnapshotV1,
 } from "../types/taskProgress";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
+import { withdrawStaleOpenItemsCardV1 } from "../utils/withdrawStaleOpenItemsCardV1";
 import { readPlanOfRecordForDisplayV1, readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
-import { listPlanItemSettlementV1, type PlanItemSettlementV1 } from "../utils/implementationChecklist";
+import {
+  listPlanItemSettlementV1,
+  listUnresolvedLegacyOwnerDecisionsV1,
+  type PlanItemSettlementV1,
+} from "../utils/implementationChecklist";
 
 /**
  * review1 Step 8: which items settled at the previous count lost that settlement because their own content
@@ -60,6 +65,59 @@ export function describeSettlementDropForTooltipV1(snapshot: PlanItemSettlementS
 }
 
 /**
+ * review2 Step 5: the chat line for owner decisions recorded before item ids existed that name wording more than one
+ * item shares, so none of them was applied. Names each record (its decision, wording and date) and says what to do.
+ */
+export function describeUnresolvedLegacyOwnerDecisionsV1(
+  rows: readonly { readonly decision: string; readonly itemText?: string; readonly itemKey: string; readonly at?: string }[]
+): string {
+  if (rows.length === 0) return "";
+  const shown = rows
+    .slice(0, 5)
+    .map((row) => {
+      const text = (row.itemText ?? row.itemKey).replace(/\s+/g, " ").trim();
+      return `"${text.length > 60 ? `${text.slice(0, 59)}…` : text}" (${row.decision}${row.at ? `, ${row.at.slice(0, 10)}` : ""})`;
+    })
+    .join(", ");
+  const more = rows.length > 5 ? ` and ${rows.length - 5} more` : "";
+  return (
+    `${rows.length} earlier decision${rows.length === 1 ? "" : "s"} of yours name${rows.length === 1 ? "s" : ""} wording that more ` +
+    `than one plan item shares, so ${rows.length === 1 ? "it was" : "none of them were"} applied to any item: ${shown}${more}. ` +
+    "Settle the item you meant again; the new decision is recorded against that item itself."
+  );
+}
+
+const reportedUnresolvedLegacyV1 = new Set<string>();
+
+/** Posts the unresolved-legacy line once per record per session; best effort. */
+async function reportUnresolvedLegacyOwnerDecisionsV1(
+  taskFolderPath: string,
+  rows: readonly { readonly decision: string; readonly itemText?: string; readonly itemKey: string; readonly at?: string; readonly formId?: string }[],
+  stage: Parameters<typeof appendChatMessageV1>[1]["stage"],
+  at: string
+): Promise<void> {
+  const fresh = rows.filter((row) => {
+    const key = `${taskFolderPath}|${row.formId ?? ""}|${row.at ?? ""}|${row.itemKey}|${row.decision}`;
+    if (reportedUnresolvedLegacyV1.has(key)) return false;
+    reportedUnresolvedLegacyV1.add(key);
+    return true;
+  });
+  if (fresh.length === 0) return;
+  await appendChatMessageV1(taskFolderPath, {
+    role: "assistant",
+    text: describeUnresolvedLegacyOwnerDecisionsV1(fresh),
+    stage,
+    at,
+    kind: "outcome",
+  }).catch(() => undefined);
+}
+
+/** Test seam: forgets which unresolved legacy decisions were already reported. */
+export function resetUnresolvedLegacyReportsForTestsV1(): void {
+  reportedUnresolvedLegacyV1.clear();
+}
+
+/**
  * review1 Step 8: counts the plan items now, compares with the snapshot stored at the previous count, posts one
  * chat line naming any item a plan change sent back to the review, and stores the new bounded snapshot. Best
  * effort: it never throws, and it writes nothing when the snapshot is unchanged.
@@ -75,12 +133,21 @@ export async function refreshPlanItemSettlementSnapshotV1(
     const plan =
       options.display === true ? await readPlanOfRecordForDisplayV1(folderUri) : await readPlanOfRecordV1(folderUri);
     if (!plan.hasChecklist || plan.text === undefined) return [];
+    // review2 Step 7: whichever path settled items (the form, the settle command, a review's ticks) comes through
+    // here, so an open-items card listing items that are now settled is withdrawn at this one point.
+    if (options.display !== true) await withdrawStaleOpenItemsCardV1(folderUri, plan.text);
     const read = await readTaskProgressStrictV1(folderUri);
     if (!read.ok) return [];
     const progress = read.decoded.progress;
     const current = listPlanItemSettlementV1(plan.text, progress.planItemEvidence ?? [], progress.planItemOwnerDecisions ?? []);
     const lost = findItemsSentBackByPlanChangeV1(progress.lastPlanItemSettlement, current);
     const at = new Date().toISOString();
+    await reportUnresolvedLegacyOwnerDecisionsV1(
+      folderUri.fsPath,
+      listUnresolvedLegacyOwnerDecisionsV1(plan.text, progress.planItemOwnerDecisions ?? []),
+      stage ?? progress.currentStage,
+      at
+    );
     const items = current
       .slice(0, MAX_PLAN_ITEM_SETTLEMENT_SNAPSHOT_ITEMS_V1)
       .map((item) => ({ hash: item.hash, settled: item.settled, label: item.label }));

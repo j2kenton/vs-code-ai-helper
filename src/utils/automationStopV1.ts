@@ -69,6 +69,11 @@ export interface AutomationStopFactsV1 {
   readonly failingTestsBlockers?: number;
   /** Step 35: a report-contract rejection that has now happened three times in the task. */
   readonly repeatedRejection?: { readonly kind: ReportContractRejectionV1["kind"]; readonly count: number; readonly lastReason: string };
+  /**
+   * review2 Step 23: why Fast Forward would stop at once if started now (an open partial-scope hold). While it is open,
+   * "Start Fast Forward" is never the recommendation: it would dispatch no round.
+   */
+  readonly startHold?: string;
 }
 
 export type AutomationNextStepIdV1 = "moveOn" | "startFastForward" | "runOneMoreCycle" | "continueTheWork" | "leaveWithMe";
@@ -95,7 +100,9 @@ export function recommendNextStepV1(facts: AutomationStopFactsV1): AutomationNex
   if (workable === 0 && itemsToBuild === 0) return "leaveWithMe";
   // A run that stalled made no progress: starting the same thing again is not a recommendation.
   if (facts.ending === "fast-forward-stalled" || facts.ending === "stop-rule") return undefined;
-  return facts.stage === "impl" ? "continueTheWork" : "startFastForward";
+  if (facts.stage === "impl") return "continueTheWork";
+  // review2 Step 23: Fast Forward would stop at once on an open hold; recommend what can run instead.
+  return facts.startHold !== undefined ? "runOneMoreCycle" : "startFastForward";
 }
 
 function shorten(text: string, max: number): string {
@@ -278,11 +285,19 @@ export function buildAutomationStoppedCardInputV1(facts: AutomationStopFactsV1):
               optionId: "leaveWithMe",
               reasoning: "What is left is for you to settle (an owner decision, or something no code change resolves); another round would not move it.",
             }
-          : {
-              kind: "option",
-              optionId: recommended === "continueTheWork" ? "continueTheWork" : "startFastForward",
-              reasoning: "Work a round can do is left, and this is the step that does it.",
-            };
+          : recommended === "runOneMoreCycle"
+            ? {
+                kind: "option",
+                optionId: "runOneMoreCycle",
+                reasoning:
+                  `Fast Forward would stop at once (${facts.startHold}), so no round would run. ` +
+                  "One cycle does not depend on that hold and works on what a round can do.",
+              }
+            : {
+                kind: "option",
+                optionId: recommended === "continueTheWork" ? "continueTheWork" : "startFastForward",
+                reasoning: "Work a round can do is left, and this is the step that does it.",
+              };
 
   return {
     decisionKey: AUTOMATION_STOPPED_DECISION_KEY_V1,
@@ -291,7 +306,10 @@ export function buildAutomationStoppedCardInputV1(facts: AutomationStopFactsV1):
     whatHappened: lines.join(" "),
     whyUserNeeded: ready
       ? "Moving to the next stage changes what the task works on, so it waits for you."
-      : "Automation stopped with work left, and it does not choose between these next steps for you.",
+      : // review2 Step 23: a card that marks a step as recommended does not claim to stay neutral.
+        recommendation.kind === "none"
+        ? "Automation stopped with work left, and it does not choose between these next steps for you."
+        : "Automation stopped with work left. One step is marked as the one Ensemble would take; the choice is still yours.",
     options,
     recommendation,
     gating: { holdsTaskPaused: false, unblocksProgress: true, detail: "Choose the next step for this stage" },

@@ -178,6 +178,9 @@ function runPanel(): PanelHarness {
     "message",
     "send-btn",
     "send-reason",
+    "answering",
+    "answering-text",
+    "answering-cancel",
   ]) {
     elements.set(id, makeElement("div", id));
   }
@@ -862,6 +865,31 @@ void describe("the chat panel's inline script", () => {
       assert.doesNotMatch(source, /runStrip|chatRunStripV1|showRunInNotifications|stopRunFromStrip/);
       assert.equal(fs.existsSync(path.join(__dirname, "..", "..", "src", "views", "chatRunStripV1.ts")), false);
     });
+  });
+
+  void it("review2 Step 43: an own-words card shows 'Answering: <card title>' above the box, focuses it, and Cancel goes back", () => {
+    const panel = runPanel();
+    panel.post(stateMessage());
+    panel.post({ type: "answeringOwnWords", text: "Answering: Step 22 acceptance line" });
+    assert.equal(panel.byId("answering").style.display, "block");
+    assert.equal(panel.byId("answering-text").textContent, "Answering: Step 22 acceptance line");
+    // Cancel tells the host and hides the line.
+    for (const handler of panel.byId("answering-cancel").listeners.get("click") ?? []) handler({});
+    assert.ok(panel.outbound.some((m) => (m as { type?: unknown }).type === "cancelOwnWordsAnswer"));
+    assert.equal(panel.byId("answering").style.display, "none");
+    // The host ending the answer hides it too.
+    panel.post({ type: "answeringOwnWords", text: "Answering: x" });
+    panel.post({ type: "answeringOwnWordsEnded" });
+    assert.equal(panel.byId("answering").style.display, "none");
+  });
+
+  void it("review2 Step 43: a busy task does not block the answer to an own-words card", () => {
+    const panel = runPanel();
+    panel.post(stateMessage({ busy: true, busyLabel: "Apply Review", waitingForUser: false }));
+    assert.equal(panel.byId("send-btn").disabled, true);
+    panel.post({ type: "answeringOwnWords", text: "Answering: Step 22" });
+    panel.post(stateMessage({ busy: true, busyLabel: "Apply Review", waitingForUser: false }));
+    assert.equal(panel.byId("send-btn").disabled, false, "the answer is not a chat send");
   });
 
   void it("shows the non-steering note on a task chat and hides it on the global chat", () => {

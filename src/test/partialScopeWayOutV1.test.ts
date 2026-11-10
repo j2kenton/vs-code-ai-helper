@@ -120,7 +120,9 @@ void describe("Fast Forward stops for an unaccepted partial scope", () => {
     assert.equal(applies, 0, "no Apply Review is dispatched for a review that could not see the whole change");
     assert.equal(result.held?.kind, "partial-scope");
     assert.equal(result.zeroFixableSuccess, false);
-    assert.match(describeFastForwardHoldV1(result.held,"High-Level Code Review", result.attempts), /add the missing files, or accept the gap/);
+    const line = describeFastForwardHoldV1(result.held, "High-Level Code Review", result.attempts);
+    assert.match(line, /The way on is the decision card that follows\./);
+    assert.doesNotMatch(line, /add the missing files/, "review2 Step 27: never tells the owner to add files when none are known missing");
   });
 
   void it("with the gap accepted (no hold) the clean review ends as before", async () => {

@@ -107,27 +107,67 @@ export function buildHeldTicksAnswerOptionsV1(
   ];
 }
 
+/** An item an earlier answer covered that cannot be carried, and why. */
+export interface DeferredAnswerSkippedItemV1 {
+  readonly item: string;
+  readonly itemId: string | null;
+  /** `notOffered`: the replacement card does not offer this id. `noId`: the answer recorded no issued id for it. */
+  readonly reason: "notOffered" | "noId";
+}
+
 export interface DeferredAnswerCarryOverV1 {
-  /** Items the earlier answer covered that the replacement card also offers. */
+  /** Items the earlier answer covered that the replacement card also offers (same issued id). */
   readonly carried: readonly string[];
+  /** The issued id of each entry in `carried` (same index). */
+  readonly carriedIds: readonly string[];
   /** Items the earlier answer covered that the replacement no longer offers. */
   readonly dropped: readonly string[];
+  /** Each dropped item with its id and why it was not carried. */
+  readonly skipped: readonly DeferredAnswerSkippedItemV1[];
   /** Items the replacement offers that the earlier answer never saw. */
   readonly newItems: readonly string[];
 }
 
-/** Which of an earlier answer's items carry over to a replacement card's offered items (same text). */
+/**
+ * Which of an earlier answer's items carry over to a replacement card's offered items. Items are matched by
+ * their issued id only (review2 Step 1): two same-worded items stay two items, and an answer that names no id
+ * for an item (or an id the replacement does not offer) never falls back to the item's wording.
+ */
 export function computeDeferredAnswerCarryOverV1(
   answeredItems: readonly string[],
-  replacementItems: readonly string[]
+  answeredIds: readonly (string | null | undefined)[] | undefined,
+  replacementItems: readonly string[],
+  replacementIds: readonly (string | null | undefined)[] | undefined
 ): DeferredAnswerCarryOverV1 {
-  const replacement = new Set(replacementItems);
-  const answered = new Set(answeredItems);
-  return {
-    carried: answeredItems.filter((item) => replacement.has(item)),
-    dropped: answeredItems.filter((item) => !replacement.has(item)),
-    newItems: replacementItems.filter((item) => !answered.has(item)),
-  };
+  const replacementIdSet = new Set<string>();
+  replacementItems.forEach((_, index) => {
+    const id = replacementIds?.[index];
+    if (id) replacementIdSet.add(id);
+  });
+  const answeredIdSet = new Set<string>();
+  const carried: string[] = [];
+  const carriedIds: string[] = [];
+  const dropped: string[] = [];
+  const skipped: DeferredAnswerSkippedItemV1[] = [];
+  answeredItems.forEach((item, index) => {
+    const id = answeredIds?.[index] ?? null;
+    if (id) answeredIdSet.add(id);
+    if (!id) {
+      dropped.push(item);
+      skipped.push({ item, itemId: null, reason: "noId" });
+    } else if (replacementIdSet.has(id) && !carriedIds.includes(id)) {
+      carried.push(item);
+      carriedIds.push(id);
+    } else {
+      dropped.push(item);
+      skipped.push({ item, itemId: id, reason: "notOffered" });
+    }
+  });
+  const newItems = replacementItems.filter((_, index) => {
+    const id = replacementIds?.[index];
+    return !id || !answeredIdSet.has(id);
+  });
+  return { carried, carriedIds, dropped, skipped, newItems };
 }
 
 function shorten(text: string, max = 70): string {
@@ -135,21 +175,31 @@ function shorten(text: string, max = 70): string {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
 }
 
-/** The one chat line for a carry-over (Step 3), naming any item that dropped out. */
+/** Names each item a carry-over did not tick, with its id and the reason. */
+export function describeSkippedCarryOverItemsV1(skipped: readonly DeferredAnswerSkippedItemV1[]): string {
+  return skipped.length > 0
+    ? ` Not ticked: ${skipped
+        .map((entry) =>
+          entry.reason === "noId"
+            ? `"${shorten(entry.item)}" (no item id was recorded for it)`
+            : `"${shorten(entry.item)}" [item:${entry.itemId}] (the newer card no longer offers it)`
+        )
+        .join(", ")}.`
+    : "";
+}
+
+/** The one chat line for a carry-over (Step 3), naming any item that was not carried and why. */
 export function describeDeferredAnswerCarryOverV1(carryOver: DeferredAnswerCarryOverV1): string {
   const total = carryOver.carried.length + carryOver.newItems.length;
   if (carryOver.carried.length === 0) {
     return (
       "A newer review replaced the card, and none of its items are ones your earlier answer covered, so the " +
-      "answer was not carried over. The new card waits for you."
+      "answer was not carried over." +
+      describeSkippedCarryOverItemsV1(carryOver.skipped) +
+      " The new card waits for you."
     );
   }
-  const dropped =
-    carryOver.dropped.length > 0
-      ? ` These items dropped out because the newer review no longer lists them: ${carryOver.dropped
-          .map((item) => `"${shorten(item)}"`)
-          .join(", ")}.`
-      : "";
+  const dropped = describeSkippedCarryOverItemsV1(carryOver.skipped);
   return (
     `Your earlier answer was carried over to ${carryOver.carried.length} of the ${total} items; ` +
     `${carryOver.newItems.length} new item${carryOver.newItems.length === 1 ? " waits" : "s wait"} for you.${dropped}`
@@ -164,7 +214,9 @@ export function carryDeferredAnswerOverV1(
   previous: WorkflowDecisionDeferredAnswerV1,
   carryOver: DeferredAnswerCarryOverV1
 ): WorkflowDecisionDeferredAnswerV1 | undefined {
-  return carryOver.carried.length > 0 ? { ...previous, itemKeys: carryOver.carried } : undefined;
+  return carryOver.carried.length > 0
+    ? { ...previous, itemKeys: carryOver.carried, itemIds: carryOver.carriedIds }
+    : undefined;
 }
 
 /** The note the held card shows about its own kept answer. */

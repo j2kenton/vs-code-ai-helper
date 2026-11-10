@@ -25,6 +25,7 @@ import {
 import { decideCommitPushChecksReuseV1 } from "../utils/commitPushChecksReuseV1";
 import { estimateChecksMinutesV1, readPublishChecksOutcomeV1 } from "../utils/publishChecksOutcomeV1";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
+import { confirmUnreviewedFilesV1 } from "./confirmUnreviewedFilesV1";
 import { runPublishScopeCheck } from "../utils/publishScopeCheck";
 import { checkPublishPreflight } from "../utils/publishPreflight";
 import { runGitCommand, resolveGitRepo, checkGitPublishReadiness, GitPublishReadiness, resolveHeadCommitSha } from "../utils/gitRepoInfo";
@@ -3816,6 +3817,16 @@ export async function commitAndPushTask(
         "Resume the task first, then choose Commit & Push.",
         false
       );
+      return;
+    }
+    // review2 Step 19: committing with changed files no review has read names that number first. Only at Publish:
+    // elsewhere the row refuses the task anyway.
+    if (
+      resolvedTask.progress.currentStage === "publish" &&
+      !(await confirmUnreviewedFilesV1(vscode.Uri.file(resolvedTask.taskFolderPath), "Commit & Push", {
+        source: "publish",
+      }))
+    ) {
       return;
     }
     await invokeCommitPushRowV1(

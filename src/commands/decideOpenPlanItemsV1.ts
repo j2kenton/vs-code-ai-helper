@@ -46,6 +46,7 @@ import { recordPlanItemOwnerDecisionV1 } from "../utils/taskProgressTransforms";
 import { withTaskLock } from "../state/taskStateStore";
 import { clearFormPlanWriteMarkerV1, markFormPlanWriteV1 } from "../utils/formPlanWriteMarkerV1";
 import { POST_OWNER_TEST_RUN_CARD_COMMAND_V1, partitionItemsByNamedCommandV1 } from "./ownerTestRunCardV1";
+import { ACCEPT_ROUND_TEST_RUNS_COMMAND_V1 } from "../utils/acceptRoundTestRunsCommandIdV1";
 import { formatTestsRefusedRemedyV1, type TestsRefusedV1 } from "../utils/testsRefusedV1";
 import type { AllowedTestCommandV1 } from "../utils/allowedTestCommandV1";
 import { clearStageActionRefusalReasonV1, takeStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
@@ -68,6 +69,8 @@ export interface OpenPlanItemReasonForDecisionV1 {
    * gate still counts it open. The form lists it and "tick" confirms the existing tick without rewriting the line.
    */
   readonly alreadyTicked?: boolean;
+  /** review2 Step 6: the round's claim for this item was dropped (its report contradicted itself); the form words the tick as accepting that claim. */
+  readonly roundClaimDropped?: boolean;
 }
 
 export interface DecideOpenPlanItemsArgV1 {
@@ -169,6 +172,7 @@ function resolveOpenFormItemsV1(
       occurrence: record.occurrence,
       reason: item.reason,
       ...(item.alreadyTicked === true ? { alreadyTicked: true } : {}),
+      ...(item.roundClaimDropped === true ? { roundClaimDropped: true } : {}),
     });
   }
   return formItems;
@@ -357,8 +361,7 @@ async function applyOpenPlanItemsFormLockedV1(input: {
     // verification. The task lock is already held by the caller.
     const recorded = await recordOwnerDecisionsV1(input.taskFolderPath, form.formId, {
       content: applied.content,
-      tickedWritten: [...applied.tickedWritten, ...applied.confirmedTicked],
-      excludedWritten: applied.excludedWritten,
+      decided: applied.decided,
     });
     provenanceNote = recorded
       ? ` ${recorded}`
@@ -400,8 +403,8 @@ async function recordOwnerDecisionsV1(
   formId: string,
   applied: {
     readonly content: string;
-    readonly tickedWritten: readonly string[];
-    readonly excludedWritten: readonly string[];
+    /** review2 Step 3: each settled item by issued id, with its own clean text (never the card's or the note's wording). */
+    readonly decided: readonly { readonly itemId: string; readonly itemText: string; readonly decision: "tick" | "exclude" }[];
   }
 ): Promise<string | undefined> {
   const planRevision = getPlanRevisionV1(applied.content);
@@ -414,11 +417,16 @@ async function recordOwnerDecisionsV1(
         // review1 Step 2/3: decisions match the item's own content (a note appended to a ticked line does not
         // change it), so nothing is carried between plan revisions. The hash is taken from the written plan.
         const planText = applied.content;
-        for (const itemText of applied.tickedWritten) {
-          next = recordPlanItemOwnerDecisionV1(next, { planRevision, planText, itemText, at, formId, decision: "tick" });
-        }
-        for (const itemText of applied.excludedWritten) {
-          next = recordPlanItemOwnerDecisionV1(next, { planRevision, planText, itemText, at, formId, decision: "exclude" });
+        for (const item of applied.decided) {
+          next = recordPlanItemOwnerDecisionV1(next, {
+            planRevision,
+            planText,
+            itemText: item.itemText,
+            itemId: item.itemId,
+            at,
+            formId,
+            decision: item.decision,
+          });
         }
         return next;
       },
@@ -701,6 +709,10 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
   readonly reviewVerifiedKeys?: ReadonlySet<string>;
   /** Normalized keys of items the round durably claimed built (the classifier's built signal). */
   readonly builtClaimedKeys?: ReadonlySet<string>;
+  /** review2 Step 11: normalized keys of items the round claimed done in a report that also declared no checklist change. */
+  readonly droppedClaimKeys?: ReadonlySet<string>;
+  /** review2 Step 6: the run file the dropped claims' report came from (for example `runs/161-claude-cli-impl.md`), named on the accept option. */
+  readonly droppedClaimRunFile?: string;
   /** bugs4 item 30: the plan's "N open, of which M are owner hand-offs" line. */
   readonly openSummary?: string;
   /** review1 Step 6: how many nested sub-items are open (named on the card; the form cannot settle them). */
@@ -714,11 +726,22 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
 }): Omit<CreateWorkflowDecisionInputV1, "decisionId"> {
   const { taskFolderPath, taskCanonicalId, stage, displayName, createdAt, resumeFastForwardV1 } = input;
   // bugs4 items 5 and 27: say why each item is open, from what the system knows.
-  const classified = classifyOpenPlanItemsV1(input.items, input.reviewVerifiedKeys, input.builtClaimedKeys);
+  const classified = classifyOpenPlanItemsV1(
+    input.items,
+    input.reviewVerifiedKeys,
+    input.builtClaimedKeys,
+    input.droppedClaimKeys
+  );
   const items: readonly OpenPlanItemReasonForDecisionV1[] = classified.map((item) => ({
     itemText: item.itemText,
     reason: item.reason,
+    ...(item.category === "claim-dropped" ? { roundClaimDropped: true } : {}),
   }));
+  const droppedClaimTexts = classified.filter((item) => item.category === "claim-dropped").map((item) => item.itemText);
+  const droppedCount = droppedClaimTexts.length;
+  // review2 Step 6: "tick it because you already did it" is owner work's wording. Items that are only a round's
+  // dropped claim are not owner work, so the sentence is left out when every listed item is one.
+  const ownerWorkWording = droppedCount < classified.length;
   const count = items.length;
   const plural = count === 1 ? "item" : "items";
   const evidenceLines = formatClassifiedOpenPlanItemsV1(classified);
@@ -729,8 +752,12 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
     label: "Decide item by item",
     resumeKind: "unpause",
     consequence:
-      "Shows a form in this chat with every open item — exclude it with a reason, tick it because you already " +
-      "did it, or leave it open — and writes your choices to plan-final.md in one pass when you press Apply, " +
+      "Shows a form in this chat with every open item — exclude it with a reason, " +
+      (ownerWorkWording
+        ? "tick it because you already did it (only for work you did yourself; a round's dropped claim reads " +
+          "\"Accept the round's claim\"), "
+        : "accept the round's claim and tick it, ") +
+      "or leave it open — and writes your choices to plan-final.md in one pass when you press Apply, " +
       "with a dated Accepted Non-Goals entry for anything excluded. Items you leave open stay open. If " +
       "you change at least one item, it then builds whatever is still open, or offers Advance once nothing " +
       "is. If you leave every item open, nothing runs and the task waits until you fix what blocks them and " +
@@ -819,9 +846,37 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
   const refusedRemedy = testsRefused ? formatTestsRefusedRemedyV1(testsRefused, input.allowedTestCommand) : "";
   // The owner-run card can only record a run of a command a waiting item names; Ensemble never invents one.
   const ownerRunOffered = partitionItemsByNamedCommandV1(awaitingReportTexts).groups.length > 0;
+  // review2 Step 6 (bugs6 item 25): for a round's dropped claims the way on is the round's own evidence, never
+  // "tick it because you already did it": accept the test runs its report names, or re-run the round so it records them.
+  const runFile = input.droppedClaimRunFile;
+  const acceptRoundRunsOption: WorkflowDecisionOptionV1 = {
+    optionId: "acceptRoundTestRuns",
+    label: `Accept the round's test runs${runFile ? ` (${runFile})` : ""}`,
+    resumeKind: "unpause",
+    consequence:
+      `Records the round's built claim and its passing test report for the ${droppedCount} item${droppedCount === 1 ? "" : "s"} ` +
+      `whose claim was dropped, taken from ${runFile ? runFile : "the round's last report"}, marked as accepted by you. ` +
+      "Only items whose report names a passing test command for them are recorded; the rest are listed. Nothing is ticked; the next review verifies them.",
+    effect: {
+      kind: "command",
+      command: ACCEPT_ROUND_TEST_RUNS_COMMAND_V1,
+      args: [{ taskFolderPath, displayName, itemTexts: droppedClaimTexts, ...(runFile ? { runFile } : {}) }],
+    },
+    recordedNext: "the round's test runs are recorded",
+  };
+  const rerunRoundOption: WorkflowDecisionOptionV1 = {
+    optionId: "rerunRoundToRecord",
+    label: "Re-run the round to record them",
+    resumeKind: "continue",
+    consequence:
+      "Dispatches this stage's next round once more. This time the report must not declare no checklist change " +
+      "while it claims items done, so its claims can be recorded. Nothing is ticked for you.",
+    effect: { kind: "command", command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction", args: [{ taskFolderPath }] },
+  };
+  const droppedOptions = droppedCount > 0 ? [acceptRoundRunsOption, rerunRoundOption] : [];
   const baseOptions = testEvidenceOnly
-    ? [runTestingRoundOption, ...(ownerRunOffered ? [ownerRanTestsOption] : []), decideOption, openPlanOption, leaveOption]
-    : [decideOption, openPlanOption, leaveOption];
+    ? [runTestingRoundOption, ...(ownerRunOffered ? [ownerRanTestsOption] : []), ...droppedOptions, decideOption, openPlanOption, leaveOption]
+    : [...droppedOptions, decideOption, openPlanOption, leaveOption];
   const refusedRecommendation: WorkflowDecisionRecommendationV1 | undefined =
     testEvidenceOnly && testsRefused
       ? ownerRunOffered
@@ -846,6 +901,10 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
       ? "The latest review verified every open item built. They stay open only because the boxes are unticked or " +
         "no passing test report is recorded; ticking them is your decision to make." +
         (refusedRemedy ? ` ${refusedRemedy}` : "")
+      : count > 0 && droppedCount === count
+        ? "The round's report contradicted itself: it declared no checklist change but claimed every one of these items " +
+          "done, so Ensemble did not use the claims. You did nothing wrong; accept the test runs the round reported, or " +
+          "re-run the round so its claims are recorded."
       : testEvidenceOnly
         ? "Every open item is waiting only for a passing test report. " +
           (testsRefused
@@ -865,6 +924,14 @@ export function buildOpenPlanItemsNeedDecisionCardInputV1(input: {
             `The latest review verified all ${count} ${plural} built. Ticking them is one click and is recorded as ` +
             "your decision, not as a test report or a review verification.",
         }
+      : count > 0 && droppedCount === count
+        ? {
+            kind: "option",
+            optionId: "acceptRoundTestRuns",
+            reasoning:
+              "The round's own report claims these done and names the test runs; only its \"no checklist change\" line made " +
+              "Ensemble drop the claims. Recording the runs it reported needs no new round, and a review still verifies them.",
+          }
       : refusedRecommendation
         ? refusedRecommendation
         : testEvidenceOnly

@@ -17,9 +17,16 @@ import {
   endedBeforeStartLineV1,
   isLivePublishChecksRunV1,
   startingLineV1,
+  startupAnnouncerExpiredV1,
   stillStartingLineV1,
 } from "../utils/startupAnnouncerLinesV1";
 import { operationChatLabelV1 } from "../utils/stepLabelsV1";
+import {
+  hasHandedOverOwnWordsTextV1,
+  OWN_WORDS_TYPE_HINT_V1,
+  ownWordsArgOfOptionV1,
+  ownWordsBannerTextV1,
+} from "../utils/ownWordsAnswerV1";
 import { logChatStatusToNotificationsV1 } from "../utils/chatStatusLogV1";
 import { isConversationEntryV1 } from "./chatTranscriptFilterV1";
 import {
@@ -142,6 +149,8 @@ import {
   APPLY_OPTION_ID_V1,
   HELD_CARD_STAYS_OPEN_NOTE_V1,
   buildHeldTicksAnswerOptionsV1,
+  computeDeferredAnswerCarryOverV1,
+  describeSkippedCarryOverItemsV1,
   offeredTickItemIdsOfV1,
   offeredTickItemsOfV1,
 } from "../commands/verifiedTicksHeldOptionsV1";
@@ -686,6 +695,23 @@ export function describeRecordedChoiceV1(label: string, recordedNext: string): s
 }
 
 /**
+ * review2 Step 27: the "Recorded:" line for a choice whose effect is `doNothing`. "This does nothing further" is only
+ * said when the option's own consequence agrees (it says "nothing"/"does not"); a consequence that says the task moves
+ * or runs something ("Moves the task to Publish on the older verdict") is recorded in its own words, never contradicted.
+ */
+export function describeDoNothingChoiceV1(label: string, consequence: string): string {
+  const text = consequence.trim();
+  const movesOrRuns = /\b(moves?|advances?|starts?|runs?|continues?|resumes?)\b/i.test(text);
+  const saysNothing = /\bnothing\b|\bdoes not\b|\bdoesn't\b|\bno new\b/i.test(text);
+  if (movesOrRuns && !saysNothing) {
+    return `Recorded: "${label}". ${text}`;
+  }
+  return text.length > 0
+    ? `Recorded: "${label}" — this does nothing further. ${text}`
+    : `Recorded: "${label}" — this does nothing further.`;
+}
+
+/**
  * bugs5 Step 1: whether the owner can do anything with this card: at least one enabled option
  * whose effect is not `doNothing`. Judge it on the viewed record (after
  * `holdDispatchingOptionsWhileOperationLiveV1`), so an option held back by a running operation
@@ -1153,6 +1179,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private readonly decisionsBeingAnsweredV1 = new Set<string>();
   /** review1 Step 53: decisions whose answer is being given by a countdown, not by the owner. */
   private readonly automaticResolutionsV1 = new Set<string>();
+  /**
+   * review2 Step 43: the own-words card this window is waiting for an answer to. The next message sent from the
+   * message box is that answer (it never starts a Chat With AI round).
+   */
+  private answeringOwnWordsV1: { readonly decisionId: string; readonly optionId: string; readonly taskFolderPath: string } | undefined;
+
+  /** Stop waiting for an own-words answer and put the message box back to normal chat. */
+  private endOwnWordsAnswerV1(): void {
+    this.answeringOwnWordsV1 = undefined;
+    void this.view?.webview.postMessage({ type: "answeringOwnWordsEnded" });
+  }
+
+  /**
+   * review2 Step 43: choosing an own-words option does not dispatch anything. It focuses this window's message box
+   * and shows "Answering: <card title>" above it; the card stays open until the answer is sent.
+   */
+  private beginOwnWordsAnswerV1(decision: WorkflowDecisionV1, option: WorkflowDecisionOptionV1): RelayedResolutionOutcomeV1 {
+    const arg = ownWordsArgOfOptionV1(option);
+    if (arg === undefined) return { ok: false };
+    this.answeringOwnWordsV1 = { decisionId: decision.decisionId, optionId: option.optionId, taskFolderPath: arg.taskFolderPath };
+    void this.view?.webview.postMessage({ type: "answeringOwnWords", text: ownWordsBannerTextV1(decision.whatHappened.split(/\r?\n/)[0] ?? decision.decisionKey) });
+    return { ok: true, transitioned: false, message: OWN_WORDS_TYPE_HINT_V1 };
+  }
 
   /**
    * review1 Step 53: runs a card's option because its countdown ended with no answer. Behaves exactly like the
@@ -1596,12 +1645,32 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         }
         return;
       }
+      if (message && typeof message === "object" && (message as { type?: unknown }).type === "cancelOwnWordsAnswer") {
+        this.endOwnWordsAnswerV1();
+        return;
+      }
       if (!isSendMessage(message) || !this.target) return;
       // Captured before any await, so a target switch mid-send still writes
       // to (and, if still current, renders) the task the message was sent to.
       const target = this.target;
       const text = message.text.trim();
       if (!text) return;
+      // review2 Step 43: while an own-words card waits, the message sent is its answer, not a chat message. It goes
+      // to the window that runs the workflow as a send that names the card, and starts no Chat With AI round.
+      const ownWordsAnswer = this.answeringOwnWordsV1;
+      if (ownWordsAnswer !== undefined) {
+        this.endOwnWordsAnswerV1();
+        if (target.kind !== "global" && normalizePath(target.taskFolderPath) === normalizePath(ownWordsAnswer.taskFolderPath)) {
+          await vscode.commands.executeCommand("vs-code-ai-helper.chatWithStage", {
+            ...target,
+            message: text,
+            sendId: crypto.randomBytes(16).toString("hex"),
+            answersDecision: { decisionId: ownWordsAnswer.decisionId, optionId: ownWordsAnswer.optionId },
+          });
+          await this.render();
+          return;
+        }
+      }
       if (target.kind !== "global") {
         // Concrete webview route of the Chat Send action family (plan §1.3):
         // consult the gate BEFORE appending the user message, so a disabled
@@ -2367,7 +2436,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         return;
       }
     } else if (effect.kind === "doNothing") {
-      await this.appendStatusLineV1(`Recorded: "${option.label}" — this does nothing further.${detail}`, stage, identity);
+      await this.appendStatusLineV1(describeDoNothingChoiceV1(option.label, option.description ?? ""), stage, identity);
       return;
     } else {
       await this.appendStatusLineV1(`Recorded: "${option.label}" — applying now.${detail}`, stage, identity);
@@ -3440,6 +3509,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await this.render();
       return { ok: outcomeOk, transitioned: outcomeOk };
     }
+    // review2 Step 43: an own-words option waits for the owner's typed answer in this window's message box.
+    if (ctx === undefined && !this.automaticResolutionsV1.has(decisionId)) {
+      const asked = this.workflowDecisionStore.get(decisionId);
+      const askedOption = asked?.state === "pending" ? asked.options.find((candidate) => candidate.optionId === optionId) : undefined;
+      const ownWords = askedOption === undefined ? undefined : ownWordsArgOfOptionV1(askedOption);
+      // Once the typed text has been handed over (the chat send did it), the choice runs its command as usual.
+      if (
+        asked !== undefined &&
+        askedOption !== undefined &&
+        ownWords !== undefined &&
+        !hasHandedOverOwnWordsTextV1(ownWords.taskFolderPath, ownWords.blockerId)
+      ) {
+        return this.beginOwnWordsAnswerV1(asked, askedOption);
+      }
+    }
     if (this.interactionServices?.resolveWorkflowDecision && this.isRemoteDecisionV1?.(decisionId) !== false) {
       // The runner raised it, so the runner resolves it and runs its effect
       // (hostDecisionMirrorV1.ts). A decision this window raised itself
@@ -3692,7 +3776,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           option.recordedNext !== undefined
             ? `${describeRecordedChoiceV1(option.label, option.recordedNext)} ${option.consequence}${closedNote}`
             : option.effect.kind === "doNothing"
-              ? `Recorded: "${option.label}" — this does nothing further. ${option.consequence}`
+              ? describeDoNothingChoiceV1(option.label, option.consequence)
               : `Recorded: "${option.label}" — applying now. ${option.consequence}${closedNote}`;
         await this.appendStatusLineV1(ackText, decision.stage, identity);
       }
@@ -4240,23 +4324,25 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           return { kind: "notCarriedOut", reason: "the card is no longer open." };
         }
         const offered = offeredTickItemsOfV1(current);
-        // The items the answer covers, with the issued id of each (from the card now open), so a same-worded twin
-        // the answer never covered is not ticked in its place.
+        // review2 Step 1: the items the answer covers are the ones whose issued id the answer recorded and the card
+        // now open still offers. Wording never matches, so a same-worded twin the answer never covered is not
+        // ticked in its place; every item skipped is named, with its id and why.
         const offeredIds = offeredTickItemIdsOfV1(current);
-        const answeredLeft = new Map<string, number>();
-        for (const key of answer.itemKeys) answeredLeft.set(key, (answeredLeft.get(key) ?? 0) + 1);
-        const covered: string[] = [];
-        const coveredIds: (string | null)[] = [];
-        offered.forEach((item, index) => {
-          const left = answeredLeft.get(item) ?? 0;
-          if (left <= 0) return;
-          answeredLeft.set(item, left - 1);
-          covered.push(item);
-          coveredIds.push(offeredIds?.[index] ?? null);
-        });
+        const carryOver = computeDeferredAnswerCarryOverV1(answer.itemKeys, answer.itemIds, offered, offeredIds);
+        const covered = [...carryOver.carried];
+        const coveredIds = [...carryOver.carriedIds];
+        const skippedNote = describeSkippedCarryOverItemsV1(carryOver.skipped).trim();
         const apply = current.options.find((candidate) => candidate.optionId === APPLY_OPTION_ID_V1);
         if (covered.length === 0 || !apply || apply.effect.kind !== "command") {
-          return { kind: "notCarriedOut", reason: "none of the items you answered for are on the card any more." };
+          return {
+            kind: "notCarriedOut",
+            reason: `none of the items you answered for are offered by the card any more.${skippedNote ? ` ${skippedNote}` : ""}`,
+          };
+        }
+        if (skippedNote) {
+          await this.append("assistant", `Your kept answer skipped some items. ${skippedNote}`, current.stage, identity).catch(
+            () => undefined
+          );
         }
         const read = await readTaskProgressStrictV1(vscode.Uri.file(taskPath)).catch(() => undefined);
         if (!read?.ok || read.decoded.progress.currentStage !== current.stage) {
@@ -4267,7 +4353,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           const result = await vscode.commands.executeCommand(apply.effect.command, {
             ...firstArg,
             offeredItems: covered,
-            ...(offeredIds ? { offeredItemIds: coveredIds } : {}),
+            offeredItemIds: coveredIds,
           });
           if (result === false) {
             return { kind: "notCarriedOut", reason: "the action did not complete (see the notification)." };
@@ -4505,7 +4591,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       }
     };
     const changeListener = taskOperations.onDidChange(noteOperation);
+    const stopAnnouncer = (): void => {
+      changeListener.dispose();
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+    };
     const tick = (): void => {
+      // review2 Step 42: an announcer this old belongs to a command still waiting from long ago; whatever starts now
+      // is another click's, and this one must not name its own action for it.
+      if (startupAnnouncerExpiredV1(startedAt, Date.now())) {
+        stopAnnouncer();
+        return;
+      }
       noteOperation();
       if (!claimOnly()) {
         preparingSince = undefined;
@@ -4537,13 +4636,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         timer.unref?.();
       },
       tick,
-      stop: () => {
-        changeListener.dispose();
-        if (timer !== undefined) {
-          clearInterval(timer);
-          timer = undefined;
-        }
-      },
+      stop: stopAnnouncer,
     };
   }
 
@@ -5765,6 +5858,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         .interaction-actions + .msg-meta { margin-top: var(--ensemble-space-2); }
         .decision-paused-note { margin: 0 0 var(--ensemble-space-3); font-size: 0.85em; color: var(--ensemble-info-foreground); }
         #send-reason { display: none; margin-left: var(--ensemble-space-2); font-size: 0.85em; color: var(--ensemble-muted-foreground); }
+        #answering { display: none; margin: 0 0 var(--ensemble-space-2); font-weight: bold; color: var(--ensemble-info-foreground); }
       </style>
       </head><body>
       <div id="context" role="status">Loading chat…</div><div id="messages" role="log" aria-live="polite" aria-label="Conversation"></div>
@@ -5774,6 +5868,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span></div>
       <div id="steering-note" role="note">Rounds don't read this chat. To change what the next rounds do, ask here to record it in the plan (for example, "add to the plan: skip the memory work"), or edit <code>plan-final.md</code> yourself.</div>
+      <div id="answering" role="status" aria-live="polite"><span id="answering-text"></span> <button type="button" id="answering-cancel" title="Stop answering this card and go back to normal chat">Cancel</button></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" id="send-btn" title="Send message (Enter)">Send</button><span id="send-reason" role="status"></span></form>
       <script nonce="${nonce}">const v=acquireVsCodeApi(), c=document.getElementById('context'), m=document.getElementById('messages'), ic=document.getElementById('interaction'), dc=document.getElementById('decisions'), en=document.getElementById('empty-notice'), e=document.getElementById('error'), b=document.getElementById('busy-indicator'), bt=document.getElementById('busy-text'), sn=document.getElementById('steering-note'), f=document.getElementById('form'), i=document.getElementById('message'), sb=document.getElementById('send-btn'), sr=document.getElementById('send-reason');
       const savedState = v.getState() || {};
@@ -6117,7 +6212,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             }
             const name='opf-'+form.formId+'-'+item.itemId;
             const radios={};
-            for(const choice of [['exclude','Exclude'],['tick','I did it — tick it'],['leave','Leave open']]){
+            // review2 Step 6: "I did it" is for owner work only; a round's dropped claim is accepted, not done by the owner.
+            const tickLabel=item.roundClaimDropped?'Accept the round’s claim — tick it':'I did it — tick it';
+            for(const choice of [['exclude','Exclude'],['tick',tickLabel],['leave','Leave open']]){
               const lab=document.createElement('label'); lab.style.display='block';
               const r=document.createElement('input'); r.type='radio'; r.name=name; r.value=choice[0];
               if(choice[0]==='leave') r.checked=true;
@@ -6397,6 +6494,18 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // separated by a visible marker: merging them silently produced one
         // mashed-up message that the next press of Send posted as it stood
         // (verification review, 2026-09-18).
+        // review2 Step 43: an own-words card was chosen. The next message sent from the box is the answer.
+        if(s.type==='answeringOwnWords'){
+          const answeringBox=document.getElementById('answering'), answeringText=document.getElementById('answering-text');
+          if(answeringText){answeringText.textContent=s.text;}
+          if(answeringBox){answeringBox.style.display='block';}
+          i.focus();return;
+        }
+        if(s.type==='answeringOwnWordsEnded'){
+          const answeringBox=document.getElementById('answering');
+          if(answeringBox){answeringBox.style.display='none';}
+          return;
+        }
         if(s.type==='restoreDraft'){
           const mark='--- below: a message that could not be sent ---';
           const typed=i.value;
@@ -6525,7 +6634,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         // lock) — s.busy is already false whenever s.waitingForUser is true
         // (see the busy derivation server-side), so no separate check is
         // needed here.
-        const sendDisabled = !!s.busy && !(s.target && s.target.kind==='global');
+        // review2 Step 43: an answer to an own-words card is not a chat send, so a busy task does not block it.
+        const answeringBoxNow = document.getElementById('answering');
+        const answeringNow = !!answeringBoxNow && answeringBoxNow.style.display==='block';
+        const sendDisabled = !!s.busy && !(s.target && s.target.kind==='global') && !answeringNow;
         sb.disabled = sendDisabled;
         if(sendDisabled){ sr.textContent='Available when '+(s.busyLabel||'the current action')+' finishes'; sr.style.display='inline'; }
         else{ sr.textContent=''; sr.style.display='none'; }
@@ -6538,6 +6650,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         });
       });
       f.addEventListener('submit',e=>{e.preventDefault();if(sb.disabled){return;}v.postMessage({type:'send',text:i.value});i.value='';});
+      const answeringCancel=document.getElementById('answering-cancel');
+      if(answeringCancel){answeringCancel.addEventListener('click',()=>{v.postMessage({type:'cancelOwnWordsAnswer'});const answeringBox=document.getElementById('answering');if(answeringBox){answeringBox.style.display='none';}});}
       i.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.ctrlKey&&!e.metaKey&&!e.shiftKey){e.preventDefault();if(!sb.disabled){f.requestSubmit();}}else if(e.key==='Escape'){i.blur();}});
       v.postMessage({type:'ready'});</script>
     </body></html>`;

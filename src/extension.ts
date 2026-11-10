@@ -105,6 +105,7 @@ import { setPlanItemCountsObserverV1 } from "./utils/effectiveReviewProgress";
 import { registerOwnerTestRunCommandsV1 } from "./commands/ownerTestRunCardV1";
 import { registerTickEvidenceGapItemsCommandV1 } from "./commands/evidenceGapChecksV1";
 import { registerWithheldTestEvidenceCommandsV1 } from "./commands/withheldTestEvidenceCommandsV1";
+import { registerAcceptRoundTestRunsCommandV1 } from "./commands/acceptRoundTestRunsV1";
 import { registerOwnerPlanDecisionCommandV1 } from "./commands/ownerPlanDecisionCommandV1";
 import { registerAutomaticDispatchGateV1 } from "./commands/automaticDispatchGateV1";
 import { startAutoContinueSweepV1 } from "./commands/autoContinueSweepWiringV1";
@@ -130,6 +131,7 @@ import { registerRetryReviewWithBackupCommandV1 } from "./commands/retryReviewWi
 import { registerRerunReviewAfterUnchangedTreeCardCommandV1 } from "./commands/rerunReviewAfterUnchangedTreeCardV1";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
+import { registerWidenReviewScopeCommandV1 } from "./commands/widenReviewScopeCurrentTaskV1";
 import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForwardCurrentTaskReview";
 import { registerRecoverLastAiResponseCommand } from "./commands/recoverLastAiResponse";
 import { registerPauseTaskCommand } from "./commands/pauseTask";
@@ -1500,6 +1502,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerOwnerTestRunCommandsV1(context);
   registerTickEvidenceGapItemsCommandV1(context);
   registerWithheldTestEvidenceCommandsV1(context);
+  registerAcceptRoundTestRunsCommandV1(context);
   registerOwnerPlanDecisionCommandV1(context);
   registerAutomaticDispatchGateV1(context);
   registerPartialScopeDecisionCommandV1(context);
@@ -1516,6 +1519,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerRerunReviewAfterUnchangedTreeCardCommandV1(context, chatViewProvider);
   registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
   registerReviewCurrentTaskCommand(context, inventory, currentTaskStore);
+  registerWidenReviewScopeCommandV1(context, inventory, currentTaskStore);
   registerFastForwardCurrentTaskReviewCommand(context, inventory, currentTaskStore);
   registerRecoverLastAiResponseCommand(context);
   registerPauseTaskCommand(context, inventory, currentTaskStore);

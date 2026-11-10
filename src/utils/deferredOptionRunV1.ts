@@ -39,6 +39,27 @@ export function createDeferredRunRegistryV1(): DeferredRunRegistryV1 {
 
 const defaultRegistryV1 = createDeferredRunRegistryV1();
 
+/**
+ * review2 Step 13: the answers this window has already carried out and reported as run, per table.
+ * A held answer's "has now run" line is written once, when it runs: a second arming of the same
+ * answer (an activation re-arm, a second signal) neither runs nor reports it again.
+ */
+const reportedRunKeysV1 = new WeakMap<DeferredRunRegistryV1, Set<string>>();
+
+function reportedRunKeysForV1(registry: DeferredRunRegistryV1): Set<string> {
+  let keys = reportedRunKeysV1.get(registry);
+  if (!keys) {
+    keys = new Set<string>();
+    reportedRunKeysV1.set(registry, keys);
+  }
+  return keys;
+}
+
+/** True when this window already carried out and reported the answer under `key`. */
+export function hasDeferredOptionRunReportedV1(key: string, registry: DeferredRunRegistryV1 = defaultRegistryV1): boolean {
+  return reportedRunKeysForV1(registry).has(key);
+}
+
 export const DEFERRED_OPTION_POLL_MS_V1 = 3_000;
 export const DEFERRED_OPTION_MAX_WAIT_MS_V1 = 6 * 60 * 60 * 1000;
 
@@ -49,7 +70,7 @@ export function isDeferredOptionRunArmedV1(key: string, registry: DeferredRunReg
 /** Returns false when this answer is already waiting (nothing new is armed). */
 export function armDeferredOptionRunV1(input: DeferredOptionRunInputV1): boolean {
   const armed = input.registry ?? defaultRegistryV1;
-  if (armed.has(input.key)) {
+  if (armed.has(input.key) || reportedRunKeysForV1(armed).has(input.key)) {
     return false;
   }
   let settled = false;
@@ -92,6 +113,9 @@ export function armDeferredOptionRunV1(input: DeferredOptionRunInputV1): boolean
       }))
       .then((outcome) => {
         armed.delete(input.key);
+        if (outcome.kind === "done") {
+          reportedRunKeysForV1(armed).add(input.key);
+        }
         return input.report(outcome);
       });
   }

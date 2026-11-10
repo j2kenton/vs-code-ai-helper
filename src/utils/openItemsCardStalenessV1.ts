@@ -24,3 +24,42 @@ export function isOpenItemsCardStaleV1(whatHappened: string, currentOpenCount: n
   const listed = parseOpenItemsCardCountV1(whatHappened);
   return listed !== undefined && currentOpenCount < listed;
 }
+
+/**
+ * review2 Step 7 (bugs6 item 26): the item texts an open-items card lists. The "Decide item by item" option carries
+ * them in its args (the same records the form resolves), which is sturdier than reading the card's prose.
+ */
+export function listOpenItemsCardItemTextsV1(
+  options: readonly {
+    readonly optionId: string;
+    readonly effect: { readonly kind: string; readonly args?: readonly unknown[] };
+  }[]
+): string[] {
+  const decide = options.find((option) => option.optionId === "decideItemByItem");
+  const first = decide?.effect.kind === "command" ? decide.effect.args?.[0] : undefined;
+  const items = (first as { readonly items?: unknown } | undefined)?.items;
+  if (!Array.isArray(items)) return [];
+  return items.flatMap((item) => {
+    const text = (item as { readonly itemText?: unknown } | null)?.itemText;
+    return typeof text === "string" ? [text] : [];
+  });
+}
+
+/**
+ * How many of the card's listed items are no longer open. `settledCount === listed.length` (with items listed)
+ * means nothing on the card is open any more. Items match by normalized text, which is only a staleness test:
+ * identical twins keep the card up until both are settled, the safe direction.
+ */
+export function countSettledOpenItemsCardItemsV1(
+  listedItemTexts: readonly string[],
+  openNowItemTexts: readonly string[],
+  normalize: (text: string) => string
+): { readonly listed: number; readonly settled: number } {
+  const openNow = new Set(openNowItemTexts.map(normalize));
+  return { listed: listedItemTexts.length, settled: listedItemTexts.filter((text) => !openNow.has(normalize(text))).length };
+}
+
+/** The chat line for a card whose listed items are all settled now. */
+export function describeOpenItemsCardAllSettledV1(listed: number): string {
+  return `the ${listed} item${listed === 1 ? " is" : "s are"} now settled; nothing is open on this card`;
+}

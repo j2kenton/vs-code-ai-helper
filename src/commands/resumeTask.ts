@@ -51,6 +51,7 @@ import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupRec
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
 import { confirmAdvanceOverOpenItemsV1 } from "./confirmAdvanceOverOpenItemsV1";
+import { confirmUnreviewedFilesV1 } from "./confirmUnreviewedFilesV1";
 import { loadResumeActionPlanV1, preflightFixedDispatchV1 } from "../utils/resumeActionPlanV1";
 import {
   FastForwardResumeStateV1,
@@ -1579,6 +1580,16 @@ export async function resumeAndSetTaskStageV1(
   if (
     expectedSourceStage !== undefined &&
     !(await confirmAdvanceOverOpenItemsV1(vscode.Uri.file(target.taskFolderPath), expectedSourceStage, stage))
+  ) {
+    return;
+  }
+  // review2 Step 19: the "Advance to Publish" card option asks the same question as Complete Stage & Move On.
+  if (
+    expectedSourceStage !== undefined &&
+    !(await confirmUnreviewedFilesV1(vscode.Uri.file(target.taskFolderPath), "Advance to Publish", {
+      destination: stage,
+      source: expectedSourceStage,
+    }))
   ) {
     return;
   }

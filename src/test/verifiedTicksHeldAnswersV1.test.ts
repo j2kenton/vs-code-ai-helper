@@ -42,7 +42,16 @@ class FakeMemento {
 
 const TASK = "/tmp/tasks/ticks-task";
 
-function ticksCard(items: readonly string[]): CreateWorkflowDecisionInputV1 {
+/** A stable fake issued id for a test item, so the same wording gets the same id unless a test says otherwise. */
+function idOf(item: string): string {
+  return `id-${item.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`;
+}
+
+function idsOf(items: readonly string[]): readonly string[] {
+  return items.map(idOf);
+}
+
+function ticksCard(items: readonly string[], itemIds: readonly (string | null)[] = idsOf(items)): CreateWorkflowDecisionInputV1 {
   return {
     decisionId: "ticks-1",
     decisionKey: "applyReviewerVerifiedTicks",
@@ -59,7 +68,7 @@ function ticksCard(items: readonly string[]): CreateWorkflowDecisionInputV1 {
         effect: {
           kind: "command",
           command: "vs-code-ai-helper.applyReviewerVerifiedTicksConfirmed",
-          args: [{ taskFolderPath: TASK, canonicalId: TASK, reviewStage: "impl-high-review", offeredItems: items }],
+          args: [{ taskFolderPath: TASK, canonicalId: TASK, reviewStage: "impl-high-review", offeredItems: items, offeredItemIds: itemIds }],
         },
       },
       {
@@ -160,6 +169,7 @@ void describe("held answers on the reviewer-verified-ticks card (bugs5 Steps 2-3
       optionId: APPLY_WHEN_PAUSED_OPTION_ID_V1,
       acceptedAt: "2026-11-01T04:30:00.000Z",
       itemKeys: ITEMS,
+      itemIds: idsOf(ITEMS),
     });
     const replaced = await store.post(ticksCard(["Item two", "Item three", "Brand new item"]));
     assert.ok(replaced.ok);
@@ -167,11 +177,45 @@ void describe("held answers on the reviewer-verified-ticks card (bugs5 Steps 2-3
     assert.equal(replaced.updatedInPlace, true);
     assert.deepEqual(replaced.deferredCarryOver, {
       carried: ["Item two", "Item three"],
+      carriedIds: [idOf("Item two"), idOf("Item three")],
       dropped: ["Item one"],
+      skipped: [{ item: "Item one", itemId: idOf("Item one"), reason: "notOffered" }],
       newItems: ["Brand new item"],
     });
     assert.deepEqual(replaced.decision.deferredAnswer?.itemKeys, ["Item two", "Item three"]);
+    assert.deepEqual(replaced.decision.deferredAnswer?.itemIds, [idOf("Item two"), idOf("Item three")]);
     assert.equal(store.listWithPendingDeferredAnswer(TASK).length, 1);
+  });
+
+  void it("two identical items stay two: an answer for the first is not carried to a card offering only the second", async () => {
+    const store = newStore();
+    await store.post(ticksCard(["Same words", "Same words"], ["id-a1", "id-a2"]));
+    await store.recordDeferredAnswer("ticks-1", {
+      kind: "applyAndDispatch",
+      optionId: APPLY_WHEN_PAUSED_OPTION_ID_V1,
+      acceptedAt: "2026-11-01T04:30:00.000Z",
+      itemKeys: ["Same words"],
+      itemIds: ["id-a1"],
+    });
+    const replaced = await store.post(ticksCard(["Same words"], ["id-a2"]));
+    assert.ok(replaced.ok);
+    if (!replaced.ok) return;
+    assert.equal(replaced.decision.deferredAnswer, undefined, "the answer for A1 must not tick A2");
+    assert.deepEqual(replaced.deferredCarryOver?.carried, []);
+    assert.deepEqual(replaced.deferredCarryOver?.skipped, [
+      { item: "Same words", itemId: "id-a1", reason: "notOffered" },
+    ]);
+    assert.ok(replaced.deferredCarryOver);
+    const line = describeDeferredAnswerCarryOverV1(replaced.deferredCarryOver);
+    assert.match(line, /\[item:id-a1\]/);
+    assert.match(line, /no longer offers it/);
+  });
+
+  void it("an answer that recorded no id for an item never carries it by wording", () => {
+    const carryOver = computeDeferredAnswerCarryOverV1(["Item one"], undefined, ["Item one"], ["id-item-one"]);
+    assert.deepEqual(carryOver.carried, []);
+    assert.deepEqual(carryOver.skipped, [{ item: "Item one", itemId: null, reason: "noId" }]);
+    assert.match(describeDeferredAnswerCarryOverV1(carryOver), /no item id was recorded/);
   });
 
   void it("a replacement sharing no item drops the kept answer", async () => {
@@ -182,6 +226,7 @@ void describe("held answers on the reviewer-verified-ticks card (bugs5 Steps 2-3
       optionId: APPLY_WHEN_PAUSED_OPTION_ID_V1,
       acceptedAt: "2026-11-01T04:30:00.000Z",
       itemKeys: ITEMS,
+      itemIds: idsOf(ITEMS),
     });
     const replaced = await store.post(ticksCard(["Something else"]));
     assert.ok(replaced.ok);
@@ -219,10 +264,11 @@ void describe("held answers on the reviewer-verified-ticks card (bugs5 Steps 2-3
   });
 
   void it("says how many items carried over, how many are new, and names what dropped out", () => {
-    const carryOver = computeDeferredAnswerCarryOverV1(ITEMS, ["Item two", "Item three", "Fresh"]);
+    const fresh = ["Item two", "Item three", "Fresh"];
+    const carryOver = computeDeferredAnswerCarryOverV1(ITEMS, idsOf(ITEMS), fresh, idsOf(fresh));
     const line = describeDeferredAnswerCarryOverV1(carryOver);
     assert.match(line, /Your earlier answer was carried over to 2 of the 3 items; 1 new item waits for you\./);
-    assert.match(line, /"Item one"/);
+    assert.match(line, /"Item one" \[item:id-item-one\]/);
   });
 
   void it("adds the tick-only option before Not yet only while Fast Forward is live", () => {

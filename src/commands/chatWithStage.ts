@@ -34,7 +34,7 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
-import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
+import { notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { runTrackedOperation, resolveWorkflowRootTaskName, linkCancellationTokens, runResumedRoundOperationV1 } from "../utils/taskOperations";
 import {
@@ -98,10 +98,21 @@ import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeResumeNotSettledV1 } from "../utils/storedAnswerResumeV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
+import { type AnswersDecisionV1, decodeAnswersDecisionV1 } from "../utils/ownWordsAnswerV1";
+import { answerOwnWordsFromChatV1 } from "../utils/ownWordsChatAnswerV1";
+import { listPendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisionDispatchV1";
 
 type ChatWithStageArg =
-  | { task?: IncompleteTask; stage?: TaskStage; message?: string; sendId?: string }
-  | { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage; message?: string; sendId?: string };
+  | { task?: IncompleteTask; stage?: TaskStage; message?: string; sendId?: string; answersDecision?: unknown }
+  | {
+      canonicalId?: string;
+      taskFolderPath?: string;
+      stage?: TaskStage;
+      message?: string;
+      sendId?: string;
+      /** review2 Step 43: the own-words card this message answers; the message is then an answer, not a chat send. */
+      answersDecision?: unknown;
+    };
 
 function normalizeArg(node: ChatWithStageArg | undefined): {
   resolverArg: { canonicalId?: string; taskFolderPath?: string } | undefined;
@@ -452,6 +463,13 @@ export async function chatWithStage(
 ): Promise<void> {
   if (isViewerHostV1()) {
     return chatWithStageInViewerV1(inventory, chatViewProvider, explicitArg);
+  }
+  // review2 Step 43: a message that answers an own-words card is the owner's answer, not a chat send. It is recorded
+  // under task.md's "## Owner decisions", and no Chat With AI round (and no AI route) is involved.
+  const ownWordsAnswer = decodeAnswersDecisionV1(explicitArg?.answersDecision);
+  if (ownWordsAnswer !== undefined) {
+    await answerOwnWordsInChatV1(inventory, chatViewProvider, explicitArg, ownWordsAnswer);
+    return;
   }
   assertLegacyAiRouteAllowedV0("chatSend.v1");
   const normalized = normalizeArg(explicitArg);
@@ -1628,6 +1646,42 @@ export async function resumeChatSendInteractionV1(
 
 
 
+/** review2 Step 43: record a typed answer to an own-words card (see `answerOwnWordsFromChatV1`). */
+async function answerOwnWordsInChatV1(
+  inventory: TaskInventory,
+  chatViewProvider: ChatViewProvider,
+  explicitArg: ChatWithStageArg | undefined,
+  answers: AnswersDecisionV1
+): Promise<void> {
+  const normalized = normalizeArg(explicitArg);
+  const message = normalized.message;
+  const taskFolderPath = normalized.resolverArg?.taskFolderPath;
+  if (message === undefined || message.trim() === "" || taskFolderPath === undefined) {
+    NotificationRouter.showWarning("The answer could not be matched to a task, so nothing was recorded.");
+    return;
+  }
+  const canonicalId = normalizePath(taskFolderPath);
+  const task = inventory.getTaskByPath(taskFolderPath);
+  // The helper's warnings are about this task, so they run inside its notification context (the router prefixes the name).
+  const result = await runWithNotificationTaskContextV1(task?.progress.displayName, taskFolderPath, () =>
+    answerOwnWordsFromChatV1(
+      { taskFolderPath, answers, text: message },
+      {
+        pending: listPendingWorkflowDecisionsForTaskV1(canonicalId),
+        appendOwnerMessage: async (text, stage) => {
+          await chatViewProvider.append("user", text, stage, { canonicalId, taskFolderPath });
+        },
+        resolve: (decisionId, optionId) => chatViewProvider.resolveWorkflowDecision(decisionId, optionId),
+        warn: (text) => NotificationRouter.showWarning(text),
+      }
+    )
+  );
+  if (result.accepted) {
+    // A viewer's relayed send is reported as taken only when this is noted (see `consumeSendAcceptedV1`).
+    noteSendAcceptedV1(taskFolderPath, message);
+  }
+}
+
 /**
  * A viewer (hostRoleV1.ts) opens the conversation itself — no AI runs for
  * that — and hands a send to the runner, which saves the message and runs
@@ -1663,6 +1717,10 @@ async function chatWithStageInViewerV1(
       // One identity per typed send, so a paused task keeps the message under
       // it and a retry never writes or sends it twice (bugs2 finding 8).
       sendId: normalized.sendId ?? crypto.randomBytes(16).toString("hex"),
+      // review2 Step 43: an own-words answer travels as a send that names the card it answers.
+      ...(decodeAnswersDecisionV1(arg?.answersDecision) !== undefined
+        ? { answersDecision: decodeAnswersDecisionV1(arg?.answersDecision) }
+        : {}),
     });
     if (!sent.ok && sent.indeterminate !== true) {
       // Definitely not sent, so hand the text back. When the runner TOOK it

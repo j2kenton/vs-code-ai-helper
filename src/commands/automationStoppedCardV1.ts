@@ -1,7 +1,13 @@
 import * as vscode from "vscode";
 
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
-import { IMPLEMENTATION_SUMMARY_FILENAME, STAGE_ARTIFACT_FILENAMES, type TaskStage } from "../types/taskProgress";
+import {
+  IMPL_REVIEW_STAGES,
+  IMPLEMENTATION_SUMMARY_FILENAME,
+  STAGE_ARTIFACT_FILENAMES,
+  type TaskStage,
+} from "../types/taskProgress";
+import { readPartialScopeHoldV1 } from "./partialScopeDecisionV1";
 import {
   AUTOMATION_STOPPED_DECISION_KEY_V1,
   buildAutomationStoppedCardInputV1,
@@ -10,7 +16,7 @@ import {
   type AutomationStopFactsV1,
 } from "../utils/automationStopV1";
 import { endFastForwardRunChainV1 } from "../utils/activeFastForwardRunsV1";
-import { buildBlockerWorkListV1 } from "../utils/blockerWorkListV1";
+import { buildBlockerWorkListV1, reviewSeparationFromHistoryV1 } from "../utils/blockerWorkListV1";
 import { readPlanItemCountsV1 } from "../utils/effectiveReviewProgress";
 import { readTextIfExists } from "../utils/fileUtils";
 import { getCanonicalImplementationUri, readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
@@ -59,6 +65,7 @@ export async function gatherAutomationStopFactsV1(input: {
     blockers,
     ...(planText !== undefined ? { planOfRecord: planText } : {}),
     priorReviewBlockers: history.slice(0, -1).map((entry) => entry.blockers ?? []),
+    reviewSeparatedByFixRound: reviewSeparationFromHistoryV1(history),
     plateauRounds: getReviewPlateauRounds(),
     declined: summaryText ? parseDeclinedBlockersV1(summaryText) : [],
   });
@@ -75,6 +82,10 @@ export async function gatherAutomationStopFactsV1(input: {
   }
   const repeated = selectRepeatedRejectionV1(progress.reportContractRejections);
   const failingTestsBlockers = blockers.filter((blocker) => isFailingTestsBlockerV1(blocker.description ?? "")).length;
+  // review2 Step 23: an open partial-scope hold would stop Fast Forward at its start, so it is never recommended.
+  const startHold = IMPL_REVIEW_STAGES.includes(stage)
+    ? await readPartialScopeHoldV1(folderUri.fsPath, stage, reviewText).catch(() => undefined)
+    : undefined;
   return {
     taskFolderPath: folderUri.fsPath,
     stage,
@@ -92,6 +103,7 @@ export async function gatherAutomationStopFactsV1(input: {
     fastForwardWasRunning: input.fastForwardWasRunning === true,
     ...(failingTestsBlockers > 0 ? { failingTestsBlockers } : {}),
     ...(repeated ? { repeatedRejection: repeated } : {}),
+    ...(startHold !== undefined ? { startHold } : {}),
   };
 }
 

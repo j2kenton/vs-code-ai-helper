@@ -6,6 +6,7 @@ import {
 } from "./implementationChecklist";
 import type { ReviewBlocker } from "./reviewReadiness";
 import type { ReviewBlockerIdentity } from "../types/taskProgress";
+import { failingCheckCommandOfBlockerV1 } from "./checkFailureBlockerIdentityV1";
 
 /**
  * review1 Step 19: Ensemble sorts a review's blockers before a round starts, so the round does not have to guess
@@ -50,14 +51,23 @@ export interface BlockerWorkListInputV1 {
    * across `plateauRounds` reviews.
    */
   readonly priorReviewBlockers?: readonly (readonly ReviewBlockerIdentity[])[];
+  /**
+   * review2 Step 42: for each review of the stage, oldest first and INCLUDING the review that produced `blockers`
+   * (one entry longer than `priorReviewBlockers`), whether an Apply Review or Implementation round ran between it
+   * and the review before it. `undefined` is an entry written before that was recorded and counts as separated.
+   * Only a separated pair counts toward "stood unchanged": two reviews of an unchanged tree are one observation.
+   */
+  readonly reviewSeparatedByFixRound?: readonly (boolean | undefined)[];
   /** `ensemble.reviewPlateauRounds`. */
   readonly plateauRounds: number;
   /** Blockers earlier rounds declined with recorded reasons (`## Remaining Blockers`). */
   readonly declined?: readonly { readonly blockerText: string; readonly reason: string }[];
 }
 
-const OWNER_ONLY_RE =
-  /\bowner (?:decision|evidence)\b|\bawaits? (?:a |an |the )?(?:human|owner|decision)|\bneeds? (?:a |an |the )?(?:human|owner)\b|\banother task\b|\bneeds your decision\b/i;
+/** Words that name an owner decision or owner evidence outright: owner-only even when the reviewer tagged it task-fixable. */
+const EXPLICIT_OWNER_RE = /\bowner (?:decision|evidence)\b|\bneeds your decision\b/i;
+/** Looser wording that can turn up inside a defect's text; a task-fixable tag outranks it (review2 Step 42). */
+const LOOSE_OWNER_RE = /\bawaits? (?:a |an |the )?(?:human|owner|decision)|\bneeds? (?:a |an |the )?(?:human|owner)\b|\banother task\b/i;
 const UNBUILT_RE =
   /\b(?:un-?built|not (?:yet )?(?:built|implemented|started|reached)|remains? (?:un-?built|incomplete|unimplemented|open|to be built)|still (?:lacks?|missing|to be built)|is missing|are missing|not delivered|incomplete)\b/i;
 
@@ -72,10 +82,15 @@ function matchesDeclined(description: string, declinedText: string): boolean {
   return a.length > 12 && b.length > 12 && (a.includes(b) || b.includes(a));
 }
 
-/** How many consecutive reviews (this one plus the prior ones, newest first) the blocker has been raised in. */
+/**
+ * How many times the blocker has stood across review-and-fix cycles: this review is the first, and each earlier
+ * consecutive review that also listed it adds one when a fix round ran between the two. Reviews with no fix round
+ * between them are one observation, not two (review2 Step 42). Without `separatedByFixRound` every review counts.
+ */
 export function countReviewsBlockerHasStoodV1(
   blocker: ReviewBlocker,
-  priorReviewBlockers: readonly (readonly ReviewBlockerIdentity[])[] | undefined
+  priorReviewBlockers: readonly (readonly ReviewBlockerIdentity[])[] | undefined,
+  separatedByFixRound?: readonly (boolean | undefined)[]
 ): number {
   const identity = blockerIdentity(blocker);
   let rounds = 1;
@@ -83,9 +98,34 @@ export function countReviewsBlockerHasStoodV1(
     const prior = priorReviewBlockers![i]!;
     const stood = prior.some((p) => p.category === identity.category && p.subject === identity.subject);
     if (!stood) break;
-    rounds++;
+    // `separatedByFixRound[i + 1]` is the review that follows prior review `i`.
+    if (separatedByFixRound?.[i + 1] !== false) rounds++;
   }
   return rounds;
+}
+
+/** The `reviewSeparatedByFixRound` input for a stage's score history (`ReviewScoreHistoryEntry.fixRoundIds`). */
+export function reviewSeparationFromHistoryV1(
+  history: readonly { readonly fixRoundIds?: readonly string[] }[]
+): (boolean | undefined)[] {
+  return history.map((entry) => (entry.fixRoundIds === undefined ? undefined : entry.fixRoundIds.length > 0));
+}
+
+const PLAN_ITEM_BLOCKER_RE =
+  /\b(?:steps?|parts?)\s+\d+|\bplan items?\b|\bchecklist\b|\[item:[0-9a-f]+\]|\bnarrow(?:ed|ing)\b|\bowner (?:decision|evidence|approval)\b|\bneeds? (?:an? |the )?owner\b/i;
+
+/**
+ * review2 Step 42: whether a blocker is about a plan item, the only kind "Tick or Exclude a Checklist Item…" can
+ * settle. A failing check is never one, whatever else its text says.
+ */
+export function isPlanItemBlockerV1(blocker: Pick<ReviewBlocker, "description"> & { readonly origin?: string }): boolean {
+  if (blocker.origin === "mechanical" || failingCheckCommandOfBlockerV1(blocker.description) !== undefined) return false;
+  return PLAN_ITEM_BLOCKER_RE.test(blocker.description);
+}
+
+/** A failing check (lint, type-check, tests): the next round runs it again, whoever else is waiting. */
+export function isFailingCheckBlockerV1(blocker: ReviewBlocker): boolean {
+  return blocker.origin === "mechanical" || failingCheckCommandOfBlockerV1(blocker.description) !== undefined;
 }
 
 export function buildBlockerWorkListV1(input: BlockerWorkListInputV1): BlockerWorkListV1 {
@@ -95,7 +135,13 @@ export function buildBlockerWorkListV1(input: BlockerWorkListInputV1): BlockerWo
   for (const blocker of input.blockers) {
     const { resolver, description } = blocker;
     const declined = input.declined?.find((d) => matchesDeclined(description, d.blockerText));
-    if (OWNER_ONLY_RE.test(description) || resolver === "spec-defect") {
+    // review2 Step 42: a failing check is work for a round, whatever words its text holds, and a task-fixable tag
+    // outranks loose owner wording. Only an explicit owner decision or owner evidence still goes to the owner.
+    const failingCheck = isFailingCheckBlockerV1(blocker);
+    const ownerOnly =
+      !failingCheck &&
+      (EXPLICIT_OWNER_RE.test(description) || (resolver !== "task-fixable" && LOOSE_OWNER_RE.test(description)));
+    if (ownerOnly || resolver === "spec-defect") {
       notThisRound.push({ blocker, reason: "it needs a decision only the owner can make", kind: "owner" });
       continue;
     }
@@ -127,10 +173,14 @@ export function buildBlockerWorkListV1(input: BlockerWorkListInputV1): BlockerWo
       });
       continue;
     }
-    if (input.plateauRounds > 0 && countReviewsBlockerHasStoodV1(blocker, input.priorReviewBlockers) >= input.plateauRounds) {
+    if (
+      input.plateauRounds > 0 &&
+      !isFailingCheckBlockerV1(blocker) &&
+      countReviewsBlockerHasStoodV1(blocker, input.priorReviewBlockers, input.reviewSeparatedByFixRound) >= input.plateauRounds
+    ) {
       notThisRound.push({
         blocker,
-        reason: `it has stood unchanged across ${input.plateauRounds} reviews, so another round on it alone would not help`,
+        reason: `it has stood unchanged across ${input.plateauRounds} reviews, with a fix round between each, so another round on it alone would not help`,
         kind: "standing",
       });
       continue;
