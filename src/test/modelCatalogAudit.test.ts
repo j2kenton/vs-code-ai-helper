@@ -558,6 +558,34 @@ void describe("checked-in manifest against the real seed", () => {
     );
   });
 
+  void it("offers Fable 5.2 on Claude Code with its five efforts, and on OpenCode Zen as a base id, both recorded as added", () => {
+    const claude = new Map((catalog.seeded["claude-cli"] ?? []).map((m) => [m.model, m.name]));
+    assert.equal(claude.get("claude-fable-5-2"), "Fable 5.2");
+    for (const [effort, label] of [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ] as const) {
+      assert.equal(claude.get(`claude-fable-5-2@${effort}`), `Fable 5.2 (${label})`);
+    }
+    // Fable 5.1 and the floating alias stay as they were: saved selections keep resolving.
+    assert.equal(claude.get("claude-fable-5-1"), "Fable 5.1");
+    assert.equal(claude.get("fable"), "Fable (latest)");
+    assert.ok(seedIndex.get("opencode-cli")?.has("opencode/claude-fable-5-2"));
+    for (const [provider, block, id] of [
+      ["claude-cli", "default", "claude-fable-5-2"],
+      ["opencode-cli", "opencode", "opencode/claude-fable-5-2"],
+    ] as const) {
+      const record = manifest.records.find((r) => r.provider === provider && r.block === block);
+      const entry = record?.entries?.find((e) => e.id === id);
+      assert.equal(entry?.status, "added", `${provider}:${id}`);
+      assert.equal(entry?.checkedAt, "2026-11-11", `${provider}:${id}`);
+      assert.ok(entry?.source, `${provider}:${id} has no evidence`);
+    }
+  });
+
   void it("records Opus 5.5 and GPT-6 as added, with evidence, on every path that seeds them", () => {
     for (const [provider, block, id] of [
       ["claude-cli", "default", "claude-opus-5-5"],

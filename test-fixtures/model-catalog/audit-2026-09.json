@@ -152,6 +152,12 @@
       "notes": "Live CLI probes ran this round for claude-fable-5-1, claude-fable-5, fable, opus, sonnet and haiku (all exit 0); see the Capture log section in audit-2026-09.md. Whether opus/sonnet/haiku float to a newer pin was not established by a single resolution, so their `(latest)` relabel was not applied.",
       "entries": [
         {
+          "id": "claude-fable-5-2",
+          "status": "added",
+          "checkedAt": "2026-11-11",
+          "source": "`claude --model claude-fable-5-2 -p ok --output-format json` on the dev box, 2026-11-11, Claude Code CLI 2.1.312 (latest published 2.1.319), subscription login: exit 0, is_error false, modelUsage names claude-fable-5-2, so the API accepts and serves the id; the CLI prints `[claude-code:unrecognized_model]` on stderr, as it did for claude-sonnet-5-5. The same probe with `fable` still resolved to claude-fable-5-1 on 2.1.312, so the `Fable (latest)` alias is not (yet) Fable 5.2 on this CLI version."
+        },
+        {
           "id": "claude-fable-5-1",
           "status": "added",
           "checkedAt": "2026-09-20",
@@ -364,6 +370,12 @@
           "id": "opencode/north-mini-code-free",
           "status": "unverified",
           "reason": "seeded from the 2026-07-21 capture but absent from the 2026-09-27 capture; kept seeded (live discovery replaces the seed wholesale once it runs) until a removal is evidenced"
+        },
+        {
+          "id": "opencode/claude-fable-5-2",
+          "status": "added",
+          "checkedAt": "2026-11-11",
+          "source": "`opencode models` (opencode 2.1.4) on the dev box, 2026-11-11, OpenCode Zen key signed in: opencode/claude-fable-5-2 listed (with opencode/claude-fable-5-1). OpenCode 2 has no `--verbose` listing, so the seed carries the base id only; live model.list discovery supplies its variants."
         }
       ]
     },

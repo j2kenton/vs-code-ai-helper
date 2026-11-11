@@ -889,6 +889,14 @@ function createSeededClaudeCliModels(): readonly DiscoveredCliModel[] {
       ["xhigh", "Extra High"],
       ["max", "Max"],
     ]),
+    { model: "claude-fable-5-2", name: "Fable 5.2" },
+    ...createVariants("claude-fable-5-2", "Fable 5.2", [
+      ["low", "Low"],
+      ["medium", "Medium"],
+      ["high", "High"],
+      ["xhigh", "Extra High"],
+      ["max", "Max"],
+    ]),
     { model: "claude-fable-5-1", name: "Fable 5.1" },
     ...createVariants("claude-fable-5-1", "Fable 5.1", [
       ["low", "Low"],
@@ -1068,7 +1076,9 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
  * from an opencode 1.18.31 capture, without regenerating the rest),
  * 2026-10-21: added GPT-6.1 Sol and Gemini 4 Argon base IDs from the
  * official Console / Go endpoint tables; 2026-10-26: added the Kimi K3.1 Pro
- * OpenCode Go base ID from the local CLI listing (see audit-2026-10-additions.md).
+ * OpenCode Go base ID from the local CLI listing (see audit-2026-10-additions.md);
+ * 2026-11-11: added the Claude Fable 5.2 Zen base ID from the local
+ * `opencode models` listing (opencode 2.1.4).
  * Their variant ladders await a live capture; empty variants here mean
  * provider defaults, not disabled thinking.
  * Compacted to one minified JSON object per line (only the fields
@@ -1088,6 +1098,8 @@ opencode/big-pickle
 {"id":"big-pickle","providerID":"opencode","name":"Big Pickle","variants":{}}
 opencode/claude-fable-5
 {"id":"claude-fable-5","providerID":"opencode","name":"Claude Fable 5","variants":{"low":{},"medium":{},"high":{},"xhigh":{},"max":{}}}
+opencode/claude-fable-5-2
+{"id":"claude-fable-5-2","providerID":"opencode","name":"Claude Fable 5.2","variants":{}}
 opencode/claude-haiku-4-5
 {"id":"claude-haiku-4-5","providerID":"opencode","name":"Claude Haiku 4.5","variants":{"high":{},"max":{}}}
 opencode/claude-opus-4-1

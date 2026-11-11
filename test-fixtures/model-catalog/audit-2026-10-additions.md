@@ -57,3 +57,22 @@ default selections are preserved.
 - Copilot remains host-discovered through VS Code's Language Model API, so a
   Copilot listing appears automatically when GitHub exposes it to the signed-in
   VS Code account.
+
+# Model additions checked November 11, 2026
+
+- Claude Code CLI: `claude-fable-5-2`, labelled `Fable 5.2`, with low,
+  medium, high, xhigh and max effort, like Fable 5.1. Evidence: on the dev box
+  with Claude Code 2.1.312 (subscription login), `claude --model
+  claude-fable-5-2 -p ok --output-format json` exits 0 and `modelUsage` names
+  `claude-fable-5-2`. The CLI prints `[claude-code:unrecognized_model]` on
+  stderr, as it did for `claude-sonnet-5-5`; the request is still served.
+- The `fable` alias keeps its `Fable (latest)` label and id. The same probe
+  with `fable` still resolved to `claude-fable-5-1` on 2.1.312, so on that CLI
+  version "latest" means Fable 5.1; a newer Claude Code may move it to 5.2.
+- OpenCode Zen: `opencode/claude-fable-5-2`, seeded as a base selection only.
+  `opencode models` (opencode 2.1.4, Zen key) lists it; OpenCode 2 has no
+  `--verbose` listing, so live `model.list` discovery supplies its variants.
+- DevPass is left unchanged: its `models` command could not run while its
+  managed service held its port, so its catalog wasn't checked. Copilot stays
+  host-discovered. Existing models and default selections are unchanged.
+
