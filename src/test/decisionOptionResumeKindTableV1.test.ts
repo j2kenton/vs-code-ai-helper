@@ -175,6 +175,8 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "commands/reviewActions.ts", optionId: "retry", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts / reviewRouting.test.ts: retry re-dispatches the stage action" },
   { file: "commands/reviewActions.ts", optionId: "adjustSettings", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: adjustSettings opens settings, dispatches nothing" },
   { file: "commands/reviewActions.ts", optionId: "wait", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: wait dispatches nothing" },
+  // bugs6 item 23: the quota card's "Turn on fallback and retry" turns the box on, then re-runs the failed review.
+  { file: "commands/reviewActions.ts", optionId: "turnOnFallback", occurrence: 0, resumeKind: "continue", dispatchProof: "providerChainExhaustion.test.ts: the card offers turnOnFallbackAndRetryV1 and recommends it when a skipped backup is switched on" },
   { file: "commands/reviewActions.ts", optionId: "stay", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: stay dispatches nothing" },
   { file: "commands/reviewActions.ts", optionId: "goToReviewAndApply", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts / commandArgNormalization.test.ts: goToReviewAndApply dispatches goToReviewAndApplyV1" },
   { file: "commands/reviewActions.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewRouting.test.ts: notNow dispatches nothing" },
@@ -428,6 +430,12 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
     proofFiles: ["providerChainExhaustion.test.ts"],
   }],
   [rowKey("commands/reviewActions.ts", "wait", 0), {
+    kind: "runtime-test",
+    proofFiles: ["providerChainExhaustion.test.ts"],
+  }],
+  // bugs6 item 23: the effect is the registered turnOnFallbackAndRetryV1 command (sets the strategy, then dispatches
+  // resumeAndRerunReview); providerChainExhaustion.test.ts asserts the card's effect.command.
+  [rowKey("commands/reviewActions.ts", "turnOnFallback", 0), {
     kind: "runtime-test",
     proofFiles: ["providerChainExhaustion.test.ts"],
   }],

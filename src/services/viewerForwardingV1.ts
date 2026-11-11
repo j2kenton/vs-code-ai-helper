@@ -46,6 +46,9 @@ export const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set([
   // chatWithStage forwards only a send, opening the panel stays local.
   "vs-code-ai-helper.chatWithStage",
   "vs-code-ai-helper.reconcilePlanChecklistConfirmed",
+  // bugs6 item 32: "Review again anyway" answered in a viewer starts the review on the runner (stage and the answer's
+  // key travel as the command argument).
+  "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1",
 ]);
 
 /**
@@ -61,10 +64,21 @@ export const RELAYABLE_COMMAND_IDS_V1: ReadonlySet<string> = new Set([
  * defines them; the task always comes from the request's own validated path.
  */
 export function decodeRelayedCommandArgV1(commandId: string, arg: unknown): Record<string, unknown> {
+  const record = typeof arg === "object" && arg !== null ? (arg as Record<string, unknown>) : {};
+  if (commandId === "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1") {
+    // bugs6 item 32: the review stage and the answer's `<interaction id>:<option id>` key, nothing else.
+    const rerun: Record<string, unknown> = {};
+    if (typeof record.stage === "string" && Object.prototype.hasOwnProperty.call(STAGE_DISPLAY_NAMES, record.stage)) {
+      rerun.stage = record.stage;
+    }
+    if (typeof record.answerKey === "string" && /^[0-9a-f]{32}:[A-Za-z]{1,40}$/.test(record.answerKey)) {
+      rerun.answerKey = record.answerKey;
+    }
+    return rerun;
+  }
   if (commandId !== "vs-code-ai-helper.chatWithStage") {
     return {};
   }
-  const record = typeof arg === "object" && arg !== null ? (arg as Record<string, unknown>) : {};
   const decoded: Record<string, unknown> = {};
   if (typeof record.message === "string" && record.message.length > 0) {
     decoded.message = record.message;

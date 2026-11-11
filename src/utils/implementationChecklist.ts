@@ -218,6 +218,41 @@ export function parseDeclinedBlockersV1(summary: string): DeclinedBlockerV1[] {
 }
 
 /**
+ * bugs6 items 41 and 46: the lines of `summary`'s own `## Remaining Blockers` section (the LAST such heading, fenced
+ * code skipped), each trimmed, blank lines dropped. Empty when the section is absent.
+ */
+export function remainingBlockersLinesV1(summary: string): string[] {
+  const all = headingsV1(summary);
+  const index = findLastHeadingV1(all, "Remaining Blockers");
+  if (index === -1) {
+    return [];
+  }
+  const lines = walkLinesV1(summary);
+  const heading = all[index];
+  const start = (heading?.line ?? -1) + 1;
+  let end = lines.length;
+  for (let h = index + 1; h < all.length; h++) {
+    const candidate = all[h];
+    if (candidate && candidate.level <= (heading?.level ?? 1)) {
+      end = candidate.line;
+      break;
+    }
+  }
+  const out: string[] = [];
+  for (let i = start; i < end; i++) {
+    const line = lines[i];
+    if (!line || line.fenced) {
+      continue;
+    }
+    const text = line.text.trim();
+    if (text.length > 0) {
+      out.push(text);
+    }
+  }
+  return out;
+}
+
+/**
  * True when `content` both declares `NO_CHECKLIST_CHANGE_MARKER_V1` ("nothing
  * to tick") and ALSO reports at least one {@link RETROACTIVE_TICK_MARKER_V1}
  * claim, in its own `## Plan Item Checklist` section, that does NOT name a
@@ -3109,6 +3144,58 @@ export function settleChecklistItemV1(
     content: settledItemText !== undefined ? `${prefix}${mergedRegion}` : planOfRecord,
     settledItemText,
   };
+}
+
+/** Result of {@link addNestedChecklistItemsV1}. */
+export interface AddNestedChecklistItemsResultV1 {
+  /** The updated plan text: `planOfRecord` itself when the parent item was not found. */
+  readonly content: string;
+  /** How many sub-items were added. */
+  readonly added: number;
+}
+
+/**
+ * bugs6 item 46: adds same-task sub-items (indented `- [ ]` lines) directly under ONE open top-level checklist item,
+ * found the way {@link settleChecklistItemV1} finds it (latest rendering, normalized text, first match). Sub-items
+ * never change the plan's total or the frozen count (a nested item is not part of the denominator), but an unticked
+ * child keeps its parent open until it is built. Every other byte is preserved.
+ */
+export function addNestedChecklistItemsV1(
+  planOfRecord: string,
+  parentItemText: string,
+  children: readonly string[]
+): AddNestedChecklistItemsResultV1 {
+  const key = normalizeChecklistItemTextV1(parentItemText);
+  const clean = children.map((child) => child.replace(/\s+/g, " ").trim()).filter((child) => child.length > 0);
+  if (clean.length === 0) {
+    return { content: planOfRecord, added: 0 };
+  }
+  let inserted = false;
+  const { prefix, region } = scopeToLatestChecklistV1(planOfRecord);
+  const merged: string[] = [];
+  for (const line of walkLinesV1(region)) {
+    merged.push(line.raw);
+    if (inserted || line.fenced) {
+      continue;
+    }
+    const match = ITEM_LINE.exec(line.raw);
+    if (!match) {
+      continue;
+    }
+    const [, open, state, , text] = match;
+    if (state !== " " || /^[ \t]/.test(open ?? "") || isExcludedChecklistItemText(text ?? "") || normalizeChecklistItemTextV1(text ?? "") !== key) {
+      continue;
+    }
+    const eol = /\r\n$/.test(line.raw) ? "\r\n" : "\n";
+    if (!/\r?\n$/.test(line.raw)) {
+      merged[merged.length - 1] = `${line.raw}${eol}`;
+    }
+    for (const child of clean) {
+      merged.push(`  - [ ] ${child}${eol}`);
+    }
+    inserted = true;
+  }
+  return inserted ? { content: `${prefix}${merged.join("")}`, added: clean.length } : { content: planOfRecord, added: 0 };
 }
 
 /** Result of {@link rewordChecklistItemV1}. */

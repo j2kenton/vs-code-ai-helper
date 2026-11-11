@@ -110,6 +110,9 @@ import { registerOwnerPlanDecisionCommandV1 } from "./commands/ownerPlanDecision
 import { registerAutomaticDispatchGateV1 } from "./commands/automaticDispatchGateV1";
 import { startAutoContinueSweepV1 } from "./commands/autoContinueSweepWiringV1";
 import { registerPartialScopeDecisionCommandV1 } from "./commands/partialScopeDecisionV1";
+import { registerDeclinedStepDecisionCommandV1 } from "./commands/declinedStepDecisionV1";
+import { openAiModelsV1, type OpenAiModelsResultV1 } from "./commands/openAiModelsV1";
+import { registerTurnOnFallbackAndRetryCommandV1 } from "./commands/turnOnFallbackAndRetryV1";
 import { registerEnablePublishBackupCommandV1 } from "./commands/enablePublishBackupV1";
 import { registerAcceptPlanItemNarrowingCommandV1 } from "./commands/acceptPlanItemNarrowingV1";
 import { registerRunOwnerEvidenceCommandV1 } from "./commands/runOwnerEvidenceCommandV1";
@@ -706,6 +709,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     "vs-code-ai-helper.runLintingFixes": "Fix Linting & Code Errors",
     "vs-code-ai-helper.renameTaskWithAI": "Rename Task with AI",
     "vs-code-ai-helper.chatWithStage": "Chat reply",
+    "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1": "Review again anyway",
   };
   const RELAYED_ACTION_TIMEOUT_MS_V1 = 30 * 60 * 1000;
   const relayRoot = resolveTaskRootCandidates()[0]?.absolutePath;
@@ -1482,11 +1486,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.openAiModels",
-    (stage?: TaskStage) => {
-      void vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
-      if (stage) {
-        settingsViewProvider.focusStage(stage);
+    async (stage?: TaskStage): Promise<OpenAiModelsResultV1> => {
+      // bugs6 items 22 and 3: await the focus, check the view is visible (re-revealing the container when it is
+      // hidden, collapsed or never opened), and return a result the card can check.
+      const result = await openAiModelsV1(
+        {
+          focusView: () => Promise.resolve(vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus")),
+          revealContainer: () => Promise.resolve(vscode.commands.executeCommand("workbench.view.extension.ai-helper")),
+          isVisible: () => settingsViewProvider.isViewVisible(),
+          hasResolved: () => settingsViewProvider.hasResolvedView(),
+          focusStage: (target) => settingsViewProvider.focusStage(target),
+          sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+        },
+        stage
+      );
+      // The Command Palette run has no card to report to: say so in a notification.
+      if (!result.opened && stage === undefined && result.message !== undefined) {
+        NotificationRouter.showWarning(result.message);
       }
+      return result;
     }
   ));
   registerViewArtifactCommands(context);
@@ -1506,6 +1524,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerOwnerPlanDecisionCommandV1(context);
   registerAutomaticDispatchGateV1(context);
   registerPartialScopeDecisionCommandV1(context);
+  registerDeclinedStepDecisionCommandV1(context);
+  registerTurnOnFallbackAndRetryCommandV1(context);
   registerEnablePublishBackupCommandV1(context);
   registerAcceptPlanItemNarrowingCommandV1(context, inventory, currentTaskStore);
   registerRunOwnerEvidenceCommandV1(context, inventory, currentTaskStore);

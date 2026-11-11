@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { readExtensionResourceV1 } from "./extensionResourcesV1";
+import { appendRoundClockPolicyV1 } from "./roundClockV1";
 
 /**
  * Reserved placeholder: expands to the shared review scoring rubric fragment
@@ -48,7 +49,12 @@ export function appendRoundGitStatePolicyV1(templateFileName: string, prompt: st
 export async function renderPromptTemplate(
   extensionUri: vscode.Uri,
   templateFileName: string,
-  variables: Record<string, string>
+  variables: Record<string, string>,
+  /**
+   * bugs6 item 41: the model an editing round will run on, so its clock block names `date -u` only when that model's
+   * adapter may run it. Ignored for every template that is not an editing round.
+   */
+  options: { readonly roundModelId?: string } = {}
 ): Promise<string> {
   const content = await readExtensionResourceV1(extensionUri, ["resources", "prompts", templateFileName]);
   let template = new TextDecoder().decode(content);
@@ -73,5 +79,10 @@ export async function renderPromptTemplate(
     template = template.split(`{{${key}}}`).join(value);
   }
 
-  return appendRoundGitStatePolicyV1(templateFileName, template);
+  return appendRoundGitStatePolicyV1(
+    templateFileName,
+    appendRoundClockPolicyV1(templateFileName, template, {
+      ...(options.roundModelId !== undefined ? { modelId: options.roundModelId } : {}),
+    })
+  );
 }

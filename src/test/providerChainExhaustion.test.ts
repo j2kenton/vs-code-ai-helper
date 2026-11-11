@@ -278,7 +278,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.status, "paused");
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for impl-high-review is available/
+      /No configured provider for Implementation › High-Level Code Review is available/
     );
     assert.match(persisted.pausedReason ?? "", /Cline CLI → Kimi CLI/);
     assert.notEqual(
@@ -833,7 +833,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.status, "paused");
     assert.match(
       persisted.pausedReason ?? "",
-      /Every configured model for impl-high-review was tried and failed/
+      /Every configured model for Implementation › High-Level Code Review was tried and failed/
     );
     assert.doesNotMatch(persisted.pausedReason ?? "", /No configured provider/);
   });
@@ -859,7 +859,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     );
     assert.doesNotMatch(
       persisted.pausedReason ?? "",
-      /Every configured model for impl-high-review was tried and failed/
+      /Every configured model for Implementation › High-Level Code Review was tried and failed/
     );
   });
 
@@ -877,7 +877,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.match(persisted.pausedReason ?? "", /is currently blocked by a/);
     assert.match(persisted.pausedReason ?? "", /Deferred, not exhausted/);
     assert.doesNotMatch(persisted.pausedReason ?? "", /was tried, but the chain was blocked/);
-    assert.doesNotMatch(persisted.pausedReason ?? "", /Every configured model for impl-high-review was tried and failed/);
+    assert.doesNotMatch(persisted.pausedReason ?? "", /Every configured model for Implementation › High-Level Code Review was tried and failed/);
     assert.ok(persisted.quotaParkRecord, "a candidatesDeferred pause must still park with a quotaParkRecord");
   });
 
@@ -928,7 +928,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.status, "paused");
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for impl-high-review is available/
+      /No configured provider for Implementation › High-Level Code Review is available/
     );
   });
 
@@ -1111,4 +1111,106 @@ void describe("pausedReason lifecycle (transforms)", () => {
       assert.deepEqual(untouched.quotaParkRecord, recordWithAccount);
     }
   );
+});
+
+/**
+ * bugs6 item 23: a quota stop under "never-switch" with a switched-on backup that was never tried names the backup and
+ * the "Fall back to backup models" box, offers "Turn on fallback and retry", and says "Every configured model" only when
+ * every switched-on model was tried.
+ */
+/* eslint-disable @typescript-eslint/no-var-requires */
+const settingsModuleForItem23 = require("../config/settings") as Record<string, unknown>;
+/* eslint-enable @typescript-eslint/no-var-requires */
+
+function withModelSettingsForItem23<T>(stageSetting: Record<string, unknown>, run: () => Promise<T>): Promise<T> {
+  const original = {
+    getModelSettings: settingsModuleForItem23.getModelSettings,
+    isProviderSelectionConfigured: settingsModuleForItem23.isProviderSelectionConfigured,
+  };
+  settingsModuleForItem23.getModelSettings = () => ({ "impl-high-review": stageSetting });
+  settingsModuleForItem23.isProviderSelectionConfigured = () => false;
+  return run().finally(() => {
+    settingsModuleForItem23.getModelSettings = original.getModelSettings;
+    settingsModuleForItem23.isProviderSelectionConfigured = original.isProviderSelectionConfigured;
+  });
+}
+
+const CODEX_DEFERRED_EXHAUSTION: ProviderChainExhaustionV1 = {
+  stage: "impl-high-review",
+  candidates: [
+    {
+      storedModelId: "codex-cli:gpt-6.1-sol@high",
+      providerLabel: "OpenAI Codex",
+      runnerId: "codex-cli",
+      reason: "You've hit your usage limit.",
+      deferredFailureKind: "quota",
+    },
+  ],
+};
+
+void describe("bugs6 item 23: a skipped switched-on backup is named, and fallback can be turned on from the card", () => {
+  void it("names the backup and the box, offers 'Turn on fallback and retry', and does not say 'Every configured model'", async () => {
+    const { folderUri } = makeTaskFolder("item23_never_switch");
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    try {
+      await withModelSettingsForItem23(
+        {
+          primary: "codex-cli:gpt-6.1-sol@high",
+          backups: ["claude-cli:claude-opus-5-5@high"],
+          strategy: "never-switch",
+        },
+        () =>
+          withHarness(async () => {
+            await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", CODEX_DEFERRED_EXHAUSTION, "candidatesDeferred");
+          })
+      );
+      const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+        .listPending(folderUri.fsPath)
+        .find((d) => d.decisionKey === "providerChainExhausted");
+      assert.ok(decision);
+      assert.match(
+        decision.whatHappened,
+        /is a backup but 'Fall back to backup models' is off for Implementation › High-Level Code Review/
+      );
+      assert.match(decision.whatHappened, /claude-opus-5-5@high is a backup but/);
+      assert.doesNotMatch(decision.whatHappened, /Every configured model/);
+      assert.match(decision.whatHappened, /Every model that was tried for Implementation › High-Level Code Review is currently deferred/);
+      const option = decision.options.find((o) => o.optionId === "turnOnFallback");
+      assert.ok(option, "the card offers the setting change");
+      assert.equal(option.label, "Turn on fallback and retry");
+      assert.match(option.consequence, /turns on "Fall back to backup models" for Implementation › High-Level Code Review/);
+      assert.equal(option.effect.kind === "command" ? option.effect.command : "", "vs-code-ai-helper.turnOnFallbackAndRetryV1");
+      assert.ok(decision.options.some((o) => o.label === "Change the model in AI Models"));
+      assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : "", "turnOnFallback");
+    } finally {
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("with fallback on, or when every switched-on model was tried, it still says 'Every configured model' and offers no setting change", async () => {
+    for (const [name, setting] of [
+      ["fallback_on", { primary: "codex-cli:gpt-6.1-sol@high", backups: ["claude-cli:claude-opus-5-5@high"], strategy: "switch-to-backup" }],
+      ["all_tried", { primary: "codex-cli:gpt-6.1-sol@high", strategy: "never-switch" }],
+    ] as const) {
+      const { folderUri } = makeTaskFolder(`item23_${name}`);
+      const context = makeExtensionContext();
+      __extensionContextV1TestOnly.set(context);
+      try {
+        await withModelSettingsForItem23(setting, () =>
+          withHarness(async () => {
+            await pauseTaskForExhaustedChainV1(folderUri, "impl-high-review", CODEX_DEFERRED_EXHAUSTION, "candidatesDeferred");
+          })
+        );
+        const decision = new WorkflowDecisionStoreV1(context.workspaceState)
+          .listPending(folderUri.fsPath)
+          .find((d) => d.decisionKey === "providerChainExhausted");
+        assert.ok(decision, name);
+        assert.match(decision.whatHappened, /Every configured model for Implementation › High-Level Code Review is currently deferred/, name);
+        assert.ok(!decision.options.some((o) => o.optionId === "turnOnFallback"), name);
+      } finally {
+        __extensionContextV1TestOnly.reset();
+      }
+    }
+  });
 });

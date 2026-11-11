@@ -234,7 +234,7 @@ export function readyToAdvanceStage(
  * the ONLY substantive blocker category those prompts ask for, so omitting
  * it here previously meant every Publish review parsed to zero structured
  * blockers), and "Review-confidence blockers" (all review levels). */
-export type BlockerCategory = "architectural" | "completion" | "review-confidence" | "shipping";
+export type BlockerCategory = "architectural" | "completion" | "review-confidence" | "shipping" | "uncategorised";
 
 /**
  * Who/what can resolve a blocker — the routing key `decideReviewRoute`
@@ -257,6 +257,8 @@ export type BlockerCategory = "architectural" | "completion" | "review-confidenc
  *    does exist and is well-defined, it just cannot be executed from this
  *    stage. Routes straight to escalation like every other non-task-fixable
  *    resolver (see decideReviewRoute in reviewRouting.ts).
+ *  - unknown: bugs6 item 45 — the reviewer wrote the line with no resolver tag and no lineage tag led to one.
+ *    The line is counted and shown, blocks clean-review advancement, and is never task-fixable.
  */
 export type BlockerResolver =
   | "task-fixable"
@@ -264,7 +266,8 @@ export type BlockerResolver =
   | "environmental-fixable"
   | "unverifiable"
   | "spec-defect"
-  | "needs-toolchain";
+  | "needs-toolchain"
+  | "unknown";
 
 /**
  * review1 Step 47: `environmental` keeps its meaning (no code change resolves it); `environmental-fixable` is
@@ -304,6 +307,71 @@ export interface ReviewBlocker {
    * record (wf10 continuation item 12).
    */
   origin?: "reviewer" | "mechanical";
+  /**
+   * bugs6 item 45: set only on a bullet that carried no resolver tag. `"lineage"`: category and resolver were
+   * inherited from the prior blocker its `[narrowed:<id>]` / `[same:<id>]` tag cites; `"heading"`: the category
+   * came from the section heading it sits under; `"none"`: nothing said (category `uncategorised`). The last two
+   * leave the resolver `unknown`.
+   */
+  untaggedSource?: "lineage" | "heading" | "none";
+}
+
+/** The prior blocker a lineage tag can cite: its id and the category and resolver it was recorded with. */
+export interface PriorBlockerRefV1 {
+  readonly id?: string;
+  readonly category: string;
+  readonly resolver: string;
+}
+
+/**
+ * bugs6 item 45: the id'd blockers of the stage's previous review (the list a re-review's lineage tags cite), from
+ * the task's score history. Empty when the stage has no earlier review.
+ */
+export function priorBlockerRefsForStageV1(
+  progress: Pick<TaskProgress, "reviewScoreHistory"> | undefined,
+  stage: TaskStage
+): readonly PriorBlockerRefV1[] {
+  const entry = [...(progress?.reviewScoreHistory ?? [])].reverse().find((e) => e.stage === stage);
+  return [...(entry?.blockers ?? []), ...(entry?.supersededBlockers ?? [])];
+}
+
+/**
+ * bugs6 item 45: the review-format warning for a review that scores below the threshold while its blockers block
+ * holds no counted line at all, or at least one line whose kind it never stated (alone or beside tagged blockers).
+ * Undefined when the review is at or above the threshold, has no block, or every counted blocker is stated. Names the
+ * next click so the owner is never left reading "no blockers" under a failing score.
+ */
+export function describeBlockersBlockGapV1(input: {
+  readonly score: number | null | undefined;
+  readonly threshold: number;
+  readonly blockPresent: boolean;
+  readonly blockers: readonly ReviewBlocker[];
+}): string | undefined {
+  if (typeof input.score !== "number" || input.score >= input.threshold || !input.blockPresent) {
+    return undefined;
+  }
+  const counted = input.blockers.filter((b) => b.origin !== "mechanical");
+  const unclassified = counted.filter((b) => b.resolver === "unknown");
+  if (unclassified.length === 0 && input.blockers.length > 0) {
+    return undefined;
+  }
+  const first = (unclassified[0]?.description ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+  const mixed = unclassified.length > 0 && unclassified.length < counted.length;
+  const subject =
+    unclassified.length === 0
+      ? "its blockers block has no counted blocker"
+      : mixed
+        ? `its blockers block has ${unclassified.length} blocker(s) whose kind the review didn't state: ${first}`
+        : `its blockers block has no categorised blocker: ${first}`;
+  return (
+    `Review-format warning: the review scored ${input.score}/10 (threshold ${input.threshold}) but ${subject}. ` +
+    "Read the review's findings, then use the stage's normal options: Apply Review to build what it names, or Review to run it again."
+  );
+}
+
+/** bugs6 item 45: how many of a review's blockers the reviewer wrote with no resolver and no lineage to take one from. */
+export function countUnclassifiedBlockersV1(blockers: readonly ReviewBlocker[]): number {
+  return blockers.filter((b) => b.resolver === "unknown" && b.origin !== "mechanical").length;
 }
 
 /**
@@ -680,6 +748,11 @@ export function hasZeroTaskFixableEvidence(content: string): boolean {
       // real blocker in a shape the parser couldn't read must never be
       // indistinguishable from a round with nothing to report — that
       // conflation is the exact incident this field exists to prevent.
+      return false;
+    }
+    // bugs6 item 45: a counted line whose resolver the review never stated is just as unknown. It is not
+    // task-fixable (so it creates no build mandate on its own), but it is never positive evidence of a clean review.
+    if (evidence.blockers.some((b) => b.resolver === "unknown")) {
       return false;
     }
     return evidence.blockers.every((b) => b.resolver !== "task-fixable");
@@ -1441,12 +1514,52 @@ export function parseReviewProgress(content: string): ReviewProgress | null {
   return { complete, total };
 }
 
-/** See {@link parseReviewBlockers}; also reports whether the block existed. */
-export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvidence {
+/**
+ * bugs6 item 45: a bullet inside the blockers block that carries no resolver bracket. It may still carry a category
+ * bracket and a lineage bracket (`- [narrowed:<id>] Complete the remaining unbuilt plan scope …`). Tried only after
+ * {@link BLOCKER_LINE_RE} fails, so a fully tagged line parses exactly as before.
+ */
+const UNTAGGED_BLOCKER_LINE_RE =
+  /^\s*[-*]\s*(?:\[\s*(architectural|completion|review-confidence|shipping)\s*\]\s*)?(?:\[\s*(new|same\s*:\s*[\w-]+|narrowed\s*:\s*[\w-]+)\s*\]\s*)?(.+?)\s*$/i;
+
+const MARKDOWN_HEADING_RE = /^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/;
+
+/** The category a section heading names ("## New architectural blockers"), or undefined when it names none. */
+export function categoryFromBlockerHeadingV1(heading: string): BlockerCategory | undefined {
+  if (/architect/i.test(heading)) return "architectural";
+  if (/review[-\s]confidence/i.test(heading)) return "review-confidence";
+  if (/shipping|publish|release/i.test(heading)) return "shipping";
+  if (/completion|unbuilt|incomplete/i.test(heading)) return "completion";
+  return undefined;
+}
+
+/** The last markdown heading in `text`, if any. */
+function lastHeadingV1(text: string): string | undefined {
+  let heading: string | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    const m = MARKDOWN_HEADING_RE.exec(line);
+    if (m?.[1]) heading = m[1];
+  }
+  return heading;
+}
+
+/**
+ * See {@link parseReviewBlockers}; also reports whether the block existed.
+ *
+ * `priorBlockers` (bugs6 item 45) is the stage's previous review's id'd blockers. A bullet with no resolver tag is
+ * never dropped: its own category tag, else the category and resolver of the prior blocker its `[narrowed:<id>]` /
+ * `[same:<id>]` tag cites, else the category of the heading it sits under with the resolver `unknown`, else
+ * `uncategorised` with the resolver `unknown`. An `unknown` resolver is counted and shown but is never task-fixable.
+ */
+export function parseReviewBlockersDetailed(
+  content: string,
+  priorBlockers?: readonly PriorBlockerRefV1[]
+): ReviewBlockerEvidence {
   const match = BLOCKERS_BLOCK_RE.exec(content);
   if (!match) {
     return { blockPresent: false, blockers: [], malformedLines: [] };
   }
+  let currentHeading = lastHeadingV1(content.slice(0, match.index));
   // Presence is decided by the MARKERS, not by the capture being non-empty.
   // `<!-- blockers:start --><!-- blockers:end -->` with nothing between them
   // captures "" (falsy), and testing the capture read that as "no block at
@@ -1464,9 +1577,34 @@ export function parseReviewBlockersDetailed(content: string): ReviewBlockerEvide
       // reported as malformed.
       continue;
     }
+    const headingMatch = MARKDOWN_HEADING_RE.exec(line);
+    if (headingMatch?.[1]) {
+      currentHeading = headingMatch[1];
+      continue;
+    }
     const lineMatch = BLOCKER_LINE_RE.exec(line);
     if (!lineMatch) {
-      malformedLines.push(trimmed);
+      const untagged = UNTAGGED_BLOCKER_LINE_RE.exec(line);
+      if (!untagged?.[3]) {
+        malformedLines.push(trimmed);
+        continue;
+      }
+      const [, ownCategory, untaggedLineageRaw, untaggedDescription] = untagged;
+      const untaggedLineage = parseLineageBracket(untaggedLineageRaw);
+      const cited =
+        untaggedLineage && untaggedLineage.kind !== "new"
+          ? (priorBlockers ?? []).find((p) => p.id !== undefined && p.id.toLowerCase() === untaggedLineage.refId)
+          : undefined;
+      const headingCategory = currentHeading ? categoryFromBlockerHeadingV1(currentHeading) : undefined;
+      const resolverFromPrior = cited && cited.resolver !== "unknown" ? (cited.resolver as BlockerResolver) : undefined;
+      blockers.push({
+        category: (ownCategory?.toLowerCase() ?? cited?.category ?? headingCategory ?? "uncategorised") as BlockerCategory,
+        resolver: resolverFromPrior ?? "unknown",
+        description: untaggedDescription ?? "",
+        origin: "reviewer",
+        untaggedSource: cited ? "lineage" : ownCategory || headingCategory ? "heading" : "none",
+        ...(untaggedLineage ? { lineage: untaggedLineage } : {}),
+      });
       continue;
     }
     const [, category, resolver, lineageRaw, description] = lineMatch;
@@ -2266,6 +2404,73 @@ export function planDeviationsNoneNoteV1(content: string): string | undefined {
 const DEVIATION_DROPS_SCOPE_RE =
   /\b(?:exclu(?:de[sd]?|sions?)|narrow(?:s|ed|ing|ings)?|descop\w*|skipp?(?:s|ed|ing)?|drops?|dropped|left\s+out|without\s+(?:a\s+)?(?:card|confirmation|sign-?off|approval)|no\s+(?:card|confirmation|sign-?off))\b/i;
 
+/** bugs6 item 44: what a review's "Material plan deviations" section says about one deviation. */
+export type DeviationReviewVerdictV1 =
+  | { readonly kind: "meets"; readonly sentence: string }
+  | { readonly kind: "blocks"; readonly blocker: string };
+
+const DEVIATION_MEETS_PLAN_RE =
+  /\b(?:not\s+a\s+(?:material\s+)?departures?|(?:does|do|did)\s+not\s+depart|neither\s+(?:one\s+)?departs?|none\s+(?:of\s+\w+\s+)?(?:that\s+)?(?:depart|change|alter)\w*|(?:meets?|matches|follows?|satisf(?:y|ies)|consistent\s+with|within)\s+(?:the\s+)?(?:plan|contract|requirements?)|status\s+notes?|no\s+(?:material\s+)?departures?|nothing\s+(?:here\s+)?departs)\b/i;
+const DEVIATION_NOT_MEETS_RE =
+  /\b(?:blockers?|violates?|contradicts?|not\s+acceptable|unacceptable|unverified|rejected?|must\s+be\s+(?:reverted|undone|fixed)|(?:does|do)\s+not\s+meet|doesn'?t\s+meet|fails?\s+to\s+meet)\b/i;
+const DEVIATION_CONTRAST_RE = /\b(?:but|however|except|although|though|still|yet)\b/i;
+/** A verdict that speaks for every deviation the review lists ("Neither departs from the plan", "None that change …"). */
+const DEVIATION_COVERS_ALL_RE = /\b(?:neither|both|none|all|these|the\s+(?:two|three|four|\d+)|no\s+(?:material\s+)?departures?)\b/i;
+
+/**
+ * bugs6 item 44: reads the review's `## Material plan deviations` section (and its blockers) for a verdict on one
+ * deviation. `blocks`: a review blocker names the same step or plan item. `meets`: a sentence about this deviation, or
+ * one that covers every listed deviation, says it is not a departure or meets the plan, with no refusal in the
+ * section about it. Undefined when the review says nothing confident about it.
+ */
+export function assessDeviationAgainstReviewV1(
+  deviationText: string,
+  reviewText: string | undefined,
+  planOfRecord?: string
+): DeviationReviewVerdictV1 | undefined {
+  if (reviewText === undefined) return undefined;
+  const holding = reviewBlockerHoldingDeviationV1(deviationText, reviewText, planOfRecord);
+  if (holding !== undefined) return { kind: "blocks", blocker: holding };
+  const section = ownerDecisionSectionV1(reviewText, "Material plan deviations");
+  if (!section) return undefined;
+  const sentences = section
+    .split(/(?<=[.;!?])\s+|\n+/)
+    .map((sentence) => sentence.replace(/^[\s>\-*•]+/, "").replace(/\*\*/g, "").trim())
+    .filter((sentence) => sentence.length > 0);
+  const terms = distinctiveTermsV1(deviationText);
+  const step = stepNamedByDeviationV1(deviationText, planOfRecord);
+  const about = (sentence: string): boolean => {
+    if (step !== undefined && new RegExp(`\\bsteps?\\s+${step}(?!\\d)`, "i").test(sentence)) return true;
+    if (terms.size === 0) return false;
+    let shared = 0;
+    for (const term of distinctiveTermsV1(sentence)) if (terms.has(term)) shared += 1;
+    return shared >= Math.min(2, terms.size);
+  };
+  const speaksForThis = (sentence: string): boolean => about(sentence) || DEVIATION_COVERS_ALL_RE.test(sentence);
+  for (const sentence of sentences) {
+    if (DEVIATION_NOT_MEETS_RE.test(sentence) && speaksForThis(sentence)) return undefined;
+  }
+  for (const sentence of sentences) {
+    if (
+      DEVIATION_MEETS_PLAN_RE.test(sentence) &&
+      !DEVIATION_CONTRAST_RE.test(sentence) &&
+      speaksForThis(sentence)
+    ) {
+      return { kind: "meets", sentence };
+    }
+  }
+  return undefined;
+}
+
+/** bugs6 item 44: the card's sentence about what the latest review said, for a verdict. */
+export function deviationReviewViewTextV1(verdict: DeviationReviewVerdictV1): string {
+  if (verdict.kind === "meets") {
+    const quoted = verdict.sentence.length > 240 ? `${verdict.sentence.slice(0, 237)}…` : verdict.sentence;
+    return ` The latest review found it meets the plan: “${quoted}”`;
+  }
+  return ` The latest review holds this as a blocker: ${verdict.blocker.length > 240 ? `${verdict.blocker.slice(0, 237)}…` : verdict.blocker}`;
+}
+
 function deviationRecommendationV1(
   raw: string,
   verifiedByReview: boolean,
@@ -2554,13 +2759,21 @@ export function parsePlanDeviationsV1(
       reviewAffirmsStepVerifiedV1(context.latestReviewText, step, raw);
     // review2 Step 39: a review that holds this step as a blocker has a view; the card says so and recommends Reject.
     const holdingBlocker = reviewBlockerHoldingDeviationV1(raw, context.latestReviewText, context.planOfRecord);
+    // bugs6 item 44: a review that assessed this deviation in its "Material plan deviations" section has a view.
+    const sectionVerdict =
+      holdingBlocker === undefined && !verifiedByReview
+        ? assessDeviationAgainstReviewV1(raw, context.latestReviewText, context.planOfRecord)
+        : undefined;
+    const meetsVerdict = sectionVerdict?.kind === "meets" ? sectionVerdict : undefined;
     const reviewView = context.latestReviewText === undefined
       ? ""
       : holdingBlocker !== undefined
         ? ` The latest review holds this as a blocker: ${holdingBlocker.length > 240 ? `${holdingBlocker.slice(0, 237)}…` : holdingBlocker}`
         : verifiedByReview
           ? " The latest review already verified it."
-          : " The latest review has not verified it.";
+          : meetsVerdict !== undefined
+            ? deviationReviewViewTextV1(meetsVerdict)
+            : " The latest review has not verified it.";
     // review2 Step 37: status sentences ("reported under Verified Complete rather than ticked") are not part of the
     // question; they go to the round's summary.
     const cardBody = splitDeviationStatusSentencesV1(raw.trim()).body || raw.trim();
@@ -2615,7 +2828,14 @@ export function parsePlanDeviationsV1(
               reason: `The latest review holds this step as a blocker: ${holdingBlocker.length > 240 ? `${holdingBlocker.slice(0, 237)}…` : holdingBlocker} Rejecting keeps the plan as written.`,
             },
           }
-        : deviationRecommendationV1(raw, verifiedByReview, context.latestReviewText !== undefined)),
+        : meetsVerdict !== undefined
+          ? {
+              recommendation: {
+                optionId: "approve-deviation",
+                reason: `Approve (the review found it meets the plan): “${meetsVerdict.sentence.length > 240 ? `${meetsVerdict.sentence.slice(0, 237)}…` : meetsVerdict.sentence}”`,
+              },
+            }
+          : deviationRecommendationV1(raw, verifiedByReview, context.latestReviewText !== undefined)),
       rawContentHash,
       rawContent: raw.trim(),
     });

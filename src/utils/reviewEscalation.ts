@@ -2620,6 +2620,11 @@ function describeResolverClearingActionV1(
       );
     case "task-fixable":
       return `another implementation round — use "Keep iterating" below.`;
+    case "unknown":
+      return (
+        "a decision on what kind of blocker this is — the review wrote the line without saying who can resolve it. " +
+        `Read it above; if building the named plan steps clears it, use "Keep iterating" to have ${stageName} re-verify.`
+      );
   }
 }
 

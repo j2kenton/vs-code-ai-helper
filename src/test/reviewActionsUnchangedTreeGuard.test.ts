@@ -592,6 +592,7 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
       assert.equal(modalCalls, 0, "no modal must ever be shown for the unchanged-tree case");
       assert.equal(askInteractionCalls.length, 1, "exactly one chat card must be posted");
       const posted = askInteractionCalls[0] as {
+        interactionId?: string;
         questions: readonly { prompt: string; options: readonly { optionId: string; label: string }[] }[];
         optionEffects?: Record<string, { kind: string; command?: string; args?: readonly unknown[] }>;
       };
@@ -601,11 +602,17 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
       const optionIds = question.options.map((o) => o.optionId);
       assert.deepEqual(optionIds, ["keepLastReview", "reviewAgainAnyway"]);
       assert.deepEqual(posted.optionEffects?.keepLastReview, { kind: "doNothing" });
-      assert.deepEqual(posted.optionEffects?.reviewAgainAnyway, {
-        kind: "command",
-        command: "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1",
-        args: [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "impl-high-review" }],
-      });
+      const rerunEffect = posted.optionEffects?.reviewAgainAnyway;
+      assert.equal(rerunEffect?.kind, "command");
+      assert.equal(rerunEffect?.kind === "command" ? rerunEffect.command : "", "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1");
+      // bugs6 item 32: the answer carries its own key (interaction id + option) so one answer starts one review.
+      const rerunArg = (rerunEffect?.kind === "command" ? rerunEffect.args?.[0] : undefined) as
+        | { taskFolderPath: string; stage: string; answerKey: string }
+        | undefined;
+      assert.equal(rerunArg?.taskFolderPath, vscode.Uri.file(folderPath).fsPath);
+      assert.equal(rerunArg?.stage, "impl-high-review");
+      assert.match(rerunArg?.answerKey ?? "", /^[0-9a-f]{32}:reviewAgainAnyway$/);
+      assert.equal(rerunArg?.answerKey.split(":")[0], posted.interactionId);
 
       assert.equal(
         modelResolutionCalled,

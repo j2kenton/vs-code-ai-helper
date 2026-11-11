@@ -87,6 +87,24 @@ export function recordOperationTerminalOutcomeV1(operationId: string, outcome: O
   }
 }
 
+const stoppedBeforeAnyRoundV1 = new Map<string, string>();
+
+/**
+ * bugs6 item 42: marks an operation that ended without dispatching a single round, so its Notifications entry says
+ * "stopped before any round: <reason>" instead of "completed". The operation's own state stays `succeeded` (the
+ * command returned); only the words change.
+ */
+export function markOperationStoppedBeforeAnyRoundV1(operationId: string, reason: string): void {
+  stoppedBeforeAnyRoundV1.set(operationId, reason);
+}
+
+/** Reads and clears the mark; called once, when the operation's Notifications entry is built. */
+export function takeOperationStoppedBeforeAnyRoundV1(operationId: string): string | undefined {
+  const reason = stoppedBeforeAnyRoundV1.get(operationId);
+  stoppedBeforeAnyRoundV1.delete(operationId);
+  return reason;
+}
+
 /** Drop a recorded outcome (tests, and an operation that never ends). */
 export function forgetOperationTerminalOutcomeV1(operationId: string): void {
   terminalOutcomesV1.delete(operationId);

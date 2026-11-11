@@ -11,6 +11,7 @@ import { planInterruptedRecoveryV1 } from "./interruptedRecoveryPlanV1";
 import { readInterruptedRecoveryStateV1 } from "./interruptedRecoveryStateV1";
 import { takeRoundOutcomeDetailsForTaskV1 } from "./roundOutcomeDetailV1";
 import { describeRefusalReasonV1 } from "./refusalGuidanceV1";
+import { takeOperationStoppedBeforeAnyRoundV1 } from "./operationEndedLineV1";
 
 /**
  * The centralized operation → Notifications-section terminal-entry policy
@@ -64,6 +65,16 @@ export function terminalEntryFor(
     return undefined;
   }
 
+  // bugs6 item 42: a run that dispatched no round never reads as completed; its owner said why it stopped.
+  const stoppedBeforeAnyRound = snap.state === "succeeded" ? takeOperationStoppedBeforeAnyRoundV1(snap.id) : undefined;
+  if (stoppedBeforeAnyRound !== undefined) {
+    return {
+      message: `${snap.label} — ${formatTaskNameForDisplay(notificationTaskDisplayNameV1(snap.taskName, snap.key))}: ${stoppedBeforeAnyRound}`,
+      level: "warning",
+      sourceOperationId: snap.id,
+      ...(snap.resultTargetUri !== undefined ? { resultTargetUri: snap.resultTargetUri } : {}),
+    };
+  }
   // A refusal is not a completion: say the action did not start, in the
   // words the user needs (the specific reason was already shown at the refusal).
   const stateText =

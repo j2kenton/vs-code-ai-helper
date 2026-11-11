@@ -1763,6 +1763,19 @@ export interface RoundLedgerOutcomeV1 {
   /** A review round's blocker count synthesized from failing checks
    * (`origin: "mechanical"`). */
   mechanicalBlockers?: number;
+  /** bugs6 item 45: how many of the review's blockers it wrote with no resolver tag that lineage could not supply
+   * (counted and shown, never task-fixable). */
+  unclassifiedBlockers?: number;
+  /**
+   * bugs6 items 41 and 46: set when the round ended with under half its time budget used and its own report says it
+   * stopped for time or leaves unblocked steps open ("stopped after 6 of 60 minutes with 9 unblocked steps left").
+   */
+  stoppedEarly?: string;
+  /**
+   * bugs6 item 46: the plan steps this round declined, with the reason from its Remaining Blockers. `kind` is
+   * `full-suite` or `too-large` for the two reasons no round can change on its own.
+   */
+  declinedSteps?: readonly { readonly step: string; readonly kind: string; readonly reason: string }[];
   /** Why a round's summary was rejected, for `state: "rejected"`. */
   rejectionReason?: string;
   /** True when ending this round left a recovery continuation owed —

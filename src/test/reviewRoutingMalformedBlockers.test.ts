@@ -87,7 +87,9 @@ void describe("handleReviewRoutingOutcome — malformed blocker lines (step 3)",
       "",
       "<!-- blockers:start -->",
       "- [completion] [task-fixable] a real, parseable blocker",
-      "- this line has no brackets at all and cannot be parsed",
+      // bugs6 item 45: a bullet with no tags is counted as a blocker now; only a line that is no bullet at all is
+      // malformed.
+      "this line has no brackets at all and cannot be parsed",
       "<!-- blockers:end -->",
     ].join("\n");
 

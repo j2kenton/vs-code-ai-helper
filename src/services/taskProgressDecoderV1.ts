@@ -1359,6 +1359,9 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
     "score",
     "reviewerBlockers",
     "mechanicalBlockers",
+    "unclassifiedBlockers",
+    "stoppedEarly",
+    "declinedSteps",
     "rejectionReason",
     "continuationOwed",
     "runLogPath",
@@ -1449,6 +1452,37 @@ function validateRoundLedgerOutcome(value: unknown): string | undefined {
     (typeof value["mechanicalBlockers"] !== "number" || !Number.isInteger(value["mechanicalBlockers"]))
   ) {
     return "roundLedger entry outcome mechanicalBlockers must be an integer";
+  }
+  if (
+    value["unclassifiedBlockers"] !== undefined &&
+    (typeof value["unclassifiedBlockers"] !== "number" || !Number.isInteger(value["unclassifiedBlockers"]))
+  ) {
+    return "roundLedger entry outcome unclassifiedBlockers must be an integer";
+  }
+  if (
+    value["stoppedEarly"] !== undefined &&
+    (typeof value["stoppedEarly"] !== "string" || value["stoppedEarly"].length === 0 || value["stoppedEarly"].length > 300)
+  ) {
+    return "roundLedger entry outcome stoppedEarly must be a bounded non-empty string";
+  }
+  if (value["declinedSteps"] !== undefined) {
+    const declined = value["declinedSteps"];
+    if (
+      !Array.isArray(declined) ||
+      declined.length > 20 ||
+      !declined.every(
+        (entry) =>
+          isPlainObject(entry) &&
+          typeof entry["step"] === "string" &&
+          entry["step"].length > 0 &&
+          entry["step"].length <= 40 &&
+          typeof entry["kind"] === "string" &&
+          typeof entry["reason"] === "string" &&
+          entry["reason"].length <= 400
+      )
+    ) {
+      return "roundLedger entry outcome declinedSteps must be a bounded list of { step, kind, reason }";
+    }
   }
   if (
     value["rejectionReason"] !== undefined &&

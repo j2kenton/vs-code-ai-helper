@@ -60,7 +60,13 @@ export async function gatherAutomationStopFactsV1(input: {
   const latest = history.at(-1);
   const previous = history.at(-2);
 
-  const blockers = reviewText ? parseReviewBlockersDetailed(reviewText).blockers : [];
+  const blockers = reviewText
+    ? parseReviewBlockersDetailed(reviewText, [
+        ...(latest?.blockers ?? []),
+        ...(previous?.blockers ?? []),
+        ...(previous?.supersededBlockers ?? []),
+      ]).blockers
+    : [];
   const list = buildBlockerWorkListV1({
     blockers,
     ...(planText !== undefined ? { planOfRecord: planText } : {}),
@@ -93,7 +99,12 @@ export async function gatherAutomationStopFactsV1(input: {
     stopReason: input.stopReason,
     score: latest?.score ?? null,
     previousScore: previous?.score ?? null,
-    blockers: { fixFirst: list.fixFirst.length, buildToClear: list.buildToClear.length, notThisRound: list.notThisRound.length },
+    blockers: {
+      fixFirst: list.fixFirst.length,
+      buildToClear: list.buildToClear.length,
+      notThisRound: list.notThisRound.length,
+      unstated: list.notThisRound.filter((item) => item.kind === "unstated").length,
+    },
     ...(counts ? { planItems: { total: counts.total, settled: counts.settled, open: counts.open, provisional: counts.provisional } } : {}),
     buildNext: extractBuildNextLinesV1(reviewText),
     dismissedDependencies,

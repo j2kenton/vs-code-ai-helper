@@ -33,6 +33,8 @@ void describe("running row hover (bugs6 item 43)", () => {
       const item = provider.getTreeItem(node);
       const tooltip = String(item.tooltip ?? "");
       assert.match(tooltip, /^Apply Review — /);
+      // bugs6 Step 25: the task is a labelled fact of its own, not only part of the heading.
+      assert.match(tooltip, /^Task: "?hover_plain"?$/m);
       assert.match(tooltip, /^Stage: Implementation$/m);
       assert.match(tooltip, /^Doing: editing files$/m);
       assert.match(tooltip, /^Model: sonnet@high$/m);

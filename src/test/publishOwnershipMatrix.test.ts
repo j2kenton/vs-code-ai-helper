@@ -3406,7 +3406,7 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     assert.equal(persisted.status, "paused", "the runtime backstop must pause the task");
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for impl-low-review is available/
+      /No configured provider for Implementation › Low-Level Code Review is available/
     );
     assert.match(persisted.pausedReason ?? "", /Cline CLI → Kimi CLI/);
     assert.notEqual(persisted.updatedAt, "2026-01-01T00:00:00.000Z", "updatedAt must be bumped");
@@ -3440,7 +3440,7 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     );
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for publish is available/
+      /No configured provider for Publish is available/
     );
   });
 });

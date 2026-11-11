@@ -661,7 +661,11 @@ export function formatRoundOutcomeMessageV1(
     } else if (outcome.score !== undefined) {
       const reviewer = outcome.reviewerBlockers ?? 0;
       const mechanical = outcome.mechanicalBlockers ?? 0;
-      parts.push(`score ${outcome.score} · ${reviewer} reviewer / ${mechanical} mechanical blocker(s)`);
+      const unclassified = outcome.unclassifiedBlockers ?? 0;
+      // bugs6 item 45: a line the review wrote with no resolver is counted, with the gap said aloud.
+      const reviewerText =
+        unclassified > 0 ? `${reviewer + unclassified} (${unclassified} whose kind the review didn't state)` : `${reviewer}`;
+      parts.push(`score ${outcome.score} · ${reviewerText} reviewer / ${mechanical} mechanical blocker(s)`);
     } else if (outcome.filesChangedUnknown) {
       parts.push("files changed (exact set unknown)");
     } else if (outcome.filesChanged !== undefined) {
@@ -670,6 +674,10 @@ export function formatRoundOutcomeMessageV1(
           ? `${outcome.filesChanged.length} file(s) changed`
           : "no files changed"
       );
+    }
+    // bugs6 items 41 and 46: a round that ended with most of its budget unused says so on its own Ended line.
+    if (outcome.stoppedEarly) {
+      parts.push(outcome.stoppedEarly);
     }
     // A stop sentence from `describeRoundStopV1` already says it; do not repeat it on the same line.
     if (outcome.observedFiles?.length && !outcome.rejectionReason?.includes("while it ran")) {

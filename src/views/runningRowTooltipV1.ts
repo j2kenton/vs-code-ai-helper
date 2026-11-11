@@ -10,6 +10,8 @@ import { describeModelWithProviderV1, getCliProvider, parseModelSelection } from
 export interface RunningRowTooltipInputV1 {
   /** The row's label, e.g. "Apply Review — review2". */
   readonly label: string;
+  /** The task's display name, shown as its own "Task:" line (the label above joins it with the action's name). */
+  readonly taskName?: string;
   readonly stageLabel?: string;
   /** What the round is doing now (the row's activity segment). */
   readonly doing: string;
@@ -73,6 +75,9 @@ function modelLines(input: RunningRowTooltipInputV1): string[] {
 /** The hover text for a running row: one labelled fact per line. */
 export function buildRunningRowTooltipV1(input: RunningRowTooltipInputV1): string {
   const lines: string[] = [input.label, ""];
+  if (input.taskName) {
+    lines.push(`Task: ${input.taskName}`);
+  }
   if (input.stageLabel) {
     lines.push(`Stage: ${input.stageLabel}`);
   }

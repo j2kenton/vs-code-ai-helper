@@ -47,7 +47,13 @@ export interface AutomationStopFactsV1 {
   readonly score?: number | null;
   readonly previousScore?: number | null;
   /** The sorted blockers (Step 19): work a round can do, and blockers that cannot move in another round. */
-  readonly blockers: { readonly fixFirst: number; readonly buildToClear: number; readonly notThisRound: number };
+  readonly blockers: {
+    readonly fixFirst: number;
+    readonly buildToClear: number;
+    readonly notThisRound: number;
+    /** bugs6 item 45: how many of `notThisRound` are lines the review wrote with no resolver tag. */
+    readonly unstated?: number;
+  };
   /** Step 5's counts. */
   readonly planItems?: { readonly total: number; readonly settled: number; readonly open: number; readonly provisional: number };
   /** The review's "Build next" / "Next step" lines, already shortened. */
@@ -149,13 +155,16 @@ function scoreLine(facts: AutomationStopFactsV1): string | undefined {
 }
 
 function blockersLine(facts: AutomationStopFactsV1): string {
-  const { fixFirst, buildToClear, notThisRound } = facts.blockers;
-  const total = fixFirst + buildToClear + notThisRound;
+  const { fixFirst, buildToClear } = facts.blockers;
+  const unstated = Math.min(facts.blockers.unstated ?? 0, facts.blockers.notThisRound);
+  const notThisRound = facts.blockers.notThisRound - unstated;
+  const total = fixFirst + buildToClear + notThisRound + unstated;
   if (total === 0) return "The review lists no blockers.";
   const parts: string[] = [];
   if (fixFirst > 0) parts.push(`${fixFirst} to fix first`);
   if (buildToClear > 0) parts.push(`${buildToClear} that building the named plan steps clears`);
   if (notThisRound > 0) parts.push(`${notThisRound} that another round cannot move (they need you, or no code change resolves them)`);
+  if (unstated > 0) parts.push(`${unstated} whose kind the review didn't state (read ${unstated === 1 ? "it" : "them"} in the review)`);
   return `${total} blocker${total === 1 ? "" : "s"} left: ${parts.join(", ")}.`;
 }
 

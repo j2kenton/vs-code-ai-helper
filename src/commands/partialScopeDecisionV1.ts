@@ -8,6 +8,7 @@
  */
 import * as vscode from "vscode";
 import { STAGE_ARTIFACT_FILENAMES, STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
+import { stageGroupLabelV1 } from "../utils/modelStageLabelsV1";
 import { resolveConfiguredReviewStages } from "../utils/modelSelection";
 import { computeNextStage } from "../utils/stageTransition";
 import type { WorkflowDecisionCommandResultV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
@@ -20,6 +21,18 @@ import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
 import { updateImplReviewFiles } from "../utils/taskProgressTransforms";
 import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 import { readFilesReadEarlierV1 } from "./reviewCoverageRecordV1";
+import {
+  buildFastForwardResumeDispatchV1,
+  fastForwardResumeSuffixV1,
+  isFastForwardResumeStateTrustedV1,
+  type FastForwardResumeStateV1,
+} from "./fastForwardResumeSuffixV1";
+import {
+  getFastForwardRunStateV1,
+  isFastForwardRunActiveV1,
+  type FastForwardRunStateV1,
+} from "../utils/activeFastForwardRunsV1";
+import { postAutomationStoppedCardV1, postStageReadyCardIfReadyV1 } from "./automationStoppedCardV1";
 import {
   listPendingWorkflowDecisionsForTaskV1,
   postWorkflowDecisionV1,
@@ -58,6 +71,103 @@ export interface ResolvePartialReviewScopeArgV1 {
   readonly action: "addAndRereview" | "accept" | "separatePass";
   readonly missingFiles: readonly string[];
   readonly hash: string;
+  /**
+   * bugs6 item 38: the Fast Forward run that was live when this card was raised (its attempt counters and the
+   * session and epoch stamps `isFastForwardResumeStateTrustedV1` checks). Set only on the two options that run the
+   * review again; absent when the card was not raised inside a Fast Forward run.
+   */
+  readonly resumeFastForwardV1?: FastForwardResumeStateV1;
+}
+
+/**
+ * bugs6 item 38: what follows a re-review the scope card started, decided once. A review that raised a new hold has
+ * its own card (nothing more runs); a trusted capture continues the run it came from; anything else ends with the
+ * stage's normal end card, naming why Fast Forward did not continue when a capture existed.
+ */
+export type ScopeReReviewFollowUpV1 =
+  | { readonly kind: "hold"; readonly reason: string }
+  | { readonly kind: "continue-fast-forward"; readonly state: FastForwardResumeStateV1 }
+  | { readonly kind: "end-card"; readonly fastForwardNotContinued?: string };
+
+export function decideScopeReReviewFollowUpV1(input: {
+  readonly capture: FastForwardResumeStateV1 | undefined;
+  readonly captureTrusted: boolean;
+  readonly otherFastForwardRunActive: boolean;
+  readonly holdReason: string | undefined;
+}): ScopeReReviewFollowUpV1 {
+  if (input.holdReason !== undefined) {
+    return { kind: "hold", reason: input.holdReason };
+  }
+  if (input.capture === undefined) {
+    return { kind: "end-card" };
+  }
+  if (input.otherFastForwardRunActive) {
+    return { kind: "end-card", fastForwardNotContinued: "another Fast Forward run is already active for this task" };
+  }
+  if (!input.captureTrusted) {
+    return {
+      kind: "end-card",
+      fastForwardNotContinued: "the run that raised this card has since ended, a different run started, or the window restarted",
+    };
+  }
+  return { kind: "continue-fast-forward", state: input.capture };
+}
+
+/** What a re-review that the scope card started needs from the outside world; faked in tests. */
+export interface ScopeReReviewDepsV1 {
+  readonly readHoldReason: () => Promise<string | undefined>;
+  readonly isTrusted: (state: FastForwardResumeStateV1) => boolean;
+  readonly isFastForwardActive: () => boolean;
+  readonly runFastForward: (command: string, arg: Record<string, unknown>) => Promise<void>;
+  readonly postEndCard: () => Promise<{ readonly posted: boolean }>;
+  readonly postStageReadyCard: () => Promise<{ readonly posted: boolean }>;
+  readonly say: (text: string) => Promise<void>;
+}
+
+/**
+ * bugs6 item 38: runs after the re-review the scope card started has ended. Never leaves "Ended Review —
+ * succeeded." as the last word: a trusted Fast Forward capture goes on with Apply Review; otherwise the stage's end
+ * card (work left) or its "is done" card (stage cleared, with the next stage's click) is posted, and a chat line says
+ * so when neither is.
+ */
+export async function continueAfterScopeReReviewV1(
+  arg: ResolvePartialReviewScopeArgV1,
+  deps: ScopeReReviewDepsV1
+): Promise<ScopeReReviewFollowUpV1> {
+  const capture = arg.resumeFastForwardV1;
+  const decision = decideScopeReReviewFollowUpV1({
+    capture,
+    captureTrusted: capture !== undefined && deps.isTrusted(capture),
+    otherFastForwardRunActive: deps.isFastForwardActive(),
+    holdReason: await deps.readHoldReason(),
+  });
+  const stageName = stageGroupLabelV1(arg.stage);
+  if (decision.kind === "hold") {
+    return decision;
+  }
+  if (decision.kind === "continue-fast-forward") {
+    const dispatch = buildFastForwardResumeDispatchV1(arg.taskFolderPath, decision.state, undefined);
+    await deps.say(
+      `The ${stageName} review with the missing files is done. Fast Forward goes on with Apply Review ` +
+        `(iteration ${decision.state.attemptNumber} of ${decision.state.maxAttempts}) for what that review left open.`
+    );
+    await deps.runFastForward(dispatch.command, dispatch.arg);
+    return decision;
+  }
+  const stopped = await deps.postEndCard();
+  if (!stopped.posted) {
+    const ready = await deps.postStageReadyCard();
+    if (!ready.posted) {
+      await deps.say(
+        `The ${stageName} review with the missing files is done and nothing more is queued. ` +
+          `Read its verdict in the chat, then click Review again, Apply Review or Move on from the ${stageName} row.`
+      );
+    }
+  }
+  if (decision.fastForwardNotContinued !== undefined) {
+    await deps.say(`Fast Forward did not continue: ${decision.fastForwardNotContinued}. Click Start Fast Forward to run it again.`);
+  }
+  return decision;
 }
 
 /** The owner's stored acceptance of a partial scope, or `undefined` when there is none. */
@@ -260,12 +370,46 @@ export async function resolvePartialReviewScopeV1(
       await vscode.commands.executeCommand("vs-code-ai-helper.nextStage", { taskFolderPath: arg.taskFolderPath });
     } else if (what === "rereview") {
       await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", { taskFolderPath: arg.taskFolderPath });
+      await continueAfterReReviewV1();
     } else if (what === "separate-pass") {
       await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
         taskFolderPath: arg.taskFolderPath,
         skipUnchangedTreeGuardV1: true,
       });
+      await continueAfterReReviewV1();
     }
+  };
+  // bugs6 item 38: the review above is a plain review, outside any Fast Forward run, so what picks the work up
+  // afterwards is decided here: the captured run continues, or the stage's normal end card is posted.
+  const continueAfterReReviewV1 = async (): Promise<void> => {
+    if (arg.action === "accept") {
+      return;
+    }
+    await continueAfterScopeReReviewV1(arg, {
+      readHoldReason: () => readPartialScopeHoldV1(arg.taskFolderPath, arg.stage).catch(() => undefined),
+      isTrusted: (state) => isFastForwardResumeStateTrustedV1(state, arg.taskFolderPath),
+      isFastForwardActive: () => isFastForwardRunActiveV1(arg.taskFolderPath),
+      runFastForward: async (command, dispatchArg) => {
+        await vscode.commands.executeCommand(command, dispatchArg);
+      },
+      postEndCard: () =>
+        postAutomationStoppedCardV1({
+          folderUri: vscode.Uri.file(arg.taskFolderPath),
+          stage: arg.stage,
+          ending: "one-cycle",
+          stopReason: "the review you asked for, with the missing files included, is done",
+        }),
+      postStageReadyCard: () =>
+        postStageReadyCardIfReadyV1(arg.taskFolderPath, "After the review with the missing files included"),
+      say: async (text) => {
+        await appendChatMessageV1(arg.taskFolderPath, {
+          role: "assistant",
+          text,
+          stage: arg.stage,
+          at: new Date().toISOString(),
+        }).catch(() => undefined);
+      },
+    }).catch(() => undefined);
   };
   if (hasLiveWorkAdmissionBestEffortV1(arg.taskFolderPath)) {
     // A round is open: a write to the task folder now would be a foreign write to it. Carry the answer out as
@@ -320,10 +464,21 @@ export function buildPartialScopeDecisionInputV1(options: {
   scoreClears?: boolean;
   /** Files whose current content an earlier review read (the coverage record); the card says so per file. */
   readEarlier?: ReadonlySet<string>;
+  /**
+   * bugs6 item 38: the live Fast Forward run (its attempt counters) when this card is raised inside one. Baked, with
+   * the run's session and epoch stamps, into the two options that run the review again, as the plateau and
+   * escalation cards do, so the answer can continue that run.
+   */
+  fastForward?: FastForwardRunStateV1;
 }): PostWorkflowDecisionInputV1 {
   const { taskFolderPath, stage, scope, score, threshold } = options;
   const scoreClears = options.scoreClears !== false;
   const canonicalId = normalizePath(taskFolderPath);
+  const ffResume = options.fastForward !== undefined ? fastForwardResumeSuffixV1(taskFolderPath, options.fastForward) : undefined;
+  const ffConsequence =
+    options.fastForward !== undefined
+      ? ` This card was raised during Fast Forward (iteration ${options.fastForward.attemptNumber} of ${options.fastForward.maxAttempts}), so once the review is done Fast Forward goes on with Apply Review for what it leaves open.`
+      : "";
   const arg = (
     action: ResolvePartialReviewScopeArgV1["action"],
     missingFiles: readonly string[] = scope.files
@@ -333,6 +488,7 @@ export function buildPartialScopeDecisionInputV1(options: {
     action,
     missingFiles,
     hash: scope.hash,
+    ...(ffResume !== undefined && action !== "accept" ? ffResume.extraArgs : {}),
   });
   const causes = classifyScopeFilesV1(scope);
   const { notInList, sizeLimit } = causes;
@@ -353,7 +509,8 @@ export function buildPartialScopeDecisionInputV1(options: {
               `Adds the ${countedV1(notInList.length, "file")} that ${notInList.length === 1 ? "is" : "are"} missing from the list to this review's scope and runs the review again.` +
               (sizeLimit.length > 0
                 ? ` The ${countedV1(sizeLimit.length, "file")} cut by the size limit ${sizeLimit.length === 1 ? "is" : "are"} already in the list, so adding cannot change that.`
-                : " Its score then covers the whole change."),
+                : " Its score then covers the whole change.") +
+              ffConsequence,
             resumeKind: "continue" as const,
             effect: {
               kind: "command" as const,
@@ -370,7 +527,8 @@ export function buildPartialScopeDecisionInputV1(options: {
             label: separatePassLabelV1(sizeLimit.length),
             consequence:
               `Runs the review again with the ${countedV1(sizeLimit.length, "file")} this review had no room for first, so ` +
-              `${sizeLimit.length === 1 ? "its" : "their"} code is read before anything else. Nothing is accepted and nothing is added to the list.`,
+              `${sizeLimit.length === 1 ? "its" : "their"} code is read before anything else. Nothing is accepted and nothing is added to the list.` +
+              ffConsequence,
             resumeKind: "continue" as const,
             effect: {
               kind: "command" as const,
@@ -431,8 +589,11 @@ export async function postPartialScopeDecisionV1(options: {
   threshold: number;
   scoreClears?: boolean;
   readEarlier?: ReadonlySet<string>;
+  /** bugs6 item 38: see `buildPartialScopeDecisionInputV1`. Read from the live run when omitted. */
+  fastForward?: FastForwardRunStateV1;
 }): Promise<WorkflowDecisionV1 | undefined> {
   const canonicalId = normalizePath(options.taskFolderPath);
+  const fastForward = options.fastForward ?? getFastForwardRunStateV1(options.taskFolderPath);
   // review2 Step 22: one open scope card per stage. A newer review's card replaces the stage's earlier ones (each has
   // its own key, since the key carries the gap's hash).
   const newKey = `partialReviewScope:${options.stage}:${options.scope.hash}`;
@@ -446,7 +607,7 @@ export async function postPartialScopeDecisionV1(options: {
       ).catch(() => undefined);
     }
   }
-  return postWorkflowDecisionV1(buildPartialScopeDecisionInputV1(options), {
+  return postWorkflowDecisionV1(buildPartialScopeDecisionInputV1({ ...options, ...(fastForward ? { fastForward } : {}) }), {
     canonicalId,
     taskFolderPath: options.taskFolderPath,
     stage: options.stage,

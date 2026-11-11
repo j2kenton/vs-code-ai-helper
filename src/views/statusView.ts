@@ -536,6 +536,7 @@ export class StatusTreeProvider implements vscode.TreeDataProvider<StatusTreeNod
       });
       item.tooltip = buildRunningRowTooltipV1({
         label,
+        taskName: formatTaskNameForDisplay(element.taskName),
         ...(stageLabel !== undefined ? { stageLabel } : {}),
         doing: activitySegment,
         ...(element.modelId !== undefined ? { modelId: element.modelId } : {}),

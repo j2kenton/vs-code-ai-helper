@@ -27,6 +27,12 @@ import {
   setUnsavedSettingsWarningEnabled,
 } from "../config/settings";
 import { ModelSettings } from "../utils/modelFallback";
+import {
+  describeEmptyStageWarningV1,
+  recordModelSettingsSaveV1,
+  STAGE_GROUP_LABELS_V1,
+  stagesLeftWithoutEnabledModelV1,
+} from "../utils/modelStageLabelsV1";
 import { ENSEMBLE_DISMISS_BUTTON_CSS_V1 } from "./sharedButtonStylesV1";
 import {
   CLI_PROVIDERS,
@@ -308,7 +314,23 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           break;
         }
         case "saveSettings": {
+          // bugs6 item 3: a save that leaves a stage with no enabled model asks first (a pop-up confirmation, the
+          // owner's rule for confirmations): that stage's next round would fail, as Implementation › High-Level Code
+          // Review's did on 2026-11-01.
+          const previousSettings = getModelSettings();
+          const emptied = stagesLeftWithoutEnabledModelV1(previousSettings, data.settings);
+          if (emptied.length > 0) {
+            const choice = await vscode.window.showWarningMessage(
+              describeEmptyStageWarningV1(emptied),
+              { modal: true },
+              "Save anyway"
+            );
+            if (choice !== "Save anyway") {
+              break;
+            }
+          }
           await setModelSettings(data.settings);
+          recordModelSettingsSaveV1(previousSettings, data.settings);
           NotificationRouter.showInformation("AI model settings saved.");
           break;
         }
@@ -542,7 +564,9 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       settings,
       models,
       stages: AI_MODEL_STAGES,
-      stageNames: STAGE_DISPLAY_NAMES,
+      // bugs6 item 3: the review stages carry their group ("Plan › High-Level Review",
+      // "Implementation › High-Level Code Review"), so no two stages differ by one word.
+      stageNames: { ...STAGE_DISPLAY_NAMES, ...STAGE_GROUP_LABELS_V1 },
       stageTitleOverrides: STAGE_TITLE_OVERRIDES,
       stageHints: STAGE_ROLE_HINTS,
       enabledProviders: getEnabledProviders(),
@@ -733,6 +757,16 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       // delivered once "rendered" confirms the rows actually exist.
       this._pendingFocus = { stage, control };
     }
+  }
+
+  /** bugs6 item 22: whether the AI Models webview has resolved in this window. */
+  public hasResolvedView(): boolean {
+    return this._view !== undefined;
+  }
+
+  /** bugs6 item 22: whether the AI Models webview is visible right now (not collapsed, hidden or in a closed container). */
+  public isViewVisible(): boolean {
+    return this._view?.visible === true;
   }
 
   public reveal(preserveFocus = false): boolean {
@@ -933,6 +967,15 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           }
           .stage-row.highlighted {
             background-color: var(--vscode-editor-findMatchHighlightBackground);
+          }
+          .stage-row.selected-stage {
+            border-left: 3px solid var(--vscode-focusBorder);
+            padding-left: var(--ensemble-space-2);
+          }
+          .fallback-off-note {
+            margin: 0 0 var(--ensemble-space-2);
+            font-size: var(--ensemble-small-font-size);
+            color: var(--vscode-descriptionForeground);
           }
           #unsaved-warning-overlay {
             position: fixed;
@@ -1342,6 +1385,20 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
             } else if (message.type === 'focusStage') {
               const row = document.getElementById('row-' + message.stage);
               if (row) {
+                // bugs6 item 3: the stage the owner came to fix stays selected and is named with its group, so a
+                // model is never put on the stage next to it by mistake.
+                document.querySelectorAll('.stage-row.selected-stage').forEach(other => other.classList.remove('selected-stage'));
+                row.classList.add('selected-stage');
+                let banner = document.getElementById('focus-banner');
+                if (!banner) {
+                  banner = document.createElement('div');
+                  banner.id = 'focus-banner';
+                  banner.className = 'provider-discovery-note';
+                  banner.setAttribute('role', 'status');
+                  const table = document.getElementById('stages-tbody');
+                  if (table && table.parentNode) table.parentNode.insertBefore(banner, table);
+                }
+                banner.textContent = 'Opened for ' + (stageDisplayNames[message.stage] || message.stage) + '. Change its models below.';
                 row.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 row.classList.add('highlighted');
                 setTimeout(() => row.classList.remove('highlighted'), 3000);
@@ -1392,6 +1449,14 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
           // the (static) container catches every current and future row.
           document.getElementById('stages-tbody').addEventListener('input', markDirty);
           document.getElementById('stages-tbody').addEventListener('change', markDirty);
+          ['input', 'change', 'click'].forEach(eventName => {
+            document.getElementById('stages-tbody').addEventListener(eventName, event => {
+              const target = event.target;
+              const stageRow = target && typeof target.closest === 'function' ? target.closest('.stage-row') : null;
+              // After the control's own handler has updated the row.
+              if (stageRow) setTimeout(() => refreshFallbackOffNote(stageRow), 0);
+            });
+          });
           document.getElementById('stages-tbody').addEventListener('click', event => {
             if (event.target.closest('.add-backup, .remove-backup')) {
               markDirty();
@@ -1619,6 +1684,33 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
 
           // The primary's wording depends on the stage's backups, so a change
           // to any row in the stage re-derives the primary's note.
+          // bugs6 item 23: a backup that is switched on under an unticked "Fall back to backup models" box is used only
+          // for second opinions; say so once on the stage, so it is never mistaken for a quota fallback.
+          function refreshFallbackOffNote(stageRow) {
+            if (!stageRow || typeof stageRow.querySelector !== 'function') return;
+            const fallback = stageRow.querySelector('.fallback-enabled');
+            const hasLiveBackup = Array.from(stageRow.querySelectorAll('.extra-backups .model-row')).some(modelRow => {
+              const enabled = modelRow.querySelector('.row-enabled');
+              const input = modelRow.querySelector('.model-combo-input');
+              return !!enabled && enabled.checked && !!input && input.value.trim() !== '';
+            });
+            let note = stageRow.querySelector('.fallback-off-note');
+            const show = !!fallback && !fallback.checked && hasLiveBackup;
+            if (!show) {
+              if (note) note.remove();
+              return;
+            }
+            if (!note) {
+              note = document.createElement('div');
+              note.className = 'fallback-off-note';
+              note.setAttribute('role', 'note');
+              const backupSection = stageRow.querySelector('.backup-section');
+              if (backupSection) backupSection.parentNode.insertBefore(note, backupSection);
+              else stageRow.appendChild(note);
+            }
+            note.textContent = 'Backup models are used only for second opinions, not when the first model runs out. Tick "Fall back to backup models" to use them when it does.';
+          }
+
           function refreshStageNotes(stageRow) {
             if (!stageRow || typeof stageRow.querySelector !== 'function') return;
             const primaryNote = stageRow.querySelector('.primary-container .provider-disabled-note');
@@ -2131,6 +2223,7 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
                 true
               );
               refreshStageNotes(row);
+              refreshFallbackOffNote(row);
 
               row.querySelector('.add-backup').addEventListener('click', () => {
                 addExtraBackupCombobox(row, stage, '', true);

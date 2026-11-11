@@ -61,6 +61,8 @@ import {
   takeOwedRunV1,
 } from "../utils/ownerAnswerGroupV1";
 import {
+  assessDeviationAgainstReviewV1,
+  deviationReviewViewTextV1,
   ParsedOwnerDecisionBlockV1,
   parseOwnerDecisionsNeededV1,
   parsePlanDeviationsV1,
@@ -1094,6 +1096,80 @@ export async function raiseOwnerDecisionCardsFromReviewV1(
   }
   return posted;
 }
+
+/**
+ * bugs6 item 44: after a review, each open deviation card of the stage is re-checked against the review's
+ * "Material plan deviations" section and blockers. A deviation the review calls "not a departure" or "meets the
+ * plan" gets "Approve (the review found it meets the plan)" with the review's sentence quoted; one the review holds
+ * as a blocker gets Reject. The card is refreshed in place (same key, nothing announced), never raised again. With no
+ * confident match the card is left as it is. Returns the number of cards updated.
+ */
+export async function refreshPlanDeviationCardsFromReviewV1(
+  taskFolderPath: string,
+  stage: TaskStage,
+  reviewContent: string,
+  planOfRecord?: string
+): Promise<number> {
+  const canonicalId = normalizePath(taskFolderPath);
+  let updated = 0;
+  for (const card of pendingOwnerPlanCardsV1(canonicalId, stage, "deviation")) {
+    const verdict = assessDeviationAgainstReviewV1(card.whatHappened, reviewContent, planOfRecord);
+    if (verdict === undefined) continue;
+    const optionId = verdict.kind === "meets" ? "approve-deviation" : "reject-deviation";
+    if (!card.options.some((option) => option.optionId === optionId)) continue;
+    const reasoning =
+      verdict.kind === "meets"
+        ? `Approve (the review found it meets the plan): “${verdict.sentence.length > 240 ? `${verdict.sentence.slice(0, 237)}…` : verdict.sentence}”`
+        : `The latest review holds this step as a blocker: ${verdict.blocker.length > 240 ? `${verdict.blocker.slice(0, 237)}…` : verdict.blocker} Rejecting keeps the plan as written.`;
+    const view = deviationReviewViewTextV1(verdict);
+    const whatHappened = DEVIATION_REVIEW_VIEW_RE.test(card.whatHappened)
+      ? card.whatHappened.replace(DEVIATION_REVIEW_VIEW_RE, view)
+      : `${card.whatHappened}${view}`;
+    if (
+      whatHappened === card.whatHappened &&
+      card.recommendation.kind === "option" &&
+      card.recommendation.optionId === optionId &&
+      card.recommendation.reasoning === reasoning
+    ) {
+      continue;
+    }
+    const effectArgs = card.options.flatMap((option) =>
+      option.effect.kind === "command" ? [option.effect.args?.[0]] : []
+    )[0] as { rawContentHash?: string } | undefined;
+    const rawContentHash = effectArgs?.rawContentHash;
+    await postWorkflowDecisionV1(
+      {
+        decisionKey: card.decisionKey,
+        taskCanonicalId: card.taskCanonicalId,
+        stage: card.stage,
+        whatHappened,
+        whyUserNeeded: card.whyUserNeeded,
+        options: card.options,
+        recommendation: { kind: "option", optionId, reasoning },
+        ...(card.evidence ? { evidence: card.evidence } : {}),
+        ...(card.gating ? { gating: card.gating } : {}),
+        ...(card.blockerIdentities ? { blockerIdentities: card.blockerIdentities } : {}),
+        ...(rawContentHash !== undefined
+          ? {
+              suppressWhileAnswered: {
+                conditionFingerprint: rawContentHash,
+                answeredOptionIds: [...card.options.map((o) => o.optionId)],
+              },
+            }
+          : {}),
+        quietRepost: true,
+      },
+      { canonicalId, taskFolderPath, stage }
+    ).then((posted) => {
+      if (posted) updated += 1;
+    });
+  }
+  return updated;
+}
+
+/** The sentence a deviation card carries about what the latest review said (any of the three wordings). */
+const DEVIATION_REVIEW_VIEW_RE =
+  / The latest review (?:has not verified it\.|already verified it\.|found it meets the plan: “[^”]*”|holds this as a blocker:[^\n]*)/;
 
 /**
  * bugs5 Step 23: Parse the `## Plan deviations` section of a round's summary and raise a card for each.

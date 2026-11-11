@@ -81,8 +81,11 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
   });
 
   void it("reports 'starting' at the top of runReviewForFolder (before its first await), resolves the model once known, and reports 'running' right before the coordinator await", () => {
-    const fnStart = source.indexOf("export async function runReviewForFolder(");
-    assert.ok(fnStart >= 0, "runReviewForFolder must exist");
+    // bugs6 item 32: `runReviewForFolder` is a thin wrapper (the owner-answer chat line); the body that reports
+    // 'starting' is `runReviewForFolderCoreV1`.
+    assert.ok(source.indexOf("export async function runReviewForFolder(") >= 0, "runReviewForFolder must exist");
+    const fnStart = source.indexOf("async function runReviewForFolderCoreV1(");
+    assert.ok(fnStart >= 0, "runReviewForFolderCoreV1 must exist");
     const fnBodyStart = source.indexOf("): Promise<void> {", fnStart);
     assert.ok(fnBodyStart >= 0);
 

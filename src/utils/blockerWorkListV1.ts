@@ -32,7 +32,7 @@ export interface BuildToClearItemV1 extends BlockerWorkItemV1 {
 export interface NotThisRoundItemV1 extends BlockerWorkItemV1 {
   readonly reason: string;
   /** Why it is not this round's work: `standing` and `declined` are the ones Step 39 hands to the owner by name. */
-  readonly kind?: "owner" | "environmental" | "needs-toolchain" | "declined" | "standing";
+  readonly kind?: "owner" | "environmental" | "needs-toolchain" | "declined" | "standing" | "unstated";
 }
 
 export interface BlockerWorkListV1 {
@@ -141,6 +141,16 @@ export function buildBlockerWorkListV1(input: BlockerWorkListInputV1): BlockerWo
     const ownerOnly =
       !failingCheck &&
       (EXPLICIT_OWNER_RE.test(description) || (resolver !== "task-fixable" && LOOSE_OWNER_RE.test(description)));
+    // bugs6 item 45: a line the review wrote with no resolver is shown, but it is not task-fixable, so it is no build
+    // mandate on its own. The owner reads it and decides.
+    if (resolver === "unknown") {
+      notThisRound.push({
+        blocker,
+        reason: "the review did not say who can resolve it (its blocker line carried no resolver tag)",
+        kind: "unstated",
+      });
+      continue;
+    }
     if (ownerOnly || resolver === "spec-defect") {
       notThisRound.push({ blocker, reason: "it needs a decision only the owner can make", kind: "owner" });
       continue;

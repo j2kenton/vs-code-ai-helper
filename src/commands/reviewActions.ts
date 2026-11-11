@@ -55,7 +55,21 @@ import {
   takeStageActionTerminalOutcomeV1,
   type TypedStageActionRefusalV1,
 } from "../utils/stageActionRefusalV1";
-import { recordOperationTerminalOutcomeV1, terminalOutcomeFromTaskActionOutcomeV1 } from "../utils/operationEndedLineV1";
+import { raiseDeclinedStepCardIfRepeatedV1, readDeclinedStepGuidanceV1 } from "./declinedStepDecisionV1";
+import { describeNoModelConfiguredV1, getLastModelChangeV1, stageGroupLabelV1 } from "../utils/modelStageLabelsV1";
+import { describeModelWithProviderV1 } from "../runners/providers";
+import {
+  describeSkippedBackupsV1,
+  describeTurnOnFallbackConsequenceV1,
+  findBackupsSkippedByNeverSwitchV1,
+  TURN_ON_FALLBACK_AND_RETRY_COMMAND_V1,
+} from "./turnOnFallbackAndRetryV1";
+import { describeEarlyStopChatLineV1, detectRoundEarlyStopV1, parseDeclinedStepsV1 } from "../utils/roundEarlyStopV1";
+import {
+  markOperationStoppedBeforeAnyRoundV1,
+  recordOperationTerminalOutcomeV1,
+  terminalOutcomeFromTaskActionOutcomeV1,
+} from "../utils/operationEndedLineV1";
 import {
   describeBreakerFastForwardEndV1,
   describeBreakerStopV1,
@@ -496,6 +510,7 @@ import { WorkflowUnavailableCodeV1 } from "../types/workflowAvailabilityV1";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1, ChatTarget, ChatViewProvider, isBlockingDecisionV1 } from "../views/chatView";
 import {
   describeFastForwardHoldV1,
+  describeFastForwardStoppedBeforeAnyRoundV1,
   findBlockingDecisionSinceRunStartV1,
   latestApplyReviewChangedNothingV1,
   unproducibleTestEvidenceHoldV1,
@@ -559,6 +574,9 @@ import {
 import { QuestionOptionV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { TaskInventory } from "../state/taskInventory";
 import {
+  describeBlockersBlockGapV1,
+  countUnclassifiedBlockersV1,
+  priorBlockerRefsForStageV1,
   hasZeroTaskFixableEvidence,
   isPlanIncomplete,
   meetsAutoAdvanceThreshold,
@@ -596,6 +614,7 @@ import {
   postOwnerOnlyBlockersCardV1,
   raiseOwnerDecisionCardsFromReviewV1,
   raisePlanDeviationCardsV1,
+  refreshPlanDeviationCardsFromReviewV1,
 } from "./ownerPlanDecisionCommandV1";
 import {
   computeReviewScopeGapV1,
@@ -749,6 +768,9 @@ import {
   getFastForwardStopLevel,
   getResilienceSettings,
   getReviewPlateauRounds,
+  getModelSettings,
+  isModelProviderEnabled,
+  isProviderSelectionConfigured,
   isAutoAdvanceEnabled,
   resolveQuotaAccountKeyV1,
   strongestAutoTriggerMode,
@@ -4107,7 +4129,13 @@ export async function handleReviewRoutingOutcome(options: {
   let progressBefore: TaskProgress | undefined;
   try {
     const resilience = getResilienceSettings();
-    const blockerEvidence = parseReviewBlockersDetailed(content);
+    // bugs6 item 45: a bullet with no resolver tag takes its category and resolver from the prior blocker its
+    // lineage tag cites, so the stage's previous review's list is read before parsing.
+    const priorBlockerRefs = priorBlockerRefsForStageV1(
+      await readTaskProgressAdvisoryV1(folderUri).catch(() => undefined),
+      targetStage
+    );
+    const blockerEvidence = parseReviewBlockersDetailed(content, priorBlockerRefs);
     // Merge in blockers synthesized directly from this round's failed
     // Verified Checks (step 4 of the fail-closed-parsing fix) — cached by
     // buildVerifiedChecksVariable moments earlier in this same round, before
@@ -4764,6 +4792,7 @@ export async function handleReviewRoutingOutcome(options: {
         ...(typeof score === "number" ? { score } : {}),
         reviewerBlockers: blockerSplit.reviewerBlockers,
         mechanicalBlockers: blockerSplit.mechanicalBlockers,
+        ...(countUnclassifiedBlockersV1(blockers) > 0 ? { unclassifiedBlockers: countUnclassifiedBlockersV1(blockers) } : {}),
         ...(reviewerChallengedNonGoalHeadings ? { reviewerChallengedNonGoal: reviewerChallengedNonGoalHeadings } : {}),
         ...(taskMdSizeBand ? { taskMdSizeBand } : {}),
         ...(identityAttachmentDegraded ? { identityAttachmentDegraded } : {}),
@@ -4896,9 +4925,36 @@ export async function handleReviewRoutingOutcome(options: {
     const ownerDecisionBlocks = parseOwnerDecisionsNeededV1(content);
     // Always called: it also withdraws cards for decisions this review no longer asks for.
     await raiseOwnerDecisionCardsFromReviewV1(folderUri.fsPath, targetStage, content).catch(() => []);
+    // bugs6 item 44: open deviation cards of this stage take this review's verdict on the same deviation.
+    await refreshPlanDeviationCardsFromReviewV1(
+      folderUri.fsPath,
+      targetStage,
+      content,
+      await readTextIfExists(vscode.Uri.joinPath(folderUri, "plan-final.md")).catch(() => undefined)
+    ).catch(() => 0);
     const allBlockersNeedOwnerDecision =
       blockers.length > 0 &&
       blockers.every((b) => isOwnerDecisionBlockerV1(b, ownerDecisionBlocks));
+    // bugs6 item 45: a failing score over a blockers block with no stated blocker is a review-format problem the
+    // owner is told about, never a card that says "no blockers".
+    const blockersBlockGap = describeBlockersBlockGapV1({
+      score,
+      threshold,
+      blockPresent: blockerEvidence.blockPresent,
+      blockers,
+    });
+    if (blockersBlockGap !== undefined) {
+      try {
+        await appendChatMessageV1(folderUri.fsPath, {
+          role: "assistant",
+          text: blockersBlockGap,
+          stage: targetStage,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // Best-effort record only; the route decision stands.
+      }
+    }
     const decision = decideReviewRoute({
       score,
       threshold,
@@ -7499,7 +7555,19 @@ export async function pauseTaskForExhaustedChainV1(
    */
   code?: WorkflowUnavailableCodeV1
 ): Promise<void> {
-  const stageName = exhaustion.stage ?? stage;
+  // bugs6 item 3: the card names the stage with its group ("Implementation › High-Level Code Review"), never the raw
+  // id, so the Plan and Implementation review stages cannot be taken for each other.
+  const stageName = stageGroupLabelV1((exhaustion.stage ?? stage) as TaskStage);
+  // bugs6 item 23: switched-on backups a quota stop skipped because "Fall back to backup models" is off. "Every
+  // configured model" is said only when no switched-on model was left untried.
+  const skippedBackupIds = findBackupsSkippedByNeverSwitchV1(
+    getModelSettings()[stage],
+    exhaustion.candidates.map((candidate) => candidate.storedModelId),
+    (modelId) => isProviderSelectionConfigured() && !isModelProviderEnabled(modelId)
+  );
+  const skippedBackupLabels = skippedBackupIds.map((modelId) => attributionModelLabel(modelId) ?? describeModelWithProviderV1(modelId));
+  const skippedBackupSentence = describeSkippedBackupsV1(stage, skippedBackupLabels);
+  const everyModelPhrase = skippedBackupIds.length === 0 ? "Every configured model" : "Every model that was tried";
   const chain =
     exhaustion.candidates.length > 0
       ? exhaustion.candidates.map((candidate) => candidate.providerLabel).join(" → ")
@@ -7595,7 +7663,9 @@ export async function pauseTaskForExhaustedChainV1(
   };
   // One message naming every model the chain tried and why, and where to
   // change the list (item 11) — not a pointer at the run log.
-  const chainTail = describeChainExhaustionTailV1(STAGE_DISPLAY_NAMES[stage], exhaustion.candidates);
+  const chainTail =
+    describeChainExhaustionTailV1(stageGroupLabelV1(stage), exhaustion.candidates) +
+    (skippedBackupSentence !== "" ? ` ${skippedBackupSentence}` : "");
   // The highest-ranked candidate's failure is the finding; a lower-ranked
   // backup that was already quota-blocked is context, never the headline.
   const primaryCandidate = exhaustion.candidates[0];
@@ -7619,33 +7689,33 @@ export async function pauseTaskForExhaustedChainV1(
       ? `The highest-ranked model failed: ${paymentHint(primaryCandidate)} ${backupUnavailableSentence()} ${chainTail}`
       :
     (code === "candidatesExhausted" || code === "candidatesDeferred") && primaryCandidate !== undefined && primaryQuotaCandidate !== undefined
-      ? `${code === "candidatesDeferred" ? `Every configured model for ${stageName} is currently deferred. ` : `Every configured model for ${stageName} was tried, but `}` +
+      ? `${code === "candidatesDeferred" ? `${everyModelPhrase} for ${stageName} is currently deferred. ` : `${everyModelPhrase} for ${stageName} was tried, but `}` +
         `the highest-ranked model, ${primaryCandidate.providerLabel}, ${code === "candidatesDeferred" ? "is currently blocked by a " : "was blocked by a "}` +
         `${primaryQuotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
         `${primaryCandidate.providerLabel}: ` +
         `${primaryCandidate.reason}. ${backupUnavailableSentence()} ` +
         `${code === "candidatesDeferred" ? "Deferred, not exhausted: the task is parked. " : ""}${chainTail}`
       : code === "candidatesExhausted" && primaryCandidate !== undefined
-      ? `Every configured model for ${stageName} was tried and failed. The highest-ranked model, ` +
+      ? `${everyModelPhrase} for ${stageName} was tried and failed. The highest-ranked model, ` +
         `${primaryCandidate.providerLabel}, failed: ${primaryCandidate.reason}. ${backupUnavailableSentence()} ` +
         `${chainTail}`
       : code === "candidatesDeferred" && primaryCandidate !== undefined
-      ? `Every configured model for ${stageName} is currently deferred. The highest-ranked model, ` +
+      ? `${everyModelPhrase} for ${stageName} is currently deferred. The highest-ranked model, ` +
         `${primaryCandidate.providerLabel}, failed first: ${primaryCandidate.reason}. ` +
         `${backupUnavailableSentence()} Deferred, not exhausted: the task is parked. ${chainTail}`
       : code === "candidatesDeferred" && quotaCandidate !== undefined
-      ? `Every configured model for ${stageName} is currently deferred. The highest-ranked model's failure ` +
+      ? `${everyModelPhrase} for ${stageName} is currently deferred. The highest-ranked model's failure ` +
         `is not available in the candidate record; the first quota-limited backup is ` +
         `${quotaCandidate.candidate.providerLabel} (${quotaCandidate.failureKind}` +
         `${quotaCandidate.resetAt !== undefined ? `, resets ${quotaCandidate.resetAt}` : ""}). ` +
         `${backupUnavailableSentence()} Deferred, not exhausted: the task is parked. ${chainTail}`
       : code === "candidatesExhausted" && quotaCandidate !== undefined
-        ? `Every configured model for ${stageName} was tried, but the chain was blocked by a ` +
+        ? `${everyModelPhrase} for ${stageName} was tried, but the chain was blocked by a ` +
           `${quotaCandidate.failureKind === "quota" ? "quota/credit-limit" : "model-entitlement"} restriction on ` +
           `${quotaCandidate.candidate.providerLabel} — this is a provider account limit, not a transport or code ` +
           `fault (${quotaCandidate.candidate.reason}). ${chainTail}`
         : code === "candidatesExhausted"
-          ? `Every configured model for ${stageName} was tried and failed — ` +
+          ? `${everyModelPhrase} for ${stageName} was tried and failed — ` +
             `the resolved chain was exhausted (${chain}). ${chainTail}`
           : `No configured provider for ${stageName} is available — ` +
             `the resolved chain was exhausted (${chain}). ${chainTail}`;
@@ -7701,10 +7771,27 @@ export async function pauseTaskForExhaustedChainV1(
       resumeKind: "unpause",
       label: "Change the model in AI Models",
       consequence:
-        `Opens AI Models focused on ${STAGE_DISPLAY_NAMES[stage]} so you can switch providers or models. ` +
+        `Opens AI Models focused on ${stageGroupLabelV1(stage)} so you can switch providers or models. ` +
         "Once you've changed it, choose \"Retry now\" (or resume the task) to try again.",
       effect: { kind: "command", command: "vs-code-ai-helper.openAiModels", args: [stage] },
     },
+    // bugs6 item 23: a switched-on backup was skipped because fallback is off; offer the one setting change that
+    // uses it, stated here before it is made, next to waiting for the reset.
+    ...(skippedBackupIds.length > 0
+      ? [
+          {
+            optionId: "turnOnFallback",
+            resumeKind: "continue" as const,
+            label: "Turn on fallback and retry",
+            consequence: describeTurnOnFallbackConsequenceV1(stage, skippedBackupLabels),
+            effect: {
+              kind: "command" as const,
+              command: TURN_ON_FALLBACK_AND_RETRY_COMMAND_V1,
+              args: [{ taskFolderPath: folderUri.fsPath, stage }],
+            },
+          },
+        ]
+      : []),
     ...(quotaParkRecord?.resetAt !== undefined
       ? [
           {
@@ -7738,7 +7825,15 @@ export async function pauseTaskForExhaustedChainV1(
   ];
 
   const recommendation: WorkflowDecisionRecommendationV1 =
-    primaryFailedForOtherReason
+    skippedBackupIds.length > 0 && !primaryFailedForOtherReason && (quotaParkRecord?.resetAt === undefined || resetIsFar)
+      ? {
+          kind: "option",
+          optionId: "turnOnFallback",
+          reasoning:
+            `${skippedBackupSentence} Turning the box on lets the review run on ${skippedBackupLabels.join(", then ")} now, ` +
+            "instead of waiting for a reset that is far off or unknown.",
+        }
+      : primaryFailedForOtherReason
       ? {
           kind: "none",
           reasoning:
@@ -8096,13 +8191,68 @@ export async function settleReviewPreflightRefusalV1(input: {
   return text;
 }
 
+/**
+ * bugs6 item 32: the owner's answer started this review ("Review again anyway"). When it returns without having
+ * dispatched a review (a guard clause, a refusal, a throw), the chat says so with the reason and the next click, as
+ * well as any notification. Plain Review clicks (no flag) keep their current behaviour. One place instead of a chat
+ * line at each of the function's many early returns.
+ */
 export async function runReviewForFolder(
+  extensionUri: vscode.Uri,
+  folderUri: vscode.Uri,
+  workspaceRoot: vscode.WorkspaceFolder,
+  currentStage: TaskStage,
+  skipOverwriteConfirmation: boolean,
+  options: Parameters<typeof runReviewForFolderCoreV1>[5] = {}
+): Promise<void> {
+  if (options.startedByOwnerAnswer !== true) {
+    return runReviewForFolderCoreV1(extensionUri, folderUri, workspaceRoot, currentStage, skipOverwriteConfirmation, options);
+  }
+  const probe = options.dispatchProbe ?? { dispatched: false };
+  const targetStage = REVIEW_TARGETS[currentStage] ?? currentStage;
+  const say = async (text: string): Promise<void> => {
+    await appendChatMessageV1(folderUri.fsPath, {
+      role: "assistant",
+      text,
+      stage: targetStage,
+      at: new Date().toISOString(),
+    }).catch(() => undefined);
+  };
+  try {
+    await runReviewForFolderCoreV1(extensionUri, folderUri, workspaceRoot, currentStage, skipOverwriteConfirmation, {
+      ...options,
+      dispatchProbe: probe,
+    });
+  } catch (error) {
+    await say(describeOwnerAnswerReviewNotStartedV1(error instanceof Error ? error.message : String(error), stageGroupLabelV1(targetStage)));
+    throw error;
+  }
+  if (!probe.dispatched) {
+    const reason =
+      peekRecentStageActionRefusalReasonV1(folderUri.fsPath) ??
+      "the review stopped before it started (see the Notifications view for the reason)";
+    await say(describeOwnerAnswerReviewNotStartedV1(reason, stageGroupLabelV1(targetStage)));
+  }
+}
+
+/** bugs6 item 32: the chat line for a review an owner's answer asked for that never started. */
+export function describeOwnerAnswerReviewNotStartedV1(reason: string, stageName: string): string {
+  const flat = reason.replace(/\s+/g, " ").trim().replace(/[.\s]+$/, "");
+  return `Your answer asked for a ${stageName} review, but none was started: ${flat}. Click Review on the ${stageName} row to try again.`;
+}
+
+async function runReviewForFolderCoreV1(
   extensionUri: vscode.Uri,
   folderUri: vscode.Uri,
   workspaceRoot: vscode.WorkspaceFolder,
   currentStage: TaskStage,
   _skipOverwriteConfirmation: boolean,  // kept for API compat, always skipped now
   options: {
+    /**
+     * bugs6 item 32: set only by a review an owner's answer started (a card's option). `runReviewForFolder` then
+     * writes a chat line for any return that did not dispatch a review.
+     */
+    startedByOwnerAnswer?: boolean;
     preserveActiveFallback?: boolean;
     /**
      * The tracked operation this review runs under. The auto-advance tail
@@ -8352,6 +8502,7 @@ export async function runReviewForFolder(
           required: true,
           options: unchangedTreeOptions,
         };
+        const unchangedTreeInteractionId = allocateHex128IdV1();
         const unchangedTreeOptionEffects: Record<string, WorkflowDecisionOptionEffectV1> = {
           ...(pendingScopeGap !== undefined
             ? {
@@ -8374,7 +8525,15 @@ export async function runReviewForFolder(
           reviewAgainAnyway: {
             kind: "command",
             command: "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1",
-            args: [{ taskFolderPath: folderUri.fsPath, stage: targetStage }],
+            // bugs6 item 32: the answer's key (this card's interaction id + the option) so one answer starts at
+            // most one review, however many windows or retries carry it.
+            args: [
+              {
+                taskFolderPath: folderUri.fsPath,
+                stage: targetStage,
+                answerKey: `${unchangedTreeInteractionId}:reviewAgainAnyway`,
+              },
+            ],
           },
         };
         await options.chatViewProvider.askInteraction(
@@ -8383,7 +8542,7 @@ export async function runReviewForFolder(
             taskFolderPath: folderUri.fsPath,
             stage: targetStage,
             taskName: runReviewForFolderProgress?.displayName,
-            interactionId: allocateHex128IdV1(),
+            interactionId: unchangedTreeInteractionId,
             operationId: allocateHex128IdV1(),
             actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
             sourceAttemptId: allocateHex128IdV1(),
@@ -9769,7 +9928,21 @@ export async function runReviewForFolder(
       : await resolveFreshModelForStage(folderUri, targetStage);
     const modelId = options.forcedModelId ?? resolvedModelId;
     if (!modelId) {
-      NotificationRouter.showWarning("No model is configured for this stage.");
+      // bugs6 item 3: name the stage with its group and, when the owner's last change went to another stage, say
+      // where the model went; offer to open the stage in AI Models.
+      const noModelText = describeNoModelConfiguredV1(targetStage, getLastModelChangeV1(), (id) => attributionModelLabel(id) ?? id);
+      NotificationRouter.showWarning(`No model is configured for this stage (${stageGroupLabelV1(targetStage)}). ${noModelText}`);
+      void offerActionInChatV1({
+        taskFolderPath: folderUri.fsPath,
+        taskLabel: formatNotificationTaskLabelV1(runReviewForFolderProgress?.displayName, folderUri.fsPath),
+        actionLabel: `Open ${stageGroupLabelV1(targetStage)} in AI Models`,
+        command: "vs-code-ai-helper.openAiModels",
+        args: [targetStage],
+        noticeText: noModelText,
+        actionResumeKind: "unpause",
+        actionConsequence: `Opens AI Models on ${stageGroupLabelV1(targetStage)}. Nothing runs until you click Review again.`,
+        doNothingOption: { label: "Not now", consequence: "Does nothing. The review stays unrun until a model is enabled." },
+      }).catch(() => undefined);
       // 2026-08-27 review, blocker "review rows never attach the coordinator
       // operation or provider attempt identities": this early return happens
       // BEFORE `coordinator.executeAction` is ever called, so `handleReviewOutcomeV1`
@@ -9782,7 +9955,7 @@ export async function runReviewForFolder(
         reviewAttemptId,
         "failed",
         {
-          rejectionReason: "no model is configured for this review stage; provider dispatch did not start",
+          rejectionReason: `no model is configured for this review stage (${stageGroupLabelV1(targetStage)}); provider dispatch did not start`,
           ...(taskMdSizeBandForOutcome ? { taskMdSizeBand: taskMdSizeBandForOutcome } : {}),
         },
         {
@@ -13683,15 +13856,41 @@ export async function fastForwardReviewWithAI(
     // clean review is NOT handled here: it flows through the zero-fixable
     // branch below so the sibling-stage blocker check still runs before any
     // success is reported.
+    // bugs6 item 42: a run that dispatched no round never reads as "completed". The Ended line and the
+    // Notifications entry both say "Fast Forward stopped before any round: <reason>" and name the click on.
+    const heldStageName = stageGroupLabelV1(targetStage);
+    const stoppedBeforeAnyRound =
+      outcome.attempts === 0 ? describeFastForwardStoppedBeforeAnyRoundV1(outcome.held, heldStageName) : undefined;
     recordOperationTerminalOutcomeV1(op.id, {
       state: "stopped",
-      reason: describeFastForwardHoldV1(outcome.held, STAGE_DISPLAY_NAMES[targetStage] ?? targetStage, outcome.attempts),
+      reason: stoppedBeforeAnyRound ?? describeFastForwardHoldV1(outcome.held, heldStageName, outcome.attempts),
     });
+    if (stoppedBeforeAnyRound !== undefined) {
+      markOperationStoppedBeforeAnyRoundV1(op.id, stoppedBeforeAnyRound);
+      // The Ended line is an outcome-kind line the transcript hides, so the stop is also a normal assistant line.
+      try {
+        await appendChatMessageV1(resolved.folderUri.fsPath, {
+          role: "assistant",
+          text: stoppedBeforeAnyRound,
+          stage: targetStage,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // Best-effort record only; the Notifications entry and the Ended line already carry the stop.
+      }
+    }
     // review2 Step 14: the stop line points at the scope card; make sure one is open, never leave the owner without it.
     if (outcome.held.kind === "partial-scope") {
-      await ensurePartialScopeCardOpenV1({ taskFolderPath: resolved.folderUri.fsPath, stage: targetStage }).catch(
-        () => undefined
-      );
+      const scopeCard = await ensurePartialScopeCardOpenV1({
+        taskFolderPath: resolved.folderUri.fsPath,
+        stage: targetStage,
+      }).catch(() => undefined);
+      // bugs6 item 38: a hold that leaves the scope card for the owner ends the run as a pause for that card. Its
+      // pause record and run chain stay, so answering "Add the missing files and review again" can continue the
+      // run (the card carries the captured run state). Other holds keep ending the run for good.
+      if (scopeCard === "already-open" || scopeCard === "re-posted") {
+        ffEndedViaPauseV1 = true;
+      }
     }
     // bugs4 item 46 / Step 20: the open items wait only for test evidence no editing round can
     // produce, so raise the classified open-items card (which names the cause and the way on)
@@ -14137,7 +14336,9 @@ async function buildApplyReviewPromptPartsV1(
    * preserving this function's original behaviour for every existing caller.
    */
   maxReviewChars?: number,
-  maxImplementationChars?: number
+  maxImplementationChars?: number,
+  /** bugs6 item 41: the model the round runs on, so the prompt's clock block fits its adapter. */
+  roundModelId?: string
 ): Promise<{ prompt: string; templateVariables: Record<string, string> } | { error: string }> {
   let canonicalUri: vscode.Uri;
   try {
@@ -14249,15 +14450,19 @@ async function buildApplyReviewPromptPartsV1(
     planFinalPath: artifactPaths.planFinalPath,
     roundProgressPath: artifactPaths.roundProgressPath,
     implSummaryPath: artifactPaths.implSummaryPath,
-    taskArtifactGuidance: withAllowedTestCommandGuidanceV1(
-      formatAuthoritativeTaskArtifactGuidanceV1(artifactPaths),
-      folderUri.fsPath
-    ),
+    taskArtifactGuidance: [
+      withAllowedTestCommandGuidanceV1(formatAuthoritativeTaskArtifactGuidanceV1(artifactPaths), folderUri.fsPath),
+      // bugs6 item 46: steps the owner answered "Build it; Publish Checks run the full suite" on.
+      await readDeclinedStepGuidanceV1(folderUri.fsPath).catch(() => ""),
+    ]
+      .filter((part) => part.length > 0)
+      .join(" "),
   };
   const renderedPrompt = await renderPromptTemplate(
     extensionUri,
     "apply-impl-review-code.md",
-    templateVariables
+    templateVariables,
+    roundModelId !== undefined ? { roundModelId } : {}
   );
   // review1 Step 21: the last rejected report, in one sentence with the fix.
   const prompt = renderedPrompt + formatReportContractReminderV1(workListProgress?.reportContractRejections);
@@ -14601,7 +14806,8 @@ async function applyImplementationReviewWithAI(
           contextPackContent,
           reviewContent,
           maxReviewChars,
-          maxImplementationChars
+          maxImplementationChars,
+          model.modelId
         ),
     });
   } catch (error) {
@@ -17816,11 +18022,52 @@ async function executeImplementationRun(
     // bugs4: the ledger row keeps the observed change list but also records
     // which of those paths the round's own report did not claim, so
     // ledger-based scope reconstruction never adopts a concurrent owner edit.
+    // bugs6 items 41 and 46: an early stop is flagged in the run record (and shows on the Ended line), and the
+    // steps the round declined are kept with their reasons so a step declined twice can raise one card.
+    const roundEarlyStopV1 = (): ReturnType<typeof detectRoundEarlyStopV1> => {
+      const activityFields = roundLedgerActivityFieldsV1(completedResult);
+      return detectRoundEarlyStopV1({
+        summary,
+        startedAtMs: Date.parse(activityFields.processStartedAt ?? ""),
+        endedAtMs: Date.parse(activityFields.processEndedAt ?? ""),
+      });
+    };
+    // The Ended line is an outcome-kind line, which the chat transcript hides, so the flag is also posted as a
+    // normal assistant line, once per round, before the round is terminalized.
+    let earlyStopChatLinePosted = false;
+    const postEarlyStopChatLineV1 = async (): Promise<void> => {
+      if (earlyStopChatLinePosted) {
+        return;
+      }
+      earlyStopChatLinePosted = true;
+      const flagged = roundEarlyStopV1();
+      if (flagged === undefined) {
+        return;
+      }
+      try {
+        await appendChatMessageV1(folderUri.fsPath, {
+          role: "assistant",
+          text: describeEarlyStopChatLineV1(flagged),
+          stage: postRunReviewStage,
+          at: new Date().toISOString(),
+        });
+      } catch {
+        // Best-effort record only; the run record already carries the flag.
+      }
+    };
     const ledgerFilesOutcomeV1 = (): RoundLedgerOutcomeV1 => {
       // run1 Step 15: the completed row carries what the round's own stream named, what only
       // changed in the workspace while it ran, and the recorded stop cause, as a failed row does.
       const activityFields = roundLedgerActivityFieldsV1(completedResult);
-      if (completedResult.filesChangedUnknown) return { filesChangedUnknown: true, ...activityFields };
+      const earlyStop = roundEarlyStopV1();
+      const declinedSteps = parseDeclinedStepsV1(summary);
+      const roundJudgementFields = {
+        ...(earlyStop !== undefined ? { stoppedEarly: earlyStop.text } : {}),
+        ...(declinedSteps.length > 0 ? { declinedSteps } : {}),
+      };
+      if (completedResult.filesChangedUnknown) {
+        return { filesChangedUnknown: true, ...activityFields, ...roundJudgementFields };
+      }
       const { unattributed } = resolveCompletedRoundAttributionV1({
         summary,
         planChecklist,
@@ -17832,6 +18079,7 @@ async function executeImplementationRun(
         filesChanged: [...completedResult.filesChanged],
         ...(unattributed.length > 0 ? { unattributedFiles: unattributed } : {}),
         ...activityFields,
+        ...roundJudgementFields,
       };
     };
     // Filled in below, only for a runner-synthesized round with a plan
@@ -19260,6 +19508,7 @@ async function executeImplementationRun(
       // (its report is unusable, so "nothing to fix" was never established),
       // and it produced no edits that would justify clearing the streak.
       if (summaryIssue === undefined) {
+        await postEarlyStopChatLineV1();
         await terminalizeRoundV1(
           implRoundId,
           "completed",
@@ -19287,6 +19536,8 @@ async function executeImplementationRun(
           }
         );
         await appendRoundOutcomeLogNoteV1(logUri, "edits-produced");
+        // bugs6 item 46: a step declined twice for a reason no round can change goes to the owner once.
+        await raiseDeclinedStepCardIfRepeatedV1(folderUri.fsPath, postRunReviewStage).catch(() => undefined);
       } else {
         // wf10 item 4 / Part 4: only a genuinely clean completion earns
         // `edits-produced` here — a round whose summary was rejected
@@ -19315,6 +19566,7 @@ async function executeImplementationRun(
         warnedAsZeroFileFailure: false,
         continuationReportProduced: acceptedSummaryOnlyReport,
       });
+      await postEarlyStopChatLineV1();
       await terminalizeRoundV1(
         implRoundId,
         "completed",
@@ -19342,6 +19594,7 @@ async function executeImplementationRun(
         }
       );
       await appendRoundOutcomeLogNoteV1(logUri, noEditsClassification);
+      await raiseDeclinedStepCardIfRepeatedV1(folderUri.fsPath, postRunReviewStage).catch(() => undefined);
     }
 
     // The run summary is written to impl-summary.md and NEVER over
@@ -21120,7 +21373,8 @@ export async function runImplementationWithAI(
                 contextPackContent,
                 sourceReviewContent,
                 maxReviewChars,
-                maxImplementationChars
+                maxImplementationChars,
+                model.modelId
               ),
           });
           if (fitted.parts === undefined) {
@@ -21230,7 +21484,8 @@ export async function runImplementationWithAI(
       const templatePrompt = await renderPromptTemplate(
         extensionUri,
         "run-implementation.md",
-        dispatchedTemplateVariables
+        dispatchedTemplateVariables,
+        { roundModelId: model.modelId }
       );
 
       // The hedge behind decidePostReviewActionV1's routing (see

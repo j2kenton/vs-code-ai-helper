@@ -34,7 +34,8 @@ void describe("resolveRoundShellCommandsV1 (run1 Step 14: rounds run no checks)"
     const commands = resolveRoundShellCommandsV1(
       projectWith({ lint: "eslint .", test: "node --test", build: "tsc", verify: "pnpm run lint && pnpm run test", "check-types": "tsc --noEmit" })
     );
-    assert.deepEqual(commands, []);
+    // bugs6 item 41: the one entry is the clock; no check, lint, test, build or verify command is listed.
+    assert.deepEqual(commands, ["date -u"]);
   });
 
   void it("allows none when the Publish commands are configured explicitly either", () => {
@@ -49,8 +50,8 @@ void describe("resolveRoundShellCommandsV1 (run1 Step 14: rounds run no checks)"
     assert.ok(!commands.some((command) => CHECK_WORDS.test(command)), commands.join(" | "));
   });
 
-  void it("allows nothing without a package.json", () => {
-    assert.deepEqual(resolveRoundShellCommandsV1(projectWith(undefined)), []);
+  void it("allows only the clock without a package.json", () => {
+    assert.deepEqual(resolveRoundShellCommandsV1(projectWith(undefined)), ["date -u"]);
   });
 
   void it("never lists git, so no rule can approve git diff --output or an external diff helper", () => {

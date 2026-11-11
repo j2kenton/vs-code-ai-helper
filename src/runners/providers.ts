@@ -56,6 +56,7 @@ import {
   DEVPASS_SUPPORTED_MAJORS_V1,
   devpassUnsupportedMajorMessageV1,
 } from "../utils/cliMajorVersionV1";
+import { EXACT_MATCH_ONLY_ROUND_SHELL_COMMANDS_V1 } from "../utils/roundShellAllowlistV1";
 import { FRAME_END_V1, FRAME_START_V1 } from "../types/aiResultEnvelope";
 import { AI_RESULT_CONTRACT_END_MARKER_V1 } from "../prompts/aiResultContractV1";
 
@@ -160,7 +161,12 @@ export interface CliBuildArgsContext {
  * into the single comma-separated value the flag accepts.
  */
 export function claudeAllowedToolsValueV1(commands: readonly string[]): string {
-  return commands.flatMap((command) => [`Bash(${command})`, `Bash(${command} *)`]).join(",");
+  return commands
+    .flatMap((command) =>
+      // bugs6 item 41: `date -u` is allowed as that exact command only, never "with any arguments".
+      EXACT_MATCH_ONLY_ROUND_SHELL_COMMANDS_V1.has(command) ? [`Bash(${command})`] : [`Bash(${command})`, `Bash(${command} *)`]
+    )
+    .join(",");
 }
 
 export interface CliConversationResumeDefinition {

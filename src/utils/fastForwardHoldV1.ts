@@ -135,6 +135,38 @@ export function unproducibleTestEvidenceHoldV1(input: {
   return undefined;
 }
 
+/**
+ * bugs6 item 42: the line for a Fast Forward run that dispatched no round at all (a hold at attempt 0). It is never
+ * "completed": it says it stopped before any round, why, and the click that moves on. The notification and the chat's
+ * Ended line both carry this text.
+ */
+export function describeFastForwardStoppedBeforeAnyRoundV1(hold: FastForwardHoldV1, stageName: string): string {
+  const lead = "Fast Forward stopped before any round:";
+  switch (hold.kind) {
+    case "pending-decision":
+      return `${lead} it is waiting for your answer to "${hold.detail}" (${stageName}). Answer or dismiss that card, then click Start Fast Forward again.`;
+    case "no-change-decision":
+      return `${lead} the last Apply Review changed no files and raised a decision ("${hold.detail}"). Answer that card, then click Start Fast Forward again.`;
+    case "test-evidence-unproducible":
+      return `${lead} ${hold.detail}. Another Apply Review would change nothing. The open-items card that follows has the ways on.`;
+    case "evidence-gap":
+      return `${lead} ${hold.detail}. Another round cannot produce a test report that counts. The card that follows has the ways on.`;
+    case "standing-blockers":
+      return `${lead} every remaining blocker is one another round cannot clear (${hold.detail}). Answer the card that follows, then click Start Fast Forward again.`;
+    case "partial-scope":
+      return (
+        `${lead} ${hold.detail}. ` +
+        (/Choose on the card below/.test(hold.detail)
+          ? "Choose on the scope card, then click Start Fast Forward again."
+          : "The way on is the scope card that follows; then click Start Fast Forward again.")
+      );
+    case "progress-gate":
+      return `${lead} ${hold.detail}. Answer the "This isn't moving" card, then click Start Fast Forward again.`;
+    case "clean-review":
+      return `${lead} ${hold.detail}. It follows the clean-review path instead.`;
+  }
+}
+
 /** The chat line for a Fast Forward that stopped on purpose, with the reason and the way on. */
 export function describeFastForwardHoldV1(hold: FastForwardHoldV1, stageName: string, attempts: number): string {
   const rounds = `${attempts} round${attempts === 1 ? "" : "s"} dispatched`;
