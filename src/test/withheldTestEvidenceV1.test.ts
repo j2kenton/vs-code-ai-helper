@@ -5,6 +5,7 @@
  * all-withheld outcome and for a mixed one (the eligible items are still ticked at once).
  */
 import * as assert from "node:assert/strict";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
@@ -15,7 +16,7 @@ import { runChecksForWithheldItemsV1, tickWithheldTestItemsV1 } from "../command
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import type { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import { setExtensionContextV1 } from "../utils/extensionContextV1";
-import { listCheckedChecklistItemTextsV1 } from "../utils/implementationChecklist";
+import { listCheckedChecklistItemTextsV1, normalizeChecklistItemTextV1 } from "../utils/implementationChecklist";
 import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
 import {
   buildWithheldTestEvidenceCardInputV1,
@@ -133,7 +134,25 @@ void describe("withheld test evidence: the card, the latched path and the comman
     assert.match(card.whatHappened, /alpha\.test\.ts/);
     assert.match(card.whatHappened, /beta\.test\.ts/);
     assert.match(card.whatHappened, /no test report is recorded for this item/);
-    assert.match(card.whatHappened, /another round cannot produce a test report that counts/);
+    // bugs7 item 1: the card says one thing about rounds. It offers none, so it never tells the owner to run one.
+    assert.doesNotMatch(card.whatHappened, /Run an Implementation or Apply Review round|No editing round is offered|run a round/i);
+    assert.match(card.whatHappened, /Ensemble ticks a test item only with a passing test report\. The review says these are done, but the report didn't count\./);
+    assert.match(card.whatHappened, /To settle them: run Publish Checks, record a test run you did, or tick them\./);
+  });
+
+  void it("no option label reads as an instruction to the owner; the tick option says the owner has checked and Ensemble ticks now (bugs7 item 2)", () => {
+    for (const items of [[ALPHA], [ALPHA, BETA]]) {
+      const card = buildWithheldTestEvidenceCardInputV1({
+        taskFolderPath: "/ws/.ensemble/2026-11-02_task_3",
+        stage: "impl-high-review",
+        taskLabel: "t",
+        items,
+      });
+      for (const option of card.options) assert.doesNotMatch(option.label, /myself|yourself/i, option.label);
+      const tick = card.options.find((o) => o.optionId === "tickThese")!;
+      assert.equal(tick.label, items.length === 1 ? "I've checked it, tick it now" : "I've checked them, tick them now");
+      assert.match(tick.consequence ?? "", /^Ensemble ticks /);
+    }
   });
 
   void it("latched, all items withheld: nothing is ticked and the card names every withheld item", async () => {
@@ -168,6 +187,77 @@ void describe("withheld test evidence: the card, the latched path and the comman
     assert.match(cards[0]!.whatHappened, /alpha\.test\.ts/);
     assert.match(cards[0]!.whatHappened, /beta\.test\.ts/);
     assert.doesNotMatch(cards[0]!.whatHappened, /completeness gate/, "the ticked item is not on the card");
+  });
+
+  void it("bugs7 item 1: the review's tick is applied with no card when a passing report on record already ran the item's test file", async () => {
+    const GAMMA = "Write the tests for Part 3 in src/test/gamma.test.ts";
+    const { folder, root } = stage([ALPHA, GAMMA], [ALPHA]);
+    fs.writeFileSync(path.join(root, "src", "test", "gamma.test.ts"), "// gamma\n");
+    const sha = crypto.createHash("sha256").update("// alpha\n").digest("hex");
+    const progressPath = path.join(folder, "task-progress.json");
+    const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+    // A passing, post-edit report recorded for ANOTHER item whose command also ran alpha.test.ts.
+    progress.planItemEvidence = [
+      {
+        planRevision: "r1",
+        itemKey: normalizeChecklistItemTextV1(GAMMA),
+        itemText: GAMMA,
+        claims: [{ source: "implementation", at: "2026-11-11T10:00:00.000Z", roundId: "round-1", evidence: "built" }],
+        testReports: [
+          {
+            at: "2026-11-11T10:00:00.000Z",
+            roundId: "round-1",
+            testIdentity: "src/test/gamma.test.ts, src/test/alpha.test.ts",
+            command: "pnpm run test:unit -- src/test/gamma.test.ts src/test/alpha.test.ts",
+            passed: 6,
+            failed: 0,
+            sourceState: "post-edit source state",
+            testDependencyStates: [{ path: "src/test/alpha.test.ts", sha256: sha }],
+          },
+        ],
+      },
+    ];
+    fs.writeFileSync(progressPath, JSON.stringify(progress));
+    const result = await applyVerifiedTicksForLatchedChecklistV1(vscode.Uri.file(folder), "impl-high-review", reviewNaming([ALPHA]), "chat1");
+    assert.equal(result.handled, true);
+    assert.equal(result.latchOutcome?.appliedCount, 1);
+    assert.equal(result.latchOutcome?.withheldTestItems, 0);
+    assert.equal(pendingKey(folder, WITHHELD_TEST_EVIDENCE_DECISION_KEY_V1).length, 0, "no withheld-evidence card");
+    const plan = fs.readFileSync(path.join(folder, "plan-final.md"), "utf8");
+    assert.deepEqual(listCheckedChecklistItemTextsV1(plan), [ALPHA]);
+  });
+
+  void it("bugs7 item 1: a report on record that ran only a same-named file elsewhere does not settle the item", async () => {
+    const { folder, root } = stage([ALPHA], [ALPHA]);
+    fs.mkdirSync(path.join(root, "packages", "b", "src", "test"), { recursive: true });
+    fs.writeFileSync(path.join(root, "packages", "b", "src", "test", "alpha.test.ts"), "// other alpha\n");
+    const sha = crypto.createHash("sha256").update("// other alpha\n").digest("hex");
+    const progressPath = path.join(folder, "task-progress.json");
+    const progress = JSON.parse(fs.readFileSync(progressPath, "utf8")) as Record<string, unknown>;
+    progress.planItemEvidence = [
+      {
+        planRevision: "r1",
+        itemKey: normalizeChecklistItemTextV1("Write the tests for Part 9 in packages/b/src/test/alpha.test.ts"),
+        itemText: "Write the tests for Part 9 in packages/b/src/test/alpha.test.ts",
+        claims: [{ source: "implementation", at: "2026-11-11T10:00:00.000Z", roundId: "round-9", evidence: "built" }],
+        testReports: [
+          {
+            at: "2026-11-11T10:00:00.000Z",
+            roundId: "round-9",
+            testIdentity: "packages/b/src/test/alpha.test.ts",
+            command: "pnpm run test:unit -- packages/b/src/test/alpha.test.ts",
+            passed: 2,
+            failed: 0,
+            sourceState: "post-edit source state",
+            testDependencyStates: [{ path: "packages/b/src/test/alpha.test.ts", sha256: sha }],
+          },
+        ],
+      },
+    ];
+    fs.writeFileSync(progressPath, JSON.stringify(progress));
+    const result = await applyVerifiedTicksForLatchedChecklistV1(vscode.Uri.file(folder), "impl-high-review", reviewNaming([ALPHA]), "chat1");
+    assert.equal(result.latchOutcome?.appliedCount, 0, "src/test/alpha.test.ts never ran; only packages/b/…/alpha.test.ts did");
+    assert.equal(result.latchOutcome?.withheldTestItems, 1);
   });
 
   void it("latched, nothing withheld: no card is raised", async () => {

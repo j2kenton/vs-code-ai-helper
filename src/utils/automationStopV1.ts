@@ -36,7 +36,9 @@ export type AutomationStopEndingV1 =
   /** A resumed run ended. */
   | "resumed-run"
   /** Step 31: the owner's own action (an answer, a tick or exclusion, a test run) left the stage ready to move on. */
-  | "stage-ready";
+  | "stage-ready"
+  /** bugs7 item 3: a review started by the owner (an answer, a click) ended below the threshold and nothing runs next. */
+  | "review-ended";
 
 export interface AutomationStopFactsV1 {
   readonly taskFolderPath: string;
@@ -44,6 +46,11 @@ export interface AutomationStopFactsV1 {
   readonly ending: AutomationStopEndingV1;
   /** Why it stopped, in plain words ("the one cycle you chose is done"). */
   readonly stopReason: string;
+  /**
+   * bugs7 item 6: a hash of the state the card describes (stage, ending, the review's content, the plan revision and
+   * the settled counts), never of the caller's wording. The same state is one card, whoever raised it.
+   */
+  readonly stateFingerprint?: string;
   readonly score?: number | null;
   readonly previousScore?: number | null;
   /** The sorted blockers (Step 19): work a round can do, and blockers that cannot move in another round. */
@@ -81,6 +88,15 @@ export interface AutomationStopFactsV1 {
    */
   readonly startHold?: string;
 }
+
+/**
+ * What Fast Forward covers, said the same way on every card that offers it (owner decision 2026-11-11,
+ * step-19-chain-boundary): it continues through the review stages, Publish Checks, fix rounds and the Publish review,
+ * and stops at Commit & Push, which stays the owner's click. It also stops where a decision is genuinely the owner's.
+ */
+export const FAST_FORWARD_COVERS_V1 =
+  "When a stage is done it moves on and carries on through the review stages, Publish Checks, fix rounds and the Publish review. " +
+  "It stops at Commit & Push, which stays your click, and wherever a decision is genuinely yours.";
 
 export type AutomationNextStepIdV1 = "moveOn" | "startFastForward" | "runOneMoreCycle" | "continueTheWork" | "leaveWithMe";
 
@@ -187,10 +203,18 @@ export function buildAutomationStoppedCardInputV1(facts: AutomationStopFactsV1):
 
   const ready = facts.ending === "stage-ready";
   const lines = [
-    ready ? `${stageName} is done: ${facts.stopReason}.` : `Automation stopped on ${stageName}: ${facts.stopReason}.`,
+    ready
+      ? `${stageName} is done: ${facts.stopReason}.`
+      : facts.ending === "review-ended"
+        ? `${stageName}: ${facts.stopReason}.`
+        : `Automation stopped on ${stageName}: ${facts.stopReason}.`,
     scoreLine(facts),
     blockersLine(facts),
     planItemsLine(facts),
+    // Owner decision 2026-11-11: the end of Publish is Commit & Push, the owner's click; no option here runs it.
+    ready && facts.stage === "publish"
+      ? "Next: Commit & Push. It stays your click: Fast Forward and the countdown never run it."
+      : undefined,
     facts.buildNext.length > 0 ? `The review's next steps: ${facts.buildNext.map((line, i) => `${i + 1}. ${line}`).join(" ")}` : undefined,
     ...facts.dismissedDependencies.map((line) => `Still outstanding from a card you dismissed: ${line}`),
     facts.repeatedRejection
@@ -212,6 +236,19 @@ export function buildAutomationStoppedCardInputV1(facts: AutomationStopFactsV1):
       // so it may run by itself after the wait. Moving on to Publish stays the owner's call.
       ...(/review$/.test(nextStage) ? { unattendedSafe: true } : {}),
     });
+    // bugs7 item 7 (Step 17): on a done stage Fast Forward moves on by itself and carries on in the next stage (a
+    // review stage, then Publish). The command is the ordinary Fast Forward: started on a stage that is already done,
+    // it crosses the edge instead of ending at once. Commit & Push is never part of it.
+    if (/review$/.test(nextStage) || nextStage === "publish") {
+      options.push({
+        optionId: "moveOnAndFastForward",
+        label: `Move on and Fast Forward ${nextStageName}`,
+        consequence: `Moves on to ${nextStageName} now and keeps going there (fix, build, re-review). ${FAST_FORWARD_COVERS_V1}`,
+        resumeKind: "continue",
+        effect: { kind: "command", command: "vs-code-ai-helper.fastForwardReviewWithAI", args: [taskArg] },
+        recordedNext: `${nextStageName} starts and Fast Forward runs there`,
+      });
+    }
   }
   if (facts.stage === "impl") {
     options.push({
@@ -222,11 +259,13 @@ export function buildAutomationStoppedCardInputV1(facts: AutomationStopFactsV1):
       effect: { kind: "command", command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction", args: [taskArg] },
       recordedNext: "one more Implementation round runs",
     });
-  } else {
+  } else if (!(facts.gateComplete && facts.reviewClean)) {
+    // bugs7 item 6: a stage that is already done has nothing for Fast Forward or a cycle to do: both would stop at
+    // once. The card then offers moving on (above) and leaving it, never a run that cannot do anything.
     options.push({
       optionId: "startFastForward",
       label: "Start Fast Forward",
-      consequence: `Keeps going on ${stageName} (fix, build, re-review) up to its round limit, stopping when the review is clean and every plan item is settled, or when nothing moves.`,
+      consequence: `Keeps going on ${stageName} (fix, build, re-review) up to its round limit, stopping when the review is clean and every plan item is settled, or when nothing moves. ${FAST_FORWARD_COVERS_V1}`,
       resumeKind: "continue",
       effect: { kind: "command", command: "vs-code-ai-helper.fastForwardReviewWithAI", args: [taskArg] },
       recordedNext: "Fast Forward runs",
@@ -314,7 +353,9 @@ export function buildAutomationStoppedCardInputV1(facts: AutomationStopFactsV1):
     stage: facts.stage,
     whatHappened: lines.join(" "),
     whyUserNeeded: ready
-      ? "Moving to the next stage changes what the task works on, so it waits for you."
+      ? facts.stage === "publish"
+        ? "Commit & Push publishes the work, so it waits for your click."
+        : "Moving to the next stage changes what the task works on, so it waits for you."
       : // review2 Step 23: a card that marks a step as recommended does not claim to stay neutral.
         recommendation.kind === "none"
         ? "Automation stopped with work left, and it does not choose between these next steps for you."

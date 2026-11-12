@@ -24,12 +24,12 @@ const LINE_50 = "Confirm no file other than the three changed, plus any test fou
 const LINE_59 = "Record the Step 4 outcome in the summary (no test changes needed).";
 
 void describe("items held only for missing test evidence name the command that would satisfy them (bugs4 item 11)", () => {
-  void it("lists each withheld item on its own line and names the targeted test command", () => {
+  void it("lists each withheld item on its own line and names the options the card has", () => {
     const text = describeWithheldTestItemsV1(["Add a parser table test.", "Add tests for the Cancel branch."]);
     assert.match(text, /^2 test-dependent items wait for a passing test report and stay provisional:/);
     assert.equal(text.split("\n").filter((line) => line.startsWith("  - ")).length, 2);
-    assert.match(text, /pnpm run test:unit -- /);
-    assert.match(text, /post-edit source state/);
+    assert.match(text, /To settle them: run Publish Checks, record a test run you did, or tick them\./);
+    assert.doesNotMatch(text, /pnpm run test:unit -- /);
     assert.doesNotMatch(text, /; Add tests/, "no more one-paragraph '; '-joined list");
   });
 

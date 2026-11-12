@@ -29,7 +29,7 @@ The Tasks view and status bar show the current task and stage. Every AI action h
 
 ### Optional: hands-off iteration
 
-Reviews score each stage out of 10, and Ensemble can drive the loop for you. **Fast Forward** repeatedly reviews and applies fixes until it reaches a target score, and **Auto Advance** moves a stage on once its review clears a threshold. Both are off by default and configurable in Ensemble's settings; because implementation and Fast Forward runs change real files, use them only under supervision.
+Reviews score each stage out of 10, and Ensemble can drive the loop for you. **Fast Forward** repeatedly reviews and applies fixes until it reaches a target score. When a stage is clean and every plan item is settled, it moves on by itself and carries on through the remaining review stages and into Publish (Publish Checks, fix rounds and the Publish review). It stops at Commit & Push, which always stays your own click, and wherever a decision is genuinely yours. **Auto Advance** moves a stage on once its review clears a threshold. Both are off by default and configurable in Ensemble's settings; because implementation and Fast Forward runs change real files, use them only under supervision. A "stage is done" card that offers a safe move to the next review stage moves on by itself after a short countdown (2 minutes by default, `ensemble.decisions.autoContinueMinutes`); "Wait for me" on the card stops it.
 
 ## Screenshots
 

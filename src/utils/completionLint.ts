@@ -1579,7 +1579,19 @@ export async function collectCompletionLint(
       return execution.closingSummaries !== undefined ? [{ command: check.command, execution }] : [];
     });
   const passedTestFiles = [
-    ...new Set(checks.filter((check) => check.code === 0).flatMap((check) => extractPassedTestFilesFromOutputV1(check.output))),
+    ...new Set(
+      checks
+        .filter((check) => check.code === 0)
+        .flatMap((check) => {
+          // bugs7 review: a member command (`[packages/b] pnpm run test`) prints paths relative to its own folder, so
+          // each name is qualified with that folder; two packages with a same-named test are then told apart.
+          const dir = /^\[([^\]]+)\]\s/.exec(check.command)?.[1]?.replace(/\\/g, "/").replace(/\/+$/, "");
+          return extractPassedTestFilesFromOutputV1(check.output).map((file) => {
+            const normalized = file.replace(/\\/g, "/").replace(/^\.\//, "");
+            return dir && !normalized.startsWith(`${dir}/`) ? `${dir}/${normalized}` : normalized;
+          });
+        })
+    ),
   ].slice(0, 300);
   const retriedPasses = checks
     .filter((check) => check.code === 0 && check.retryCount > 0)

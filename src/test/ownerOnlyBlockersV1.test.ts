@@ -152,6 +152,38 @@ void describe("review1 Step 38: only options that can work at this stage", () =>
     assert.doesNotMatch(change.consequence, /plan-final\.md/);
   });
 
+  void it("bugs7 item 4: a task-fixable blocker with work the review names gets Apply Review, recommended, never a tick", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folder = nodePath.join("/tmp", ".ensemble", "standing-task-fixable");
+    const card = await postOwnerOnlyBlockersCardV1({
+      taskFolderPath: folder,
+      stage: "impl-high-review",
+      blockerDescriptions: ["Step 12 rewording per owner decision step-12-hard-stop is not applied: Step 12 rewording"],
+      buildNext: ["Build Step 12's rewording"],
+    });
+    assert.ok(card);
+    assert.equal(card.recommendation?.kind === "option" ? card.recommendation.optionId : undefined, "applyReviewToBuild");
+    const apply = card.options.find((o) => o.optionId === "applyReviewToBuild")!;
+    assert.match(apply.label, /Build Step 12's rewording/);
+    assert.equal(apply.effect.kind === "command" ? apply.effect.command : "", "vs-code-ai-helper.resumeAndApplyCurrentStageAction");
+    assert.match(card.whatHappened, /Build Step 12's rewording/);
+  });
+
+  void it("bugs7 item 4: the card for a blocker only the owner can settle is unchanged", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const folder = nodePath.join("/tmp", ".ensemble", "standing-owner-only");
+    const card = await postOwnerOnlyBlockersCardV1({
+      taskFolderPath: folder,
+      stage: "impl-high-review",
+      blockerDescriptions: ["Step 6 owner decision: token hand-off versus the simpler design"],
+    });
+    assert.ok(card);
+    assert.ok(!card.options.some((o) => o.optionId === "applyReviewToBuild"));
+    assert.match(card.whatHappened, /can only be settled by you/);
+  });
+
   void it("the plateau card at a plan stage opens plan.md, offers no publish override and does not recommend staying paused", () => {
     const description = "Narrowing needs an owner decision: scope of the no-pop-ups rule";
     const decision = buildEscalationDecisionV1(

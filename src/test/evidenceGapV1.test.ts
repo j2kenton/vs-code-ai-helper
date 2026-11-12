@@ -10,6 +10,7 @@ import type * as vscode from "vscode";
 import {
   buildEvidenceGapCardInputV1,
   extractPassedTestFilesFromOutputV1,
+  identifyItemTestFilesDetailV1,
   identifyItemTestFilesV1,
   isEvidenceOnlyGapV1,
   matchPassedOutputToItemsV1,
@@ -17,7 +18,9 @@ import {
   TICK_EVIDENCE_GAP_ITEMS_COMMAND_V1,
   type EvidenceGapCardFactsV1,
 } from "../utils/evidenceGapV1";
+import { classifyEvidenceRunFailuresV1 } from "../utils/evidenceRunFailuresV1";
 import { describeFastForwardHoldV1 } from "../utils/fastForwardHoldV1";
+import { buildTestFailuresV1 } from "../utils/testFailuresV1";
 import {
   clearPublishChecksPassedFilesV1,
   recordPublishChecksPassedFilesV1,
@@ -103,7 +106,7 @@ void describe("the evidence-gap card (Step 34)", () => {
     assert.equal(card.recommendation.kind, "option");
     assert.equal(card.recommendation.kind === "option" ? card.recommendation.optionId : "", "tickThese");
     const tick = card.options[0]!;
-    assert.equal(tick.label, "Tick these 2 items");
+    assert.equal(tick.label, "I've checked them, tick them now");
     assert.equal(tick.effect.kind === "command" ? tick.effect.command : "", TICK_EVIDENCE_GAP_ITEMS_COMMAND_V1);
   });
 
@@ -113,10 +116,16 @@ void describe("the evidence-gap card (Step 34)", () => {
     assert.match(buildEvidenceGapCardInputV1(f).whatHappened, /could not run: the command was refused/);
   });
 
-  void it("recommends recording a run when the checks ran but the item still has no passing run", () => {
+  void it("recommends recording a run only when the checks ran and passed without covering the item; never after a failed run", () => {
+    const passed = facts({ attempt: "passed", items: [{ itemText: STEP7, passingRuns: 0 }] });
+    assert.equal(recommendEvidenceGapOptionV1(passed), "recordRun");
     const f = facts({ attempt: "failed", items: [{ itemText: STEP7, passingRuns: 0 }] });
-    assert.equal(recommendEvidenceGapOptionV1(f), "recordRun");
-    assert.match(buildEvidenceGapCardInputV1(f).whatHappened, /ran once and failed/);
+    assert.equal(recommendEvidenceGapOptionV1(f), "none", "a failing suite recommends neither a recorded run nor a tick");
+    const card = buildEvidenceGapCardInputV1(f);
+    assert.match(card.whatHappened, /ran once and failed/);
+    assert.equal(card.recommendation.kind, "none");
+    const failedWithPassingRuns = facts({ attempt: "failed" });
+    assert.notEqual(recommendEvidenceGapOptionV1(failedWithPassingRuns), "tickThese");
   });
 
   void it("says no editing round was dispatched, and names why the count is short on Move on", () => {
@@ -224,5 +233,145 @@ void describe("Fast Forward and the evidence-only gap (Step 34)", () => {
     });
     assert.equal(asked, 1);
     assert.equal(applies, 3);
+  });
+});
+
+/** Trimmed from `.ensemble/2026-11-01_task_2/runs/raw-check-output-2026-11-11T07-08-19-628Z.log` (the 2026-11-11 run). */
+const BUGS6_FAILED_RUN_LOG = [
+  "ℹ tests 9733",
+  "ℹ pass 9727",
+  "ℹ fail 2",
+  "✖ failing tests:",
+  "",
+  "test at out/test/decisionOptionResumeKindTableV1.test.js:629:29",
+  "✖ every option literal actually present in an inventory file is accounted for by a table row (31.929445ms)",
+  "  AssertionError [ERR_ASSERTION]: a new or removed option literal was found that the inventory table does not (yet) account for:",
+  '  commands/reviewActions.ts: optionId "turnOnFallback" appears 1 time(s) in source but the table has 0 row(s) for it',
+  "",
+  "test at out/test/taskStateStoreLocking.test.js:119:27",
+  "✖ a task write waits for a workspace lease another host holds, then runs, and a task created meanwhile exists (70.318604ms)",
+  "  Error: Unable to acquire Ensemble state lock.",
+  "      at PrimarySessionLock.acquire (/workspace/vs-code-ai-helper/out/state/primarySessionLock.js:88:23)",
+  " ELIFECYCLE  Test failed. See above for more details.",
+].join("\n");
+
+void describe("bugs7 item 5: a failed evidence run names the failing tests and what they touch", () => {
+  const classified = classifyEvidenceRunFailuresV1({
+    failures: buildTestFailuresV1(BUGS6_FAILED_RUN_LOG),
+    changedFiles: ["src/commands/reviewActions.ts", "src/utils/automationStopV1.ts"],
+  });
+
+  void it("replays the 2026-11-11 log: both tests are listed, the first is the task's own breakage, the second has no link found", () => {
+    assert.equal(classified.length, 2);
+    const [table, locking] = classified;
+    assert.match(table!.file ?? "", /decisionOptionResumeKindTableV1/);
+    assert.equal(table!.classification, "touches-task", "its message names reviewActions.ts, which the task changed");
+    assert.deepEqual(table!.touches, ["src/commands/reviewActions.ts"]);
+    assert.match(locking!.file ?? "", /taskStateStoreLocking/);
+    assert.equal(locking!.classification, "no-link", "it names none of the task's changed files, and is not called unrelated");
+    for (const failure of classified) assert.notEqual(failure.classification as string, "unrelated");
+  });
+
+  void it("the card lists both tests, recommends the fix round, and never recommends a recorded run or a tick", () => {
+    const f = facts({ attempt: "failed", items: [{ itemText: STEP7, passingRuns: 0 }], failures: classified });
+    assert.equal(recommendEvidenceGapOptionV1(f), "fixFailingTests");
+    const card = buildEvidenceGapCardInputV1(f);
+    assert.match(card.whatHappened, /decisionOptionResumeKindTableV1[\s\S]*touches this task's changes \(src\/commands\/reviewActions\.ts\)/);
+    assert.match(card.whatHappened, /taskStateStoreLocking[\s\S]*no link to this task's changes found/);
+    assert.equal(card.options[0]!.optionId, "fixFailingTests");
+    assert.equal(card.options[0]!.label, "Fix the failing tests");
+    assert.equal(card.options[0]!.effect.kind === "command" ? card.options[0]!.effect.command : "", "vs-code-ai-helper.resumeAndApplyCurrentStageAction");
+    assert.equal(card.recommendation.kind === "option" ? card.recommendation.optionId : "", "fixFailingTests");
+    const moveOn = card.options.find((o) => o.optionId === "moveOn")!;
+    assert.match(moveOn.consequence, /test suite is failing/);
+  });
+
+  void it("only a known flake recommends running again; an unexplained failure recommends neither, and offers both", () => {
+    const outside = classifyEvidenceRunFailuresV1({
+      failures: buildTestFailuresV1(BUGS6_FAILED_RUN_LOG).slice(1),
+      changedFiles: ["src/commands/reviewActions.ts"],
+      knownFlakes: ["taskStateStoreLocking"],
+    });
+    assert.equal(outside[0]!.classification, "probable-flake");
+    assert.equal(recommendEvidenceGapOptionV1(facts({ attempt: "failed", failures: outside })), "runChecksAgain");
+    const unexplained = classifyEvidenceRunFailuresV1({
+      failures: buildTestFailuresV1(BUGS6_FAILED_RUN_LOG).slice(1),
+      changedFiles: ["src/commands/reviewActions.ts"],
+    });
+    const card = buildEvidenceGapCardInputV1(facts({ attempt: "failed", failures: unexplained }));
+    assert.equal(card.recommendation.kind, "none");
+    const ids = card.options.map((o) => o.optionId);
+    assert.ok(ids.includes("fixFailingTests") && ids.includes("runChecksAgain"));
+  });
+});
+
+void describe("bugs7 item 1: the evidence-gap matcher uses the one resolver", () => {
+  void it("the singular tick label agrees with its one item", () => {
+    const card = buildEvidenceGapCardInputV1(facts({ items: [{ itemText: STEP7, passingRuns: 1 }] }));
+    assert.equal(card.options[0]!.label, "I've checked it, tick it now");
+    for (const option of card.options) assert.doesNotMatch(option.label, /myself|yourself/i);
+  });
+
+  void it("a passing full-suite output naming the files an item's round added records the item; an ambiguous one stays unidentified", () => {
+    const known = [
+      "src/test/roundClockAndEarlyStopV1.test.ts",
+      "src/test/roundShellAllowlistV1.test.ts",
+      "packages/a/dupe.test.ts",
+      "packages/b/dupe.test.ts",
+    ];
+    const step16 = "Step 16: Add unit tests for the round clock and the shell rule";
+    const resolved = identifyItemTestFilesDetailV1(step16, [], {
+      knownTestFiles: known,
+      roundChangedTestFiles: ["src/test/roundClockAndEarlyStopV1.test.ts", "src/test/roundShellAllowlistV1.test.ts"],
+    });
+    const ambiguous = identifyItemTestFilesDetailV1("Step 3: Add tests for `dupe`", [], { knownTestFiles: known });
+    const output = "✔ out/test/roundClockAndEarlyStopV1.test.js\n✔ out/test/roundShellAllowlistV1.test.js\n✔ packages/a/dupe.test.ts";
+    const matched = matchPassedOutputToItemsV1(
+      [
+        { itemText: step16, testFiles: resolved.files },
+        { itemText: "Step 3", testFiles: ambiguous.files, ambiguous: ambiguous.ambiguous },
+      ],
+      extractPassedTestFilesFromOutputV1(output),
+      { knownTestFiles: known }
+    );
+    assert.deepEqual(matched.recordable.map((entry) => entry.itemText), [step16]);
+    assert.match(matched.unidentified[0]!.reason, /could be more than one test file/);
+  });
+});
+
+void describe("bugs7 item 5: stack-only references and the option table", () => {
+  void it("a failure whose complete stack names a changed source file touches the task, even when its assertion is cut short", () => {
+    const failure = {
+      name: "keeps the lock",
+      file: "src/test/zeta.test.ts",
+      assertion: "expected 1, got 2",
+      detail: "expected 1, got 2\n    at Object.run (src/utils/changedThing.ts:10:3)\n    at async Context.<anonymous> (out/test/zeta.test.js:5:1)",
+    };
+    const [result] = classifyEvidenceRunFailuresV1({ failures: [failure], changedFiles: ["src/utils/changedThing.ts"] });
+    assert.equal(result!.classification, "touches-task");
+    assert.deepEqual(result!.touches, ["src/utils/changedThing.ts"]);
+    const { detail: _dropped, ...withoutStack } = failure;
+    const [shortOnly] = classifyEvidenceRunFailuresV1({ failures: [withoutStack], changedFiles: ["src/utils/changedThing.ts"] });
+    assert.equal(shortOnly!.classification, "no-link", "without the stack there is nothing to link it by");
+  });
+
+  void it("buildTestFailuresV1 keeps the complete failure text for classification, and the saved assertion stays short", () => {
+    const [table] = buildTestFailuresV1(BUGS6_FAILED_RUN_LOG);
+    assert.ok((table!.detail ?? "").includes("reviewActions.ts"));
+    assert.ok((table!.assertion ?? "").length <= 300);
+  });
+
+  void it("tickThese, runChecksAgain, recordRun, fixFailingTests and moveOn each carry a command effect (the table's evidence)", () => {
+    const failures = classifyEvidenceRunFailuresV1({
+      failures: buildTestFailuresV1(BUGS6_FAILED_RUN_LOG),
+      changedFiles: ["src/commands/reviewActions.ts"],
+    });
+    const card = buildEvidenceGapCardInputV1(facts({ attempt: "failed", failures }));
+    for (const id of ["tickThese", "runChecksAgain", "recordRun", "fixFailingTests", "moveOn"]) {
+      const option = card.options.find((o) => o.optionId === id);
+      assert.ok(option, `${id} is offered`);
+      assert.equal(option.effect.kind, "command", id);
+      assert.equal(option.resumeKind, "continue", id);
+    }
   });
 });

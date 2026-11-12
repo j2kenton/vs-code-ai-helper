@@ -58,6 +58,13 @@ export interface BlockerWorkListInputV1 {
    * Only a separated pair counts toward "stood unchanged": two reviews of an unchanged tree are one observation.
    */
   readonly reviewSeparatedByFixRound?: readonly (boolean | undefined)[];
+  /** bugs7 item 4: the ISO time of each prior review (aligned with `priorReviewBlockers`); used with `ownerAnswerAtOf`. */
+  readonly priorReviewAts?: readonly (string | undefined)[];
+  /**
+   * bugs7 item 4: when the owner last answered a decision about this blocker (ISO time), if ever. The reviews before
+   * that answer asked the owner, not a round, so they do not count towards "stood unchanged".
+   */
+  readonly ownerAnswerAtOf?: (blocker: ReviewBlocker) => string | undefined;
   /** `ensemble.reviewPlateauRounds`. */
   readonly plateauRounds: number;
   /** Blockers earlier rounds declined with recorded reasons (`## Remaining Blockers`). */
@@ -66,6 +73,9 @@ export interface BlockerWorkListInputV1 {
 
 /** Words that name an owner decision or owner evidence outright: owner-only even when the reviewer tagged it task-fixable. */
 const EXPLICIT_OWNER_RE = /\bowner (?:decision|evidence)\b|\bneeds your decision\b/i;
+/** "per owner decision X", "following the owner decision": the line applies a decision that is already recorded. */
+const RECORDED_DECISION_REFERENCE_RE =
+  /\b(?:per|under|following|after|as decided in|recorded in|according to)\s+(?:the\s+|your\s+)?owner(?:'s)? decision\b/i;
 /** Looser wording that can turn up inside a defect's text; a task-fixable tag outranks it (review2 Step 42). */
 const LOOSE_OWNER_RE = /\bawaits? (?:a |an |the )?(?:human|owner|decision)|\bneeds? (?:a |an |the )?(?:human|owner)\b|\banother task\b/i;
 const UNBUILT_RE =
@@ -82,6 +92,12 @@ function matchesDeclined(description: string, declinedText: string): boolean {
   return a.length > 12 && b.length > 12 && (a.includes(b) || b.includes(a));
 }
 
+/** True when two reviews gave a blocker the same resolver, or one of them recorded none (or "unknown"). */
+function sameResolverV1(prior: string | undefined, current: string | undefined): boolean {
+  if (prior === undefined || current === undefined || prior === "unknown" || current === "unknown") return true;
+  return prior === current;
+}
+
 /**
  * How many times the blocker has stood across review-and-fix cycles: this review is the first, and each earlier
  * consecutive review that also listed it adds one when a fix round ran between the two. Reviews with no fix round
@@ -90,13 +106,22 @@ function matchesDeclined(description: string, declinedText: string): boolean {
 export function countReviewsBlockerHasStoodV1(
   blocker: ReviewBlocker,
   priorReviewBlockers: readonly (readonly ReviewBlockerIdentity[])[] | undefined,
-  separatedByFixRound?: readonly (boolean | undefined)[]
+  separatedByFixRound?: readonly (boolean | undefined)[],
+  owner?: { readonly answeredAt: string | undefined; readonly priorReviewAts: readonly (string | undefined)[] | undefined }
 ): number {
   const identity = blockerIdentity(blocker);
   let rounds = 1;
   for (let i = (priorReviewBlockers?.length ?? 0) - 1; i >= 0; i--) {
+    const priorAt = owner?.priorReviewAts?.[i];
+    // A review from before the owner's answer asked the owner, not a round: the count restarts after the answer.
+    if (owner?.answeredAt !== undefined && priorAt !== undefined && priorAt <= owner.answeredAt) break;
     const prior = priorReviewBlockers![i]!;
-    const stood = prior.some((p) => p.category === identity.category && p.subject === identity.subject);
+    // bugs7 item 4: the count restarts where the resolver changed. A blocker that stood as an owner decision and was then
+    // narrowed to a task-fixable code change (after the owner answered) is a new one for a round. A history entry that
+    // recorded no resolver does not break the chain.
+    const stood = prior.some(
+      (p) => p.category === identity.category && p.subject === identity.subject && sameResolverV1(p.resolver, identity.resolver)
+    );
     if (!stood) break;
     // `separatedByFixRound[i + 1]` is the review that follows prior review `i`.
     if (separatedByFixRound?.[i + 1] !== false) rounds++;
@@ -138,9 +163,16 @@ export function buildBlockerWorkListV1(input: BlockerWorkListInputV1): BlockerWo
     // review2 Step 42: a failing check is work for a round, whatever words its text holds, and a task-fixable tag
     // outranks loose owner wording. Only an explicit owner decision or owner evidence still goes to the owner.
     const failingCheck = isFailingCheckBlockerV1(blocker);
+    // bugs7 item 4: a task-fixable line that points at an owner decision already made ("Step 12 rewording per owner
+    // decision step-12-hard-stop is not applied") is the code change that answer asked for, not a question for the
+    // owner. The same holds when the owner has answered a decision card about it (`ownerAnswerAtOf`).
+    const appliesRecordedDecision =
+      resolver === "task-fixable" &&
+      (RECORDED_DECISION_REFERENCE_RE.test(description) || input.ownerAnswerAtOf?.(blocker) !== undefined);
     const ownerOnly =
       !failingCheck &&
-      (EXPLICIT_OWNER_RE.test(description) || (resolver !== "task-fixable" && LOOSE_OWNER_RE.test(description)));
+      ((EXPLICIT_OWNER_RE.test(description) && !appliesRecordedDecision) ||
+        (resolver !== "task-fixable" && LOOSE_OWNER_RE.test(description)));
     // bugs6 item 45: a line the review wrote with no resolver is shown, but it is not task-fixable, so it is no build
     // mandate on its own. The owner reads it and decides.
     if (resolver === "unknown") {
@@ -186,7 +218,10 @@ export function buildBlockerWorkListV1(input: BlockerWorkListInputV1): BlockerWo
     if (
       input.plateauRounds > 0 &&
       !isFailingCheckBlockerV1(blocker) &&
-      countReviewsBlockerHasStoodV1(blocker, input.priorReviewBlockers, input.reviewSeparatedByFixRound) >= input.plateauRounds
+      countReviewsBlockerHasStoodV1(blocker, input.priorReviewBlockers, input.reviewSeparatedByFixRound, {
+        answeredAt: input.ownerAnswerAtOf?.(blocker),
+        priorReviewAts: input.priorReviewAts,
+      }) >= input.plateauRounds
     ) {
       notThisRound.push({
         blocker,

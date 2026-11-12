@@ -1437,7 +1437,7 @@
         },
         "ensemble.decisions.autoContinueMinutes": {
           "type": "integer",
-          "default": 15,
+          "default": 2,
           "minimum": 0,
           "maximum": 1440,
           "scope": "window",

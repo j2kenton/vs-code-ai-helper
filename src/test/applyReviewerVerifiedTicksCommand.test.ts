@@ -972,7 +972,9 @@ void describe("applyReviewerVerifiedTicks — editing-round test evidence", () =
     const chat = result.captured.find((entry) => entry.method === "chat")?.message ?? "";
     assert.match(chat, /no passing test report counts/);
     assert.match(chat, /\n {2}- Add regression cases in dispatch\.test\.ts/, "the item is listed as a bullet, not joined into one paragraph");
-    assert.match(chat, /pnpm run test:unit -- /, "the card names the command that would satisfy the rule");
+    // bugs7 item 1: the card says one thing about rounds. It offers none, so it names what the owner can do instead.
+    assert.match(chat, /To settle them: run Publish Checks, record a test run you did, or tick them\./);
+    assert.doesNotMatch(chat, /Run an Implementation or Apply Review round/);
     assert.match(chat, /Add regression cases in dispatch\.test\.ts — no test report is recorded for this item/, "bugs4 Step 20: each withheld item carries its own reason");
     assert.equal(
       result.captured.some((entry) => entry.method === "warning" && /without an applicable passing/.test(entry.message)),

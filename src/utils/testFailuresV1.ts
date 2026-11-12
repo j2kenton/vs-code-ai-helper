@@ -21,6 +21,35 @@ export interface TestFailureV1 {
   readonly file?: string;
   readonly line?: number;
   readonly assertion?: string;
+  /**
+   * bugs7 review: the failure's complete message and the stack frames printed around it, before the shortened
+   * `assertion` is cut. Used only to tell which of the task's changed files a failure names; never shown or saved.
+   */
+  readonly detail?: string;
+}
+
+const DETAIL_WINDOW_CHARS = 3000;
+
+/** The raw output from where the test (by title, else by file) first appears: its full message and stack. */
+function failureDetailWindow(
+  rawOutput: string,
+  title: string,
+  file: string | undefined,
+  fullAssertion: string | undefined,
+  otherTitles: readonly string[]
+): string | undefined {
+  let at = title !== "" ? rawOutput.indexOf(title) : -1;
+  if (at < 0 && file) at = rawOutput.indexOf(path.basename(file.replace(/\\/g, "/")));
+  let end = at >= 0 ? at + DETAIL_WINDOW_CHARS : 0;
+  // The window stops where another failing test starts, so one test is never charged with its neighbour's stack.
+  for (const other of otherTitles) {
+    if (other === "" || other === title || at < 0) continue;
+    const next = rawOutput.indexOf(other, at + title.length);
+    if (next >= 0 && next < end) end = next;
+  }
+  const window = at >= 0 ? rawOutput.slice(at, end) : "";
+  const detail = [fullAssertion ?? "", window].filter((part) => part !== "").join("\n");
+  return detail === "" ? undefined : detail;
 }
 
 /** A blocker about tests that fail (not about tests missing, not run, or not yet written). */
@@ -51,8 +80,13 @@ export function buildTestFailuresV1(
   max = TEST_FAILURES_MAX_LISTED_V1
 ): TestFailureV1[] {
   const assertionByFile = new Map<string, string>();
+  const fullAssertionByFile = new Map<string, string>();
   for (const cluster of summary.clusters ?? []) {
-    if (cluster.assertion) assertionByFile.set(cluster.file, cluster.assertion.replace(/\s+/g, " ").trim().slice(0, ASSERTION_MAX_CHARS));
+    if (cluster.assertion) {
+      const flat = cluster.assertion.replace(/\s+/g, " ").trim();
+      assertionByFile.set(cluster.file, flat.slice(0, ASSERTION_MAX_CHARS));
+      fullAssertionByFile.set(cluster.file, flat);
+    }
   }
   const failures: TestFailureV1[] = [];
   const seen = new Set<string>();
@@ -62,11 +96,13 @@ export function buildTestFailuresV1(
     seen.add(key);
     const line = test.file ? lineForFile(test.file, rawOutput) : undefined;
     const assertion = test.file ? assertionByFile.get(test.file) : undefined;
+    const detail = failureDetailWindow(rawOutput, test.title, test.file, test.file ? fullAssertionByFile.get(test.file) : undefined, summary.tests.map((t) => t.title));
     failures.push({
       name: test.title,
       ...(test.file ? { file: test.file } : {}),
       ...(line !== undefined ? { line } : {}),
       ...(assertion ? { assertion } : {}),
+      ...(detail !== undefined ? { detail } : {}),
     });
     if (failures.length >= max) break;
   }

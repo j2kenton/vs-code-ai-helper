@@ -75,6 +75,30 @@ void describe("buildBlockerWorkListV1 (Step 19)", () => {
     assert.equal(countReviewsBlockerHasStoodV1(STANDING, brokenStreak), 2, "a review without it ends the streak");
   });
 
+  void it("bugs7 item 4: the standing count restarts where the resolver changed, so an answered owner decision is work for a round", () => {
+    // Same lineage three reviews running: twice as an environmental owner decision, then narrowed to a task-fixable change.
+    const asOwnerDecision = blocker("completion", "environmental", "Step 12 hard stop: owner decision needed on roundClockV1.ts");
+    const narrowed = blocker("completion", "task-fixable", "Step 12 hard stop: owner decision needed on roundClockV1.ts");
+    const prior = [identities([asOwnerDecision]), identities([asOwnerDecision])];
+    assert.equal(countReviewsBlockerHasStoodV1(narrowed, prior), 1, "a different resolver in the earlier reviews restarts the count");
+    const list = buildBlockerWorkListV1({
+      blockers: [blocker("architectural", "task-fixable", "roundClockV1.ts still calls start + 60 minutes the hard stop")],
+      planOfRecord: PLAN,
+      priorReviewBlockers: [
+        identities([blocker("architectural", "environmental", "roundClockV1.ts still calls start + 60 minutes the hard stop")]),
+        identities([blocker("architectural", "environmental", "roundClockV1.ts still calls start + 60 minutes the hard stop")]),
+      ],
+      plateauRounds: 3,
+    });
+    assert.equal(list.notThisRound.length, 0, "no longer standing");
+    assert.equal(list.fixFirst.length, 1, "Fast Forward would dispatch the round");
+    // The same resolver across the plateau still stands, and a history entry with no resolver does not break the chain.
+    const same = [identities([STANDING]), identities([STANDING])];
+    assert.equal(countReviewsBlockerHasStoodV1(STANDING, same), 3);
+    const unrecorded = same.map((entry) => entry.map(({ resolver: _resolver, ...rest }) => rest as ReviewBlockerIdentity));
+    assert.equal(countReviewsBlockerHasStoodV1(STANDING, unrecorded), 3);
+  });
+
   void it("owner decisions, environmental and needs-toolchain blockers are not this round's work", () => {
     const toolchain = blocker("completion", "needs-toolchain", "Run `npm run test:integration` from outside the task");
     const list = buildBlockerWorkListV1({ blockers: [ENVIRONMENTAL, OWNER, toolchain], planOfRecord: PLAN, plateauRounds: 4 });

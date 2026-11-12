@@ -183,7 +183,7 @@ void describe("test report forms (bugs4 item 21)", () => {
     assert.equal(getApplicablePassingTestReportForItemV1(PLAN, GIT_LOCK_ITEM, summary), undefined);
     const diagnosis = diagnoseApplicablePassingTestReportForItemV1(PLAN, GIT_LOCK_ITEM, summary);
     assert.equal(diagnosis.kind, "not-applicable");
-    assert.match(diagnosis.kind === "not-applicable" ? diagnosis.reason : "", /missingsuitev1\.test\.ts/);
+    assert.match(diagnosis.kind === "not-applicable" ? diagnosis.reason : "", /missingsuitev1\.test\.ts/i);
   });
 
   void it("controls: a failing run, a bare 'test' word, and a command naming other tests never count", () => {

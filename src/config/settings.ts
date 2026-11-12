@@ -581,8 +581,12 @@ export const RESILIENCE_DEFAULTS = {
   askOwnerAfterFailedRounds: 3,
 } as const;
 
-/** review1 Step 53: minutes a safe card waits before its recommended option runs by itself (default 15, 0 = off). */
-export const AUTO_CONTINUE_MINUTES_DEFAULT_V1 = 15;
+/**
+ * review1 Step 53: minutes a safe card waits before its recommended option runs by itself (default 2, 0 = off).
+ * bugs7 item 7: 2, not 15; a step that needs no judgement and can lose nothing must not stall a task. VS Code gives the
+ * new default to anyone who never set the value and keeps a value someone set, so no migration is needed.
+ */
+export const AUTO_CONTINUE_MINUTES_DEFAULT_V1 = 2;
 
 export function readAutoContinueMinutes(): number {
   const value = readSetting<unknown>("decisions.autoContinueMinutes", AUTO_CONTINUE_MINUTES_DEFAULT_V1);

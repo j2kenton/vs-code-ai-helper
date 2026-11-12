@@ -146,6 +146,30 @@ void describe("review1 Step 46: a blocker that stood across four reviews goes to
     }
   });
 
+  void it("bugs7 item 4: two reviews with the blocker as an owner decision, then narrowed to a task-fixable change: Fast Forward has work for a round", async () => {
+    const context = makeExtensionContext();
+    __extensionContextV1TestOnly.set(context);
+    const { folder, restore } = await makeTask(3);
+    try {
+      const progressPath = nodePath.join(folder, "task-progress.json");
+      const progress = JSON.parse(await fs.readFile(progressPath, "utf8")) as { reviewScoreHistory: Array<Record<string, unknown>> };
+      // The first two reviews carried the line as an owner decision; the newest is the narrowed, task-fixable one.
+      for (const index of [0, 1]) {
+        progress.reviewScoreHistory[index] = {
+          ...progress.reviewScoreHistory[index],
+          blockers: [{ category: "architectural", resolver: "environmental", subject: "src/utils/saveguard.ts", id: LINEAGE_ID }],
+        };
+      }
+      await fs.writeFile(progressPath, JSON.stringify(progress), "utf8");
+      const folderUri = vscode.Uri.file(folder);
+      const review = reviewWith(`- [architectural] [task-fixable] [narrowed:${LINEAGE_ID}] ${BLOCKER_TEXT}`);
+      const standing = await standingOnlyBlockersV1({ folderUri, stage: "impl-high-review", reviewText: review });
+      assert.equal(standing, undefined, "the count restarted where the resolver changed, so a round has work to do");
+    } finally {
+      restore();
+    }
+  });
+
   void it("the check after a later review holds the loop with no further editing round", async () => {
     const context = makeExtensionContext();
     __extensionContextV1TestOnly.set(context);
@@ -179,6 +203,28 @@ void describe("review1 Step 46: a blocker that stood across four reviews goes to
       assert.match(result.held?.detail ?? "", /saveGuard/);
       assert.equal(applies, 1, "only the round that was already under way; none is started for the standing blocker");
       assert.equal(reviews, 1);
+    } finally {
+      restore();
+    }
+  });
+
+  void it("bugs7 item 4: a lineage that stood as an owner decision and was narrowed to a task-fixable change is a round's work", async () => {
+    __extensionContextV1TestOnly.set(makeExtensionContext());
+    // Four reviews carry the lineage, as plateauRounds (4) would count it, but the first three were owner-only.
+    const { folder, restore } = await makeTask(4);
+    try {
+      const progressPath = nodePath.join(folder, "task-progress.json");
+      const progress = JSON.parse(await fs.readFile(progressPath, "utf8")) as { reviewScoreHistory: { blockers: { resolver: string }[] }[] };
+      progress.reviewScoreHistory.slice(0, 3).forEach((row) => row.blockers.forEach((b) => (b.resolver = "environmental")));
+      await fs.writeFile(progressPath, JSON.stringify(progress), "utf8");
+      const review = reviewWith(`- [architectural] [task-fixable] [narrowed:${LINEAGE_ID}] ${BLOCKER_TEXT}`);
+      const standing = await standingOnlyBlockersV1({ folderUri: vscode.Uri.file(folder), stage: "impl-high-review", reviewText: review });
+      assert.equal(standing, undefined, "the count restarted where the resolver changed, so Fast Forward dispatches Apply Review");
+      // The same history with the resolver unchanged still stands (the unchanged-case card is not affected).
+      progress.reviewScoreHistory.slice(0, 3).forEach((row) => row.blockers.forEach((b) => (b.resolver = "task-fixable")));
+      await fs.writeFile(progressPath, JSON.stringify(progress), "utf8");
+      const stillStanding = await standingOnlyBlockersV1({ folderUri: vscode.Uri.file(folder), stage: "impl-high-review", reviewText: review });
+      assert.equal(stillStanding?.length, 1);
     } finally {
       restore();
     }

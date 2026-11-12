@@ -208,6 +208,15 @@ export function assertGatingRequirementV1(decisionKey: string, gating: HandoffGa
   throw new Error(`workflow decision "${decisionKey}" must supply "gating" (PART 5 creation-time guard)`);
 }
 
+/** Every decision recorded for the task in any state (answered ones keep their `resolvedAt`), read-only; empty without a context. */
+export function listWorkflowDecisionsForTaskV1(taskCanonicalId: string): readonly WorkflowDecisionV1[] {
+  const context = getExtensionContextV1();
+  if (!context) {
+    return [];
+  }
+  return new WorkflowDecisionStoreV1(decisionStoreStateV1(context)).listForTask(taskCanonicalId);
+}
+
 /** The task's pending decisions, read-only; empty when there is no extension context. */
 export function listPendingWorkflowDecisionsForTaskV1(taskCanonicalId: string): readonly WorkflowDecisionV1[] {
   const context = getExtensionContextV1();

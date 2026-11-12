@@ -225,6 +225,32 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "runners/runnerRegistry.ts", optionId: "rerunAfterReset", occurrence: 0, resumeKind: "continue", dispatchProof: "runnerRegistry: rerunAfterReset dispatches a fresh round after reset" },
   { file: "runners/runnerRegistry.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "runnerRegistry: notNow dispatches nothing" },
 
+  // src/utils/evidenceGapV1.ts (bugs7 item 5): the evidence-gap card, with "Fix the failing tests" after a failed run.
+  { file: "utils/evidenceGapV1.ts", optionId: "tickThese", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: tickThese runs the tick command for the listed items" },
+  { file: "utils/evidenceGapV1.ts", optionId: "runChecksAgain", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: runChecksAgain runs Publish Checks" },
+  { file: "utils/evidenceGapV1.ts", optionId: "recordRun", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: recordRun opens the owner test-run form" },
+  { file: "utils/evidenceGapV1.ts", optionId: "fixFailingTests", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: fixFailingTests dispatches Apply Review and is recommended for a failure that touches the task" },
+  { file: "utils/evidenceGapV1.ts", optionId: "moveOn", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: moveOn advances to the next stage" },
+  // src/utils/automationStopV1.ts (bugs7 items 6 and 7): the automation-stopped / "stage is done" card.
+  { file: "utils/automationStopV1.ts", optionId: "moveOn", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: moveOn runs nextStage" },
+  { file: "utils/automationStopV1.ts", optionId: "moveOnAndFastForward", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: moveOnAndFastForward runs Fast Forward, which crosses the done stage's edge" },
+  { file: "utils/automationStopV1.ts", optionId: "continueTheWork", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: continueTheWork runs the editing round" },
+  { file: "utils/automationStopV1.ts", optionId: "startFastForward", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: startFastForward runs Fast Forward" },
+  { file: "utils/automationStopV1.ts", optionId: "runOneMoreCycle", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: runOneMoreCycle runs one Apply Review" },
+  { file: "utils/automationStopV1.ts", optionId: "runPublishChecksNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: runPublishChecksNow runs Publish Checks once, no model round" },
+  { file: "utils/automationStopV1.ts", optionId: "changeStageModel", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: changeStageModel opens AI Models" },
+  { file: "utils/automationStopV1.ts", optionId: "leaveWithMe", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: leaveWithMe does nothing" },
+  // src/utils/withheldTestEvidenceCardV1.ts (bugs7 item 2): the withheld-test-evidence card.
+  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "runChecks", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: runChecks runs Publish Checks for the items" },
+  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "recordRun", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: recordRun opens the owner test-run form" },
+  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "tickThese", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: tickThese runs the tick command" },
+  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: notNow does nothing" },
+  // src/commands/ownerPlanDecisionCommandV1.ts (bugs7 item 4): the owner-only / standing blockers card.
+  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "applyReviewToBuild", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: applyReviewToBuild runs Apply Review for the review's named work" },
+  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "settleItem", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: settleItem opens the settle-item form" },
+  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "changePlan", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: changePlan opens the plan's Accepted Non-Goals" },
+  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: notNow does nothing" },
+
   // src/commands/implementationRecoveryV1.ts
   { file: "commands/implementationRecoveryV1.ts", optionId: "keep", occurrence: 0, resumeKind: "unpause", dispatchProof: "implementationRecoveryV1: keep dispatches nothing (user decision recorded, no automation follow-up)" },
   { file: "commands/implementationRecoveryV1.ts", optionId: "restore", occurrence: 0, resumeKind: "unpause", dispatchProof: "implementationRecoveryV1: restore dispatches nothing (user decision recorded, no automation follow-up)" },
@@ -407,6 +433,30 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   // belongs in the trivial (type-guaranteed) bucket, not runtime-test.
   [rowKey("commands/reconcilePlanChecklist.ts", "notYet", 0), { kind: "trivial-no-dispatch" }],
 
+  // bugs7 item 5: the evidence-gap card's options; evidenceGapV1.test.ts asserts each option's real effect.
+  [rowKey("utils/evidenceGapV1.ts", "tickThese", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
+  [rowKey("utils/evidenceGapV1.ts", "runChecksAgain", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
+  [rowKey("utils/evidenceGapV1.ts", "recordRun", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
+  [rowKey("utils/evidenceGapV1.ts", "fixFailingTests", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
+  [rowKey("utils/evidenceGapV1.ts", "moveOn", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
+  // bugs7 Step 16: the stop card, the withheld-evidence card and the owner-only-blockers card; the proof file builds each
+  // real card and asserts every option's real `.effect`.
+  [rowKey("utils/automationStopV1.ts", "moveOn", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/automationStopV1.ts", "moveOnAndFastForward", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/automationStopV1.ts", "continueTheWork", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/automationStopV1.ts", "startFastForward", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/automationStopV1.ts", "runOneMoreCycle", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/automationStopV1.ts", "runPublishChecksNow", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/automationStopV1.ts", "changeStageModel", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/automationStopV1.ts", "leaveWithMe", 0), { kind: "trivial-no-dispatch" }],
+  [rowKey("utils/withheldTestEvidenceCardV1.ts", "runChecks", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/withheldTestEvidenceCardV1.ts", "recordRun", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/withheldTestEvidenceCardV1.ts", "tickThese", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("utils/withheldTestEvidenceCardV1.ts", "notNow", 0), { kind: "trivial-no-dispatch" }],
+  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "applyReviewToBuild", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "settleItem", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "changePlan", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
+  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "notNow", 0), { kind: "trivial-no-dispatch" }],
   [rowKey("commands/applyReviewerVerifiedTicks.ts", "apply", 0), { kind: "runtime-test", proofFiles: ["applyReviewerVerifiedTicksCommand.test.ts"] }],
   // Corrected during verification: skip's effect IS doNothing
   // (applyReviewerVerifiedTicks.ts:222), not a command.

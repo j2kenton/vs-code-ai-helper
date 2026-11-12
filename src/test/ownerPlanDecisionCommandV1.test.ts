@@ -14,8 +14,10 @@ import {
   parseReviewBlockersDetailed,
 } from "../utils/reviewReadiness";
 import {
+  describeOwnerAnswerNextV1,
   executeOwnerPlanDecisionLockedV1,
   findAmbiguousRewordTargetV1,
+  ownerOptionNeedsCodeChangeV1,
   postOwnerOnlyBlockersCardV1,
   postOwnerPlanDecisionCardV1,
   RECORD_OWNER_PLAN_DECISION_COMMAND_V1,
@@ -790,6 +792,49 @@ void describe("review1 Step 40: an owner-decision answer re-runs the review, and
     });
     assert.equal(started, true);
     assert.equal(calls, 1);
+  });
+
+  void it("bugs7 item 3: an option that needs a code change starts Apply Review first, not the review alone", async () => {
+    const calls: { id: string; args: unknown[] }[] = [];
+    const started = await startReReviewAfterOwnerDecisionV1({ ...baseArg, thenApplyReview: true }, (id, ...args) => {
+      calls.push({ id, args });
+      return Promise.resolve(true);
+    });
+    assert.equal(started, true);
+    assert.deepEqual(calls.map((c) => c.id), ["vs-code-ai-helper.resumeAndApplyCurrentStageAction"]);
+  });
+
+  void it("bugs7 item 3: the review's `Needs a code change` line, or its 'one round rewords' wording, routes to Apply Review; 'applying now' is said only then", () => {
+    const [block] = parseOwnerDecisionsNeededV1(
+      [
+        "## Owner decisions needed",
+        "### step-12-hard-stop",
+        "Id: step-12-hard-stop",
+        "Plan purpose: the round clock",
+        "Problem: the prompt says the 60 minutes is the hard stop",
+        "Options:",
+        "- Keep the round's 60 minutes, reworded — one round rewords two sentences. Needs a code change: yes",
+        "- Drop the clock — the plan is edited. Needs a code change: no",
+        "- Leave the wording — nothing builds it",
+        "Recommendation: Keep the round's 60 minutes, reworded, because it is cheap.",
+        "Technical details: roundClockV1.ts",
+      ].join("\n")
+    );
+    assert.ok(block);
+    const [reword, drop, leave] = block.options;
+    assert.equal(reword!.needsCodeChange, true);
+    assert.equal(drop!.needsCodeChange, false);
+    assert.equal(leave!.needsCodeChange, undefined);
+    assert.doesNotMatch(reword!.consequence, /Needs a code change/i);
+    assert.equal(ownerOptionNeedsCodeChangeV1(reword!, block), true);
+    assert.equal(ownerOptionNeedsCodeChangeV1(drop!, block), false);
+    assert.equal(ownerOptionNeedsCodeChangeV1(leave!, block), false);
+    // Without the line, the review's own words about a round decide.
+    const worded = { ...reword!, needsCodeChange: undefined };
+    assert.equal(ownerOptionNeedsCodeChangeV1(worded, block), true, "one round rewords two sentences");
+    assert.match(describeOwnerAnswerNextV1(reword!, block, "High-Level Code Review"), /^applying now: Apply Review builds it/);
+    assert.equal(describeOwnerAnswerNextV1(drop!, block, "High-Level Code Review"), "checking it now with High-Level Code Review");
+    assert.doesNotMatch(describeOwnerAnswerNextV1(drop!, block, "High-Level Code Review"), /applying now/);
   });
 
   void it("a failing start is reported as not started, never thrown into the answer", async () => {

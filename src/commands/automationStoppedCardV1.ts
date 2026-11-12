@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import * as vscode from "vscode";
 
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
@@ -20,7 +21,7 @@ import { buildBlockerWorkListV1, reviewSeparationFromHistoryV1 } from "../utils/
 import { readPlanItemCountsV1 } from "../utils/effectiveReviewProgress";
 import { readTextIfExists } from "../utils/fileUtils";
 import { getCanonicalImplementationUri, readPlanOfRecordV1 } from "../utils/implementationArtifactResolver";
-import { parseDeclinedBlockersV1 } from "../utils/implementationChecklist";
+import { getPlanRevisionV1, parseDeclinedBlockersV1 } from "../utils/implementationChecklist";
 import { selectRepeatedRejectionV1 } from "../utils/reportContractRejectionsV1";
 import { getReviewPlateauRounds } from "../config/settings";
 import { previousVersionUri } from "../utils/artifactBackups";
@@ -35,7 +36,12 @@ import { reviewInputsChangedSinceV1 } from "../utils/reviewInputsChangedV1";
 import { detectTestsRefusedV1 } from "../utils/testsRefusedV1";
 import { normalizePath } from "../utils/taskRoot";
 import { isFailingTestsBlockerV1 } from "../utils/testFailuresV1";
-import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import {
+  listPendingWorkflowDecisionsForTaskV1,
+  listWorkflowDecisionsForTaskV1,
+  postWorkflowDecisionV1,
+} from "../utils/workflowDecisionDispatchV1";
+import { latestOwnerAnswerAtV1 } from "../utils/ownerAnswerTimeV1";
 
 /**
  * review1 Step 29: gather where a task stands from what is on disk (review artifact, plan counts, sorted blockers,
@@ -71,6 +77,13 @@ export async function gatherAutomationStopFactsV1(input: {
     blockers,
     ...(planText !== undefined ? { planOfRecord: planText } : {}),
     priorReviewBlockers: history.slice(0, -1).map((entry) => entry.blockers ?? []),
+    priorReviewAts: history.slice(0, -1).map((entry) => entry.at),
+    ownerAnswerAtOf: (blocker) =>
+      latestOwnerAnswerAtV1(
+        listWorkflowDecisionsForTaskV1(normalizePath(folderUri.fsPath)),
+        blocker.description,
+        blocker.lineage !== undefined && blocker.lineage.kind !== "new" ? blocker.lineage.refId : undefined
+      ),
     reviewSeparatedByFixRound: reviewSeparationFromHistoryV1(history),
     plateauRounds: getReviewPlateauRounds(),
     declined: summaryText ? parseDeclinedBlockersV1(summaryText) : [],
@@ -92,11 +105,24 @@ export async function gatherAutomationStopFactsV1(input: {
   const startHold = IMPL_REVIEW_STAGES.includes(stage)
     ? await readPartialScopeHoldV1(folderUri.fsPath, stage, reviewText).catch(() => undefined)
     : undefined;
+  const stateFingerprint = createHash("sha256")
+    .update(
+      [
+        stage,
+        input.ending,
+        reviewText === undefined ? "no-review" : createHash("sha256").update(reviewText).digest("hex"),
+        planText === undefined ? "no-plan" : getPlanRevisionV1(planText),
+        counts ? `${counts.total}/${counts.settled}/${counts.open}/${counts.provisional}` : "no-counts",
+      ].join("|")
+    )
+    .digest("hex")
+    .slice(0, 16);
   return {
     taskFolderPath: folderUri.fsPath,
     stage,
     ending: input.ending,
     stopReason: input.stopReason,
+    stateFingerprint,
     score: latest?.score ?? null,
     previousScore: previous?.score ?? null,
     blockers: {
@@ -182,7 +208,24 @@ export async function postAutomationStoppedCardV1(input: {
     const stageIsReady = facts.gateComplete && facts.reviewClean;
     // A stop card is for work left; the "<Stage> is done" card (Step 31) is for exactly the opposite.
     if (input.ending === "stage-ready" ? !stageIsReady : stageIsReady) return { posted: false };
-    const card = buildAutomationStoppedCardInputV1(facts);
+    const built = buildAutomationStoppedCardInputV1(facts);
+    // bugs7 item 6: one card per state. The card carries the fingerprint of the state it describes (stage, ending,
+    // review content, plan revision, settled counts) as its identity; an open card with the same key, stage and
+    // identity is already the card for it, whichever caller (and whichever wording) raised it. Raising it again put
+    // two "is done" cards in the chat a second apart.
+    const card =
+      facts.stateFingerprint !== undefined
+        ? { ...built, suppressWhileAnswered: { conditionFingerprint: facts.stateFingerprint, answeredOptionIds: [] as string[] } }
+        : built;
+    // The posting path may add options of its own (a countdown's "Wait for me"), so the open card is matched by the
+    // state fingerprint at the front of its identity, never by its option list.
+    const identityPrefix = facts.stateFingerprint !== undefined ? `${facts.stateFingerprint}|` : undefined;
+    const alreadyOpen =
+      identityPrefix !== undefined &&
+      listPendingWorkflowDecisionsForTaskV1(normalizePath(input.folderUri.fsPath)).some(
+        (open) => open.decisionKey === card.decisionKey && open.stage === card.stage && (open.identity ?? "").startsWith(identityPrefix)
+      );
+    if (alreadyOpen) return { posted: false };
     const posted = await postWorkflowDecisionV1(card, {
       canonicalId: normalizePath(input.folderUri.fsPath),
       taskFolderPath: input.folderUri.fsPath,
@@ -236,12 +279,41 @@ export function reviewDescribesCurrentWorkspaceV1(
   return isReviewDispatchAgainstUnchangedTreeV1(reviewText, identity.headSha, identity.treeFingerprint);
 }
 
-export async function postStageReadyCardIfReadyV1(
+/** bugs7 item 6: calls that arrive while one for the same task is running are the same state; they share its result. */
+const stageReadyInFlightV1 = new Map<string, Promise<{ readonly posted: boolean }>>();
+const stageReadyReaderIdsV1 = new WeakMap<object, number>();
+let stageReadyReaderCounterV1 = 0;
+
+export function postStageReadyCardIfReadyV1(
   taskFolderPath: string,
   whatTheOwnerDid: string,
   deps: {
     readonly readWorkspaceIdentity?: (workspaceRoot: string, reviewUri: vscode.Uri) => Promise<StageReadyWorkspaceIdentityV1>;
   } = {}
+): Promise<{ readonly posted: boolean }> {
+  // Calls collapse only when they read the workspace the same way (the real reader, or the same injected one).
+  const reader = deps.readWorkspaceIdentity;
+  let readerId = 0;
+  if (reader !== undefined) {
+    readerId = stageReadyReaderIdsV1.get(reader) ?? ++stageReadyReaderCounterV1;
+    stageReadyReaderIdsV1.set(reader, readerId);
+  }
+  const key = `${normalizePath(taskFolderPath)}|${readerId}`;
+  const running = stageReadyInFlightV1.get(key);
+  if (running !== undefined) return running;
+  const run = postStageReadyCardIfReadyCoreV1(taskFolderPath, whatTheOwnerDid, deps).finally(() => {
+    stageReadyInFlightV1.delete(key);
+  });
+  stageReadyInFlightV1.set(key, run);
+  return run;
+}
+
+async function postStageReadyCardIfReadyCoreV1(
+  taskFolderPath: string,
+  whatTheOwnerDid: string,
+  deps: {
+    readonly readWorkspaceIdentity?: (workspaceRoot: string, reviewUri: vscode.Uri) => Promise<StageReadyWorkspaceIdentityV1>;
+  }
 ): Promise<{ readonly posted: boolean }> {
   try {
     const folderUri = vscode.Uri.file(taskFolderPath);

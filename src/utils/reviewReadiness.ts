@@ -1887,6 +1887,11 @@ export interface ParsedOwnerDecisionOptionV1 {
    * The choice is still recorded as the owner's decision, but the blocker is not set aside.
    */
   readonly rejects?: boolean;
+  /**
+   * bugs7 item 3: the review's own `Needs a code change: yes/no` line for this option. `yes` means a round (Apply Review)
+   * has to apply the answer; the card then runs Apply Review, then the review, not the review alone.
+   */
+  readonly needsCodeChange?: boolean;
 }
 
 export interface ParsedOwnerDecisionBlockV1 {
@@ -2024,6 +2029,10 @@ function parseOwnerDecisionOptionV1(
   rest = rest.replace(/\s*\[\s*exclude\s*\]/gi, "");
   const recommended = /\(\s*recommended\s*\)/i.test(rest);
   rest = rest.replace(/\s*\(\s*recommended\s*\)/gi, "");
+  // bugs7 item 3: "Needs a code change: yes/no" says whether a round has to apply this answer.
+  const codeChangeLine = /\s*\bneeds\s+a\s+code\s+change\s*:\s*(yes|no)\b\.?/i.exec(rest);
+  const needsCodeChange = codeChangeLine ? /^yes$/i.test(codeChangeLine[1] ?? "") : undefined;
+  rest = rest.replace(/\s*\bneeds\s+a\s+code\s+change\s*:\s*(?:yes|no)\b\.?/gi, "");
   let explicitId: string | undefined;
   const idMatch = /^([A-Za-z][\w-]*)\s*:\s+(\S[\s\S]*)$/.exec(rest);
   if (idMatch) {
@@ -2047,6 +2056,7 @@ function parseOwnerDecisionOptionV1(
       consequence: consequence || `Applies "${label}".`,
       ...(consequence ? { tradeOffs: consequence } : {}),
       ...(excludes && planItems.length > 0 ? { planAction: { kind: "exclude" as const, items: planItems } } : {}),
+      ...(needsCodeChange !== undefined ? { needsCodeChange } : {}),
     },
   };
 }

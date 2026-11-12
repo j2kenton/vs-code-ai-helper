@@ -2,7 +2,16 @@ import type { WorkflowDecisionOptionV1, WorkflowDecisionRecommendationV1 } from 
 import type { PostWorkflowDecisionInputV1 } from "./workflowDecisionDispatchV1";
 import { STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
 import { normalizePath } from "./taskRoot";
+import { describeEvidenceRunFailuresV1, type ClassifiedEvidenceRunFailureV1 } from "./evidenceRunFailuresV1";
 import { extractTestFileTokensV1 } from "./testDependencyStateV1";
+import {
+  ambiguousTestNameReasonV1,
+  commandCoversTestFileV1,
+  resolveItemTestFilesV1,
+  type AmbiguousTestNameV1,
+  type ItemTestFilesContextV1,
+  type ResolvedItemTestFilesV1,
+} from "./itemTestFilesV1";
 
 /**
  * review1 Step 34: the evidence-only gap. A review meets the stop level with no blockers and the only plan items
@@ -40,20 +49,32 @@ export function testFileKeyV1(file: string): string {
   return base.replace(/\.(?:[cm]?[jt]sx?)$/i, "").toLowerCase();
 }
 
-/** The test files an item names: from its own text, else from the commands of its latest rejected or expired reports. */
-export function identifyItemTestFilesV1(itemText: string, rejectedReportTexts: readonly string[]): string[] {
-  const own = extractTestFileTokensV1(itemText);
-  const tokens = own.length > 0 ? own : extractTestFileTokensV1(...rejectedReportTexts);
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const token of tokens) {
-    const key = testFileKeyV1(token);
-    if (!seen.has(key)) {
-      seen.add(key);
-      out.push(token);
-    }
-  }
-  return out;
+/**
+ * bugs7 item 1: the item's test files, from the one resolver the claim matcher also uses: the files its text names,
+ * else the files its claim's evidence names, else the test files its rounds changed, else its rejected reports'
+ * commands. Without `context` only names with a `.test.`/`.spec.` suffix count.
+ */
+export function identifyItemTestFilesDetailV1(
+  itemText: string,
+  rejectedReportTexts: readonly string[],
+  context?: ItemTestFilesContextV1,
+  evidenceText?: string
+): ResolvedItemTestFilesV1 {
+  return resolveItemTestFilesV1({
+    itemText,
+    rejectedReportTexts,
+    ...(evidenceText !== undefined ? { evidenceText } : {}),
+    ...(context ? { context } : {}),
+  });
+}
+
+export function identifyItemTestFilesV1(
+  itemText: string,
+  rejectedReportTexts: readonly string[],
+  context?: ItemTestFilesContextV1,
+  evidenceText?: string
+): string[] {
+  return [...identifyItemTestFilesDetailV1(itemText, rejectedReportTexts, context, evidenceText).files];
 }
 
 export interface EvidenceGapMatchV1 {
@@ -62,22 +83,30 @@ export interface EvidenceGapMatchV1 {
 }
 
 /**
- * Splits the items into those a passing run can be recorded for (every test file the item names appears in the
- * output's file list) and those left provisional, each with the reason.
+ * Splits the items into those a passing run can be recorded for (every test file the item resolves to is covered by
+ * the output's file list, by file identity: two files that only share a stem are not one test) and those left
+ * provisional, each with the reason. An item whose name fits several known files is listed with that reason.
  */
 export function matchPassedOutputToItemsV1(
-  items: readonly { readonly itemText: string; readonly testFiles: readonly string[] }[],
-  passedTestFiles: readonly string[]
+  items: readonly {
+    readonly itemText: string;
+    readonly testFiles: readonly string[];
+    readonly ambiguous?: readonly AmbiguousTestNameV1[];
+  }[],
+  passedTestFiles: readonly string[],
+  context?: ItemTestFilesContextV1
 ): EvidenceGapMatchV1 {
-  const ran = new Set(passedTestFiles.map(testFileKeyV1));
   const recordable: { itemText: string; testFiles: readonly string[] }[] = [];
   const unidentified: { itemText: string; reason: string }[] = [];
   for (const item of items) {
     if (item.testFiles.length === 0) {
-      unidentified.push({ itemText: item.itemText, reason: "no test file could be identified for it" });
+      unidentified.push({
+        itemText: item.itemText,
+        reason: item.ambiguous && item.ambiguous.length > 0 ? ambiguousTestNameReasonV1(item.ambiguous) : "no test file could be identified for it",
+      });
       continue;
     }
-    const missing = item.testFiles.filter((file) => !ran.has(testFileKeyV1(file)));
+    const missing = item.testFiles.filter((file) => !commandCoversTestFileV1(passedTestFiles, file, context));
     if (missing.length > 0) {
       unidentified.push({ itemText: item.itemText, reason: `the passing output does not name ${missing.map((f) => `\`${f}\``).join(", ")}` });
     } else {
@@ -106,12 +135,27 @@ export interface EvidenceGapCardFactsV1 {
   readonly recordedCount: number;
   readonly planItems?: { readonly total: number; readonly settled: number };
   readonly nextStage?: TaskStage;
+  /** bugs7 item 5: the failing tests of a failed run, each classified against the task's changed files. */
+  readonly failures?: readonly ClassifiedEvidenceRunFailureV1[];
 }
 
-export type EvidenceGapRecommendationV1 = "tickThese" | "runChecksAgain" | "recordRun";
+export type EvidenceGapRecommendationV1 = "tickThese" | "runChecksAgain" | "recordRun" | "fixFailingTests" | "none";
 
-/** Tick when every listed item has a passing run on record, else rerun if the last attempt could not run, else record a run. */
+export const FIX_FAILING_TESTS_OPTION_ID_V1 = "fixFailingTests";
+
+/**
+ * After a failed run, the suite fails: ticking and recording a run are never recommended. A failure that touches the
+ * task's changes is the task's own breakage, and a round fixes it; only failures on the known-flake record recommend
+ * running again; anything else is not recommended either way, because Ensemble cannot tell whether the task caused it.
+ * Otherwise: tick when every listed item has a passing run on record, rerun if the attempt could not run, else record a run.
+ */
 export function recommendEvidenceGapOptionV1(facts: EvidenceGapCardFactsV1): EvidenceGapRecommendationV1 {
+  if (facts.attempt === "failed") {
+    const failures = facts.failures ?? [];
+    if (failures.some((failure) => failure.classification === "touches-task")) return "fixFailingTests";
+    if (failures.length > 0 && failures.every((failure) => failure.classification === "probable-flake")) return "runChecksAgain";
+    return "none";
+  }
   if (facts.items.length > 0 && facts.items.every((item) => item.passingRuns > 0)) return "tickThese";
   if (facts.attempt === "could-not-run") return "runChecksAgain";
   return "recordRun";
@@ -127,15 +171,19 @@ export function buildEvidenceGapCardInputV1(facts: EvidenceGapCardFactsV1): Omit
   const nextStageName = facts.nextStage !== undefined ? STAGE_DISPLAY_NAMES[facts.nextStage] : undefined;
   const taskArg = { taskFolderPath: facts.taskFolderPath };
   const count = facts.items.length;
+  const failures = facts.attempt === "failed" ? facts.failures ?? [] : [];
   const attemptLine =
     facts.attempt === "passed"
       ? `Publish Checks ran once and passed${facts.recordedCount > 0 ? `, and ${facts.recordedCount} item${facts.recordedCount === 1 ? " was" : "s were"} recorded from their output` : ""}, but ${count} item${count === 1 ? "" : "s"} could not be matched to a test file in it.`
       : facts.attempt === "failed"
-        ? `Publish Checks ran once and failed${facts.attemptDetail ? ` (${shorten(facts.attemptDetail, 200)})` : ""}, so nothing was recorded.`
+        ? `Publish Checks ran once and failed${facts.attemptDetail ? ` (${shorten(facts.attemptDetail, 200)})` : ""}, so nothing was recorded. The suite is failing, so a recorded run or a tick would not settle these items yet.` +
+          (failures.length > 0 ? `\nFailing tests:\n${describeEvidenceRunFailuresV1(failures).join("\n")}` : "")
         : `Publish Checks could not run${facts.attemptDetail ? `: ${shorten(facts.attemptDetail, 200)}` : ""}.`;
   const lines = [
     `Automation stopped on ${stageName}: the review is clean${typeof facts.score === "number" ? ` (${facts.score}/10)` : ""} and only test evidence is missing for ${count} built plan item${count === 1 ? "" : "s"}.`,
-    "No editing round was dispatched for it, because another round cannot produce a test report that counts.",
+    failures.length > 0
+      ? "No editing round was dispatched for the missing evidence itself, because another round cannot produce a test report that counts; a failing test is different, and a round can fix it."
+      : "No editing round was dispatched for it, because another round cannot produce a test report that counts.",
     attemptLine,
     ...facts.items.slice(0, 8).map(
       (item) => `- ${shorten(item.itemText, 140)} (${item.passingRuns > 0 ? `${item.passingRuns} passing run${item.passingRuns === 1 ? "" : "s"} on record` : "no passing run on record"}${item.reason ? `; ${item.reason}` : ""})`
@@ -146,8 +194,8 @@ export function buildEvidenceGapCardInputV1(facts: EvidenceGapCardFactsV1): Omit
   const options: WorkflowDecisionOptionV1[] = [
     {
       optionId: "tickThese",
-      label: `Tick these ${count} item${count === 1 ? "" : "s"}`,
-      consequence: `Records your tick for ${count === 1 ? "this item" : "these items"} as the person who accepts the passing runs on record. The plan lines are not changed, and the next review sees your tick.`,
+      label: count === 1 ? "I've checked it, tick it now" : "I've checked them, tick them now",
+      consequence: `Ensemble records your tick for ${count === 1 ? "this item" : "these items"} now, as the person who accepts the passing runs on record. The plan lines are not changed, and the next review sees your tick.`,
       resumeKind: "continue",
       effect: { kind: "command", command: TICK_EVIDENCE_GAP_ITEMS_COMMAND_V1, args: [{ ...taskArg, itemTexts: facts.items.map((item) => item.itemText) }] },
       recordedNext: "your ticks are recorded",
@@ -173,11 +221,29 @@ export function buildEvidenceGapCardInputV1(facts: EvidenceGapCardFactsV1): Omit
       recordedNext: "the test-run form is open",
     },
   ];
+  if (failures.length > 0) {
+    options.unshift({
+      // A literal (the same text as FIX_FAILING_TESTS_OPTION_ID_V1) so the decision-option inventory sees this option.
+      optionId: "fixFailingTests",
+      label: "Fix the failing tests",
+      consequence:
+        "Runs one Apply Review round that is given the failing tests above (name, assertion, file and line), then re-reviews. " +
+        "Nothing is ticked or recorded for you.",
+      resumeKind: "continue",
+      effect: { kind: "command", command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction", args: [taskArg] },
+      recordedNext: "an Apply Review round runs on the failing tests, then the review",
+    });
+  }
   if (nextStageName !== undefined) {
     options.push({
       optionId: "moveOn",
       label: `Move on to ${nextStageName}`,
-      consequence: `Advances to ${nextStageName} with ${count} plan item${count === 1 ? "" : "s"} still counted as provisional (built, but no passing test report counted). Publish Checks run every test before Commit & Push.`,
+      consequence:
+        `Advances to ${nextStageName} with ${count} plan item${count === 1 ? "" : "s"} still counted as provisional (built, but no passing test report counted). ` +
+        (facts.attempt === "failed"
+          ? "The test suite is failing, and moving on carries the failing tests with it. "
+          : "") +
+        "Publish Checks run every test before Commit & Push.",
       resumeKind: "continue",
       effect: { kind: "command", command: "vs-code-ai-helper.nextStage", args: [taskArg] },
       recordedNext: `${nextStageName} starts`,
@@ -188,8 +254,13 @@ export function buildEvidenceGapCardInputV1(facts: EvidenceGapCardFactsV1): Omit
     tickThese: "Every item listed has a passing run on record, so ticking them settles the evidence gap without another run.",
     runChecksAgain: "The last attempt could not run, so nothing has been tried yet.",
     recordRun: "Publish Checks did not give evidence for these items, so a run you did is the way to settle them.",
+    fixFailingTests: "A failing test touches this task's own changes, so the task most likely broke it; one round can fix it, and the suite has to pass before any run or tick counts.",
+    none: "Ensemble cannot tell whether this task caused the failing tests. Fixing them and running the checks again are both open; the choice is yours, and a recorded run or a tick is not recommended while the suite fails.",
   };
-  const recommendation: WorkflowDecisionRecommendationV1 = { kind: "option", optionId: recommended, reasoning: reasoning[recommended] };
+  const recommendation: WorkflowDecisionRecommendationV1 =
+    recommended === "none"
+      ? { kind: "none", reasoning: reasoning.none }
+      : { kind: "option", optionId: recommended, reasoning: reasoning[recommended] };
   return {
     decisionKey: EVIDENCE_GAP_DECISION_KEY_V1,
     taskCanonicalId: normalizePath(facts.taskFolderPath),

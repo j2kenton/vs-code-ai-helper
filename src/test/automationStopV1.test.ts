@@ -96,6 +96,14 @@ void describe("the automation-stopped card (Steps 29-30)", () => {
     assert.match(ready.whatHappened, /^Low-Level Code Review is done|^High-Level Code Review is done/);
     assert.ok(ready.options.some((o) => o.optionId === "moveOn" && /Move on to Low-Level Code Review/.test(o.label)));
     assert.deepEqual(ready.recommendation.kind === "option" && ready.recommendation.optionId, "moveOn");
+    // bugs7 item 6: on a stage that is done, Fast Forward and a one-cycle round would stop at once, so neither is offered.
+    // Moving on and Fast Forward in the next review stage is offered when the next stage is a review stage.
+    const nextIsReview = ready.options.some((o) => o.optionId === "moveOnAndFastForward");
+    assert.deepEqual(ready.options.map((o) => o.optionId), nextIsReview ? ["moveOn", "moveOnAndFastForward", "leaveWithMe"] : ["moveOn", "leaveWithMe"]);
+    assert.ok(
+      ready.options.every((o) => o.optionId !== "startFastForward" && o.optionId !== "runOneMoreCycle"),
+      "no option dispatches a run that cannot do anything on a done stage"
+    );
     const notReady = buildAutomationStoppedCardInputV1(BASE_FACTS);
     assert.ok(!notReady.options.some((o) => o.optionId === "moveOn"), "no Move on while plan work or blockers remain");
   });
@@ -197,6 +205,32 @@ void describe("every automation ending with work left raises the card (Step 30)"
     assert.match(source, /ending: "resumed-run"/);
     assert.match(source, /ending: "one-cycle"/);
     assert.match(source, /decision\.route === "iterate" && options\.chainedReReview === true && !isFastForwardRunActiveV1/);
+  });
+  void it("bugs7 item 3: a review that ends below the threshold with nothing running posts the review-ended card, inside no Fast Forward or automation dispatch", () => {
+    assert.match(source, /ending: "review-ended"/);
+    assert.match(
+      source,
+      /options\.chainedReReview !== true && !isFastForwardRunActiveV1\(folderUri\.fsPath\) && !isAutomationDispatchContextV1\(\)/
+    );
+    // The chained one-cycle review keeps its own card, so the two never both post.
+    assert.match(source, /decision\.route === "iterate" && options\.chainedReReview === true/);
+  });
+  void it("bugs7 item 3: the review-ended card names the review's work and offers Apply Review or Fast Forward as the next click", () => {
+    const card = buildAutomationStoppedCardInputV1(
+      facts({
+        ending: "review-ended",
+        stopReason: "the review scored 7/10, below the 8 needed, and nothing is running",
+        buildNext: ["Build Step 12's rewording"],
+        reviewClean: false,
+        gateComplete: false,
+      })
+    );
+    assert.match(card.whatHappened, /^High-Level Code Review: the review scored 7\/10/);
+    assert.doesNotMatch(card.whatHappened, /Automation stopped/);
+    assert.match(card.whatHappened, /Build Step 12's rewording/);
+    const ids = card.options.map((o) => o.optionId);
+    assert.ok(ids.includes("startFastForward") && ids.includes("runOneMoreCycle"), "a click that moves it is on the card");
+    assert.equal(card.recommendation.kind, "option");
   });
   void it("a hold or a pause already carries its own card, so only the four non-held endings call the helper", () => {
     const calls = source.match(/postFfStopCardV1\(/g) ?? [];

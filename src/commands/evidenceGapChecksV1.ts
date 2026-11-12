@@ -6,13 +6,20 @@ import { STAGE_ARTIFACT_FILENAMES, type TaskStage } from "../types/taskProgress"
 import { nextStageAfterV1 } from "../utils/automationStopV1";
 import {
   buildEvidenceGapCardInputV1,
-  identifyItemTestFilesV1,
+  identifyItemTestFilesDetailV1,
   isEvidenceOnlyGapV1,
   matchPassedOutputToItemsV1,
   TICK_EVIDENCE_GAP_ITEMS_COMMAND_V1,
   type EvidenceGapAttemptV1,
 } from "../utils/evidenceGapV1";
 import { readTextIfExists } from "../utils/fileUtils";
+import { classifyEvidenceRunFailuresV1, type ClassifiedEvidenceRunFailureV1 } from "../utils/evidenceRunFailuresV1";
+import type { FailingTestSummaryV1 } from "../utils/failingTestsV1";
+import { listChangedFilesSinceShaV1, resolveGitRepo } from "../utils/gitRepoInfo";
+import type { ItemTestFilesContextV1 } from "../utils/itemTestFilesV1";
+import { readTaskImplementationBaselineShaV1 } from "../utils/taskImplementationBaselineV1";
+import { buildTestFailuresV1, formatTestFailuresV1, writeTestFailuresFileV1, type TestFailureV1 } from "../utils/testFailuresV1";
+import { buildItemTestFilesContextV1, scanKnownTestFilesV1, type RoundLedgerIdsV1 } from "./itemTestFilesContextV1";
 import { getCanonicalImplementationUri } from "../utils/implementationArtifactResolver";
 import {
   getPlanRevisionV1,
@@ -40,6 +47,52 @@ import { applyOwnerTickToProvisionalItemV1 } from "./settleChecklistItem";
 export interface EvidenceGapChecksRunV1 {
   readonly ran: boolean;
   readonly detail?: string;
+  /** bugs7 item 5: the failed checks of the run (command, output, failing tests), when it ran and did not pass. */
+  readonly failedChecks?: readonly {
+    readonly command: string;
+    readonly output: string;
+    readonly failingTests?: FailingTestSummaryV1;
+    readonly quarantined?: boolean;
+  }[];
+  readonly runAt?: string;
+}
+
+/** The files the task changed (workspace-relative), from the task-start baseline; empty when git cannot say. */
+export async function readTaskChangedFilesV1(folderUri: vscode.Uri, workspaceRootFsPath: string): Promise<string[]> {
+  try {
+    const baselineSha = await readTaskImplementationBaselineShaV1(folderUri);
+    const repoRoot = await resolveGitRepo(workspaceRootFsPath);
+    if (!baselineSha || !repoRoot) return [];
+    return (await listChangedFilesSinceShaV1(repoRoot, baselineSha, workspaceRootFsPath)).files;
+  } catch {
+    return [];
+  }
+}
+
+/** The failing tests of a failed run, classified against the task's changed files; saved for the next round to read. */
+export async function describeEvidenceRunFailuresForTaskV1(input: {
+  readonly folderUri: vscode.Uri;
+  readonly workspaceRootFsPath: string;
+  readonly run: EvidenceGapChecksRunV1;
+  readonly readChangedFiles?: typeof readTaskChangedFilesV1;
+}): Promise<ClassifiedEvidenceRunFailureV1[]> {
+  const checks = input.run.failedChecks ?? [];
+  const failures: TestFailureV1[] = [];
+  const flakes: string[] = [];
+  for (const check of checks) {
+    const built = buildTestFailuresV1(check.output, check.failingTests);
+    failures.push(...built);
+    if (check.quarantined === true) for (const failure of built) flakes.push(failure.file ?? failure.name);
+  }
+  if (failures.length === 0) return [];
+  const changedFiles = await (input.readChangedFiles ?? readTaskChangedFilesV1)(input.folderUri, input.workspaceRootFsPath);
+  const classified = classifyEvidenceRunFailuresV1({ failures, changedFiles, knownFlakes: flakes });
+  // The next Apply Review reads these (review1 Step 51's file), so "Fix the failing tests" has the failures in hand.
+  await writeTestFailuresFileV1(
+    input.folderUri.fsPath,
+    formatTestFailuresV1(failures, { runAt: input.run.runAt ?? new Date().toISOString() })
+  ).catch(() => undefined);
+  return classified;
 }
 
 /**
@@ -79,7 +132,13 @@ export async function runEvidenceGapChecksV1(input: {
       passed: result.passedModuloKnownFlakes ?? result.passed,
       testFiles: result.passedTestFiles ?? [],
     });
-    return { ran: true };
+    const failed = (result.failedChecks ?? []).map((check) => ({
+      command: check.command,
+      output: check.output,
+      ...(check.failingTests !== undefined ? { failingTests: check.failingTests } : {}),
+      quarantined: check.quarantine !== undefined,
+    }));
+    return { ran: true, runAt: result.runAt, ...(failed.length > 0 ? { failedChecks: failed } : {}) };
   } catch (error) {
     if (error instanceof vscode.CancellationError) throw error;
     return { ran: false, detail: error instanceof Error ? error.message : String(error) };
@@ -157,10 +216,19 @@ export async function closeEvidenceGapWithPublishChecksV1(input: {
     return { itemText: item.text, passingRuns, ...(reason !== undefined ? { reason } : {}) };
   });
   const nextStage = nextStageAfterV1(input.stage);
+  const failures =
+    attempt === "failed"
+      ? await describeEvidenceRunFailuresForTaskV1({
+          folderUri: input.folderUri,
+          workspaceRootFsPath: input.workspaceRootFsPath,
+          run,
+        }).catch(() => [])
+      : [];
   const card = buildEvidenceGapCardInputV1({
     taskFolderPath,
     stage: input.stage,
     attempt,
+    ...(failures.length > 0 ? { failures } : {}),
     ...(run.detail !== undefined ? { attemptDetail: run.detail } : {}),
     score: input.score,
     items,
@@ -196,19 +264,37 @@ export async function recordPublishChecksReportsForItemsV1(input: {
   readonly progress: {
     readonly planItemEvidence?: readonly {
       readonly itemKey: string;
-      readonly testReports?: readonly { readonly testIdentity: string; readonly command: string }[];
+      readonly claims?: readonly { readonly roundId?: string; readonly evidence?: string }[];
+      readonly verifications?: readonly { readonly roundId?: string }[];
+      readonly testReports?: readonly { readonly testIdentity: string; readonly command: string; readonly roundId?: string }[];
     }[];
+    readonly roundLedger?: readonly RoundLedgerIdsV1[];
   };
   readonly itemTexts: readonly string[];
+  /** The passing output's test files; a member command's names are already qualified with its folder. */
   readonly passedTestFiles: readonly string[];
 }): Promise<{ readonly recordedItems: readonly string[]; readonly reasonByItem: Map<string, string> }> {
   const reasonByItem = new Map<string, string>();
-  const itemsWithFiles = input.itemTexts.map((itemText) => {
-    const row = (input.progress.planItemEvidence ?? []).find((entry) => entry.itemKey === normalizeChecklistItemTextV1(itemText));
-    const rejectedCommands = (row?.testReports ?? []).slice(-5).map((report) => `${report.testIdentity} ${report.command}`);
-    return { itemText, testFiles: identifyItemTestFilesV1(itemText, rejectedCommands) };
-  });
-  const matched = matchPassedOutputToItemsV1(itemsWithFiles, input.passedTestFiles);
+  // bugs7 item 1: one resolver for the item's test files; its rounds' changed test files come from their run records.
+  const known = await scanKnownTestFilesV1(input.workspaceRootFsPath).catch(() => ({ files: [] as string[], capped: false }));
+  const itemsWithFiles = await Promise.all(
+    input.itemTexts.map(async (itemText) => {
+      const row = (input.progress.planItemEvidence ?? []).find((entry) => entry.itemKey === normalizeChecklistItemTextV1(itemText));
+      const rejectedCommands = (row?.testReports ?? []).slice(-5).map((report) => `${report.testIdentity} ${report.command}`);
+      const itemContext = await buildItemTestFilesContextV1({
+        workspaceRoot: input.workspaceRootFsPath,
+        taskFolderPath: input.folderUri.fsPath,
+        ...(row ? { evidenceRow: row } : {}),
+        ...(input.progress.roundLedger ? { roundLedger: input.progress.roundLedger } : {}),
+        known,
+      }).catch(() => undefined);
+      const claimEvidence = (row?.claims ?? []).map((claim) => claim.evidence ?? "").join(" ");
+      const resolved = identifyItemTestFilesDetailV1(itemText, rejectedCommands, itemContext, claimEvidence);
+      return { itemText, testFiles: resolved.files, ambiguous: resolved.ambiguous };
+    })
+  );
+  const context: ItemTestFilesContextV1 = { knownTestFiles: known.files, knownFilesCapped: known.capped };
+  const matched = matchPassedOutputToItemsV1(itemsWithFiles, input.passedTestFiles, context);
   for (const entry of matched.unidentified) reasonByItem.set(normalizeChecklistItemTextV1(entry.itemText), entry.reason);
   if (matched.recordable.length === 0) return { recordedItems: [], reasonByItem };
   const at = new Date().toISOString();

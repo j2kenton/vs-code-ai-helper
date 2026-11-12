@@ -32,6 +32,13 @@ import {
   walkLinesV1,
 } from "./markdownStructure";
 import { DEFAULT_TEXT_ANSWER_MAX_LENGTH_V1 } from "../types/structuredQuestionV1";
+import {
+  ambiguousTestNameReasonV1,
+  commandCoversTestFileV1,
+  contextForItemV1,
+  resolveItemTestFilesV1,
+  type ItemTestFilesContextV1,
+} from "./itemTestFilesV1";
 
 /**
  * One checklist line, split so a merge can rewrite only the checkbox glyph and
@@ -4461,7 +4468,6 @@ export type TestReportDiagnosisV1 =
   | { readonly kind: "applicable"; readonly report: ApplicablePlanItemTestReportV1 }
   | { readonly kind: "not-applicable"; readonly reason: string };
 
-const TEST_FILE_TOKEN_V1 = /[\w@.\-/\\]+?\.(?:test|spec)\.(?:[cm]?[jt]sx?)(?![\w-])/gi;
 /**
  * A statement that the run used the edited tree. review1 Step 13: besides "post-edit source state", "post-edit
  * run", "final source" and "tree fingerprint", plain statements count: "on the working tree after the edit",
@@ -4489,26 +4495,36 @@ function normalizeTestPathTokenV1(token: string): string {
     .replace(/^[([{'"`]+|[)\]}'"`,;]+$/g, "");
 }
 
-/** `src/test/X.test.ts` and the compiled `out/test/X.test.js` are one test: compare by directory-free stem. */
-function testStemV1(token: string): string {
-  const normalized = normalizeTestPathTokenV1(token);
-  return (normalized.split("/").pop() ?? normalized).replace(/\.(?:[cm]?[jt]sx?)$/, "");
+/**
+ * bugs7 item 1: `src/test/X.test.ts` and the compiled `out/test/X.test.js` are one test, but two files that only share
+ * a directory-free stem (`packages/a/x.test.ts`, `packages/b/x.test.ts`) are not. The identity rule lives in
+ * `commandCoversTestFileV1`; a directory the runner was pointed at covers the tests under it, and a bare word such as
+ * `test` never covers every test file.
+ */
+function recordCoversTestV1(
+  commandTokens: readonly string[],
+  evidencePath: string,
+  context?: ItemTestFilesContextV1,
+  baseDir?: string
+): boolean {
+  return commandCoversTestFileV1(commandTokens, normalizeTestPathTokenV1(evidencePath), context, baseDir !== undefined ? { baseDir } : {});
 }
 
-function recordCoversTestV1(commandTokens: readonly string[], evidencePath: string): boolean {
-  const wanted = normalizeTestPathTokenV1(evidencePath);
-  const wantedStem = testStemV1(wanted);
-  return commandTokens.some((raw) => {
-    const token = normalizeTestPathTokenV1(raw);
-    if (!token) return false;
-    if (token === wanted) return true;
-    const last = token.split("/").pop() ?? token;
-    if (/\.[a-z]+$/.test(last)) return wantedStem.length > 0 && testStemV1(token) === wantedStem;
-    // A directory the runner was pointed at (`vitest run src/__tests__/`) covers the tests under it.
-    // Only path-shaped tokens count: a bare word such as `test` must not cover every test file.
-    const dir = token.replace(/\/+$/, "");
-    return dir.includes("/") && (wanted.startsWith(`${dir}/`) || wanted.includes(`/${dir}/`));
-  });
+/**
+ * The folder a stored test report ran in: its recorded working directory, else a `cd <dir> &&` or `[dir]` prefix of
+ * its command. `undefined` for the workspace root.
+ */
+export function reportBaseDirV1(command: string, workingDirectory?: string): string | undefined {
+  const stated = workingDirectory?.trim();
+  return recordBaseDirV1(command, stated ? `working directory: ${stated}` : "");
+}
+
+/** The folder a Verification record ran in: its stated `cwd`/working directory, a `cd <dir> &&` prefix, or a `[dir]` prefix. */
+function recordBaseDirV1(command: string, recordText: string): string | undefined {
+  const stated = /(?:working directory|cwd)\s*[:=]\s*`?([^`\s][^`\n]*?)`?\s*(?:$|[,;.)])/i.exec(recordText)?.[1]?.trim();
+  const dir = stated ?? /^\s*cd\s+([^\s&;]+)\s*(?:&&|;)/.exec(command)?.[1] ?? /^\s*\[([^\]]+)\]\s/.exec(command)?.[1];
+  const cleaned = dir?.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+  return cleaned !== undefined && cleaned !== "" && cleaned !== "." ? cleaned : undefined;
 }
 
 /**
@@ -4519,11 +4535,29 @@ function recordCoversTestV1(commandTokens: readonly string[], evidencePath: stri
  * parser tied to this command when it accepted the report, so there is no file to re-check; the
  * narrower basename-only check this replaces rejected every such report at apply time.
  */
-export function reportCommandCoversTestIdentityV1(command: string, testIdentity: string): boolean {
+export function reportCommandCoversTestIdentityV1(
+  command: string,
+  testIdentity: string,
+  context?: ItemTestFilesContextV1,
+  baseDir?: string
+): boolean {
   const identity = testIdentity.trim().replace(/\\/g, "/").replace(/^\.\//, "");
-  const bareTestFile = !/\s/.test(identity) && /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(identity);
-  if (!bareTestFile) return true;
-  return recordCoversTestV1(command.split(/[\s'"`;=,]+/), identity);
+  const commandTokens = command.split(/[\s'"`;=,]+/);
+  // A file-list identity (one file, or several joined with ", ") is covered file by file, by identity.
+  const parts = identity.split(/\s*,\s*/).filter((part) => part !== "");
+  const isTestFile = (part: string): boolean => !/\s/.test(part) && /\.(?:test|spec)\.[cm]?[jt]sx?$/i.test(part);
+  if (parts.length > 0 && parts.every(isTestFile)) {
+    return parts.every((part) => recordCoversTestV1(commandTokens, part, context, baseDir));
+  }
+  // A command-shaped identity (the evidence quoted the command) must be the report's own command. An identity that is
+  // neither (an older record's sentence) names no file, so there is nothing to re-check.
+  const collapse = (text: string): string => text.replace(/\s+/g, " ").trim().toLowerCase();
+  const wantedCommand = collapse(identity);
+  const have = collapse(command);
+  if (/^(?:pnpm|npm|npx|yarn|node|vitest|jest|cd|bun|deno|tsx)\b/.test(wantedCommand)) {
+    return have === wantedCommand || have.includes(wantedCommand) || wantedCommand.includes(have);
+  }
+  return true;
 }
 
 function countsInRecordV1(text: string, pattern: RegExp): number[] {
@@ -4543,9 +4577,12 @@ function countsInRecordV1(text: string, pattern: RegExp): number[] {
 export function diagnoseApplicablePassingTestReportForItemV1(
   planOfRecord: string,
   itemText: string,
-  editingRoundReport: string
+  editingRoundReport: string,
+  suppliedContext?: ItemTestFilesContextV1
 ): TestReportDiagnosisV1 {
   const no = (reason: string): TestReportDiagnosisV1 => ({ kind: "not-applicable", reason });
+  // The item's own historical round files (rounds that built or claimed it) join the caller's round files.
+  const context = contextForItemV1(suppliedContext, normalizeChecklistItemTextV1(itemText));
   if (!editingRoundReport) return no("the round left no report");
   if (!isTestDependentChecklistItemV1(itemText)) return no("the item is not test-dependent");
   const wanted = normalizeChecklistItemTextV1(itemText);
@@ -4616,15 +4653,19 @@ export function diagnoseApplicablePassingTestReportForItemV1(
   const evidenceCommands = [...itemClaimEvidence.matchAll(/`([^`]+)`/g)]
     .map((m) => (m[1] ?? "").trim())
     .filter((span) => /\s/.test(span));
-  const evidenceNamesTests = /\btests?\b|\.(?:test|spec)\.|\bvitest\b|\bjest\b/i.test(itemClaimEvidence);
-  if (!itemClaimEvidence || (!evidenceNamesTests && evidenceCommands.length === 0)) {
+  // bugs7 item 1: the item's test files, from its own text, the claim's evidence (module names with or without
+  // `.test.ts`) and the files the rounds that built it changed. The whole evidence sentence is never a path.
+  const resolvedTestFiles = resolveItemTestFilesV1({ itemText, evidenceText: itemClaimEvidence, ...(context ? { context } : {}) });
+  const evidenceNamesTests =
+    /\btests?\b|\.(?:test|spec)\.|\bvitest\b|\bjest\b/i.test(itemClaimEvidence) || resolvedTestFiles.files.length > 0;
+  if (!evidenceNamesTests && evidenceCommands.length === 0) {
     return no("the item's evidence names no test file, test name or command (name the test file, for example `foo.test.ts`, or the command in backticks)");
   }
   const evidenceKey = itemClaimEvidence
     .replace(/^\s*test(?:\s+evidence)?\s*[:=]\s*/i, "")
     .trim()
     .toLowerCase();
-  if (!evidenceKey) return no("the item's evidence names no test file, test name or command (name the test file, for example `foo.test.ts`, or the command in backticks)");
+  if (!evidenceKey && resolvedTestFiles.files.length === 0) return no("the item's evidence names no test file, test name or command (name the test file, for example `foo.test.ts`, or the command in backticks)");
 
   const verificationAt = findLastHeadingV1(all, "Verification");
   const verificationHeading = verificationAt < 0 ? undefined : all[verificationAt];
@@ -4658,6 +4699,8 @@ export function diagnoseApplicablePassingTestReportForItemV1(
     readonly command: string;
     readonly commandTokens: string[];
     readonly text: string;
+    /** The folder the command ran in, when the record says (a bare name is then read relative to it). */
+    readonly baseDir?: string;
   }
   const records: VerificationRecordV1[] = [];
   for (let i = 0; i < verificationLines.length; i++) {
@@ -4675,10 +4718,13 @@ export function diagnoseApplicablePassingTestReportForItemV1(
       recordLines.push(next.text);
       if (!NOT_RUN_LINE_V1.test(next.text)) listed.push(next.text);
     }
+    const recordText = recordLines.join(" ");
+    const baseDir = recordBaseDirV1(command, recordText);
     records.push({
       command,
       commandTokens: [command, ...listed].join(" ").split(/[\s'"`;=,]+/),
-      text: recordLines.join(" "),
+      text: recordText,
+      ...(baseDir !== undefined ? { baseDir } : {}),
     });
   }
   if (records.length === 0) {
@@ -4708,21 +4754,35 @@ export function diagnoseApplicablePassingTestReportForItemV1(
       const have = collapse(r.command);
       return have === wantedCommand || have.includes(wantedCommand) || wantedCommand.includes(have);
     });
-    const report = record ? build(record, wantedCommand) : undefined;
+    // bugs7 review: pointing at a passing command is not enough. The command must also cover every file the item
+    // resolved to, and an item whose test name is ambiguous settles nothing by quoting a command.
+    const coversResolved =
+      record !== undefined &&
+      resolvedTestFiles.ambiguous.length === 0 &&
+      resolvedTestFiles.files.length > 0 &&
+      resolvedTestFiles.files.every((file) => recordCoversTestV1(record.commandTokens, file, context, record.baseDir));
+    const report = record && coversResolved ? build(record, resolvedTestFiles.files.join(", ").slice(0, 1000)) : undefined;
     if (report) return { kind: "applicable", report };
   }
 
   // Evidence naming one or several test files, with prose around them: every
   // named file must be covered by a passing command.
-  const named = [...new Set((itemClaimEvidence.match(TEST_FILE_TOKEN_V1) ?? []).map(normalizeTestPathTokenV1))];
-  const targets = named.length > 0 ? named : [evidenceKey.replace(/\\/g, "/").replace(/^\.\//, "")];
+  if (resolvedTestFiles.files.length === 0) {
+    return no(
+      resolvedTestFiles.ambiguous.length > 0
+        ? ambiguousTestNameReasonV1(resolvedTestFiles.ambiguous)
+        : "no test file could be identified for this item (name the test file, for example `foo.test.ts`)"
+    );
+  }
+  const targets = resolvedTestFiles.files;
+  const identity = targets.join(", ").slice(0, 1000);
   let firstReport: ApplicablePlanItemTestReportV1 | undefined;
   for (const target of targets) {
-    const covering = records.filter((r) => recordCoversTestV1(r.commandTokens, target));
+    const covering = records.filter((r) => recordCoversTestV1(r.commandTokens, target, context, r.baseDir));
     if (covering.length === 0) {
-      return no(`no Verification command names ${named.length > 0 ? `\`${target}\`` : `“${evidenceKey.slice(0, 80)}”`}`);
+      return no(`no Verification command names \`${target}\``);
     }
-    const report = covering.map((r) => build(r, evidenceKey)).find((r): r is ApplicablePlanItemTestReportV1 => r !== undefined);
+    const report = covering.map((r) => build(r, identity)).find((r): r is ApplicablePlanItemTestReportV1 => r !== undefined);
     if (!report) {
       return no(`the command covering \`${target}\` did not report “N passed” and “0 failed” (state both counts next to the command)`);
     }
@@ -4738,14 +4798,15 @@ export function diagnoseApplicablePassingTestReportForItemV1(
  */
 export function listUncountedTestReportClaimsV1(
   planOfRecord: string,
-  editingRoundReport: string
+  editingRoundReport: string,
+  context?: ItemTestFilesContextV1
 ): ReadonlyArray<{ readonly itemText: string; readonly reason: string }> {
   const uncounted: Array<{ itemText: string; reason: string }> = [];
   const candidates = itemsInLatestRendering(planOfRecord)
     .filter((item) => !item.excluded && isTestDependentChecklistItemV1(item.text))
     .map((item) => unescapeChecklistItemTextV1(item.text));
   for (const itemText of candidates) {
-    const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport);
+    const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport, context);
     if (diagnosis.kind === "applicable") continue;
     if (/did not claim this item done|left no report/.test(diagnosis.reason)) continue;
     uncounted.push({ itemText, reason: diagnosis.reason });
@@ -4770,18 +4831,20 @@ export function formatUncountedTestReportClaimsSectionV1(
 export function getApplicablePassingTestReportForItemV1(
   planOfRecord: string,
   itemText: string,
-  editingRoundReport: string
+  editingRoundReport: string,
+  context?: ItemTestFilesContextV1
 ): ApplicablePlanItemTestReportV1 | undefined {
-  const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport);
+  const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport, context);
   return diagnosis.kind === "applicable" ? diagnosis.report : undefined;
 }
 
 export function hasApplicablePassingTestReportForItemV1(
   planOfRecord: string,
   itemText: string,
-  editingRoundReport: string
+  editingRoundReport: string,
+  context?: ItemTestFilesContextV1
 ): boolean {
-  return getApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport) !== undefined;
+  return getApplicablePassingTestReportForItemV1(planOfRecord, itemText, editingRoundReport, context) !== undefined;
 }
 
 /** Ordered, untruncated authority for what an editing round may claim as open plan work. */
@@ -5295,7 +5358,7 @@ type MergeChecklistProgressOutcomeV1 =
 export function mergeChecklistProgressV1(
   planOfRecord: string,
   summary: string,
-  options?: { readonly reviewerVerified?: boolean }
+  options?: { readonly reviewerVerified?: boolean; readonly testFilesContext?: ItemTestFilesContextV1 }
 ): MergeChecklistProgressResultV1 {
   // review1 Step 9: claims by item id or a bare `Step N` are resolved to the item they name; a reference that
   // names nothing (or several items) is reported here with a true reason and is never an unmatched claim, so
@@ -5308,7 +5371,7 @@ export function mergeChecklistProgressV1(
 function mergeChecklistProgressCoreV1(
   planOfRecord: string,
   summary: string,
-  options: { readonly reviewerVerified?: boolean } | undefined,
+  options: { readonly reviewerVerified?: boolean; readonly testFilesContext?: ItemTestFilesContextV1 } | undefined,
   referenceProblems: string[]
 ): MergeChecklistProgressResultV1 {
   // Only the echoed checklist counts as reported progress. The summary's own
@@ -5502,7 +5565,7 @@ function mergeChecklistProgressCoreV1(
     for (const key of [...reported.keys()]) {
       const itemText = planTextByKey.get(key);
       if (itemText && isTestDependentChecklistItemV1(itemText) &&
-          !hasApplicablePassingTestReportForItemV1(planOfRecord, itemText, summary)) {
+          !hasApplicablePassingTestReportForItemV1(planOfRecord, itemText, summary, options?.testFilesContext)) {
         reported.delete(key);
         retroactiveKeys.delete(key);
         retroactiveEvidenceByKey.delete(key);

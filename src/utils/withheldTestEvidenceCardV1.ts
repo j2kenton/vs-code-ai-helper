@@ -1,7 +1,6 @@
 import { STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
 import type { WorkflowDecisionOptionV1 } from "../types/workflowDecisionV1";
 import type { PostWorkflowDecisionInputV1 } from "./workflowDecisionDispatchV1";
-import { TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1 } from "./implementationChecklist";
 import { normalizePath } from "./taskRoot";
 
 /**
@@ -45,8 +44,8 @@ export function buildWithheldTestEvidenceCardInputV1(
       return `  - ${shorten(item, 140)}${reason ? ` — ${reason}` : ""}`;
     }),
     count > 8 ? `  - …and ${count - 8} more` : undefined,
-    TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1,
-    "No editing round is offered for this: another round cannot produce a test report that counts.",
+    "Ensemble ticks a test item only with a passing test report. The review says these are done, but the report didn't count.",
+    "To settle them: run Publish Checks, record a test run you did, or tick them.",
   ].filter((line): line is string => line !== undefined);
   const options: WorkflowDecisionOptionV1[] = [
     {
@@ -69,8 +68,8 @@ export function buildWithheldTestEvidenceCardInputV1(
     },
     {
       optionId: "tickThese",
-      label: count === 1 ? "Tick this item myself" : `Tick these ${count} items myself`,
-      consequence: `Ticks ${count === 1 ? "the item" : "the items"} in plan-final.md and records the tick as yours, accepting the review's verification without a test report. Use it when you know the tests pass.`,
+      label: count === 1 ? "I've checked it, tick it now" : "I've checked them, tick them now",
+      consequence: `Ensemble ticks ${count === 1 ? "the item" : "the items"} in plan-final.md now and records the tick as yours, without a test report. Use it when you know the tests pass.`,
       resumeKind: "continue",
       effect: { kind: "command", command: TICK_WITHHELD_TEST_ITEMS_COMMAND_V1, args: [{ ...taskArg, itemTexts: facts.items }] },
       recordedNext: "your ticks are recorded",

@@ -35,8 +35,11 @@ import {
   isTestDependentChecklistItemV1,
   POST_EDIT_STATEMENT_V1,
   reportCommandCoversTestIdentityV1,
+  reportBaseDirV1,
   TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1,
 } from "../utils/implementationChecklist";
+import { commandCoversTestFileV1, resolveItemTestFilesV1, type ItemTestFilesContextV1 } from "../utils/itemTestFilesV1";
+import { buildItemTestFilesContextV1, type RoundLedgerIdsV1 } from "./itemTestFilesContextV1";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
 import { writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
 import { PlanItemEvidenceV1, PlanItemOwnerTestRunV1, PlanItemTestReportV1, STAGE_ARTIFACT_FILENAMES, TaskStage, isReviewStage } from "../types/taskProgress";
@@ -321,7 +324,7 @@ export function describeWithheldTestItemsV1(
         return reason ? `  - ${item} — ${reason}` : `  - ${item}`;
       })
       .join("\n") + more;
-  return `${items.length} test-dependent item${items.length === 1 ? "" : "s"} wait${items.length === 1 ? "s" : ""} for a passing test report and stay provisional:\n${bullets}\n${TEST_EVIDENCE_SATISFYING_COMMAND_HINT_V1}`;
+  return `${items.length} test-dependent item${items.length === 1 ? "" : "s"} wait${items.length === 1 ? "s" : ""} for a passing test report and stay provisional:\n${bullets}\nTo settle them: run Publish Checks, record a test run you did, or tick them.`;
 }
 
 /**
@@ -409,6 +412,123 @@ export function ownerRecordedPassingRunCoversItemV1(
   });
 }
 
+interface GateResolvedFilesV1 {
+  readonly files: readonly string[];
+  readonly ambiguous: boolean;
+  readonly context: ItemTestFilesContextV1 | undefined;
+  /** The workspace root, so a report's absolute working directory can be read as a folder inside it. */
+  readonly workspaceRoot?: string;
+}
+
+/** A stored report's working directory as a workspace-relative folder (`undefined` for the root or outside it). */
+function reportBaseDirForGateV1(
+  report: Pick<PlanItemTestReportV1, "command" | "workingDirectory">,
+  workspaceRoot: string | undefined
+): string | undefined {
+  let stated = report.workingDirectory?.trim();
+  if (stated && workspaceRoot !== undefined && path.isAbsolute(stated)) {
+    const relative = path.relative(workspaceRoot, stated).replace(/\\/g, "/");
+    stated = relative.startsWith("..") || path.isAbsolute(relative) ? undefined : relative;
+  } else if (stated && path.isAbsolute(stated)) {
+    stated = undefined;
+  }
+  return reportBaseDirV1(report.command, stated);
+}
+
+/** The item's resolved test files for the evidence gate (none known when the workspace cannot be read). */
+async function resolveItemFilesForGateV1(
+  itemText: string,
+  itemRows: readonly PlanItemEvidenceV1[],
+  workspaceRoot: string | undefined,
+  taskFolderPath: string | undefined,
+  roundLedger?: readonly RoundLedgerIdsV1[]
+): Promise<GateResolvedFilesV1> {
+  if (workspaceRoot === undefined) return { files: [], ambiguous: false, context: undefined };
+  const context = await buildItemTestFilesContextV1({
+    workspaceRoot,
+    ...(taskFolderPath !== undefined ? { taskFolderPath } : {}),
+    ...(roundLedger !== undefined ? { roundLedger } : {}),
+    evidenceRow: {
+      claims: itemRows.flatMap((row) => row.claims),
+      verifications: itemRows.flatMap((row) => row.verifications ?? []),
+      testReports: itemRows.flatMap((row) => row.testReports ?? []),
+    },
+  }).catch(() => undefined);
+  if (!context) return { files: [], ambiguous: false, context: undefined };
+  const claimEvidence = itemRows.flatMap((row) => row.claims.map((claim) => claim.evidence ?? "")).join(" ");
+  const resolved = resolveItemTestFilesV1({ itemText, evidenceText: claimEvidence, context });
+  return { files: resolved.files, ambiguous: resolved.ambiguous.length > 0, context, workspaceRoot };
+}
+
+/**
+ * A round's report covers the item only when its command covers every resolved file, by identity. An item that
+ * resolves to no file is covered by nothing: a passing command settles a test item only through the files it ran.
+ */
+function reportCoversResolvedFilesV1(
+  report: Pick<PlanItemTestReportV1, "command" | "workingDirectory">,
+  resolved: GateResolvedFilesV1
+): boolean {
+  if (resolved.ambiguous || resolved.files.length === 0) return false;
+  const tokens = report.command.split(/[\s'"`;=,]+/);
+  const baseDir = reportBaseDirForGateV1(report, resolved.workspaceRoot);
+  return resolved.files.every((file) =>
+    commandCoversTestFileV1(tokens, file, resolved.context, baseDir !== undefined ? { baseDir } : {})
+  );
+}
+
+/**
+ * bugs7 item 1 (Step 5): the round ids of the passing reports (a report with 0 failed that is still current: a round's
+ * post-edit report, or a Publish Checks report) that together cover every test file the item resolves to, or
+ * `undefined` when the item resolves to no file, to an ambiguous name, or a file no current passing report ran.
+ */
+async function acceptedPassingReportsCoverItemV1(input: {
+  readonly itemText: string;
+  readonly itemRows: readonly PlanItemEvidenceV1[];
+  readonly evidenceRecords: readonly PlanItemEvidenceV1[];
+  readonly workspaceRoot: string | undefined;
+  readonly taskFolderPath: string | undefined;
+  readonly roundLedger?: readonly RoundLedgerIdsV1[];
+}): Promise<string[] | undefined> {
+  if (input.workspaceRoot === undefined) return undefined;
+  const context = await buildItemTestFilesContextV1({
+    workspaceRoot: input.workspaceRoot,
+    ...(input.taskFolderPath !== undefined ? { taskFolderPath: input.taskFolderPath } : {}),
+    ...(input.roundLedger !== undefined ? { roundLedger: input.roundLedger } : {}),
+    evidenceRow: {
+      claims: input.itemRows.flatMap((row) => row.claims),
+      verifications: input.itemRows.flatMap((row) => row.verifications ?? []),
+      testReports: input.itemRows.flatMap((row) => row.testReports ?? []),
+    },
+  }).catch(() => undefined);
+  if (!context) return undefined;
+  const claimEvidence = input.itemRows.flatMap((row) => row.claims.map((claim) => claim.evidence ?? "")).join(" ");
+  const resolved = resolveItemTestFilesV1({ itemText: input.itemText, evidenceText: claimEvidence, context });
+  if (resolved.files.length === 0 || resolved.ambiguous.length > 0) return undefined;
+  const current: PlanItemTestReportV1[] = [];
+  for (const report of input.evidenceRecords.flatMap((record) => record.testReports ?? [])) {
+    if (report.passed <= 0 || report.failed !== 0) continue;
+    if (report.source !== "publishChecks" && !POST_EDIT_STATEMENT_V1.test(report.sourceState)) continue;
+    if (await reportSourceStateStillCurrentV1(report, input.workspaceRoot)) current.push(report);
+  }
+  const roundIds = new Set<string>();
+  for (const file of resolved.files) {
+    // A round's report covers what its COMMAND ran; its `testIdentity` is only what it was recorded against. A Publish
+    // Checks report has no command line to match, so its identity is the list of files the run's output named.
+    const covering = current.filter((report) => {
+      const baseDir = reportBaseDirForGateV1(report, input.workspaceRoot);
+      return commandCoversTestFileV1(
+        (report.source === "publishChecks" ? `${report.command} ${report.testIdentity}` : report.command).split(/[\s'"`;=,]+/),
+        file,
+        context,
+        baseDir !== undefined ? { baseDir } : {}
+      );
+    });
+    if (covering.length === 0) return undefined;
+    for (const report of covering) roundIds.add(report.roundId);
+  }
+  return [...roundIds];
+}
+
 /**
  * The test-evidence gate a reviewer's verification passes through: an item
  * that is not test-dependent is accepted as is; a test-dependent one only
@@ -423,7 +543,11 @@ async function gateTestDependentItemsV1(
   workspaceRoot: string | undefined,
   ownerTestRuns: readonly PlanItemOwnerTestRunV1[] = [],
   /** review1 (review fix): the plan item each of `items` means, by position; falls back to naming it by text. */
-  itemEntries: readonly (PlanItemHashEntryV1 | undefined)[] = []
+  itemEntries: readonly (PlanItemHashEntryV1 | undefined)[] = [],
+  /** bugs7 item 1: the task folder, so an item's test files can come from the run records of the rounds that built it. */
+  taskFolderPath?: string,
+  /** bugs7 item 1: the round ledger, so a run record that prints an operation or attempt id is still found. */
+  roundLedger?: readonly RoundLedgerIdsV1[]
 ): Promise<{
   accepted: string[];
   /** Positions in `items` of the accepted ones, aligned with `accepted` and `testReportRoundIds`. */
@@ -455,11 +579,15 @@ async function gateTestDependentItemsV1(
     const itemRows = evidenceRecords.filter((record) =>
       itemEntry !== undefined ? planItemRowAppliesV1(record, itemEntry) : record.itemKey === itemKey
     );
+    // bugs7 review: a report counts for the item only when its command covers every file the item resolves to, by
+    // identity; an ambiguous test name never settles anything (a quoted command is no exception).
+    const resolvedForItem = await resolveItemFilesForGateV1(itemText, itemRows, workspaceRoot, taskFolderPath, roundLedger);
     const candidateReports = itemRows
       .flatMap((record) => record.testReports ?? [])
       .filter((report) =>
         report.passed > 0 &&
         report.failed === 0 &&
+        (report.source === "publishChecks" || reportCoversResolvedFilesV1(report, resolvedForItem)) &&
         // bugs4 item 21: the SAME statement the report parser accepted ("post-edit run", "final
         // source", a tree fingerprint). A narrower copy here withheld every report the parser had
         // just accepted when the round wrote "on the final source".
@@ -468,7 +596,12 @@ async function gateTestDependentItemsV1(
         // Likewise its test files came from the run's own output, not from a command line to match them against.
         (report.source === "publishChecks" ||
           (POST_EDIT_STATEMENT_V1.test(report.sourceState) &&
-            reportCommandCoversTestIdentityV1(report.command, report.testIdentity)))
+            reportCommandCoversTestIdentityV1(
+              report.command,
+              report.testIdentity,
+              resolvedForItem.context,
+              reportBaseDirForGateV1(report, workspaceRoot)
+            )))
       );
     const currentReports: PlanItemTestReportV1[] = [];
     for (const report of candidateReports) {
@@ -485,6 +618,22 @@ async function gateTestDependentItemsV1(
         accepted.push(itemText);
         acceptedIndices.push(itemIndex);
         testReportRoundIds.push([]);
+        continue;
+      }
+      // bugs7 item 1 (Step 5): the review names the item verified and a passing report already accepted for the
+      // task ran the item's test files (resolved by the one resolver): tick it, with no card.
+      const coveringRoundIds = await acceptedPassingReportsCoverItemV1({
+        itemText,
+        itemRows,
+        evidenceRecords,
+        workspaceRoot,
+        taskFolderPath,
+        ...(roundLedger !== undefined ? { roundLedger } : {}),
+      });
+      if (coveringRoundIds !== undefined) {
+        accepted.push(itemText);
+        acceptedIndices.push(itemIndex);
+        testReportRoundIds.push(coveringRoundIds);
         continue;
       }
       withheld.push(itemText);
@@ -645,7 +794,9 @@ export async function recordReviewerVerificationOfTickedItemsV1(
     plan.text,
     resolveWorkspaceRootForTaskV1(folderUri),
     progressRead.decoded.progress.planItemOwnerTestRuns ?? [],
-    ticked
+    ticked,
+    folderUri.fsPath,
+    progressRead.decoded.progress.roundLedger
   );
   if (acceptedIndices.length === 0) return 0;
   const verifiedAt = new Date().toISOString();
@@ -791,7 +942,9 @@ export async function deriveApplicableVerifiedTicksV1(
     plan.text,
     resolveWorkspaceRootForTaskV1(folderUri),
     progressRead.ok ? progressRead.decoded.progress.planItemOwnerTestRuns ?? [] : [],
-    candidateEntries
+    candidateEntries,
+    folderUri.fsPath,
+    progressRead.ok ? progressRead.decoded.progress.roundLedger : undefined
   );
   const { accepted: applicable, testReportRoundIds: applicableTestReportRoundIds, withheld: withheldTestItems, withheldReasons } = gated;
   const applicableItemIds = gated.acceptedIndices.map((index) => scopedTargets[index]?.itemId);

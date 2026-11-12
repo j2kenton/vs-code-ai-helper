@@ -4,8 +4,11 @@
  * covered here because they are not built yet.
  */
 import * as assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { describe, it } from "node:test";
 
+import { AUTO_CONTINUE_MINUTES_DEFAULT_V1 } from "../config/settings";
 import {
   WAIT_FOR_ME_OPTION_ID_V1,
   describeAutoContinueCountdownV1,
@@ -127,5 +130,16 @@ void describe("review1 Step 53: auto-continue policy", () => {
       describeAutoContinuedLineV1("Apply 9 Reviewer-Verified Ticks", 15),
       "Continued automatically with ‘Apply 9 Reviewer-Verified Ticks’ after 15 min (no answer)."
     );
+  });
+});
+
+void describe("the unattended countdown default (bugs7 item 7)", () => {
+  void it("is 2 minutes in package.json and in the code, so the two cannot drift", () => {
+    const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "..", "..", "package.json"), "utf8")) as {
+      contributes: { configuration: { properties: Record<string, { default?: unknown }> } };
+    };
+    const configured = manifest.contributes.configuration.properties["ensemble.decisions.autoContinueMinutes"];
+    assert.equal(configured?.default, 2);
+    assert.equal(AUTO_CONTINUE_MINUTES_DEFAULT_V1, 2);
   });
 });

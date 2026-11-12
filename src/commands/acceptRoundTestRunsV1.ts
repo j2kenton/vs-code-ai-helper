@@ -16,7 +16,9 @@ import {
 import { formatNotificationTaskLabelV1 } from "../utils/notificationTaskContextV1";
 import { recordPlanItemClaimEvidenceV1, recordPlanItemTestReportV1 } from "../utils/taskProgressTransforms";
 import { computeTestDependencyStatesV1 } from "../utils/testDependencyStateV1";
+import type { ItemTestFilesContextV1 } from "../utils/itemTestFilesV1";
 import { resolveWorkspaceRootForTaskV1 } from "./applyReviewerVerifiedTicks";
+import { buildItemTestFilesContextV1 } from "./itemTestFilesContextV1";
 
 /**
  * review2 Step 6 (bugs6 item 25): "Accept the round's test runs". The open-items card offers it for items whose
@@ -43,7 +45,8 @@ export interface RoundTestRunAcceptancePlanV1 {
 export function planRoundTestRunAcceptanceV1(
   planText: string,
   roundReport: string,
-  itemTexts: readonly string[]
+  itemTexts: readonly string[],
+  context?: ItemTestFilesContextV1
 ): RoundTestRunAcceptancePlanV1 {
   const accepted: { itemText: string; report: ApplicablePlanItemTestReportV1 }[] = [];
   const notRecorded: { itemText: string; reason: string }[] = [];
@@ -52,7 +55,7 @@ export function planRoundTestRunAcceptanceV1(
     const key = normalizeChecklistItemTextV1(itemText);
     if (seen.has(key)) continue;
     seen.add(key);
-    const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planText, itemText, roundReport);
+    const diagnosis = diagnoseApplicablePassingTestReportForItemV1(planText, itemText, roundReport, context);
     if (diagnosis.kind === "applicable") accepted.push({ itemText, report: diagnosis.report });
     else notRecorded.push({ itemText, reason: diagnosis.reason });
   }
@@ -74,7 +77,14 @@ export async function acceptRoundTestRunsV1(
       message: `${taskName}: plan-final.md, the round's report or the progress file could not be read, so nothing was recorded.`,
     };
   }
-  const plan = planRoundTestRunAcceptanceV1(planText, roundReport, arg.itemTexts);
+  const contextRoot = resolveWorkspaceRootForTaskV1(folderUri) ?? arg.taskFolderPath;
+  const testFilesContext = await buildItemTestFilesContextV1({
+    workspaceRoot: contextRoot,
+    taskFolderPath: arg.taskFolderPath,
+    planItemEvidence: read.decoded.progress.planItemEvidence ?? [],
+    roundLedger: read.decoded.progress.roundLedger ?? [],
+  }).catch(() => undefined);
+  const plan = planRoundTestRunAcceptanceV1(planText, roundReport, arg.itemTexts, testFilesContext);
   const source = arg.runFile ? `the round's run ${arg.runFile}` : "the round's last report";
   if (plan.accepted.length > 0) {
     const workspaceRoot = resolveWorkspaceRootForTaskV1(folderUri) ?? arg.taskFolderPath;

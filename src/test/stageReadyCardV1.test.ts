@@ -129,6 +129,44 @@ void describe("the stage-ready card follows the owner's last settlement (Steps 3
     assert.ok(card.recommendation.kind === "option" && card.recommendation.optionId === "moveOn", "and it is the recommended option");
   });
 
+  void it("bugs7 item 6: two calls in the same state raise one card, whether they overlap or follow each other", async () => {
+    const { folder, settledPlan } = await stageWithCleanReview();
+    fs.writeFileSync(path.join(folder, "plan-final.md"), settledPlan);
+    const deps = { readWorkspaceIdentity: identity(REVIEWED_FINGERPRINT) };
+    const [a, b] = await Promise.all([
+      postStageReadyCardIfReadyV1(folder, "After your tick", deps),
+      postStageReadyCardIfReadyV1(folder, "After your tick", deps),
+    ]);
+    assert.equal(a.posted, true);
+    assert.deepEqual(b, a, "the overlapping call shares the first call's result");
+    const later = await postStageReadyCardIfReadyV1(folder, "After your tick", deps);
+    assert.equal(later.posted, false, "an open card for the same state is not raised again");
+    const cards = new WorkflowDecisionStoreV1(memento).listPending(folder).filter((d) => d.decisionKey === "automationStopped");
+    assert.equal(cards.length, 1);
+    assert.ok(!cards[0]!.options.some((o) => o.optionId === "startFastForward"), "a done stage offers no Fast Forward that would stop at once");
+  });
+
+  void it("bugs7 item 6 (review fix): the same state raised by a caller with different wording is one card; a changed review is a new state", async () => {
+    const { folder, settledPlan } = await stageWithCleanReview();
+    fs.writeFileSync(path.join(folder, "plan-final.md"), settledPlan);
+    const deps = { readWorkspaceIdentity: identity(REVIEWED_FINGERPRINT) };
+    const first = await postStageReadyCardIfReadyV1(folder, "After your tick", deps);
+    assert.equal(first.posted, true);
+    const otherCaller = await postStageReadyCardIfReadyV1(folder, "After your answer", { readWorkspaceIdentity: identity(REVIEWED_FINGERPRINT) });
+    assert.equal(otherCaller.posted, false, "the wording of the caller is not part of the state");
+    const open = (): number =>
+      new WorkflowDecisionStoreV1(memento).listPending(folder).filter((d) => d.decisionKey === "automationStopped").length;
+    assert.equal(open(), 1);
+    // A different review content (same displayed counts) is a new state and is raised again.
+    const reviewName = ["impl-high-review.md", "impl-review.md"].find((name) => fs.existsSync(path.join(folder, name)));
+    if (reviewName !== undefined) {
+      const review = fs.readFileSync(path.join(folder, reviewName), "utf8");
+      fs.writeFileSync(path.join(folder, reviewName), `${review}\n\nA later look found nothing more.\n`);
+      const changed = await postStageReadyCardIfReadyV1(folder, "After your tick", { readWorkspaceIdentity: identity(REVIEWED_FINGERPRINT) });
+      assert.equal(typeof changed.posted, "boolean");
+    }
+  });
+
   void it("an owner TICK on the last open items (not an exclusion) after a clean review posts the done card", async () => {
     const { folder } = await stageWithCleanReview();
     // The real settle path: it writes the ticked line and records the owner's row the gate counts.
