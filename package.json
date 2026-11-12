@@ -1753,7 +1753,8 @@
     "publish:major": "vsce publish major",
     "install:local": "node scripts/install-local.mjs",
     "release": "powershell -ExecutionPolicy Bypass -File scripts/release.ps1",
-    "ensemble:release": "npm run release"
+    "ensemble:release": "npm run release",
+    "ship": "powershell -ExecutionPolicy Bypass -File scripts/ship.ps1"
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
