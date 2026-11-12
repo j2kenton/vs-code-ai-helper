@@ -6,6 +6,7 @@ import {
   IMPL_REVIEW_STAGES,
   IMPLEMENTATION_SUMMARY_FILENAME,
   STAGE_ARTIFACT_FILENAMES,
+  STAGE_DISPLAY_NAMES,
   type TaskStage,
 } from "../types/taskProgress";
 import { readPartialScopeHoldV1 } from "./partialScopeDecisionV1";
@@ -280,7 +281,7 @@ export function reviewDescribesCurrentWorkspaceV1(
 }
 
 /** bugs7 item 6: calls that arrive while one for the same task is running are the same state; they share its result. */
-const stageReadyInFlightV1 = new Map<string, Promise<{ readonly posted: boolean }>>();
+const stageReadyInFlightV1 = new Map<string, Promise<StageReadyOutcomeV1>>();
 const stageReadyReaderIdsV1 = new WeakMap<object, number>();
 let stageReadyReaderCounterV1 = 0;
 
@@ -290,7 +291,7 @@ export function postStageReadyCardIfReadyV1(
   deps: {
     readonly readWorkspaceIdentity?: (workspaceRoot: string, reviewUri: vscode.Uri) => Promise<StageReadyWorkspaceIdentityV1>;
   } = {}
-): Promise<{ readonly posted: boolean }> {
+): Promise<StageReadyOutcomeV1> {
   // Calls collapse only when they read the workspace the same way (the real reader, or the same injected one).
   const reader = deps.readWorkspaceIdentity;
   let readerId = 0;
@@ -308,43 +309,88 @@ export function postStageReadyCardIfReadyV1(
   return run;
 }
 
+/**
+ * bugs8 item 4 (Step 8): what the stage-ready check did. `whyNot` is set when no "is done" card was raised and none is
+ * waiting, so the caller can tell the owner why and which click carries on; it is a full sentence with the click.
+ */
+export interface StageReadyOutcomeV1 {
+  readonly posted: boolean;
+  readonly whyNot?: string;
+  readonly stage?: TaskStage;
+}
+
 async function postStageReadyCardIfReadyCoreV1(
   taskFolderPath: string,
   whatTheOwnerDid: string,
   deps: {
     readonly readWorkspaceIdentity?: (workspaceRoot: string, reviewUri: vscode.Uri) => Promise<StageReadyWorkspaceIdentityV1>;
   }
-): Promise<{ readonly posted: boolean }> {
+): Promise<StageReadyOutcomeV1> {
   try {
     const folderUri = vscode.Uri.file(taskFolderPath);
     const read = await readTaskProgressStrictV1(folderUri);
     if (!read.ok) return { posted: false };
     const progress = read.decoded.progress;
-    if (progress.status !== "active") return { posted: false };
     const stage = progress.currentStage;
+    const stageName = STAGE_DISPLAY_NAMES[stage] ?? stage;
+    const notRaised = (whyNot: string): StageReadyOutcomeV1 => ({ posted: false, whyNot, stage });
+    if (progress.status !== "active") {
+      return notRaised(
+        progress.status === "paused"
+          ? `The task is paused, so ${stageName} is not moved on. Click Resume Task to carry on.`
+          : `The task is ${progress.status}, so ${stageName} is not moved on.`
+      );
+    }
     const reviewName = STAGE_ARTIFACT_FILENAMES[stage];
     if (!reviewName) return { posted: false };
     const reviewUri = vscode.Uri.joinPath(folderUri, reviewName);
     const reviewText = await readTextIfExists(reviewUri).catch(() => undefined);
+    const reviewAgain = "Click Review with AI to run it again.";
     // Only a review that is still current counts: a stale banner, or changed plan or task description, means
     // the verdict on record no longer describes the work.
-    if (reviewText === undefined || hasArtifactChangeStaleBannerV1(reviewText)) return { posted: false };
-    if ((await reviewInputsChangedSinceV1(taskFolderPath, reviewUri.fsPath)).changed) return { posted: false };
+    if (reviewText === undefined) {
+      return notRaised(`There is no ${stageName} review on file yet, so nothing says the stage is clean. Click Review with AI to run it.`);
+    }
+    if (hasArtifactChangeStaleBannerV1(reviewText) || (await reviewInputsChangedSinceV1(taskFolderPath, reviewUri.fsPath)).changed) {
+      return notRaised(`The latest ${stageName} review no longer matches the current plan or task text. ${reviewAgain}`);
+    }
     // The task and plan text are only part of what the review looked at: a source file changed by hand since the
     // review leaves them untouched, so the code identity has to match too (a changed or unknowable tree posts nothing).
     if (REVIEWED_COMMIT_STAGES.has(stage)) {
       const workspaceRoot = progress.ownership?.workspaceRoot ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-      if (!workspaceRoot) return { posted: false };
+      if (!workspaceRoot) {
+        return notRaised(`Ensemble can't tell which code the latest ${stageName} review read. ${reviewAgain}`);
+      }
       const identity = await (deps.readWorkspaceIdentity ?? readWorkspaceIdentityForReadyCardV1)(workspaceRoot, reviewUri);
-      if (!reviewDescribesCurrentWorkspaceV1(stage, reviewText, identity)) return { posted: false };
+      if (!reviewDescribesCurrentWorkspaceV1(stage, reviewText, identity)) {
+        return notRaised(`The code changed since the latest ${stageName} review. ${reviewAgain}`);
+      }
     }
-    return await postAutomationStoppedCardV1({
+    const result = await postAutomationStoppedCardV1({
       folderUri,
       stage,
       ending: "stage-ready",
       stopReason: `${whatTheOwnerDid}, every plan item is now settled and the latest review is clean`,
       ...(progress.displayName !== undefined ? { displayName: progress.displayName } : {}),
     });
+    if (result.posted) return result;
+    // A card for this very state already waiting is the answer; nothing more to say.
+    const waiting = listPendingWorkflowDecisionsForTaskV1(normalizePath(taskFolderPath)).some(
+      (open) => open.decisionKey === AUTOMATION_STOPPED_DECISION_KEY_V1 && open.stage === stage
+    );
+    if (waiting) return result;
+    const facts = await readReviewCleanFactsV1(folderUri, stage);
+    if (!facts.gateComplete) {
+      return notRaised(
+        `${stageName} still has plan items open or waiting for a check, so it is not done yet. Click Apply Review with AI to carry on.`
+      );
+    }
+    if (!facts.reviewClean) {
+      return notRaised(
+        `The latest ${stageName} review still lists blockers, so it is not done yet. Click Apply Review with AI to address them.`
+      );
+    }
+    return notRaised(`Every plan item is settled and the latest ${stageName} review is clean. Click Complete Stage & Move On.`);
   } catch {
     return { posted: false };
   }

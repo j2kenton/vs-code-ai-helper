@@ -27,6 +27,7 @@ import {
   planStageAction,
   splitStageActionEnvelopes,
 } from "../../utils/chatStageActionEnvelope";
+import { type OwnerDecisionEnvelopeV1, splitOwnerDecisionEnvelopesV1 } from "../../utils/chatOwnerDecisionV1";
 import { parseReviewBlockers } from "../../utils/reviewReadiness";
 import {
   ensureWorkflowTaskFolderRootV1,
@@ -185,6 +186,36 @@ async function applyChatFileUpdateEnvelopesV1(
   return { note: await writeMarkdownUpdateV1(taskFolderPath, plan.relPath, plan.targetPath, plan.content) };
 }
 
+function isPlanMdPathV1(relPath: string): boolean {
+  return relPath.trim().replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase() === PLAN_FILENAME.toLowerCase();
+}
+
+/**
+ * bugs8 item 2: the file writer the owner-decision recorder uses once the owner has confirmed
+ * (`dispatchProposedOwnerDecisionsV1` in `chatWithStage.ts`). Returns an error text, or undefined when written.
+ */
+export async function writeOwnerDecisionFileV1(
+  taskFolderPath: string,
+  relPath: string,
+  content: string
+): Promise<string | undefined> {
+  const outcome = await writeMarkdownUpdateV1(taskFolderPath, relPath, path.join(taskFolderPath, relPath), content);
+  return outcome.startsWith("_Updated") ? undefined : outcome.replace(/^_|\._$/g, "");
+}
+
+/**
+ * bugs8 item 2: the reply note for owner-decision envelopes. Nothing is written during promotion: the decisions are
+ * carried on the persisted message (`proposedOwnerDecisions`) and written only after the owner confirms, like a
+ * drafted blocker-resolving edit. The write is limited to task.md "## Owner decisions" and one plain plan
+ * sub-bullet, so no checklist line or tick can change.
+ */
+function describeOwnerDecisionProposalV1(decisions: readonly OwnerDecisionEnvelopeV1[]): string | undefined {
+  if (decisions.length === 0) return undefined;
+  const ids = decisions.map((decision) => `\`${decision.blockerId}\``).join(", ");
+  const one = decisions.length === 1;
+  return `_Drafted ${one ? "a record of your decision" : "records of your decisions"} for ${ids} in task.md and plan-final.md. Confirm to write ${one ? "it" : "them"}; nothing is written until you do._`;
+}
+
 /**
  * wf10 item 19: a chat edit to `plan.md` drafted while the chat's own stage
  * is a plan-review stage with exactly one recorded blocker, AND accompanied
@@ -270,7 +301,12 @@ async function promoteChatSendContentV1(
   // None of the three bracket markers may survive into the displayed/
   // persisted text, whether or not each is acted on — strip all of them
   // unconditionally before anything else touches content.text.
-  const { text: fileStrippedText, updates } = splitFileUpdateEnvelopes(content.text);
+  const { text: decisionStrippedText, decisions } = splitOwnerDecisionEnvelopesV1(content.text);
+  const { text: fileStrippedText, updates: proposedUpdates } = splitFileUpdateEnvelopes(decisionStrippedText);
+  // bugs8 item 2: an owner decision is recorded through its own envelope; a plan.md rewrite in the same reply is
+  // never applied (it redrafts plan.md in another format and leaves the files rounds read untouched).
+  const planRedrafts = decisions.length > 0 ? proposedUpdates.filter((update) => isPlanMdPathV1(update.relPath)) : [];
+  const updates = proposedUpdates.filter((update) => !planRedrafts.includes(update));
   const { text: markerStrippedText, resolvesBlocker } = splitResolvesBlockerMarkerV1(fileStrippedText);
   const { text: strippedText, actions } = splitStageActionEnvelopes(markerStrippedText);
   // Execution needs vscode.window (a confirmation dialog), unavailable
@@ -298,7 +334,15 @@ async function promoteChatSendContentV1(
       });
     }
     const fileOutcome = await applyChatFileUpdateEnvelopesV1(input.taskFolderPath, stage, updates, resolvesBlocker);
-    for (const note of [fileOutcome.note, actionOutcomeNote]) {
+    const decisionNotes: string[] = [];
+    const decisionProposalNote = describeOwnerDecisionProposalV1(decisions);
+    if (decisionProposalNote) decisionNotes.push(decisionProposalNote);
+    if (planRedrafts.length > 0) {
+      decisionNotes.push(
+        "plan.md was not rewritten: an owner decision is recorded in task.md and the plan-final.md sub-bullet once you confirm, and plan.md is kept in step with the same wording, never redrafted."
+      );
+    }
+    for (const note of [fileOutcome.note, ...decisionNotes, actionOutcomeNote]) {
       if (note) {
         finalText = finalText.length > 0 ? `${finalText}\n\n${note}` : note;
       }
@@ -312,6 +356,7 @@ async function promoteChatSendContentV1(
         finalText,
         proposedStageAction,
         proposedBlockerSupersessionEdit: fileOutcome.proposedEdit,
+        ...(decisions.length > 0 ? { proposedOwnerDecisions: decisions } : {}),
       });
     }
     // Review-flagged (2026-08-23): a caller-computed read-then-full-write
@@ -327,6 +372,7 @@ async function promoteChatSendContentV1(
       at: new Date().toISOString(),
       ...(proposedStageAction ? { proposedStageAction } : {}),
       ...(fileOutcome.proposedEdit ? { proposedBlockerSupersessionEdit: fileOutcome.proposedEdit } : {}),
+      ...(decisions.length > 0 ? { proposedOwnerDecisions: [...decisions] } : {}),
     }, canonicalId);
     if (input.sendId) {
       await recordChatSendStateV1(input.taskFolderPath, input.sendId, "completed", {

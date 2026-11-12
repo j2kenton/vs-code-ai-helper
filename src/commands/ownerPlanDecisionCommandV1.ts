@@ -12,6 +12,11 @@ import {
 } from "../types/taskProgress";
 import { appendOwnerDecisionV1 } from "../utils/ownerEvidenceV1";
 import type { WorkflowDecisionCommandResultV1, WorkflowDecisionOptionV1, WorkflowDecisionV1 } from "../types/workflowDecisionV1";
+import {
+  describeStageDispatchNotStartedV1,
+  RESUME_TASK_CLICK_V1,
+  type StageDispatchOutcomeV1,
+} from "../types/stageDispatchOutcomeV1";
 import { normalizePath } from "../utils/taskRoot";
 import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 import { armDeferredOptionRunV1 } from "../utils/deferredOptionRunV1";
@@ -51,6 +56,9 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { OWN_WORDS_TYPE_HINT_V1, takeHandedOverOwnWordsTextV1 } from "../utils/ownWordsAnswerV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { extractBuildNextLinesV1 } from "../utils/automationStopV1";
+import { getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
+import { peekRecentStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
+import { postPausedNothingOpenLineV1, repostPlateauCardAfterOwnerDecisionV1 } from "../utils/reviewEscalation";
 import {
   decideFollowUpRunV1,
   describeHeldFollowUpRunV1,
@@ -403,7 +411,7 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
     : arg.ownWords
     ? `Recorded your answer for ${arg.blockerId}${recordedInTask ? " in task.md under Owner decisions" : ""}. The plan is unchanged; the review reads your words and decides whether they settle the blocker.`
     : arg.rejects
-    ? `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. The plan stays as written, and the next round builds it that way.`
+    ? `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. The plan stays as written${arg.thenApplyReview === true ? "; Apply Review builds it that way next." : "."}`
     : change.settledItems.length > 0 || change.rewordedItems.length > 0
       ? `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. ${[
           change.settledItems.length > 0 ? `Excluded ${change.settledItems.length} plan item(s)` : "",
@@ -411,10 +419,10 @@ export async function executeOwnerPlanDecisionLockedV1(arg: RecordOwnerPlanDecis
             ? `Reworded ${change.rewordedItems.length} plan item(s) (the review has to re-check ${change.rewordedItems.length === 1 ? "it" : "them"})`
             : "",
         ].filter(Boolean).join("; ")} in plan-final.md with your decision noted; ${
-          arg.thenApplyReview === true ? "Apply Review builds it now; the review checks it after." : "the next review will not carry this blocker."
+          arg.thenApplyReview === true ? "Apply Review builds it next; the review checks it after." : "the next review will not carry this blocker."
         }`
       : `Recorded: "${arg.optionLabel}" for ${arg.blockerId}. Your decision is noted in plan-final.md; ${
-          arg.thenApplyReview === true ? "Apply Review builds it now; the review checks it after." : "the next review will not carry this blocker."
+          arg.thenApplyReview === true ? "Apply Review builds it next; the review checks it after." : "the next review will not carry this blocker."
         }`}${taskRecordNote}`;
   await appendChatMessageV1(arg.taskFolderPath, {
     role: "assistant",
@@ -460,17 +468,126 @@ export async function recordOwnerPlanDecisionV1(
   // A round is live: the answer is written, and the review started, when that round ends (see the deferred run below).
   const deferred = hasLiveWorkAdmissionBestEffortV1(arg.taskFolderPath);
   const result = await recordOwnerPlanDecisionRecordOnlyV1(arg);
-  if (result.outcome === "done" && !deferred) {
-    await followUpAfterOwnerAnswerV1(arg);
+  if (result.outcome !== "done") {
+    return result;
   }
-  return result;
+  if (deferred) {
+    return {
+      ...result,
+      dispatch: { kind: "held", reason: "a round is running", startsWhen: "this starts when it ends" },
+    };
+  }
+  const dispatch = await followUpAfterOwnerAnswerV1(arg);
+  await closeAnswerWithoutStartV1(arg, dispatch);
+  return { ...result, dispatch };
+}
+
+/** What an answer that did not start a round leaves behind: why, the rebuilt stop card, and the pause line. */
+async function closeAnswerWithoutStartV1(arg: RecordOwnerPlanDecisionArgV1, dispatch: StageDispatchOutcomeV1): Promise<void> {
+  if (dispatch.kind === "started") return;
+  // A refusal says why it did not start first; the reason it gives is the specific one.
+  if (dispatch.kind === "refused") {
+    await sayNothingStartedV1(arg, dispatch);
+  }
+  await rebuildStopCardAfterOwnerDecisionV1(arg);
+  // A card closed without starting anything: a still-paused task says why and which click resumes it.
+  if (dispatch.kind === "refused") {
+    await postPausedNothingOpenLineV1(arg.taskFolderPath, arg.stage).catch(() => undefined);
+  } else if (dispatch.kind === "recordedOnly") {
+    // The pause line already gives the reason and the click, so a second "Nothing started" line is only written when
+    // that line was not (the task is not paused with nothing open, or it already spoke for this pause state).
+    const spoke = await postPausedNothingOpenLineV1(arg.taskFolderPath, arg.stage).catch(() => false);
+    if (spoke) return;
+    if (await isPausedWithNoCardOpenV1(arg.taskFolderPath)) {
+      await sayNothingStartedV1(arg, dispatch);
+    } else {
+      // Owner decision nonstart-feedback-rule: every non-start outcome is explained, with the next action that fits the
+      // state. A task that is not paused with nothing open must not be told to "Resume Task".
+      await sayRecordedOnlyOutsidePauseV1(arg, dispatch);
+    }
+  }
+}
+
+/**
+ * The line for a recorded-only answer when the task is not paused with nothing open. The next action comes from what is
+ * actually true: open cards are the owner's to answer, a running or owed round carries on by itself, and an idle task has
+ * nothing arranged, so the click is Run Current Stage Action (an empty card list never proves automatic continuation).
+ */
+async function sayRecordedOnlyOutsidePauseV1(arg: RecordOwnerPlanDecisionArgV1, dispatch: StageDispatchOutcomeV1): Promise<void> {
+  if (dispatch.kind !== "recordedOnly") return;
+  const reason = dispatch.reason.trim().replace(/[.\s]+$/, "");
+  const canonicalId = normalizePath(arg.taskFolderPath);
+  const cardsWaiting = listPendingWorkflowDecisionsForTaskV1(canonicalId).length;
+  const running =
+    getLiveTaskOperationV1(arg.taskFolderPath) !== undefined ||
+    hasLiveWorkAdmissionBestEffortV1(arg.taskFolderPath) ||
+    peekOwedRunV1(canonicalId) !== undefined;
+  const read = await readTaskProgressStrictV1(vscode.Uri.file(arg.taskFolderPath)).catch(() => undefined);
+  const status = read?.ok ? read.decoded.progress.status : undefined;
+  let next: string;
+  if (cardsWaiting > 0) {
+    next = `Answer the open ${cardsWaiting === 1 ? "card" : "cards"} to carry on.`;
+  } else if (running) {
+    next = "A round is already running for this task; it carries on when that ends.";
+  } else if (status === "completed" || status === "archived") {
+    next = "The task is finished; nothing is needed from you.";
+  } else {
+    next = "Nothing is running for this task right now. Click Run Current Stage Action to carry on.";
+  }
+  await appendChatMessageV1(arg.taskFolderPath, {
+    role: "assistant",
+    text: `Nothing started: ${reason}. ${next}`,
+    stage: arg.stage,
+    at: new Date().toISOString(),
+  }).catch(() => undefined);
+}
+
+/** True when the task is paused and no card is waiting, so "Click Resume Task" is the one thing the owner can do. */
+async function isPausedWithNoCardOpenV1(taskFolderPath: string): Promise<boolean> {
+  const read = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath)).catch(() => undefined);
+  if (!read?.ok || read.decoded.progress.status !== "paused") return false;
+  return listPendingWorkflowDecisionsForTaskV1(normalizePath(taskFolderPath)).length === 0;
+}
+
+/**
+ * Bugs8 Step 6: an answer that started nothing says why and which click carries on ("Nothing started: <reason>. Click
+ * <click> to carry on."). The line is a plain assistant line, not an `outcome` one: `outcome` lines are status for the
+ * Notifications log and are hidden from the conversation, and this is the line the owner has to read. A held start says
+ * what starts it through the follow-up's own line.
+ */
+async function sayNothingStartedV1(arg: RecordOwnerPlanDecisionArgV1, dispatch: StageDispatchOutcomeV1): Promise<void> {
+  if (dispatch.kind !== "refused" && dispatch.kind !== "recordedOnly") return;
+  const text = describeStageDispatchNotStartedV1(dispatch);
+  if (text === undefined) return;
+  await appendChatMessageV1(arg.taskFolderPath, {
+    role: "assistant",
+    text,
+    stage: arg.stage,
+    at: new Date().toISOString(),
+  }).catch(() => undefined);
+}
+
+/**
+ * bugs8 item 3 (Step 14, after the decision): the last owner-decision card for the stage is answered and the answer
+ * started no round, so the stop gets its one can't-progress card back, rebuilt from the latest review (no choices the
+ * decision card already offered, at most four options). Nothing is raised while other decision cards for the stage
+ * wait, or while a held run is owed (it is the way on). Best effort: the answer is already recorded.
+ */
+async function rebuildStopCardAfterOwnerDecisionV1(arg: RecordOwnerPlanDecisionArgV1): Promise<void> {
+  const canonicalId = normalizePath(arg.taskFolderPath);
+  if (openOwnerPlanSiblingsV1(arg) > 0 || peekOwedRunV1(canonicalId) !== undefined) return;
+  await repostPlateauCardAfterOwnerDecisionV1(
+    arg.taskFolderPath,
+    arg.stage,
+    `${OWNER_PLAN_DECISION_KEY_PREFIX_V1}${arg.blockerId}`
+  ).catch(() => undefined);
 }
 
 /** What the group-aware follow-up needs from the outside; the defaults are the real ones. */
 export interface OwnerFollowUpDepsV1 {
   /** Other pending owner-plan cards (the round's group) at the answered card's stage. */
   readonly openSiblings: (arg: RecordOwnerPlanDecisionArgV1) => number;
-  readonly start: (arg: RecordOwnerPlanDecisionArgV1) => Promise<boolean>;
+  readonly start: (arg: RecordOwnerPlanDecisionArgV1) => Promise<StageDispatchOutcomeV1>;
   readonly say: (arg: RecordOwnerPlanDecisionArgV1, text: string) => Promise<void>;
   /** Post the "Run now" card for a held run. */
   readonly offerRunNow: (arg: RecordOwnerPlanDecisionArgV1) => Promise<void>;
@@ -489,13 +606,13 @@ function openOwnerPlanSiblingsV1(arg: RecordOwnerPlanDecisionArgV1): number {
 const DEFAULT_FOLLOW_UP_DEPS_V1: OwnerFollowUpDepsV1 = {
   openSiblings: openOwnerPlanSiblingsV1,
   start: (arg) => startReReviewAfterOwnerDecisionV1(arg),
+  // A plain assistant line, not `outcome` (hidden status): it says what is held and the owner has to read it.
   say: async (arg, text) => {
     await appendChatMessageV1(arg.taskFolderPath, {
       role: "assistant",
       text,
       stage: arg.stage,
       at: new Date().toISOString(),
-      kind: "outcome",
     }).catch(() => undefined);
   },
   offerRunNow: async (arg) => {
@@ -531,9 +648,9 @@ const DEFAULT_FOLLOW_UP_DEPS_V1: OwnerFollowUpDepsV1 = {
 export async function followUpAfterOwnerAnswerV1(
   arg: RecordOwnerPlanDecisionArgV1,
   deps: OwnerFollowUpDepsV1 = DEFAULT_FOLLOW_UP_DEPS_V1
-): Promise<boolean> {
+): Promise<StageDispatchOutcomeV1> {
   const canonicalId = normalizePath(arg.taskFolderPath);
-  const startsRun = !((arg.rejects === true && arg.ownWords !== true) || arg.planAction?.kind === "approveDeviation");
+  const startsRun = answerStartsRunV1(arg);
   const owed = peekOwedRunV1(canonicalId) as { readonly arg: RecordOwnerPlanDecisionArgV1; readonly at: string } | undefined;
   const decision = decideFollowUpRunV1({
     startsRun,
@@ -551,7 +668,9 @@ export async function followUpAfterOwnerAnswerV1(
     case "start-owed": {
       const run = takeOwedRunV1(canonicalId) as { readonly arg: RecordOwnerPlanDecisionArgV1; readonly at: string };
       // "Run now" (or any review) already ran since the answer was held: nothing is owed any more.
-      if (await deps.reviewStartedSince(run.arg, run.at)) return false;
+      if (await deps.reviewStartedSince(run.arg, run.at)) {
+        return { kind: "recordedOnly", reason: "a review has run since, so the owed run is no longer needed", click: RESUME_TASK_CLICK_V1 };
+      }
       return deps.start(run.arg);
     }
     case "hold":
@@ -561,10 +680,24 @@ export async function followUpAfterOwnerAnswerV1(
       });
       await deps.say(arg, describeHeldFollowUpRunV1(decision.open));
       await deps.offerRunNow(arg);
-      return false;
+      return {
+        kind: "held",
+        reason: `${decision.open} decision${decision.open === 1 ? " is" : "s are"} still open`,
+        startsWhen: "the run starts once they are answered, or when you choose Run now",
+      };
     case "none":
-      return false;
+      return {
+        kind: "recordedOnly",
+        reason: "the answer is recorded and it owes no round",
+        click: RESUME_TASK_CLICK_V1,
+      };
   }
+}
+
+/** An answer starts a run unless it keeps the plan as written without needing a code change, or approves a deviation. */
+function answerStartsRunV1(arg: RecordOwnerPlanDecisionArgV1): boolean {
+  const keepsPlanWithNoRound = arg.rejects === true && arg.ownWords !== true && arg.thenApplyReview !== true;
+  return !(keepsPlanWithNoRound || arg.planAction?.kind === "approveDeviation");
 }
 
 /** The reword target `arg` names when it matches several top-level items and gives no occurrence; otherwise undefined. */
@@ -602,26 +735,44 @@ export async function startReReviewAfterOwnerDecisionV1(
   arg: RecordOwnerPlanDecisionArgV1,
   executeCommand: (command: string, ...args: unknown[]) => PromiseLike<unknown> = (command, ...args) =>
     vscode.commands.executeCommand(command, ...args)
-): Promise<boolean> {
-  if ((arg.rejects === true && arg.ownWords !== true) || arg.planAction?.kind === "approveDeviation") {
-    return false;
+): Promise<StageDispatchOutcomeV1> {
+  if (!answerStartsRunV1(arg)) {
+    return {
+      kind: "recordedOnly",
+      reason: arg.planAction?.kind === "approveDeviation" ? "the deviation is recorded and the work carries on" : "the plan stays as written",
+      click: RESUME_TASK_CLICK_V1,
+    };
   }
   try {
     if (arg.thenApplyReview === true) {
       // One Apply Review, no re-review: the next review (which follows that round in the usual way) judges the fix
-      // against the recorded rule.
-      const started = await executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
+      // against the recorded rule. "Applying now" is written only when the start is confirmed (an operation registered
+      // for the task, or the command resolving true), never before the command has begun.
+      const result = await executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {
         taskFolderPath: arg.taskFolderPath,
+        onStartedV1: () => {
+          const text = `Applying now: Apply Review builds it, then ${STAGE_DISPLAY_NAMES[arg.stage]} checks it.`;
+          void appendChatMessageV1(arg.taskFolderPath, {
+            role: "assistant",
+            text,
+            stage: arg.stage,
+            at: new Date().toISOString(),
+            kind: "outcome",
+          }).catch(() => undefined);
+        },
       });
-      return started === true;
+      return dispatchOutcomeFromResultV1(result);
     }
-    const started = await executeCommand(
+    let confirmedStart = false;
+    const result = await executeCommand(
       "vs-code-ai-helper.resumeAndRerunReview",
       { taskFolderPath: arg.taskFolderPath },
       {
         // Only task.md and the plan changed, not the code, so the unchanged-tree guard would refuse the review.
         skipUnchangedTreeGuardV1: true,
-        onDispatchingV1: () => {
+        // Written only when the review's start is confirmed (an operation registered, or the command resolved true).
+        onStartedV1: () => {
+          confirmedStart = true;
           const text = `Saved; checking it now with ${STAGE_DISPLAY_NAMES[arg.stage]}.`;
           void appendChatMessageV1(arg.taskFolderPath, {
             role: "assistant",
@@ -633,10 +784,36 @@ export async function startReReviewAfterOwnerDecisionV1(
         },
       }
     );
-    return started === true;
-  } catch {
-    return false;
+    // The small adapter for `resumeAndRerunReview`'s boolean: `true` is a confirmed start, `false` a refusal with the
+    // reason the review recorded, when it recorded one.
+    return result === true || confirmedStart
+      ? { kind: "started" }
+      : {
+          kind: "refused",
+          reason:
+            peekRecentStageActionRefusalReasonV1(arg.taskFolderPath) ?? "the review did not start (see the message above for the cause)",
+          click: RESUME_TASK_CLICK_V1,
+        };
+  } catch (error) {
+    return {
+      kind: "refused",
+      reason: `the start failed (${error instanceof Error ? error.message : String(error)})`,
+      click: RESUME_TASK_CLICK_V1,
+    };
   }
+}
+
+/** The outcome a stage-dispatch command reported; an older command's plain boolean reads as started / refused. */
+function dispatchOutcomeFromResultV1(result: unknown): StageDispatchOutcomeV1 {
+  if (typeof result === "object" && result !== null) {
+    const kind = (result as { kind?: unknown }).kind;
+    if (kind === "started" || kind === "held" || kind === "refused" || kind === "recordedOnly") {
+      return result as StageDispatchOutcomeV1;
+    }
+  }
+  return result === true
+    ? { kind: "started" }
+    : { kind: "refused", reason: "the action did not report a start", click: RESUME_TASK_CLICK_V1 };
 }
 
 async function recordOwnerPlanDecisionRecordOnlyV1(
@@ -652,20 +829,25 @@ async function recordOwnerPlanDecisionRecordOnlyV1(
       carryOut: async () => {
         await withTaskLock(arg.taskFolderPath, () => executeOwnerPlanDecisionLockedV1(arg));
         releaseHeldWriteV1(normalizePath(arg.taskFolderPath), arg.blockerId);
-        await followUpAfterOwnerAnswerV1(arg);
+        const dispatch = await followUpAfterOwnerAnswerV1(arg);
+        // bugs8 Step 14: the deferred answer gets the same closing as an immediate one when it starts no round.
+        await closeAnswerWithoutStartV1(arg, dispatch);
         return { kind: "done" };
       },
       report: () => Promise.resolve(),
     });
 
     noteHeldWriteV1(normalizePath(arg.taskFolderPath), arg.blockerId);
-    const heldText = `Your choice "${arg.optionLabel}" for ${arg.blockerId} is recorded. It is written to plan-final.md as soon as the running round ends.`;
+    const heldText =
+      `Your choice "${arg.optionLabel}" for ${arg.blockerId} is recorded. It is written to plan-final.md as soon as the ` +
+      "running round ends, and any follow-up the answer needs starts then. Nothing for you to click meanwhile.";
+    // Owner decision nonstart-feedback-rule: a plain assistant line, not an `outcome` one (those are hidden from the
+    // conversation). This is the only explanation the owner gets for why nothing has started yet.
     await appendChatMessageV1(arg.taskFolderPath, {
       role: "assistant",
       text: heldText,
       stage: arg.stage,
       at: new Date().toISOString(),
-      kind: "outcome",
     }).catch(() => undefined);
     void logChatStatusToNotificationsV1(arg.taskFolderPath, heldText, arg.stage);
 
@@ -731,10 +913,13 @@ export function describeOwnerAnswerNextV1(
   reviewNextText?: string
 ): string {
   if (option.planAction?.kind === "approveDeviation") return "the deviation is recorded and the work carries on";
-  if (option.rejects) return "the plan stays as written, and the next round builds it that way";
-  return ownerOptionNeedsCodeChangeV1(option, block, reviewNextText)
-    ? `applying now: Apply Review builds it, then ${stageName} checks it`
-    : `checking it now with ${stageName}`;
+  // bugs8 Step 5/6: a code change is tested before `rejects` (a rejecting answer can still need one), and the words say
+  // what the answer will start, never that it is already running: "Applying now" is written when the start is confirmed.
+  if (ownerOptionNeedsCodeChangeV1(option, block, reviewNextText)) {
+    return `Apply Review builds it, then ${stageName} checks it`;
+  }
+  if (option.rejects) return "the plan stays as written";
+  return `${stageName} checks it next`;
 }
 
 /**
@@ -797,9 +982,13 @@ export async function postOwnerPlanDecisionCardV1(options: {
             : opt.consequence,
         // review1 Step 40: an answer that settles the blocker re-runs the stage's review (the command starts it);
         // keeping the plan as written, or approving a deviation, starts nothing.
-        resumeKind: opt.rejects || opt.planAction?.kind === "approveDeviation" ? ("unpause" as const) : ("continue" as const),
-        // bugs7 item 3: "applying now" is only said when something applies the answer. An answer that needs a code
-        // change runs Apply Review (then the review); any other answer only starts the review ("checking it now").
+        // bugs8 Step 5: a rejecting answer that needs a code change still starts Apply Review, so it continues.
+        resumeKind:
+          (opt.rejects && !ownerOptionNeedsCodeChangeV1(opt, block, reviewNextText)) || opt.planAction?.kind === "approveDeviation"
+            ? ("unpause" as const)
+            : ("continue" as const),
+        // bugs7 item 3 / bugs8 Step 6: the words say what the answer will start; "Applying now" is written only once
+        // the start is confirmed. An answer that needs a code change runs Apply Review (then the review).
         recordedNext: describeOwnerAnswerNextV1(opt, block, STAGE_DISPLAY_NAMES[stage] ?? stage, reviewNextText),
         effect: {
           kind: "command" as const,
@@ -857,7 +1046,21 @@ export async function postOwnerPlanDecisionCardV1(options: {
     },
   };
 
-  return postWorkflowDecisionV1(cardInput, { canonicalId, taskFolderPath, stage });
+  const posted = await postWorkflowDecisionV1(cardInput, { canonicalId, taskFolderPath, stage });
+  if (posted !== undefined) {
+    // bugs8 item 3: one card per stop. A can't-progress card already waiting for this stage is replaced by this one.
+    const plateauCardPending = listPendingWorkflowDecisionsForTaskV1(canonicalId).some(
+      (card) => card.stage === stage && card.decisionKey === "reviewPlateauEscalation"
+    );
+    if (plateauCardPending) {
+      await withdrawWorkflowDecisionsByKeyV1(
+        { taskFolderPath, canonicalId },
+        "reviewPlateauEscalation",
+        "replaced by the decision card"
+      ).catch(() => undefined);
+    }
+  }
+  return posted;
 }
 
 /**

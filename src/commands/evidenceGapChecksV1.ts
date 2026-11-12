@@ -42,6 +42,8 @@ import { computeTestDependencyStatesV1 } from "../utils/testDependencyStateV1";
 import { normalizePath } from "../utils/taskRoot";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import { applyOwnerTickToProvisionalItemV1 } from "./settleChecklistItem";
+import type { StageReadyOutcomeV1 } from "./automationStoppedCardV1";
+import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 
 /** What the caller's one Publish Checks attempt did: it ran, or it could not (refused, cancelled, gate closed). */
 export interface EvidenceGapChecksRunV1 {
@@ -329,6 +331,20 @@ export async function recordPublishChecksReportsForItemsV1(input: {
   return { recordedItems: patched ? matched.recordable.map((entry) => entry.itemText) : [], reasonByItem };
 }
 
+/**
+ * bugs8 item 4 (Step 8): a tick that raised no "is done" card says why in the chat, with the click that carries on.
+ * Nothing is written when the card was raised (or is already waiting): the card is the message.
+ */
+export async function sayWhyNoStageReadyCardV1(taskFolderPath: string, ready: StageReadyOutcomeV1): Promise<void> {
+  if (ready.posted || ready.whyNot === undefined || ready.stage === undefined) return;
+  await appendChatMessageV1(taskFolderPath, {
+    role: "assistant",
+    text: `Your tick is recorded. ${ready.whyNot}`,
+    stage: ready.stage,
+    at: new Date().toISOString(),
+  }).catch(() => undefined);
+}
+
 /** `vs-code-ai-helper.tickEvidenceGapItems`: the stop card's "Tick these N items", recording the owner's tick for each. */
 export function registerTickEvidenceGapItemsCommandV1(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
@@ -337,9 +353,18 @@ export function registerTickEvidenceGapItemsCommandV1(context: vscode.ExtensionC
       async (arg?: { readonly taskFolderPath?: string; readonly itemTexts?: readonly string[] }): Promise<number> => {
         if (!arg?.taskFolderPath || !arg.itemTexts?.length) return 0;
         let recorded = 0;
+        // The stage-ready check each tick starts (it raises the "is done" card when the stage is clean and settled).
+        // The last one sees every tick, so its answer is the one the owner is told when no card was raised.
+        let lastStageReady: Promise<StageReadyOutcomeV1> | undefined;
         for (const itemText of arg.itemTexts) {
           const outcome = await applyOwnerTickToProvisionalItemV1(arg.taskFolderPath, itemText);
-          if (outcome.kind === "ownerTickRecorded") recorded += 1;
+          if (outcome.kind === "ownerTickRecorded") {
+            recorded += 1;
+            lastStageReady = outcome.stageReady ?? lastStageReady;
+          }
+        }
+        if (recorded > 0 && lastStageReady !== undefined) {
+          await sayWhyNoStageReadyCardV1(arg.taskFolderPath, await lastStageReady);
         }
         return recorded;
       }

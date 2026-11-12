@@ -33,6 +33,7 @@ export interface ChatSendRecordV1 {
   readonly finalText?: string;
   readonly proposedStageAction?: unknown;
   readonly proposedBlockerSupersessionEdit?: unknown;
+  readonly proposedOwnerDecisions?: unknown;
   readonly promotionEvidence?: unknown;
 }
 
@@ -52,6 +53,20 @@ function isProposedBlockerEditV1(value: unknown): value is NonNullable<ChatMessa
     "content" in value && typeof value.content === "string" &&
     "blockerDescription" in value && typeof value.blockerDescription === "string" &&
     "reviewStage" in value && isTaskStageV1(value.reviewStage);
+}
+
+function isProposedOwnerDecisionsV1(value: unknown): value is NonNullable<ChatMessage["proposedOwnerDecisions"]> {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (item) =>
+        item !== null &&
+        typeof item === "object" &&
+        typeof (item as { blockerId?: unknown }).blockerId === "string" &&
+        typeof (item as { decision?: unknown }).decision === "string"
+    )
+  );
 }
 
 function getSendStatePath(taskFolderPath: string): string {
@@ -105,6 +120,7 @@ export async function recordChatSendStateV1(
     finalText?: string;
     proposedStageAction?: unknown;
     proposedBlockerSupersessionEdit?: unknown;
+    proposedOwnerDecisions?: unknown;
     promotionEvidence?: unknown;
   }
 ): Promise<void> {
@@ -155,6 +171,7 @@ export async function recordChatSendStateV1(
     ...(details?.finalText !== undefined ? { finalText: details.finalText } : {}),
     ...(details?.proposedStageAction !== undefined ? { proposedStageAction: details.proposedStageAction } : {}),
     ...(details?.proposedBlockerSupersessionEdit !== undefined ? { proposedBlockerSupersessionEdit: details.proposedBlockerSupersessionEdit } : {}),
+    ...(details?.proposedOwnerDecisions !== undefined ? { proposedOwnerDecisions: details.proposedOwnerDecisions } : {}),
     ...(details?.promotionEvidence !== undefined ? { promotionEvidence: details.promotionEvidence } : {}),
   };
   if (!folderCache) {
@@ -247,6 +264,9 @@ export async function reconcileChatSendStateV1(
               : {}),
             ...(isProposedBlockerEditV1(current.proposedBlockerSupersessionEdit)
               ? { proposedBlockerSupersessionEdit: current.proposedBlockerSupersessionEdit }
+              : {}),
+            ...(isProposedOwnerDecisionsV1(current.proposedOwnerDecisions)
+              ? { proposedOwnerDecisions: current.proposedOwnerDecisions }
               : {}),
           },
           canonicalId

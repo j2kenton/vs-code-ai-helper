@@ -77,9 +77,13 @@ function ownerDecisionCardsCoverV1(
 export function hasPendingOwnerDecisionCardV1(
   canonicalId: string,
   stage: TaskStage,
-  identities?: readonly string[]
+  identities?: readonly string[],
+  /** A card being answered right now: it still counts as pending until the answer returns, so it is not counted. */
+  ignoreDecisionKey?: string
 ): boolean {
-  const cards = pendingForStageV1(canonicalId, stage).filter((d) => isOwnerDecisionCardKeyV1(d.decisionKey));
+  const cards = pendingForStageV1(canonicalId, stage).filter(
+    (d) => isOwnerDecisionCardKeyV1(d.decisionKey) && d.decisionKey !== ignoreDecisionKey
+  );
   return ownerDecisionCardsCoverV1(cards, identities);
 }
 

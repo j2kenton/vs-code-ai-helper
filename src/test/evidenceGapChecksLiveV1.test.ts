@@ -12,9 +12,19 @@ import * as vscode from "vscode";
 
 import {
   closeEvidenceGapWithPublishChecksV1,
+  registerTickEvidenceGapItemsCommandV1,
   runEvidenceGapChecksV1,
   type EvidenceGapChecksRunV1,
 } from "../commands/evidenceGapChecksV1";
+import { AUTOMATION_STOPPED_DECISION_KEY_V1 } from "../commands/automationStoppedCardV1";
+import { buildEvidenceGapCardInputV1, TICK_EVIDENCE_GAP_ITEMS_COMMAND_V1 } from "../utils/evidenceGapV1";
+import { recordReviewInputsV1 } from "../utils/reviewInputsChangedV1";
+import { __extensionContextV1TestOnly } from "../utils/extensionContextV1";
+import { deactivateNotificationRouter, initNotificationRouter } from "../utils/notificationRouter";
+import { listPendingWorkflowDecisionsForTaskV1, postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
+import { normalizePath } from "../utils/taskRoot";
+import { readChatHistory } from "../utils/chatHistoryStore";
+import type { WorkflowDecisionV1 } from "../types/workflowDecisionV1";
 import {
   getPlanRevisionV1,
   normalizeChecklistItemTextV1,
@@ -189,5 +199,179 @@ void describe("the gap's one checks run passes Step 24's gate first (Step 34)", 
     });
     assert.deepEqual(result, { ran: false, detail: "no valid scope" });
     assert.equal(takePublishChecksPassedFilesV1(folder), undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bugs8 item 4 (Part A1, regression test only): ticking the last item settles the stage, and the owner is told.
+// ---------------------------------------------------------------------------
+
+const READY_REVIEW = "Readiness: 9/10\n\n## Blockers\n\n<!-- blockers:start -->\n<!-- blockers:end -->\n";
+
+type TickHandlerV1 = (arg: { taskFolderPath: string; itemTexts: readonly string[] }) => Promise<number>;
+
+/** The handler `registerTickEvidenceGapItemsCommandV1` registers, captured so the test runs the real thing. */
+function captureTickHandlerV1(): TickHandlerV1 {
+  const commandsTarget = vscode.commands as unknown as {
+    registerCommand: (id: string, callback: (...args: never[]) => unknown) => { dispose(): void };
+  };
+  const original = commandsTarget.registerCommand;
+  const holder: { handler?: TickHandlerV1 } = {};
+  commandsTarget.registerCommand = (id, callback) => {
+    if (id === TICK_EVIDENCE_GAP_ITEMS_COMMAND_V1) {
+      holder.handler = callback as unknown as TickHandlerV1;
+    }
+    return { dispose: (): void => undefined };
+  };
+  try {
+    registerTickEvidenceGapItemsCommandV1({ subscriptions: [] } as unknown as vscode.ExtensionContext);
+  } finally {
+    commandsTarget.registerCommand = original;
+  }
+  assert.ok(holder.handler, "test setup: the tick command registered a handler");
+  return holder.handler;
+}
+
+/** A clean, current review at a plan-review stage (plan reviews carry no commit stamps, so no git state is read). */
+function makeReadyTaskV1(): { folder: string } {
+  const fixture = makeOwnedTaskFolder("evidence-gap-ready-");
+  roots.push(path.dirname(path.dirname(fixture.folder)));
+  const revision = getPlanRevisionV1(PLAN);
+  const file = path.join(fixture.folder, "task-progress.json");
+  const json = JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
+  json["currentStage"] = "plan-high-review";
+  json["status"] = "active";
+  json["displayName"] = "bugs8 item 4";
+  json["planItemEvidence"] = [STEP7, STEP17, STEP22].map((text) => ({
+    planRevision: revision,
+    itemKey: normalizeChecklistItemTextV1(text),
+    itemText: text,
+    claims: [{ source: "implementation", at: "2026-11-03T06:00:00.000Z", roundId: "r1" }],
+  }));
+  fs.writeFileSync(file, JSON.stringify(json, null, 2), "utf8");
+  fs.writeFileSync(path.join(fixture.folder, "task.md"), "# Task\n\n## Task Description\n\nX\n", "utf8");
+  fs.writeFileSync(path.join(fixture.folder, "plan.md"), "# Plan\n", "utf8");
+  fs.writeFileSync(path.join(fixture.folder, "plan-final.md"), PLAN, "utf8");
+  return { folder: fixture.folder };
+}
+
+/** The review is written last, and newer than every input it read, so it is the current one. */
+async function writeCurrentReviewV1(folder: string): Promise<void> {
+  const reviewPath = path.join(folder, "plan-high-review.md");
+  await recordReviewInputsV1(folder, reviewPath);
+  fs.writeFileSync(reviewPath, READY_REVIEW, "utf8");
+  const later = new Date(Date.now() + 5_000);
+  fs.utimesSync(reviewPath, later, later);
+}
+
+function pendingIsDoneCardsV1(folder: string): readonly WorkflowDecisionV1[] {
+  return listPendingWorkflowDecisionsForTaskV1(normalizePath(folder)).filter(
+    (card) => card.decisionKey === AUTOMATION_STOPPED_DECISION_KEY_V1 && /is done/.test(card.whatHappened)
+  );
+}
+
+void describe("bugs8 item 4: a tick that settles the last item says the stage is done", () => {
+  void it("ticking the last item from an evidence card of an earlier failed Publish Checks run raises exactly one 'is done' card", async () => {
+    const values = new Map<string, unknown>();
+    const memento = {
+      get<T>(key: string, defaultValue: T): T {
+        return (values.has(key) ? values.get(key) : defaultValue) as T;
+      },
+      update(key: string, value: unknown): Promise<void> {
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      keys: (): string[] => [...values.keys()],
+    } as unknown as vscode.Memento;
+    __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
+    initNotificationRouter({ addEntry: (): void => undefined });
+    try {
+      const { folder } = makeReadyTaskV1();
+      await writeCurrentReviewV1(folder);
+      const tick = captureTickHandlerV1();
+
+      // The evening before: Publish Checks failed, and its evidence card listed the item still waiting.
+      const oldCard = buildEvidenceGapCardInputV1({
+        taskFolderPath: folder,
+        stage: "plan-high-review",
+        attempt: "failed",
+        attemptDetail: "2 tests failed",
+        score: 9,
+        items: [{ itemText: STEP22, passingRuns: 0 }],
+        recordedCount: 0,
+        planItems: { total: 3, settled: 2 },
+        nextStage: "plan-low-review",
+      });
+      await postWorkflowDecisionV1(oldCard, {
+        canonicalId: normalizePath(folder),
+        taskFolderPath: folder,
+        stage: "plan-high-review",
+        taskName: "bugs8 item 4",
+      });
+
+      // Every item but one is settled by the owner's earlier ticks; none of them completes the stage.
+      assert.equal(await tick({ taskFolderPath: folder, itemTexts: [STEP7, STEP17] }), 2, "setup: the first two ticks were not recorded");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(pendingIsDoneCardsV1(folder).length, 0, "setup: a tick that leaves an item open already raised an 'is done' card");
+
+      // The last tick, from the old card.
+      assert.equal(await tick({ taskFolderPath: folder, itemTexts: [STEP22] }), 1, "setup: the last tick was not recorded");
+      for (let attempt = 0; attempt < 400 && pendingIsDoneCardsV1(folder).length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      // A second card would be raised a moment after the first, so wait before counting.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      const cards = pendingIsDoneCardsV1(folder);
+      assert.equal(cards.length, 1, `item4: no is-done card (found ${cards.length})`);
+      const recommendation = cards[0]!.recommendation;
+      assert.ok(
+        recommendation.kind === "option" && recommendation.optionId === "moveOn",
+        "item4: the 'is done' card does not recommend Move on"
+      );
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
+  });
+
+  void it("bugs8 Step 8: a tick that raises no 'is done' card says why in the chat and names the click, once per tick command", async () => {
+    const values = new Map<string, unknown>();
+    const memento = {
+      get<T>(key: string, defaultValue: T): T {
+        return (values.has(key) ? values.get(key) : defaultValue) as T;
+      },
+      update(key: string, value: unknown): Promise<void> {
+        values.set(key, value);
+        return Promise.resolve();
+      },
+      keys: (): string[] => [...values.keys()],
+    } as unknown as vscode.Memento;
+    __extensionContextV1TestOnly.set({ workspaceState: memento } as unknown as vscode.ExtensionContext);
+    initNotificationRouter({ addEntry: (): void => undefined });
+    try {
+      const { folder } = makeReadyTaskV1();
+      await writeCurrentReviewV1(folder);
+      const tick = captureTickHandlerV1();
+      const lines = async (): Promise<string[]> =>
+        (await readChatHistory(folder, folder)).map((message) => message.text).filter((text) => /Your tick is recorded/.test(text));
+
+      // An item is still open: no card, and one line that says why and which click carries on.
+      assert.equal(await tick({ taskFolderPath: folder, itemTexts: [STEP7, STEP17] }), 2, "setup: the ticks were not recorded");
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      assert.equal(pendingIsDoneCardsV1(folder).length, 0, "setup: a card was raised with an item still open");
+      const open = await lines();
+      assert.equal(open.length, 1, `step8: expected one line for the tick command, found ${open.length}`);
+      assert.match(open[0]!, /still has plan items open or waiting for a check/, "step8: the line does not say why no card was raised");
+      assert.match(open[0]!, /Click Apply Review with AI/, "step8: the line does not name the click");
+
+      // The last tick raises the card, so it adds no line.
+      assert.equal(await tick({ taskFolderPath: folder, itemTexts: [STEP22] }), 1, "setup: the last tick was not recorded");
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      assert.equal(pendingIsDoneCardsV1(folder).length, 1, "step8: the last tick raised no 'is done' card");
+      assert.equal((await lines()).length, 1, "step8: a tick that raised the card also wrote a 'why not' line");
+    } finally {
+      deactivateNotificationRouter();
+      __extensionContextV1TestOnly.reset();
+    }
   });
 });

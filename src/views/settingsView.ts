@@ -30,7 +30,6 @@ import { ModelSettings } from "../utils/modelFallback";
 import {
   describeEmptyStageWarningV1,
   recordModelSettingsSaveV1,
-  STAGE_GROUP_LABELS_V1,
   stagesLeftWithoutEnabledModelV1,
 } from "../utils/modelStageLabelsV1";
 import { ENSEMBLE_DISMISS_BUTTON_CSS_V1 } from "./sharedButtonStylesV1";
@@ -315,8 +314,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
         }
         case "saveSettings": {
           // bugs6 item 3: a save that leaves a stage with no enabled model asks first (a pop-up confirmation, the
-          // owner's rule for confirmations): that stage's next round would fail, as Implementation › High-Level Code
-          // Review's did on 2026-11-01.
+          // owner's rule for confirmations): that stage's next round would fail, as High-Level Code Review's did on
+          // 2026-11-01.
           const previousSettings = getModelSettings();
           const emptied = stagesLeftWithoutEnabledModelV1(previousSettings, data.settings);
           if (emptied.length > 0) {
@@ -564,9 +563,8 @@ export class SettingsViewProvider implements vscode.WebviewViewProvider {
       settings,
       models,
       stages: AI_MODEL_STAGES,
-      // bugs6 item 3: the review stages carry their group ("Plan › High-Level Review",
-      // "Implementation › High-Level Code Review"), so no two stages differ by one word.
-      stageNames: { ...STAGE_DISPLAY_NAMES, ...STAGE_GROUP_LABELS_V1 },
+      // bugs8 item 5: one name per stage, the Tasks pane's ("High-Level Review (Plan)" and "High-Level Code Review").
+      stageNames: { ...STAGE_DISPLAY_NAMES },
       stageTitleOverrides: STAGE_TITLE_OVERRIDES,
       stageHints: STAGE_ROLE_HINTS,
       enabledProviders: getEnabledProviders(),

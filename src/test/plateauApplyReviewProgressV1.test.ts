@@ -203,7 +203,9 @@ void describe("plateau card with a defect beside a mostly unbuilt plan (bugs4 it
     assert.match(reasoning, /already built and ticked, waiting only for verification/);
   });
 
-  void it("control: model ticks alone, with no review affirmation that they are built, still recommend building (bugs4 item 53)", () => {
+  void it("bugs8 item 3: items that are all built but not yet checked never get a Build option, whatever the review says about them", () => {
+    // Before bugs8 a model tick was only a claim, so Build was still offered for it. The stop card's own split ("N to
+    // build, M built but not yet checked") now decides: nothing is left to build, so the evidence path is offered.
     const card = buildEscalationDecisionV1("plateau", STAGE, "plateau", target, {
       ...base,
       blockersCount: 1,
@@ -213,11 +215,14 @@ void describe("plateau card with a defect beside a mostly unbuilt plan (bugs4 it
       hasNonFixableBlocker: true,
       planItemsOpen: 132,
       provisionalTicks: 132,
+      provisionalItemTexts: ["Step 1: first built item"],
       reviewAffirmsOpenItemsBuilt: false,
       applyReviewRoundsClosedNone: 0,
     });
     const optionId = card.recommendation?.kind === "option" ? card.recommendation.optionId : "";
-    assert.equal(optionId, "buildRemaining");
+    assert.notEqual(optionId, "buildRemaining");
+    assert.ok(!card.options.some((option) => option.optionId === "buildRemaining"), "Build was offered with nothing left to build");
+    assert.ok(card.options.some((option) => option.optionId === "checkBuiltItems"), "the evidence path was not offered");
   });
 
   void it("control: open items that are NOT all built still recommend building them", () => {

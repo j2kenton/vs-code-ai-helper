@@ -117,7 +117,7 @@ void describe("bugs6 item 32: the viewer relays 'Review again anyway' to the run
     await rerunReviewAfterUnchangedTreeCardV1(vscode.Uri.file("/ext"), input, undefined, deps);
     assert.equal(calls, 1);
     assert.match(said[0] ?? "", /has not said whether/);
-    assert.equal(describeRerunNotRelayedV1("Implementation › Low-Level Code Review", true), said[0]);
+    assert.equal(describeRerunNotRelayedV1("Low-Level Code Review", true), said[0]);
   });
 });
 

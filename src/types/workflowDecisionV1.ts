@@ -29,6 +29,7 @@
 
 import { TaskStage } from "./taskProgress";
 import { HandoffGatingV1 } from "./handoffGuidanceV1";
+import type { StageDispatchOutcomeV1 } from "./stageDispatchOutcomeV1";
 
 /** One selectable effect of choosing a decision's option. */
 export type WorkflowDecisionOptionEffectV1 =
@@ -61,6 +62,12 @@ export interface WorkflowDecisionCommandResultV1 {
    * operation ends.
    */
   readonly reopenCard?: boolean;
+  /**
+   * bugs8 Step 4: set by a command that owes a stage dispatch (an owner answer that starts a round). Says whether that
+   * dispatch `started` (a confirmed start), is `held`, was `refused`, or was `recordedOnly`. A command without it makes
+   * no claim about a start, and the chat writes no "applying now" for it.
+   */
+  readonly dispatch?: StageDispatchOutcomeV1;
 }
 
 export function isWorkflowDecisionCommandResultV1(value: unknown): value is WorkflowDecisionCommandResultV1 {

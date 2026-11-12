@@ -118,6 +118,8 @@ const INVENTORY: readonly InventoryRow[] = [
   // record still has open checklist items — moves the task to Implementation
   // (and continues Fast Forward there when one was interrupted).
   { file: "utils/reviewEscalation.ts", optionId: "buildRemaining", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: buildRemaining dispatches resumeAndSetTaskStage to impl" },
+  // bugs8 item 3 (Step 13): built-but-unchecked items get the Publish Checks evidence path, not a build round.
+  { file: "utils/reviewEscalation.ts", optionId: "checkBuiltItems", occurrence: 0, resumeKind: "continue", dispatchProof: "ownerPlanDecisionCommandV1.test.ts: checkBuiltItems runs Publish Checks for the built items and buildRemaining is not offered" },
   { file: "utils/reviewEscalation.ts", optionId: "reconsiderRequirement", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: reconsiderRequirement opens Accepted Non-Goals, dispatches nothing" },
   { file: "utils/reviewEscalation.ts", optionId: "keepIterating", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: keepIterating (task-fixable branch) is continue" },
   { file: "utils/reviewEscalation.ts", optionId: "handleMyself", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: handleMyself leaves task paused" },
@@ -402,6 +404,7 @@ type RowEvidenceV1 = RuntimeTestEvidenceV1 | TrivialNoDispatchEvidenceV1 | Known
 const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvidenceV1>([
   [rowKey("utils/reviewEscalation.ts", "advance", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts", "commandArgNormalization.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "buildRemaining", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
+  [rowKey("utils/reviewEscalation.ts", "checkBuiltItems", 0), { kind: "runtime-test", proofFiles: ["ownerPlanDecisionCommandV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "reconsiderRequirement", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepIterating", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "handleMyself", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],

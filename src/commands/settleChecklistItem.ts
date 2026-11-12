@@ -24,7 +24,7 @@ import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { recordPlanItemOwnerDecisionV1 } from "../utils/taskProgressTransforms";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
 import { askChatFreeTextV1 } from "../utils/chatFreeTextV1";
-import { postStageReadyCardIfReadyV1 } from "./automationStoppedCardV1";
+import { postStageReadyCardIfReadyV1, type StageReadyOutcomeV1 } from "./automationStoppedCardV1";
 import { refreshPlanItemSettlementSnapshotV1 } from "./planItemSettlementNoticeV1";
 
 /**
@@ -50,7 +50,12 @@ export type SettleChecklistItemArgV1 =
 export type SettleChecklistItemOutcomeV1 =
   | { readonly kind: "settled"; readonly itemText: string }
   /** review1 Step 7: a ticked item awaiting a check was settled by recording the owner's tick (the line is untouched). */
-  | { readonly kind: "ownerTickRecorded"; readonly itemText: string }
+  | {
+      readonly kind: "ownerTickRecorded";
+      readonly itemText: string;
+      /** bugs8 Step 8: the stage-ready check this tick started (never rejects); a caller that reports to the owner awaits it. */
+      readonly stageReady?: Promise<StageReadyOutcomeV1>;
+    }
   /** review1 Step 7: the item is ticked and a reviewer or the owner already settled it. */
   | { readonly kind: "alreadySettled"; readonly itemText: string }
   | { readonly kind: "noPlan" }
@@ -129,8 +134,8 @@ export async function applyOwnerTickToProvisionalItemV1(
   const settledId = ids.length === hashEntries.length ? ids[hashEntries.indexOf(entry)]?.itemId : undefined;
   await recordOwnerSettlementV1(taskFolderPath, plan, entry.text, "tick", settledId);
   // review1 Step 31: if that was the last open item and the review is clean, say so at once.
-  void postStageReadyCardIfReadyV1(taskFolderPath, "After your tick");
-  return { kind: "ownerTickRecorded", itemText: entry.text };
+  const stageReady = postStageReadyCardIfReadyV1(taskFolderPath, "After your tick");
+  return { kind: "ownerTickRecorded", itemText: entry.text, stageReady };
 }
 
 /**

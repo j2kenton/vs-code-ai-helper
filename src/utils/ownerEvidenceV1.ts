@@ -47,6 +47,61 @@ export async function appendOwnerEvidenceV1(
   await fs.writeFile(taskPath, `${original.replace(/\s*$/, "")}\n\n## Owner evidence\n\n${subsection}\n`);
 }
 
+interface OwnerDecisionRecordV1 {
+  readonly blockerId: string;
+  readonly blockerText: string;
+  readonly answer: string;
+}
+
+function ownerDecisionEntryV1(decision: OwnerDecisionRecordV1, date: string): string {
+  const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
+  return (
+    `### ${date} — ${decision.blockerId}\n\n` +
+    `Blocker answered:\n> ${oneLine(decision.blockerText)}\n\n` +
+    `Owner's answer: ${oneLine(decision.answer)}\n`
+  );
+}
+
+/**
+ * bugs8 item 2: marks every earlier `## Owner decisions` entry for `blockerId` as superseded (its heading gains
+ * "(superseded <date>)"), so a replacing decision is read as the current one while the old entry stays on record.
+ * An entry that is already marked is left alone.
+ */
+export function markOwnerDecisionsSupersededV1(original: string, blockerId: string, date: string): string {
+  const section = /^## Owner decisions[ \t]*$/im.exec(original);
+  if (!section) return original;
+  const start = section.index + section[0].length;
+  const nextHeading = /^## /m.exec(original.slice(start));
+  const end = nextHeading ? start + nextHeading.index : original.length;
+  const escaped = blockerId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const entryHeading = new RegExp(`^(### \\d{4}-\\d{2}-\\d{2} — ${escaped})[ \\t]*$`, "gm");
+  const marked = original.slice(start, end).replace(entryHeading, `$1 (superseded ${date})`);
+  return `${original.slice(0, start)}${marked}${original.slice(end)}`;
+}
+
+/**
+ * bugs8 item 2: records an owner decision that REPLACES an earlier one for the same blocker: the earlier entries are
+ * marked superseded and the new entry is added at the top of `## Owner decisions`. Returns false, writing nothing,
+ * when task.md cannot be read or this exact answer is already recorded.
+ */
+export async function recordReplacingOwnerDecisionV1(
+  taskFolderPath: string,
+  decision: OwnerDecisionRecordV1,
+  date = new Date().toISOString().slice(0, 10)
+): Promise<boolean> {
+  const taskPath = path.join(taskFolderPath, "task.md");
+  let original: string;
+  try {
+    original = await fs.readFile(taskPath, "utf8");
+  } catch {
+    return false;
+  }
+  if (original.includes(ownerDecisionEntryV1(decision, date))) return false;
+  const marked = markOwnerDecisionsSupersededV1(original, decision.blockerId, date);
+  if (marked !== original) await fs.writeFile(taskPath, marked);
+  return appendOwnerDecisionV1(taskFolderPath, decision, date);
+}
+
 /**
  * review1 Step 40: records an owner's answer to an owner-decision blocker under `## Owner decisions` in task.md,
  * dated, with the blocker id, the blocker text and the answer. Reviews read task.md as the owner's own words, so a
@@ -65,11 +120,7 @@ export async function appendOwnerDecisionV1(
   } catch {
     return false;
   }
-  const oneLine = (text: string): string => text.replace(/\s+/g, " ").trim();
-  const entry =
-    `### ${date} — ${decision.blockerId}\n\n` +
-    `Blocker answered:\n> ${oneLine(decision.blockerText)}\n\n` +
-    `Owner's answer: ${oneLine(decision.answer)}\n`;
+  const entry = ownerDecisionEntryV1(decision, date);
   if (original.includes(entry)) return false;
   const heading = /^## Owner decisions[ \t]*$/im;
   const existing = heading.exec(original);

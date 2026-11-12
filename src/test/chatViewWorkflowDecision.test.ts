@@ -1239,7 +1239,9 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.text.includes("Do it"));
       assert.ok(ack, "expected a stored entry acknowledging the resolved decision");
-      assert.match(ack.text, /applying now/i);
+      // bugs8 Step 6: the acknowledgement says only what is true (the choice is recorded), never that it is applying.
+      assert.match(ack.text, /^Recorded: "Do it"/);
+      assert.doesNotMatch(ack.text, /applying now/i);
     } finally {
       notify.restore();
       cmds.restore();
@@ -1589,8 +1591,9 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         ...(await storedStatusLines(folder)),
         ...((lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? []),
       ];
-      const applyingAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /applying now/i.test(e.text));
-      assert.ok(applyingAck, "expected the immediate 'applying now' acknowledgement before the command resolves");
+      const applyingAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /^Recorded: /.test(e.text));
+      assert.ok(applyingAck, "expected the immediate 'Recorded' acknowledgement before the command resolves");
+      assert.doesNotMatch(applyingAck.text, /applying now/i, "the acknowledgement must not claim a start the command has not confirmed");
       const failureAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /did not complete/i.test(e.text));
       assert.ok(failureAck, "expected a follow-up acknowledgement that the command did not actually complete");
     } finally {
@@ -2092,8 +2095,9 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         "the chosen option's bound command must actually be dispatched"
       );
       const entries = await storedStatusLines(folder);
-      const ack = entries.find((e) => e.role === "assistant" && /applying now/i.test(e.text));
-      assert.ok(ack, "expected an 'applying now' acknowledgement, matching the decision-card effect path");
+      const ack = entries.find((e) => e.role === "assistant" && /^Recorded: /.test(e.text));
+      assert.ok(ack, "expected a 'Recorded' acknowledgement, matching the decision-card effect path");
+      assert.doesNotMatch(ack.text, /applying now/i);
 
       const interactions = await readChatInteractions(folder, folder);
       const settled = interactions.find((i) => i.interactionId === interactionId);

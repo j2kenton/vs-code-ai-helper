@@ -1,26 +1,18 @@
 /**
  * bugs6 item 3: AI Models names every stage with its group, warns before a save leaves a stage with no enabled model,
  * remembers which stage's model the owner changed last, and says so when a round finds a stage with nothing enabled
- * ("GLM 5.3 was just enabled on Plan › High-Level Review; did you mean Implementation › High-Level Code Review?").
+ * ("GLM 5.3 was just enabled on High-Level Review (Plan); did you mean High-Level Code Review?").
  */
 import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES, type TaskStage } from "../types/taskProgress";
 import type { ModelSettings, StageModelSetting } from "./modelFallback";
 
 /**
- * The stage names as AI Models and the cards that point at it show them. The Plan and Implementation review stages
- * differed by one word ("High-Level Review" and "High-Level Code Review"); each now carries its group, so the two can
- * never be taken for each other.
+ * bugs8 item 5: a stage has one name everywhere, the Tasks pane's (`STAGE_DISPLAY_NAMES`). The two Plan review stages
+ * keep "(Plan)" in it ("High-Level Review (Plan)" against "High-Level Code Review"), so they cannot be taken for the
+ * code reviews. AI Models, its cards, the quota card and Fast Forward's stop lines all name stages through this.
  */
-export const STAGE_GROUP_LABELS_V1: Partial<Record<TaskStage, string>> = {
-  "plan-high-review": "Plan › High-Level Review",
-  "plan-low-review": "Plan › Low-Level Review",
-  "impl-high-review": "Implementation › High-Level Code Review",
-  "impl-low-review": "Implementation › Low-Level Code Review",
-};
-
-/** "Implementation › High-Level Code Review"; stages with no group keep their plain name. */
 export function stageGroupLabelV1(stage: TaskStage): string {
-  return STAGE_GROUP_LABELS_V1[stage] ?? STAGE_DISPLAY_NAMES[stage] ?? stage;
+  return STAGE_DISPLAY_NAMES[stage] ?? stage;
 }
 
 /** The enabled model ids of one stage's chain, primary first. */

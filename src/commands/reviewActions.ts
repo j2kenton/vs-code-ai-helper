@@ -7607,8 +7607,8 @@ export async function pauseTaskForExhaustedChainV1(
    */
   code?: WorkflowUnavailableCodeV1
 ): Promise<void> {
-  // bugs6 item 3: the card names the stage with its group ("Implementation › High-Level Code Review"), never the raw
-  // id, so the Plan and Implementation review stages cannot be taken for each other.
+  // bugs8 item 5: the card names the stage as the Tasks pane does ("High-Level Code Review"), never the raw id; the
+  // Plan reviews keep "(Plan)" in that name, so the Plan and code review stages cannot be taken for each other.
   const stageName = stageGroupLabelV1((exhaustion.stage ?? stage) as TaskStage);
   // bugs6 item 23: switched-on backups a quota stop skipped because "Fall back to backup models" is off. "Every
   // configured model" is said only when no switched-on model was left untried.

@@ -161,7 +161,7 @@ void describe("review2 Step 41: cards from one round are a group", () => {
       openSiblings: () => open.value,
       start: (arg) => {
         log.started.push(arg.blockerId);
-        return Promise.resolve(true);
+        return Promise.resolve({ kind: "started" } as const);
       },
       say: (_arg, text) => {
         log.said.push(text);
@@ -180,7 +180,7 @@ void describe("review2 Step 41: cards from one round are a group", () => {
     const open = { value: 3 };
     const { deps, log } = fakeDeps(open);
     // The owner answers the review's card ("Allow escalation countdowns") first: three round cards are still open.
-    assert.equal(await followUpAfterOwnerAnswerV1(ARG("review-card"), deps), false);
+    assert.equal((await followUpAfterOwnerAnswerV1(ARG("review-card"), deps)).kind, "held");
     assert.deepEqual(log.started, [], "no review starts at once");
     assert.equal(log.offered, 1, "the Run now card is offered");
     assert.match(log.said[0]!, /3 decisions from this round/);
@@ -202,7 +202,7 @@ void describe("review2 Step 41: cards from one round are a group", () => {
 
   void it("an answer with no siblings starts its run at once", async () => {
     const { deps, log } = fakeDeps({ value: 0 });
-    assert.equal(await followUpAfterOwnerAnswerV1(ARG("only"), deps), true);
+    assert.equal((await followUpAfterOwnerAnswerV1(ARG("only"), deps)).kind, "started");
     assert.deepEqual(log.started, ["only"]);
     assert.equal(log.offered, 0);
   });

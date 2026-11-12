@@ -30,7 +30,7 @@ export function findBackupsSkippedByNeverSwitchV1(
   );
 }
 
-/** "Claude Opus 5.5 is a backup but 'Fall back to backup models' is off for Implementation › High-Level Code Review." */
+/** "Claude Opus 5.5 is a backup but 'Fall back to backup models' is off for High-Level Code Review." */
 export function describeSkippedBackupsV1(stage: TaskStage, labels: readonly string[]): string {
   if (labels.length === 0) return "";
   const subject = labels.length === 1 ? `${labels[0]} is a backup` : `${labels.join(" and ")} are backups`;

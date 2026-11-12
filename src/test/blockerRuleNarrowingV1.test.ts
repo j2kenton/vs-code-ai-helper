@@ -147,7 +147,7 @@ void describe("the rule answer is followed by exactly one Apply Review (review2 
       calls.push(command);
       return Promise.resolve(true);
     });
-    assert.equal(started, true);
+    assert.equal(started.kind, "started");
     assert.deepEqual(calls, ["vs-code-ai-helper.resumeAndApplyCurrentStageAction"]);
   });
 

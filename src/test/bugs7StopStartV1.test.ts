@@ -46,7 +46,7 @@ void describe("an answer group keeps the strongest outstanding requirement (bugs
       openSiblings: () => open.value,
       start: (arg) => {
         started.push(arg);
-        return Promise.resolve(true);
+        return Promise.resolve({ kind: "started" } as const);
       },
       say: () => Promise.resolve(),
       offerRunNow: () => Promise.resolve(),
@@ -109,8 +109,8 @@ void describe("the fallback reads the recommendation and the review's own build-
     assert.match(reviewNextRoundTextV1(review) ?? "", /the next round should reword/i);
     assert.equal(ownerOptionNeedsCodeChangeV1(keep, bare, reviewNextRoundTextV1(review)), true);
     assert.equal(ownerOptionNeedsCodeChangeV1(drop, bare, reviewNextRoundTextV1(review)), false);
-    assert.match(describeOwnerAnswerNextV1(keep, bare, "High-Level Code Review", reviewNextRoundTextV1(review)), /^applying now/);
-    assert.match(describeOwnerAnswerNextV1(drop, bare, "High-Level Code Review", reviewNextRoundTextV1(review)), /^checking it now/);
+    assert.match(describeOwnerAnswerNextV1(keep, bare, "High-Level Code Review", reviewNextRoundTextV1(review)), /^Apply Review builds it/);
+    assert.match(describeOwnerAnswerNextV1(drop, bare, "High-Level Code Review", reviewNextRoundTextV1(review)), /checks it next$/);
   });
 });
 

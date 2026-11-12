@@ -15,6 +15,7 @@ import {
   stageGroupLabelV1,
   stagesLeftWithoutEnabledModelV1,
 } from "../utils/modelStageLabelsV1";
+import { AI_MODEL_STAGES, STAGE_DISPLAY_NAMES } from "../types/taskProgress";
 import { openAiModelsV1, type OpenAiModelsDepsV1 } from "../commands/openAiModelsV1";
 import {
   describeSkippedBackupsV1,
@@ -24,23 +25,54 @@ import {
 } from "../commands/turnOnFallbackAndRetryV1";
 import type { ModelSettings } from "../utils/modelFallback";
 
-const SETTINGS_VIEW_SOURCE = fs.readFileSync(path.resolve(__dirname, "../../src/views/settingsView.ts"), "utf8");
+const SRC_ROOT = path.resolve(__dirname, "../../src");
+const SETTINGS_VIEW_SOURCE = fs.readFileSync(path.join(SRC_ROOT, "views", "settingsView.ts"), "utf8");
+const REVIEW_ACTIONS_SOURCE = fs.readFileSync(path.join(SRC_ROOT, "commands", "reviewActions.ts"), "utf8");
 
-void describe("bugs6 item 3: stages are named with their group", () => {
-  void it("the Plan and Implementation review stages differ by more than one word", () => {
-    const plan = stageGroupLabelV1("plan-high-review");
-    const impl = stageGroupLabelV1("impl-high-review");
-    assert.equal(plan, "Plan › High-Level Review");
-    assert.equal(impl, "Implementation › High-Level Code Review");
-    const planWords = new Set(plan.split(/\s+/));
-    const differing = impl.split(/\s+/).filter((word) => !planWords.has(word));
-    assert.ok(differing.length > 1, `the labels differ by ${differing.join(", ")}`);
-    assert.equal(stageGroupLabelV1("impl-low-review"), "Implementation › Low-Level Code Review");
+void describe("bugs8 item 5: one name per stage, the Tasks pane's", () => {
+  void it("the Plan review stages keep '(Plan)', so they cannot be taken for the code reviews", () => {
+    assert.equal(stageGroupLabelV1("plan-high-review"), "High-Level Review (Plan)");
+    assert.equal(stageGroupLabelV1("plan-low-review"), "Low-Level Review (Plan)");
+    assert.equal(stageGroupLabelV1("impl-high-review"), "High-Level Code Review");
+    assert.equal(stageGroupLabelV1("impl-low-review"), "Low-Level Code Review");
     assert.equal(stageGroupLabelV1("publish"), "Publish");
   });
 
-  void it("AI Models sends the group labels as the stage names, selects the focused stage and names it", () => {
-    assert.match(SETTINGS_VIEW_SOURCE, /stageNames: \{ \.\.\.STAGE_DISPLAY_NAMES, \.\.\.STAGE_GROUP_LABELS_V1 \}/);
+  void it("for every stage, the AI Models row label, the quota card's stage name and the Tasks pane's row label are the same string", () => {
+    // AI Models sends `{ ...STAGE_DISPLAY_NAMES }` as its stage names (asserted below); the quota card and every other
+    // card name a stage through `stageGroupLabelV1`; the Tasks pane's rows use `STAGE_DISPLAY_NAMES` directly.
+    const aiModelsRowLabels: Record<string, string> = { ...STAGE_DISPLAY_NAMES };
+    for (const stage of AI_MODEL_STAGES) {
+      const tasksPane = STAGE_DISPLAY_NAMES[stage];
+      assert.equal(aiModelsRowLabels[stage], tasksPane, `AI Models row for ${stage}`);
+      assert.equal(stageGroupLabelV1(stage), tasksPane, `quota card stage name for ${stage}`);
+    }
+    assert.match(REVIEW_ACTIONS_SOURCE, /const stageName = stageGroupLabelV1\(\(exhaustion\.stage \?\? stage\) as TaskStage\);/);
+  });
+
+  void it("no non-test source file in src/ labels a stage 'Plan ›' or 'Implementation ›'", () => {
+    const offenders: string[] = [];
+    const walk = (directory: string): void => {
+      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+        const full = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          if (entry.name === "test" || entry.name === "node_modules") continue;
+          walk(full);
+        } else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) {
+          const text = fs.readFileSync(full, "utf8");
+          text.split("\n").forEach((line, index) => {
+            if (/Plan ›|Implementation ›/.test(line)) offenders.push(`${path.relative(SRC_ROOT, full)}:${index + 1}`);
+          });
+        }
+      }
+    };
+    walk(SRC_ROOT);
+    assert.deepEqual(offenders, [], `stage labels with a group prefix: ${offenders.join(", ")}`);
+  });
+
+  void it("AI Models sends the Tasks pane's names as the stage names, selects the focused stage and names it", () => {
+    assert.match(SETTINGS_VIEW_SOURCE, /stageNames: \{ \.\.\.STAGE_DISPLAY_NAMES \}/);
+    assert.doesNotMatch(SETTINGS_VIEW_SOURCE, /STAGE_GROUP_LABELS_V1/);
     assert.match(SETTINGS_VIEW_SOURCE, /row\.classList\.add\('selected-stage'\)/);
     assert.match(SETTINGS_VIEW_SOURCE, /'Opened for ' \+ \(stageDisplayNames\[message\.stage\] \|\| message\.stage\)/);
   });
@@ -75,10 +107,10 @@ void describe("bugs6 item 3: saving a stage with no enabled model warns first", 
     assert.deepEqual(stagesLeftWithoutEnabledModelV1({}, {}), []);
   });
 
-  void it("the warning names the stage with its group", () => {
+  void it("the warning names the stage as the Tasks pane does", () => {
     assert.equal(
       describeEmptyStageWarningV1(["impl-high-review"]),
-      "Implementation › High-Level Code Review would have no enabled model; its next round will fail."
+      "High-Level Code Review would have no enabled model; its next round will fail."
     );
   });
 
@@ -91,7 +123,7 @@ void describe("bugs6 item 3: saving a stage with no enabled model warns first", 
 void describe("bugs6 item 3: the retry names the stage and the last-changed stage", () => {
   beforeEach(() => __resetLastModelChangeForTestV1());
 
-  void it("a model enabled on Plan › High-Level Review is named when Implementation › High-Level Code Review has none", () => {
+  void it("a model enabled on High-Level Review (Plan) is named when High-Level Code Review has none", () => {
     const previous: ModelSettings = { "impl-high-review": { primary: "kimi-cli:k3", primaryEnabled: false, strategy: "never-switch" } };
     const next: ModelSettings = {
       ...previous,
@@ -103,13 +135,13 @@ void describe("bugs6 item 3: the retry names the stage and the last-changed stag
     const text = describeNoModelConfiguredV1("impl-high-review", last, () => "GLM 5.3");
     assert.match(
       text,
-      /GLM 5\.3 was just enabled on Plan › High-Level Review; did you mean Implementation › High-Level Code Review\?/
+      /GLM 5\.3 was just enabled on High-Level Review \(Plan\); did you mean High-Level Code Review\?/
     );
-    assert.match(text, /Open Implementation › High-Level Code Review in AI Models/);
+    assert.match(text, /Open High-Level Code Review in AI Models/);
   });
 
   void it("with no earlier change, or a change on the same stage, it still names the stage and the way to open it", () => {
-    assert.match(describeNoModelConfiguredV1("impl-high-review", undefined), /No model is enabled for Implementation › High-Level Code Review\./);
+    assert.match(describeNoModelConfiguredV1("impl-high-review", undefined), /No model is enabled for High-Level Code Review\./);
     assert.doesNotMatch(
       describeNoModelConfiguredV1("impl-high-review", { stage: "impl-high-review", modelId: "x", at: "t" }),
       /did you mean/
@@ -171,7 +203,7 @@ void describe("bugs6 item 22: openAiModels always ends with AI Models visible, o
     assert.match(result.reason ?? "", /did not load/);
     assert.match(result.message ?? "", /AI Models could not be shown \(the AI Models section did not load in this window\)/);
     assert.match(result.message ?? "", /View: Open View…/);
-    assert.match(result.message ?? "", /Implementation › High-Level Code Review/);
+    assert.match(result.message ?? "", /High-Level Code Review/);
     assert.ok(!calls.some((call) => call.startsWith("focusStage")), "focusStage is sent only to a visible view");
   });
 
@@ -213,11 +245,11 @@ void describe("bugs6 item 23: the skipped backup and the setting change", () => 
   void it("the sentence and the option text say which setting changes", () => {
     assert.equal(
       describeSkippedBackupsV1("impl-high-review", ["Claude Opus 5.5"]),
-      "Claude Opus 5.5 is a backup but 'Fall back to backup models' is off for Implementation › High-Level Code Review, so it was not tried."
+      "Claude Opus 5.5 is a backup but 'Fall back to backup models' is off for High-Level Code Review, so it was not tried."
     );
     assert.match(
       describeTurnOnFallbackConsequenceV1("impl-high-review", ["Claude Opus 5.5"]),
-      /turns on "Fall back to backup models" for Implementation › High-Level Code Review \(it is off now\)\..*runs on Claude Opus 5\.5/
+      /turns on "Fall back to backup models" for High-Level Code Review \(it is off now\)\..*runs on Claude Opus 5\.5/
     );
   });
 

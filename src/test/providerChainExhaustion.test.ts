@@ -278,7 +278,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.status, "paused");
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for Implementation › High-Level Code Review is available/
+      /No configured provider for High-Level Code Review is available/
     );
     assert.match(persisted.pausedReason ?? "", /Cline CLI → Kimi CLI/);
     assert.notEqual(
@@ -833,7 +833,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.status, "paused");
     assert.match(
       persisted.pausedReason ?? "",
-      /Every configured model for Implementation › High-Level Code Review was tried and failed/
+      /Every configured model for High-Level Code Review was tried and failed/
     );
     assert.doesNotMatch(persisted.pausedReason ?? "", /No configured provider/);
   });
@@ -859,7 +859,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     );
     assert.doesNotMatch(
       persisted.pausedReason ?? "",
-      /Every configured model for Implementation › High-Level Code Review was tried and failed/
+      /Every configured model for High-Level Code Review was tried and failed/
     );
   });
 
@@ -877,7 +877,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.match(persisted.pausedReason ?? "", /is currently blocked by a/);
     assert.match(persisted.pausedReason ?? "", /Deferred, not exhausted/);
     assert.doesNotMatch(persisted.pausedReason ?? "", /was tried, but the chain was blocked/);
-    assert.doesNotMatch(persisted.pausedReason ?? "", /Every configured model for Implementation › High-Level Code Review was tried and failed/);
+    assert.doesNotMatch(persisted.pausedReason ?? "", /Every configured model for High-Level Code Review was tried and failed/);
     assert.ok(persisted.quotaParkRecord, "a candidatesDeferred pause must still park with a quotaParkRecord");
   });
 
@@ -928,7 +928,7 @@ void describe("provider chain exhaustion (stage owner)", () => {
     assert.equal(persisted.status, "paused");
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for Implementation › High-Level Code Review is available/
+      /No configured provider for High-Level Code Review is available/
     );
   });
 
@@ -1171,15 +1171,15 @@ void describe("bugs6 item 23: a skipped switched-on backup is named, and fallbac
       assert.ok(decision);
       assert.match(
         decision.whatHappened,
-        /is a backup but 'Fall back to backup models' is off for Implementation › High-Level Code Review/
+        /is a backup but 'Fall back to backup models' is off for High-Level Code Review/
       );
       assert.match(decision.whatHappened, /claude-opus-5-5@high is a backup but/);
       assert.doesNotMatch(decision.whatHappened, /Every configured model/);
-      assert.match(decision.whatHappened, /Every model that was tried for Implementation › High-Level Code Review is currently deferred/);
+      assert.match(decision.whatHappened, /Every model that was tried for High-Level Code Review is currently deferred/);
       const option = decision.options.find((o) => o.optionId === "turnOnFallback");
       assert.ok(option, "the card offers the setting change");
       assert.equal(option.label, "Turn on fallback and retry");
-      assert.match(option.consequence, /turns on "Fall back to backup models" for Implementation › High-Level Code Review/);
+      assert.match(option.consequence, /turns on "Fall back to backup models" for High-Level Code Review/);
       assert.equal(option.effect.kind === "command" ? option.effect.command : "", "vs-code-ai-helper.turnOnFallbackAndRetryV1");
       assert.ok(decision.options.some((o) => o.label === "Change the model in AI Models"));
       assert.equal(decision.recommendation.kind === "option" ? decision.recommendation.optionId : "", "turnOnFallback");
@@ -1206,7 +1206,7 @@ void describe("bugs6 item 23: a skipped switched-on backup is named, and fallbac
           .listPending(folderUri.fsPath)
           .find((d) => d.decisionKey === "providerChainExhausted");
         assert.ok(decision, name);
-        assert.match(decision.whatHappened, /Every configured model for Implementation › High-Level Code Review is currently deferred/, name);
+        assert.match(decision.whatHappened, /Every configured model for High-Level Code Review is currently deferred/, name);
         assert.ok(!decision.options.some((o) => o.optionId === "turnOnFallback"), name);
       } finally {
         __extensionContextV1TestOnly.reset();

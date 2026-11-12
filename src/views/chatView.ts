@@ -202,7 +202,11 @@ import {
 } from "../utils/autoContinueV1";
 import { AUTOMATION_STOPPED_DECISION_KEY_V1, postStageReadyCardIfReadyV1 } from "../commands/automationStoppedCardV1";
 import { decidePostReviewActionV1, IMPL_REVIEW_STAGES_V1 } from "../utils/reviewRouting";
-import { ESCALATION_DECISION_KEYS_V1, postRemainingOwnerEvidenceStepsV1 } from "../utils/reviewEscalation";
+import {
+  ESCALATION_DECISION_KEYS_V1,
+  postPausedNothingOpenLineV1,
+  postRemainingOwnerEvidenceStepsV1,
+} from "../utils/reviewEscalation";
 import {
   currentActorNameV1,
   describeCardDismissalV1,
@@ -2238,6 +2242,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         decision.stage,
         identity
       );
+      // bugs8 Step 7: a card closed without starting anything. A task still paused with nothing open says why and
+      // which click resumes it.
+      await postPausedNothingOpenLineV1(identity.taskFolderPath, decision.stage).catch(() => undefined);
     }
     await this.render();
     return { ok: true, transitioned: false };
@@ -2463,7 +2470,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       await this.appendStatusLineV1(describeDoNothingChoiceV1(option.label, option.description ?? ""), stage, identity);
       return;
     } else {
-      await this.appendStatusLineV1(`Recorded: "${option.label}" — applying now.${detail}`, stage, identity);
+      // Only what is already true: the choice is recorded. A start is announced by the command itself once it is confirmed.
+      await this.appendStatusLineV1(`Recorded: "${option.label}".${detail}`, stage, identity);
     }
     try {
       const result = await vscode.commands.executeCommand(effect.command, ...(effect.args ?? []));
@@ -3557,7 +3565,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       // `pending` on the runner, and the next mirror refresh (watcher or the
       // 10-second timer) then drops the record from this window — so reading
       // it back after the relay to correct a failed follow-up was a race
-      // whose loss left the transcript asserting "applying now" for ever
+      // whose loss left the transcript asserting a start for ever
       // (verification review, 2026-09-18).
       const answered = this.workflowDecisionStore.get(decisionId);
       const answeredIdentityV1 =
@@ -3801,7 +3809,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
             ? `${describeRecordedChoiceV1(option.label, option.recordedNext)} ${option.consequence}${closedNote}`
             : option.effect.kind === "doNothing"
               ? describeDoNothingChoiceV1(option.label, option.consequence)
-              : `Recorded: "${option.label}" — applying now. ${option.consequence}${closedNote}`;
+              : `Recorded: "${option.label}". ${option.consequence}${closedNote}`;
         await this.appendStatusLineV1(ackText, decision.stage, identity);
       }
       if (option.effect.kind === "command" && ctx?.skipEffect !== true) {
@@ -3844,7 +3852,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           // notification and then returns normally (see
           // goToReviewAndApplyV1.ts), so the only trustworthy signal here is
           // the resolved value. Treating only a thrown error as failure left
-          // the "applying now" acknowledgement above standing uncorrected
+          // the acknowledgement above standing uncorrected
           // even when the command it described did not actually happen.
           const result = await vscode.commands.executeCommand(
             option.effect.command,
@@ -4676,7 +4684,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
      * mirrored record is normally gone by now (see the caller). */
     capturedV1?: { readonly stage: WorkflowDecisionV1["stage"]; readonly taskCanonicalId: string }
   ): Promise<void> {
-    // The runner has already written "applying now" against this decision, so
+    // The runner has already written its acknowledgement against this decision, so
     // a failure HERE must correct that line exactly as a local click's failure
     // does — otherwise the transcript permanently claims something that never
     // happened, and the card is gone (verification review, 2026-09-17).
@@ -5944,7 +5952,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       <div id="empty-notice" role="status"></div>
       <div id="error" role="alert"></div>
       <div id="busy-indicator" role="status" aria-live="polite"><span id="busy-text"></span></div>
-      <div id="steering-note" role="note">Rounds don't read this chat. To change what the next rounds do, ask here to record it in the plan (for example, "add to the plan: skip the memory work"), or edit <code>plan-final.md</code> yourself.</div>
+      <div id="steering-note" role="note">Rounds don't read this chat. To change what the next rounds do, ask here to record it in the plan (for example, "add to the plan: skip the memory work"), or edit <code>plan-final.md</code> yourself. An owner decision you give here ("record this under Owner decisions") is written to <code>task.md</code> and to one plain sub-bullet of <code>plan-final.md</code> once you confirm it, never to a checklist line; the reply names any file it could not write.</div>
       <div id="answering" role="status" aria-live="polite"><span id="answering-text"></span> <button type="button" id="answering-cancel" title="Stop answering this card and go back to normal chat">Cancel</button></div>
       <form id="form"><textarea id="message" rows="3" aria-label="Message the AI" placeholder="Message the AI… (Enter to send, Shift+Enter for a new line)"></textarea><button type="submit" id="send-btn" title="Send message (Enter)">Send</button><span id="send-reason" role="status"></span></form>
       <nav id="stage-nav" aria-label="Other stages of this task"></nav>

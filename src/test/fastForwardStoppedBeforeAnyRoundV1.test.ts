@@ -158,7 +158,7 @@ void describe("bugs6 item 42: the end card while a hold applies", () => {
 void describe("bugs6 item 42: the stop is a visible chat line, not only a hidden Ended line", () => {
   const text = describeFastForwardStoppedBeforeAnyRoundV1(
     { kind: "partial-scope", detail: "4 files were not reviewed" },
-    "Implementation › High-Level Code Review"
+    "High-Level Code Review"
   );
 
   void it("a plain assistant line with the stop text is shown in the chat transcript, an outcome-kind line is not", () => {

@@ -409,7 +409,7 @@ void test("every bracket envelope token this prompt advertises is consumed by th
   ];
   assert.deepEqual(
     new Set(advertisedTokens),
-    new Set(["UPDATE_FILE", "ACTION", "STAGE_ACTION"]),
+    new Set(["UPDATE_FILE", "ACTION", "STAGE_ACTION", "RECORD_OWNER_DECISION"]),
     "a bracket envelope token was added to (or removed from) the prompt without updating this guard's wired-token list"
   );
 
@@ -440,7 +440,9 @@ void test("every bracket envelope token this prompt advertises is consumed by th
           ? "[[UPDATE_FILE:notes.md]]new content[[/UPDATE_FILE]]"
           : token === "STAGE_ACTION"
             ? "[[STAGE_ACTION:completeTask]]"
-            : "[[ACTION:completeTask]]";
+            : token === "RECORD_OWNER_DECISION"
+              ? "[[RECORD_OWNER_DECISION:blocker-1]]Decision: keep the plan.[[/RECORD_OWNER_DECISION]]"
+              : "[[ACTION:completeTask]]";
       const content: CompletedContentV1 = {
         contentType: "chat-message.v1",
         schemaVersion: 1,
@@ -466,6 +468,14 @@ void test("every bracket envelope token this prompt advertises is consumed by th
           last.proposedStageAction?.id,
           "completeTask",
           `${token}'s recognized proposal must be attached to its persisted message, not silently dropped`
+        );
+      }
+      // bugs8 item 2: an owner decision is proposed on the message (written only after the owner confirms).
+      if (token === "RECORD_OWNER_DECISION") {
+        assert.deepEqual(
+          last.proposedOwnerDecisions?.map((decision) => decision.blockerId),
+          ["blocker-1"],
+          "the owner decision must ride on the persisted message for the confirm dialog, not be dropped or written unconfirmed"
         );
       }
     }
