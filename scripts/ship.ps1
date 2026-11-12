@@ -4,6 +4,8 @@
   Marketplace, then update the dev box and this machine's VS Code to it.
 
     ship                  run the release menu (scripts/release.ps1), then roll out
+    ship -Choice patch    answer the release menu without asking (1-6, or
+                          patch / minor / major / pre-release / promote)
     ship -Version 1.20.0  skip the release; roll out 1.20.0 once it is live
     ship -SkipBox         do not touch the dev box
     ship -SkipLocal       do not touch this machine's VS Code
@@ -26,6 +28,7 @@
 #>
 
 param(
+    [string]$Choice,
     [string]$Version,
     [switch]$SkipBox,
     [switch]$SkipLocal,
@@ -92,6 +95,9 @@ function Wait-Live([string]$v) {
 if ($Version -and $Version -notmatch '^\d+\.\d+\.\d+$') {
     throw "-Version must look like 1.20.0 (got '$Version')."
 }
+if ($Version -and $Choice) {
+    throw "Use -Choice to release, or -Version to roll out an existing version, not both."
+}
 
 # The caller's folder is restored in the finally below: a script run with &
 # from the profile shares the terminal's location, so without this every
@@ -106,7 +112,9 @@ if ($Version) {
 }
 else {
     $before = Get-PackageVersion
-    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\release.ps1')
+    $releaseArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $RepoRoot 'scripts\release.ps1'))
+    if ($Choice) { $releaseArgs += @('-Choice', $Choice) }
+    & powershell @releaseArgs
     $releaseExit = $LASTEXITCODE
     $target = Get-PackageVersion
 

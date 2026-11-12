@@ -2,7 +2,14 @@
 <#
   Release script: bumps the extension version and publishes to the VS Code Marketplace.
   Replaces the "update versioning if not done yet and publish" AI prompt with a fixed script.
+
+  -Choice answers the menu without asking (1-6, or patch / minor / major /
+  pre-release / promote); the Release workflow in .github/workflows passes it.
 #>
+
+param(
+    [string]$Choice
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -329,7 +336,13 @@ if ($onPreReleaseLine) {
 }
 Write-Host ""
 
-$choice = Read-Host "Enter 1-6 (or type patch/minor/major/pre-release/promote)"
+# PowerShell names are case-insensitive: $choice below IS the -Choice parameter.
+if ($choice) {
+    Write-Host "Choice given on the command line: $choice"
+}
+else {
+    $choice = Read-Host "Enter 1-6 (or type patch/minor/major/pre-release/promote)"
+}
 
 $promoteThenPreRelease = $choice.Trim() -eq "6"
 if ($promoteThenPreRelease -or $choice.Trim().ToLower() -match '^(5|promote)$') {

@@ -1,0 +1,116 @@
+name: Release
+
+# Publishes Ensemble to the Marketplace from GitHub, so a release can be started
+# from anywhere (browser, phone, the dev box) with no publishing credentials on
+# that machine. Runs the same scripts/release.ps1 as a laptop release, through
+# scripts/ship.ps1, which also waits until the new version is live (listed AND
+# downloadable) before the run goes green.
+#
+#   Start:  Actions tab -> Release -> Run workflow, or
+#           gh workflow run release.yml -f release=patch
+#   After:  laptop  ship -Version <version>     (box + local VS Code)
+#           box     ~/update-ensemble.sh <version>
+#
+# One-time setup: a repo secret VSCE_PAT (Azure DevOps personal access token,
+# scope Marketplace -> Manage).
+#
+# Windows, not Linux: release.ps1 is Windows PowerShell 5.1 and the promote
+# options clean up their worktree with cmd.exe. ci.yml already proves the
+# install and build on windows-latest.
+#
+# The version commit and tag are pushed with GITHUB_TOKEN, and GitHub does not
+# start other workflows for pushes made with that token, so ci.yml and
+# native-e2e.yml do not run for the release commit or tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Which kind of release (same as the release.ps1 menu)
+        type: choice
+        required: true
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+          - pre-release
+          - promote
+          - promote + pre-release
+
+permissions:
+  contents: write
+
+# Never two releases at once: each one bumps and pushes main.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release ${{ inputs.release }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    if: github.ref == 'refs/heads/main'
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Check the Marketplace token is set
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if (-not $env:VSCE_PAT) {
+            throw "The repo secret VSCE_PAT is not set (Settings -> Secrets and variables -> Actions). Nothing was published."
+          }
+
+      # Full history and tags: release.ps1 finds the newest release tag, and
+      # the promote options build from it.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # pnpm version comes from the root package.json "packageManager" pin.
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # vsce commits the version bump and the promote options commit and tag.
+      - name: Configure the committer identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Release and wait until live
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          RELEASE_KIND: ${{ inputs.release }}
+        run: |
+          $map = @{
+            'patch' = '1'; 'minor' = '2'; 'major' = '3'; 'pre-release' = '4';
+            'promote' = '5'; 'promote + pre-release' = '6'
+          }
+          $choice = $map[$env:RELEASE_KIND]
+          if (-not $choice) { throw "Unknown release kind '$env:RELEASE_KIND'." }
+          & .\scripts\ship.ps1 -Choice $choice -SkipBox -SkipLocal
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Summary
+        if: always()
+        run: |
+          $v = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          @(
+            "### Ensemble $v",
+            "",
+            "package.json on this run ends at **$v** (if the release failed before publishing, nothing went out; see the log).",
+            "",
+            "Roll it out:",
+            "- laptop: ``ship -Version $v`` (box and local VS Code)",
+            "- box: ``~/update-ensemble.sh $v``"
+          ) -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
