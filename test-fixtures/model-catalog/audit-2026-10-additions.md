@@ -76,3 +76,19 @@ default selections are preserved.
   managed service held its port, so its catalog wasn't checked. Copilot stays
   host-discovered. Existing models and default selections are unchanged.
 
+# Model additions checked November 19, 2026
+
+- Antigravity CLI: `Gemini 4 Neon (Low)`, `(Medium)`, `(High)` and `(XHigh)`.
+  Evidence: on the dev box, `agy models` (agy 1.5.12) lists all four, and
+  `agy --model "Gemini 4 Neon (Low)"` and `"(XHigh)"` each answered a
+  one-line `--print` prompt with exit 0. Google's model page gives the
+  `gemini-4-neon` id and general availability from 2026-11-18 (it does not
+  cover Antigravity; the `agy` evidence above does):
+  https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/4-neon .
+- OpenCode Zen: `opencode/gemini-4-neon`, seeded as a base selection only;
+  the box's `opencode models` lists it. Live `model.list` discovery supplies
+  its variants. Recorded as `added` in `audit-2026-09.json`.
+- Left unchanged: OpenCode Go (its listing has no Neon id), DevPass (its
+  `models` command again could not run while its managed service held its
+  port), Gemini CLI (same rule as Argon above), Copilot (host-discovered).
+

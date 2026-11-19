@@ -376,6 +376,12 @@
           "status": "added",
           "checkedAt": "2026-11-11",
           "source": "`opencode models` (opencode 2.1.4) on the dev box, 2026-11-11, OpenCode Zen key signed in: opencode/claude-fable-5-2 listed (with opencode/claude-fable-5-1). OpenCode 2 has no `--verbose` listing, so the seed carries the base id only; live model.list discovery supplies its variants."
+        },
+        {
+          "id": "opencode/gemini-4-neon",
+          "status": "added",
+          "checkedAt": "2026-11-19",
+          "source": "`opencode models` on the dev box, 2026-11-19, OpenCode Zen key signed in: opencode/gemini-4-neon listed (with gemini-4-argon, gemini-4-carbon and gemini-4-hydrogen). Seed base selection only; live model.list discovery supplies its variants."
         }
       ]
     },

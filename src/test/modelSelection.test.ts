@@ -878,6 +878,26 @@ void describe("getAvailableModels", () => {
             providerLabel: "Antigravity CLI (subscription CLI)",
           },
           {
+            id: "antigravity-cli:Gemini 4 Neon (Low)",
+            name: "Gemini 4 Neon (Low)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 4 Neon (Medium)",
+            name: "Gemini 4 Neon (Medium)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 4 Neon (High)",
+            name: "Gemini 4 Neon (High)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
+            id: "antigravity-cli:Gemini 4 Neon (XHigh)",
+            name: "Gemini 4 Neon (XHigh)",
+            providerLabel: "Antigravity CLI (subscription CLI)",
+          },
+          {
             id: "antigravity-cli:Gemini 3.8 Flash (Low)",
             name: "Gemini 3.8 Flash (Low)",
             providerLabel: "Antigravity CLI (subscription CLI)",
@@ -1875,7 +1895,7 @@ void describe("GPT-6 / Opus 5.5 listed entries validate against the provider lad
   void it("seeds the confirmed OpenCode model IDs using provider default variants", async () => {
     const ids = await seededPickerIds("opencode");
     for (const model of ["opencode/gpt-6.1-sol", "opencode/gemini-4-argon",
-      "opencode-go/gemini-4-argon-contributor"]) {
+      "opencode/gemini-4-neon", "opencode-go/gemini-4-argon-contributor"]) {
       assert.ok(ids.includes(`opencode-cli:${model}`), model);
       assert.deepStrictEqual(parseOpencodeModelSelection(model), { model, variant: undefined });
       assert.deepStrictEqual(ladderOf(ids, `opencode-cli:${model}`), []);

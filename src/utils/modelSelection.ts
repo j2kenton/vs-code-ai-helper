@@ -1078,7 +1078,8 @@ function createSeededClineModels(): readonly DiscoveredCliModel[] {
  * official Console / Go endpoint tables; 2026-10-26: added the Kimi K3.1 Pro
  * OpenCode Go base ID from the local CLI listing (see audit-2026-10-additions.md);
  * 2026-11-11: added the Claude Fable 5.2 Zen base ID from the local
- * `opencode models` listing (opencode 2.1.4).
+ * `opencode models` listing (opencode 2.1.4); 2026-11-19: added the Gemini 4
+ * Neon Zen base ID from the box's `opencode models` listing.
  * Their variant ladders await a live capture; empty variants here mean
  * provider defaults, not disabled thinking.
  * Compacted to one minified JSON object per line (only the fields
@@ -1132,6 +1133,8 @@ opencode/deepseek-v4-pro
 {"id":"deepseek-v4-pro","providerID":"opencode","name":"DeepSeek V4 Pro","variants":{"high":{},"max":{}}}
 opencode/gemini-4-argon
 {"id":"gemini-4-argon","providerID":"opencode","name":"Gemini 4 Argon","variants":{}}
+opencode/gemini-4-neon
+{"id":"gemini-4-neon","providerID":"opencode","name":"Gemini 4 Neon","variants":{}}
 opencode/gemini-3.8-flash
 {"id":"gemini-3.8-flash","providerID":"opencode","name":"Gemini 3.8 Flash","variants":{"low":{},"medium":{},"high":{}}}
 opencode/gemini-3-flash
@@ -1834,6 +1837,12 @@ const SEEDED_CLI_MODELS: Readonly<
   // slug like `gemini-3.5-flash-medium` fails with "invalid --model"). Keep
   // these in sync with `agy models`' own output — see cliModelDiscovery.ts.
   "antigravity-cli": [
+    // Gemini 4 Neon: `agy models` (agy 1.5.12) lists Low/Medium/High/XHigh,
+    // and `agy --model "Gemini 4 Neon (Low)"` / "(XHigh)" ran, 2026-11-19.
+    { model: "Gemini 4 Neon (Low)", name: "Gemini 4 Neon (Low)" },
+    { model: "Gemini 4 Neon (Medium)", name: "Gemini 4 Neon (Medium)" },
+    { model: "Gemini 4 Neon (High)", name: "Gemini 4 Neon (High)" },
+    { model: "Gemini 4 Neon (XHigh)", name: "Gemini 4 Neon (XHigh)" },
     // Official model picker / thinking levels, checked 2026-10-21.
     { model: "Gemini 3.8 Flash (Low)", name: "Gemini 3.8 Flash (Low)" },
     { model: "Gemini 3.8 Flash (Medium)", name: "Gemini 3.8 Flash (Medium)" },
