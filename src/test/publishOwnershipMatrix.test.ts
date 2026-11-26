@@ -93,8 +93,6 @@ const runEditActionModule = require("../commands/runEditActionV1") as Record<str
 const workAdmissionModule = require("../state/workAdmissionV1") as Record<string, unknown>;
 /* eslint-enable @typescript-eslint/no-var-requires */
 
-import { recordReviewInputsV1 } from "../utils/reviewInputsChangedV1";
-
 const REAL_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "ensemble-publish-owner-"));
 
 // Publish review now refuses to build a prompt unless publish-checks.md
@@ -3406,7 +3404,7 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     assert.equal(persisted.status, "paused", "the runtime backstop must pause the task");
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for Low-Level Code Review is available/
+      /No configured provider for impl-low-review is available/
     );
     assert.match(persisted.pausedReason ?? "", /Cline CLI → Kimi CLI/);
     assert.notEqual(persisted.updatedAt, "2026-01-01T00:00:00.000Z", "updatedAt must be bumped");
@@ -3440,7 +3438,7 @@ void describe("provider-chain exhaustion — probe-available/invoke-fail reaches
     );
     assert.match(
       persisted.pausedReason ?? "",
-      /No configured provider for Publish is available/
+      /No configured provider for publish is available/
     );
   });
 });
@@ -3488,11 +3486,6 @@ void describe("runReviewForFolder: unchanged-tree guard refuses dispatch at the 
     const { folderPath } = makeTaskFolder(name, "impl-low-review");
     const contextPack = path.join(folderPath, "context-pack.md");
     fs.writeFileSync(contextPack, "# Context\n", "utf8");
-    // review1 Step 27: a review whose inputs (task.md, plan.md, plan-final.md) are not on record cannot be shown
-    // unchanged, so the guard would let the dispatch through. Record them as the review's dispatch would, before
-    // the fingerprint (the record file is part of the tree) and before the review artifact it vouches for.
-    await recordReviewInputsV1(folderPath, path.join(folderPath, "impl-low-review.md"));
-    await new Promise((resolve) => setTimeout(resolve, 10));
     // Fingerprint computed AFTER every other fixture file (including
     // context-pack.md above) is in place and BEFORE the review artifact
     // itself is written — the guard excludes that artifact (and its backup)

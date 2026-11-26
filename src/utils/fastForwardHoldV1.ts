@@ -86,26 +86,7 @@ export function unproducibleTestEvidenceHoldV1(input: {
   readonly hasAllowedTestCommand: boolean;
   /** True when files changed since the round that reported the refusal. */
   readonly changedSinceRefusal?: boolean;
-  /**
-   * review2 Step 44: every unticked top-level item waits on test evidence (`openItemsAllWaitOnTestEvidenceV1`). Asked
-   * only after a clean review, so nothing is left to build; an Apply Review over such items has nothing to do.
-   */
-  readonly uncheckedAllWaitOnTestEvidence?: boolean;
 }): string | undefined {
-  if (input.uncheckedCount > 0 && input.uncheckedAllWaitOnTestEvidence === true) {
-    const count = input.uncheckedCount;
-    const items = `${count} open ${count === 1 ? "item waits" : "items wait"} only for a passing test report, and the review found nothing left to build`;
-    if (input.lastRoundTestsRefused && input.changedSinceRefusal !== true) {
-      return (
-        `${items}, and the last editing round's test commands were refused, so another round on the same provider cannot ` +
-        "produce that evidence. Allow the test command, run it yourself and record the run, or settle the items by decision"
-      );
-    }
-    return (
-      `${items}. A round cannot make a test report appear by editing. ` +
-      "Run the tests yourself and record the run, or settle the items by decision"
-    );
-  }
   if (input.uncheckedCount > 0 || input.provisional.length === 0) {
     return undefined;
   }
@@ -135,38 +116,6 @@ export function unproducibleTestEvidenceHoldV1(input: {
   return undefined;
 }
 
-/**
- * bugs6 item 42: the line for a Fast Forward run that dispatched no round at all (a hold at attempt 0). It is never
- * "completed": it says it stopped before any round, why, and the click that moves on. The notification and the chat's
- * Ended line both carry this text.
- */
-export function describeFastForwardStoppedBeforeAnyRoundV1(hold: FastForwardHoldV1, stageName: string): string {
-  const lead = "Fast Forward stopped before any round:";
-  switch (hold.kind) {
-    case "pending-decision":
-      return `${lead} it is waiting for your answer to "${hold.detail}" (${stageName}). Answer or dismiss that card, then click Start Fast Forward again.`;
-    case "no-change-decision":
-      return `${lead} the last Apply Review changed no files and raised a decision ("${hold.detail}"). Answer that card, then click Start Fast Forward again.`;
-    case "test-evidence-unproducible":
-      return `${lead} ${hold.detail}. Another Apply Review would change nothing. The open-items card that follows has the ways on.`;
-    case "evidence-gap":
-      return `${lead} ${hold.detail}. Another round cannot produce a test report that counts. The card that follows has the ways on.`;
-    case "standing-blockers":
-      return `${lead} every remaining blocker is one another round cannot clear (${hold.detail}). Answer the card that follows, then click Start Fast Forward again.`;
-    case "partial-scope":
-      return (
-        `${lead} ${hold.detail}. ` +
-        (/Choose on the card below/.test(hold.detail)
-          ? "Choose on the scope card, then click Start Fast Forward again."
-          : "The way on is the scope card that follows; then click Start Fast Forward again.")
-      );
-    case "progress-gate":
-      return `${lead} ${hold.detail}. Answer the "This isn't moving" card, then click Start Fast Forward again.`;
-    case "clean-review":
-      return `${lead} ${hold.detail}. It follows the clean-review path instead.`;
-  }
-}
-
 /** The chat line for a Fast Forward that stopped on purpose, with the reason and the way on. */
 export function describeFastForwardHoldV1(hold: FastForwardHoldV1, stageName: string, attempts: number): string {
   const rounds = `${attempts} round${attempts === 1 ? "" : "s"} dispatched`;
@@ -186,31 +135,6 @@ export function describeFastForwardHoldV1(hold: FastForwardHoldV1, stageName: st
         `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
         `Another Apply Review would change nothing, so none was dispatched (${rounds}). ` +
         "The open items and the ways on are in the decision card that follows."
-      );
-    case "evidence-gap":
-      return (
-        `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
-        `No Apply Review was dispatched for it, because another round cannot produce a test report that counts (${rounds}). ` +
-        "The items and the ways on are in the decision card that follows."
-      );
-    case "standing-blockers":
-      return (
-        `Fast Forward (${stageName}) stopped: every remaining blocker is one another round cannot clear ` +
-        `(${hold.detail}). Spending a round on them alone would repeat the same result (${rounds}). ` +
-        "The question is on the decision card that follows."
-      );
-    case "partial-scope":
-      return (
-        `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
-        `Reviewing the same list again would repeat that, so no round was dispatched (${rounds}). ` +
-        // review2 Step 27: the detail names the card's exact buttons when the gap is known, and never says "add the
-        // missing files" when none are missing from the list; without a gap record the card is simply the way on.
-        (/Choose on the card below/.test(hold.detail) ? "" : "The way on is the decision card that follows.")
-      ).trimEnd();
-    case "progress-gate":
-      return (
-        `Fast Forward (${stageName}) stopped: ${hold.detail}. ` +
-        `Nothing more is dispatched until you answer the "This isn't moving" card (${rounds}).`
       );
     case "clean-review":
       return (

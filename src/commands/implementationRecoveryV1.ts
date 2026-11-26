@@ -101,9 +101,7 @@ import {
   RoundLedgerTerminalStateV1,
   TerminalizeRoundResultV1,
 } from "../utils/roundLedgerV1";
-import { describeChangedFilesKeptV1, describeEnsembleRetriesGaveUpV1 } from "../utils/roundStopCauseV1";
 import { resolveHostIdentityV1 } from "../state/hostIdentityV1";
-import { fastForwardRoundFieldsV1, fastForwardRoundStampV1 } from "../utils/activeFastForwardRunsV1";
 
 /**
  * How long the transition's own lease on the pending dispatch lasts. Short by
@@ -453,12 +451,6 @@ export interface ImplementationRecoveryInputV1 {
   readonly filesChanged: readonly string[];
   /** True when the change set could not be enumerated — recorded explicitly. */
   readonly filesChangedUnknown: boolean;
-  /** run1 Step 8: the stop cause the runner's settlement recorded on the triggering round. */
-  readonly stopCause?: string;
-  /** run1 Step 11: files the round's own stream named as edited. */
-  readonly attributedFiles?: readonly string[];
-  /** run1 Step 11: files observed changing while it ran, not proven to be the round's. */
-  readonly observedFiles?: readonly string[];
   /** The task's current (possibly review) stage, for the invalid marker. */
   readonly postRunReviewStage: TaskStage;
   /** Root operation whose end gates the continuation chain dispatch. */
@@ -594,15 +586,6 @@ export async function beginImplementationRecoveryV1(
   const sourceOutcome: RoundLedgerOutcomeV1 = {
     rejectionReason: input.reason,
     continuationOwed: true,
-    // run1 Steps 8 and 11: the row keeps the cause the runner's settlement recorded, the files the
-    // round's own stream named, and the files only observed changing (not proven to be its own).
-    ...(input.stopCause !== undefined ? { stopCause: input.stopCause } : {}),
-    ...(input.attributedFiles !== undefined && input.attributedFiles.length > 0
-      ? { attributedFiles: [...input.attributedFiles] }
-      : {}),
-    ...(input.observedFiles !== undefined && input.observedFiles.length > 0
-      ? { observedFiles: [...input.observedFiles] }
-      : {}),
     // RC4 item 2: a known-empty change set is recorded explicitly
     // (`filesChanged: []`), never omitted — an omitted set means "unknown"
     // to `reviewPredatesLatestImplementationRoundV1`, which stales the review.
@@ -784,7 +767,8 @@ export async function beginImplementationRecoveryV1(
         `${formatNotificationTaskLabelV1(undefined, folderName)} — ` +
           `⚠️ The implementation round did not finish its turn (${input.reason}), and the continuation could ` +
           "not be recorded (the progress write failed, even after a retry). No continuation round could be " +
-          "scheduled — rerun the implementation manually. The changed files are kept."
+          "scheduled — rerun the implementation manually. The unreported edits are preserved in " +
+          "pendingImplReviewFiles."
       );
       return;
     }
@@ -796,12 +780,12 @@ export async function beginImplementationRecoveryV1(
           : `⚠️ The implementation round did not finish its turn: ${input.reason}. `;
     const quarantineClause =
       quarantinedPaths.length > 0
-        ? `${describeChangedFilesKeptV1(quarantinedPaths.length)} `
+        ? `Its ${quarantinedPaths.length} changed file(s) were quarantined for the continuation round. `
         : input.filesChangedUnknown
-          ? "Its changed files could not be listed. "
+          ? "Its change set could not be enumerated (recorded as unknown). "
           : "";
     const outcomeClause = capReached
-      ? `${describeEnsembleRetriesGaveUpV1(MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1)} The task needs your decision.`
+      ? `The continuation budget (${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}) is exhausted, so automated recovery has stopped and the task needs a human decision.`
       : `A continuation implementation round (${continuations} of ${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${selectedMode}) has been scheduled to complete and report the work.`;
     const whatHappened = `${lead}${quarantineClause}${outcomeClause}`;
 
@@ -860,11 +844,11 @@ export async function beginImplementationRecoveryV1(
               // opposed keep/revert pair.
               label: capReached ? "Leave paused for review" : "Keep this round's changes",
               consequence: capReached
-                ? "Does nothing — the task stays paused and the changed files are kept until you review or " +
-                  "rerun the round yourself."
+                ? "Does nothing — the task stays paused with the unreported edits preserved in " +
+                  "pendingImplReviewFiles until you review or rerun the round yourself."
                 : `Does nothing — the scheduled continuation round (${continuations} of ` +
                   `${MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1}, ${selectedMode}) will attempt to finish and ` +
-                  "report the round's work; this round's edits are kept, not discarded.",
+                  "report the round's work; this round's edits are kept, quarantined, not discarded.",
               effect: { kind: "doNothing" },
             },
             {
@@ -877,7 +861,7 @@ export async function beginImplementationRecoveryV1(
               label: "Revert this round's changes",
               destructive: true,
               consequence:
-                `Overwrites the current implementation summary and review with their previous versions, ` +
+                `Overwrites the current implementation summary and review with their _prev backups, ` +
                 `discarding this round's completed work (${filesClause}) and returning the task to its ` +
                 "pre-round state. This cannot be undone from within the extension.",
               effect: {
@@ -891,7 +875,7 @@ export async function beginImplementationRecoveryV1(
             ? {
                 kind: "none",
                 reasoning:
-                  "Ensemble has stopped trying by itself and nothing is running to prefer over restoring — " +
+                  "Automated recovery is exhausted and nothing is running to prefer over restoring — " +
                   "whether to discard this round's edits depends on judging them yourself.",
               }
             : {
@@ -906,7 +890,7 @@ export async function beginImplementationRecoveryV1(
             unblocksProgress: false,
             detail: capReached
               ? "This does not resume the task by itself — the task is paused separately (a plateau " +
-                "escalation, asked as a question in this chat) because Ensemble has stopped trying by itself; " +
+                "escalation, asked as a question in this chat) because the continuation budget is exhausted; " +
                 "answer that question to decide how to proceed, or restore here to discard this round's work first."
               : "This does not pause or unblock anything — the scheduled continuation round runs on its own " +
                 "regardless of your answer here. Use this only if you want to discard this round's edits before " +
@@ -939,9 +923,9 @@ export async function beginImplementationRecoveryV1(
         folderUri,
         persisted?.currentStage ?? input.postRunReviewStage,
         "plateau",
-        `${continuations} implementation rounds in a row ended without a usable report ` +
-          `(${describeImplRecoveryTriggerV1(input.trigger)}). Ensemble's automatic continuation is no longer ` +
-          "getting the round to finish. The changed files are kept for the next round.",
+        `${continuations} consecutive implementation round(s) ended without a usable report ` +
+          `(${input.trigger}). Automated continuation is no longer making the round finish; ` +
+          "the unreported edits are preserved in pendingImplReviewFiles.",
         persisted?.reviewAttemptId,
         persisted ?? undefined,
         false
@@ -1138,21 +1122,9 @@ export async function claimImplRecoveryDispatchV1(
       // could never find this row (review fix, 2026-08-27: "recovery linkage
       // selects the first task-wide live row rather than resolving the
       // actual source identity" — the id a caller holds must always resolve).
-      // review1 Step 32: a continuation belongs to the Fast Forward run its source round belonged to.
-      // A source row from before stamps existed has no answer to hand on, so its continuation stays unstamped
-      // (unless a run is live now) rather than claiming it was not part of a run.
-      const sourceRow = resolveRoundV1(current, continuationOf);
-      const sourceFastForwardRun = sourceRow?.fastForwardRunV1;
-      const sourceUnstamped = sourceRow !== undefined && sourceRow.fastForwardStampedV1 !== true && !sourceFastForwardRun;
-      const fastForwardField = sourceFastForwardRun
-        ? { fastForwardStampedV1: true as const, fastForwardRunV1: sourceFastForwardRun }
-        : sourceUnstamped
-          ? fastForwardRoundStampV1(folderUri.fsPath)
-          : fastForwardRoundFieldsV1(folderUri.fsPath);
       const continuationRow: RoundLedgerEntryV1 = openRow
         ? {
             ...openRow,
-            ...fastForwardField,
             attemptIds: openRow.attemptIds.includes(continuationAttemptId)
               ? openRow.attemptIds
               : [...openRow.attemptIds, continuationAttemptId],
@@ -1167,7 +1139,6 @@ export async function claimImplRecoveryDispatchV1(
             mode: "continuation",
             startedAt: new Date().toISOString(),
             state: "open",
-            ...fastForwardField,
           };
         openedContinuationRoundId = continuationRow.roundId;
         next = upsertRoundLedgerEntryV1(next, continuationRow);
@@ -1538,7 +1509,7 @@ export function describeImplRecoveryTriggerV1(trigger: ImplRecoveryTriggerV1): s
     case "summaryRejected":
       return "the last implementation round's summary was rejected as unusable";
     case "externallyTerminated":
-      return "the last implementation round was stopped by Ensemble (its time limit or its no-activity stop) before it could report";
+      return "the last implementation round was stopped from outside (timeout or inactivity) before it could report";
     case "providerFailedMidRound":
       return "the last implementation round's provider failed mid-round after making unverified edits";
   }
@@ -1609,8 +1580,8 @@ export function describeOwedImplRecoveryRefusalV1(
   if (recovery.dispatch === "pending") {
     lines.push(
       discardOfferable
-        ? "- Status: pending. Ensemble tried several times by itself and has stopped trying; it will not " +
-          "dispatch this continuation again on its own."
+        ? "- Status: pending, continuation budget exhausted — automated recovery has stopped; the sweep " +
+          "will not dispatch this record."
         : "- Status: pending — the next sweep or a manual retry will dispatch its continuation round."
     );
   } else {

@@ -39,3 +39,28 @@ for (const name of EDITING_ROUND_PROMPTS) {
     });
   });
 }
+
+/**
+ * bugs6 items 41 and 46 (1.18 backport): Apply Review rounds stopped after 6 and 12 of their 60 minutes, one on a
+ * guess that time was nearly up, one after declining a single hard step while saying nothing blocked the rest.
+ */
+void describe("apply-impl-review-code.md (bugs6 items 41 and 46)", () => {
+  const text = (): string => promptText("apply-impl-review-code.md");
+
+  void it("says to stop for time only with about 10 minutes left, never on a guess", () => {
+    assert.match(text(), /Stop for time only when you can see that about 10 minutes or less of the budget are left, never on a guess/);
+    assert.match(text(), /where you cannot read the clock, stop early only when every remaining step is blocked/);
+    assert.doesNotMatch(text(), /If the remaining work will not fit in the budget/);
+  });
+
+  void it("says to go on to the next unblocked step after declining one", () => {
+    assert.match(
+      text(),
+      /When you decline or can't finish a step, record why under Remaining Blockers, then go on to the next step that nothing blocks\. Stop early only when every remaining step is blocked, or when about 10 minutes are left\./
+    );
+  });
+
+  void it("says a full suite it cannot run is no reason to decline a step", () => {
+    assert.match(text(), /Rounds don't run the full suite because Publish Checks do, so being unable to run it is not a reason to decline a step/);
+  });
+});

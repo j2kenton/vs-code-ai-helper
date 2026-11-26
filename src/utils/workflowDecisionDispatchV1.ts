@@ -1,10 +1,5 @@
 import * as vscode from "vscode";
 import { getExtensionContextV1 } from "./extensionContextV1";
-import { readAutoContinueMinutes } from "../config/settings";
-import { planAutoContinueV1, withWaitForMeOptionV1 } from "./autoContinueV1";
-import { currentRunBindingV1, matchesKeepGoingV1, withKeepGoingOptionV1 } from "./autoContinueKeepGoingV1";
-import { requestAutoContinueSweepNowV1 } from "../state/autoContinueSweepTriggerV1";
-import { readAutoContinueTaskStateV1 } from "./autoContinueTaskStateV1";
 
 /**
  * The Memento the DECISION VIEWS are built over. In a viewer that is not
@@ -208,15 +203,6 @@ export function assertGatingRequirementV1(decisionKey: string, gating: HandoffGa
   throw new Error(`workflow decision "${decisionKey}" must supply "gating" (PART 5 creation-time guard)`);
 }
 
-/** Every decision recorded for the task in any state (answered ones keep their `resolvedAt`), read-only; empty without a context. */
-export function listWorkflowDecisionsForTaskV1(taskCanonicalId: string): readonly WorkflowDecisionV1[] {
-  const context = getExtensionContextV1();
-  if (!context) {
-    return [];
-  }
-  return new WorkflowDecisionStoreV1(decisionStoreStateV1(context)).listForTask(taskCanonicalId);
-}
-
 /** The task's pending decisions, read-only; empty when there is no extension context. */
 export function listPendingWorkflowDecisionsForTaskV1(taskCanonicalId: string): readonly WorkflowDecisionV1[] {
   const context = getExtensionContextV1();
@@ -299,63 +285,13 @@ export async function postWorkflowDecisionV1(
   }
   const preconditioned = await applyRecommendationPreconditionsV1(input, target);
   const store = new WorkflowDecisionStoreV1(decisionStoreStateV1(context));
-  // review1 Step 53: a card whose recommended option is safe to run unattended carries a countdown and a
-  // "Wait for me" choice. The plan is made from the card as it will be stored.
-  const autoContinueMinutes = readAutoContinueMinutes();
-  const plannedCountdown =
-    autoContinueMinutes > 0
-      ? planAutoContinueV1(
-          { options: preconditioned.options, recommendation: preconditioned.recommendation, state: "pending" },
-          autoContinueMinutes,
-          Date.now(),
-          await readAutoContinueTaskStateV1(target.taskFolderPath)
-        )
-      : undefined;
-  // review1 Step 54: the owner already chose "and keep going" for this kind of card in this run, so it runs at once.
-  const keepGoingApplies =
-    plannedCountdown !== undefined &&
-    matchesKeepGoingV1(
-      {
-        taskCanonicalId: target.canonicalId,
-        decisionKey: input.decisionKey,
-        options: preconditioned.options,
-        recommendation: preconditioned.recommendation,
-        state: "pending",
-      },
-      store.listKeepGoing(),
-      Date.now(),
-      currentRunBindingV1(target.taskFolderPath)
-    );
-  const autoContinuePlan =
-    plannedCountdown !== undefined && keepGoingApplies
-      ? { ...plannedCountdown, deadline: new Date().toISOString(), keepGoing: true }
-      : plannedCountdown;
-  const autoContinueOption =
-    autoContinuePlan !== undefined
-      ? preconditioned.options.find((candidate) => candidate.optionId === autoContinuePlan.optionId)
-      : undefined;
-  const storedInput =
-    autoContinuePlan !== undefined && autoContinueOption !== undefined
-      ? {
-          ...preconditioned,
-          // The countdown sentence is not stored: the chat draws it from the deadline each time (describeAutoContinueNoteV1).
-          options: withKeepGoingOptionV1(withWaitForMeOptionV1(preconditioned.options), autoContinuePlan.optionId),
-        }
-      : preconditioned;
   const result = await store.post({
-    ...storedInput,
-    decisionId: storedInput.decisionId ?? crypto.randomUUID(),
+    ...preconditioned,
+    decisionId: preconditioned.decisionId ?? crypto.randomUUID(),
     createdAt: new Date().toISOString(),
   });
   if (!result.ok) {
     throw new Error(`workflow decision "${input.decisionKey}" failed validation: ${result.reason}`);
-  }
-  if (!result.suppressed && autoContinuePlan !== undefined && autoContinueOption !== undefined) {
-    // The deadline lives on the stored record, so the periodic sweep finds it again after a reload.
-    await store.armAutoContinue(result.decision.decisionId, autoContinuePlan);
-    if (autoContinuePlan.keepGoing === true) {
-      requestAutoContinueSweepNowV1();
-    }
   }
   if (result.suppressed) {
     // Already answered with the same condition and answers (item 7): no new
@@ -676,9 +612,9 @@ function outcomeOfSettledDecisionV1(decision: WorkflowDecisionV1): AwaitedDecisi
 export async function withdrawWorkflowDecisionsByKeyV1(
   target: Pick<ChatTarget, "taskFolderPath" | "canonicalId">,
   decisionKey: string,
-  reasonOrFor: string | ((decision: WorkflowDecisionV1) => string),
+  reason: string,
   /** When given, only pending decisions it accepts are withdrawn (bugs4 item 13: stale open-items card). */
-  shouldWithdraw?: (decision: WorkflowDecisionV1) => boolean
+  shouldWithdraw?: (decision: { readonly whatHappened: string }) => boolean
 ): Promise<void> {
   const context = getExtensionContextV1();
   if (!context) {
@@ -689,7 +625,6 @@ export async function withdrawWorkflowDecisionsByKeyV1(
     .listPending(target.canonicalId)
     .filter((d) => d.decisionKey === decisionKey && (shouldWithdraw === undefined || shouldWithdraw(d)));
   for (const decision of matches) {
-    const reason = typeof reasonOrFor === "string" ? reasonOrFor : reasonOrFor(decision);
     try {
       const result = await store.withdraw(decision.decisionId, reason);
       if (result.kind === "withdrawn") {

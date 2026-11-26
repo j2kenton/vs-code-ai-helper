@@ -231,12 +231,6 @@ export interface TaskProgress {
   planItemOwnerDecisions?: PlanItemOwnerDecisionV1[];
   /** Test runs the owner recorded by hand, as test evidence with owner provenance (bugs4 item 21). */
   planItemOwnerTestRuns?: PlanItemOwnerTestRunV1[];
-  /** A bounded snapshot of which plan items were settled at the last count (review1 Step 8; mirror of `src/types/taskProgress.ts`). */
-  lastPlanItemSettlement?: PlanItemSettlementSnapshotV1;
-  /** Each rejection of a round's report under the summary contract, by kind (review1 Step 21). Bounded. */
-  reportContractRejections?: ReportContractRejectionV1[];
-  /** The one measure of "is this task moving?" read by the gate in front of every automatic dispatch (review1 Step 23). */
-  progressWatch?: ProgressWatchV1;
   /** Durable record of a round that tried to add, remove, or renumber a
    * checklist item in `plan-final.md` (mirror of `src/types/taskProgress.ts`).
    * Capped at MAX_CHECKLIST_CHANGE_PROPOSALS (oldest dropped first). */
@@ -308,27 +302,6 @@ export interface TaskProgress {
    * transition. See the extension's copy for the full state-machine
    * commentary. */
   stageReviewPasses?: Partial<Record<TaskStage, number>>;
-  /** Mirror of `src/types/taskProgress.ts` (run1 Step 25): other tasks' `task.md` edits already
-   * said once on a round end line, as `<task folder>:<sha256>`. Bounded to the latest 100. */
-  notedForeignEdits?: string[];
-  /** Mirror of `src/types/taskProgress.ts` (run1 Step 31): when the OWNER paused the task (ISO time). */
-  ownerPausedAt?: string;
-  /** Mirror of `src/types/taskProgress.ts` (review2 Step 17): the per-file review coverage record. */
-  reviewCoverage?: ReviewCoverageV1;
-}
-
-/** Mirror of `src/types/taskProgress.ts`: the content hash one review read a file at (review2 Step 17). */
-export interface ReviewCoverageEntryV1 {
-  hash: string;
-  runId: string;
-  stage: TaskStage;
-}
-
-/** Mirror of `src/types/taskProgress.ts`: the per-task review coverage record (review2 Step 17). */
-export interface ReviewCoverageV1 {
-  files: Record<string, ReviewCoverageEntryV1>;
-  changedFiles: string[];
-  updatedAt: string;
 }
 
 /** One artifact deliberately accepted as absent by a human completion override. */
@@ -772,89 +745,6 @@ export interface PlanItemOwnerTestRunV1 {
   readonly itemKeys: readonly string[];
 }
 export const MAX_PLAN_ITEM_OWNER_TEST_RUNS = 200;
-
-/** review1 Step 21: one rejected report (`TaskProgress.reportContractRejections`). */
-export interface ReportContractRejectionV1 {
-  readonly at: string;
-  readonly kind:
-    | "no-summary"
-    | "checkbox-files-changed"
-    | "empty-files-changed"
-    | "empty-verification"
-    | "missing-files-changed"
-    | "missing-verification"
-    | "checklist-claim"
-    | "other";
-  readonly reason: string;
-  readonly roundId?: string;
-  readonly stage?: TaskStage;
-}
-export const REPORT_CONTRACT_REJECTION_KINDS_V1 = [
-  "no-summary",
-  "checkbox-files-changed",
-  "empty-files-changed",
-  "empty-verification",
-  "missing-files-changed",
-  "missing-verification",
-  "checklist-claim",
-  "other",
-] as const;
-
-/** How an automatic or manual round ended, for the "This isn't moving" card (review1 Step 23). */
-export type ProgressWatchEndingKindV1 =
-  | "completed"
-  | "cut-off"
-  | "quota"
-  | "provider-error"
-  | "refused"
-  | "rejected"
-  | "cancelled"
-  | "dropped"
-  | "other";
-export const PROGRESS_WATCH_ENDING_KINDS_V1: readonly ProgressWatchEndingKindV1[] = [
-  "completed", "cut-off", "quota", "provider-error", "refused", "rejected", "cancelled", "dropped", "other",
-];
-
-/** One round ending kept in {@link ProgressWatchV1.endings}. */
-export interface ProgressWatchEndingV1 {
-  readonly at: string;
-  readonly kind: ProgressWatchEndingKindV1;
-  readonly automatic: boolean;
-  readonly roundId?: string;
-  readonly stage?: TaskStage;
-  readonly model?: string;
-  readonly quotaResetAt?: string;
-}
-
-/** `TaskProgress.progressWatch` (review1 Step 23). */
-export interface ProgressWatchV1 {
-  readonly lastProgressAt: string;
-  readonly lastProgressWhat: string;
-  readonly autoRoundsSinceProgress: number;
-  readonly consecutiveFailedAutoRounds: number;
-  readonly endings: readonly ProgressWatchEndingV1[];
-  readonly best?: { readonly score?: number; readonly settled?: number; readonly taskFixable?: number };
-  readonly bestStage?: TaskStage;
-  readonly signalsSeenAt?: string;
-  readonly heldAt?: string;
-  readonly heldFor?: "rounds" | "failed";
-}
-export const MAX_PROGRESS_WATCH_ENDINGS_V1 = 40;
-
-/** review1 Step 8: one plan item in a {@link PlanItemSettlementSnapshotV1}. */
-export interface PlanItemSettlementEntryV1 {
-  readonly hash: string;
-  readonly settled: boolean;
-  readonly label: string;
-}
-
-/** review1 Step 8: the plan items' settlement at the last count, and the items the latest plan change sent back. */
-export interface PlanItemSettlementSnapshotV1 {
-  readonly at: string;
-  readonly items: readonly PlanItemSettlementEntryV1[];
-  readonly lost?: { readonly at: string; readonly labels: readonly string[] };
-}
-export const MAX_PLAN_ITEM_SETTLEMENT_SNAPSHOT_ITEMS_V1 = 400;
 /** Bound on `checklistProgressUnreliableClaims`. */
 export const MAX_LATCHING_CLAIMS_V1 = 200;
 

@@ -1,6 +1,5 @@
 import * as vscode from "vscode";
-import { runWithAdmittedAutomaticDispatchV1, runWithAutomaticOriginV1 } from "../state/automationDispatchContextV1";
-import { admitAutomaticDispatchV1 } from "../commands/automaticDispatchGateV1";
+import { runWithAutomaticOriginV1 } from "../state/automationDispatchContextV1";
 import { taskOperations, TaskOperationHandle } from "./taskOperations";
 import {
   announceAutoStartBestEffortV1,
@@ -133,37 +132,13 @@ export interface AutomationChainDeps {
     listener: (snapshot: AutomationChainEndSnapshot) => void
   ): { dispose(): void };
   execute(command: string, arg: unknown): Thenable<unknown>;
-  /**
-   * review1 Step 24: the "is this working?" gate in front of every automatic dispatch. Resolves true when the
-   * dispatch may run. Absent in unit tests that supply their own deps, which then run ungated.
-   */
-  admit?(taskKey: string, command: string): Promise<boolean>;
 }
 
 function defaultDeps(): AutomationChainDeps {
   return {
     onDidEnd: (listener) => taskOperations.onDidEnd(listener),
     execute: (command, arg) => vscode.commands.executeCommand(command, arg),
-    admit: async (taskKey) =>
-      (await admitAutomaticDispatchV1({ taskFolderPath: taskKey, kind: "automation-chain" })).admitted,
   };
-}
-
-/**
- * review1 Step 24: run one automatic dispatch's command behind the progress gate. A refused dispatch resolves
- * `false` (a declined command), which the callers record as a dropped round, never as a clean ending.
- */
-function executeBehindProgressGateV1(
-  dispatch: AutomationDispatch,
-  deps: AutomationChainDeps,
-  body: () => Thenable<unknown>
-): Promise<unknown> {
-  if (!dispatch.taskKey || !deps.admit) {
-    return Promise.resolve(runWithAutomaticOriginV1(body));
-  }
-  return deps.admit(dispatch.taskKey, dispatch.command).then((admitted) =>
-    admitted ? runWithAdmittedAutomaticDispatchV1(body) : false
-  );
 }
 
 /**
@@ -591,7 +566,7 @@ export function scheduleAutomationChain(
         }
       })
       .then(() =>
-        executeBehindProgressGateV1(dispatch, deps, () => {
+        runWithAutomaticOriginV1(() => {
           clearAutomationCommandOutcomeV1(dispatch.taskKey);
           return deps.execute(dispatch.command, dispatch.arg);
         })
@@ -686,7 +661,7 @@ export function scheduleAutomationChain(
           })
           .then(() => {
             Promise.resolve(
-              executeBehindProgressGateV1(dispatch, deps, () => {
+              runWithAutomaticOriginV1(() => {
                 clearAutomationCommandOutcomeV1(dispatch.taskKey);
                 return deps.execute(dispatch.command, dispatch.arg);
               })

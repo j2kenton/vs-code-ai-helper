@@ -1,5 +1,4 @@
 import * as vscode from "vscode";
-import { createHash } from "node:crypto";
 import {
   EscalationKind,
   IMPL_REVIEW_STAGES,
@@ -33,7 +32,6 @@ import {
   hasNarrowingPrefixV1,
   findNarrowingBlockerV1,
   findPlanStageNarrowingBlockerV1,
-  narrowingReasonIsCheckedV1,
 } from "./planItemNarrowingV1";
 import { taskFixableAreAllUnbuiltWorkV1, isUnbuiltWorkBlockerV1 } from "./reviewRouting";
 import {
@@ -55,79 +53,37 @@ import {
   type ScopedItemListV1,
 } from "./deferredPlanScopeV1";
 import {
-  isTestDependentChecklistItemV1,
+  countChecklistEvidenceProgressV1,
+  describeChecklistGateGapV1,
+  describeOpenAndHandOffsV1,
   listProvisionalTickedItemsV1,
   normalizeChecklistItemTextV1,
   resolveBlockerPlanReferencesV1,
   resolveExcludedOwnerHandoffV1,
-  resolveVerifiedCompleteEntryTextsV1,
 } from "./implementationChecklist";
 import { getCanonicalImplementationUri } from "./implementationArtifactResolver";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
-import { detectNarrowedBlockerV1, type NarrowedBlockerV1 } from "./blockerRuleNarrowingV1";
 import * as path from "path";
 import {
   AGENT_CAN_GATHER_RE,
   BlockerResolver,
-  isEnvironmentalResolverV1,
   parseOwnerDecisionsNeededV1,
-  parseReviewBlockers,
   parseReviewVerifiedCompleteV1,
   ReviewBlocker,
 } from "./reviewReadiness";
 import { KEEP_ITERATING_SEQUENCE_NOTE_V1 } from "./plateauFixCycleV1";
 import { normalizeReviewEvidenceV1 } from "./reviewEvidenceNormalizerV1";
-import {
-  computePlanItemCountsV1,
-  describeOpenAndHandOffsFromCountsV1,
-  effectiveReviewProgressV1,
-  readPlanItemCountsV1,
-} from "./effectiveReviewProgress";
-import {
-  listPendingWorkflowDecisionsForTaskV1,
-  PostWorkflowDecisionInputV1,
-  postWorkflowDecisionV1,
-} from "./workflowDecisionDispatchV1";
+import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "./effectiveReviewProgress";
+import { PostWorkflowDecisionInputV1, postWorkflowDecisionV1 } from "./workflowDecisionDispatchV1";
 import {
   WorkflowDecisionOptionEffectV1,
   WorkflowDecisionOptionV1,
   WorkflowDecisionRecommendationV1,
 } from "../types/workflowDecisionV1";
 import { QuestionOptionV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
-import { appendChatMessageV1, LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 } from "./chatHistoryStore";
+import { LOCAL_ONLY_INTERACTION_ACTION_KEY_V1 } from "./chatHistoryStore";
 import { allocateHex128IdV1 } from "../types/actionCorrelationV1";
 import { OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "./ownerEvidenceV1";
-import { RUN_CHECKS_FOR_WITHHELD_ITEMS_COMMAND_V1 } from "./withheldTestEvidenceCardV1";
-import {
-  findAllowlistedCommandInTextV1,
-  RECORD_OWNER_RUN_COMMAND_V1,
-  RUN_OWNER_EVIDENCE_COMMAND_V1,
-} from "./ownerEvidenceCommandAllowlistV1";
-import {
-  buildOwnerEvidenceUpFrontQuestionsV1,
-  listUnansweredOwnerEvidenceStepsAfterV1,
-  listUnansweredOwnerEvidenceStepsV1,
-  ownerEvidenceFormStepsV1,
-  ownerEvidenceStepsKeyV1,
-} from "./ownerEvidenceUpFrontV1";
-import { getExtensionContextV1 } from "./extensionContextV1";
-import { getLiveTaskOperationV1 } from "./liveTaskOperationLookupV1";
-import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
-import { openPlanStageArgV1, optionAppliesAtStageV1, planFileNameForStageV1 } from "./optionAppliesAtStageV1";
-import { blockerOwnerIdentityV1, hasPendingOwnerDecisionCardV1 } from "./ownerCardCoverageV1";
-import {
-  EnvironmentalEvidenceBlockerV1,
-  EnvironmentalFailureEvidenceV1,
-  extractEnvironmentalFailureEvidenceV1,
-  formatEnvironmentReportV1,
-  formatFailureReportV1,
-} from "./environmentalFailureEvidenceV1";
-import { resolveReadOnlyDiagnosisAvailabilityV1 } from "./readOnlyDiagnosisAvailabilityV1";
-import { parseRecordedCompletionChecksEvidenceV1 } from "./completionLint";
-import { reviewInputsChangedSinceV1 } from "./reviewInputsChangedV1";
-import { advanceNeedsOpenItemsConfirmationV1, advanceOverOpenItemsLabelV1 } from "./advanceOverOpenItemsV1";
-import { describeReviewedLineV1, filesPhraseV1, type ReviewCoverageSummaryV1 } from "./reviewCoverageV1";
-import { readReviewCoverageSummaryV1 } from "./reviewCoverageIoV1";
 
 /** Minimal shape this module needs from ChatViewProvider — avoids importing
  * the view layer from a utils module (chatView.ts pulls in webview/vscode UI
@@ -497,23 +453,7 @@ function describeOpenPlanItemsNoteV1(planItemsOpen: number | undefined, nextStag
   return ` ${planItemsOpen} plan ${plural} still open and will not be built at ${nextStageName}.`;
 }
 
-/**
- * review1 Step 57: the "accept it as environmental" move keeps the labelled override ("Move on, leaving N plan items
- * open") when it leaves High-Level Code Review with plan items open; otherwise it keeps its own label. The
- * environmental acceptance is still named in the consequence text.
- */
-function withEnvironmentalAcceptLabelV1(
-  option: WorkflowDecisionOptionV1,
-  nextStage: TaskStage,
-  planItemsOpen: number | undefined
-): WorkflowDecisionOptionV1 {
-  const isOverride = option.label !== `Advance to ${STAGE_DISPLAY_NAMES[nextStage]}`;
-  return isOverride && planItemsOpen !== undefined && planItemsOpen > 0
-    ? { ...option, consequence: `Accepts the environmental failure as well. ${option.consequence}` }
-    : { ...option, label: "Accept it as environmental and continue" };
-}
-
-export function buildAdvanceOptionV1(
+function buildAdvanceOptionV1(
   nextStage: TaskStage,
   taskFolderPath: string,
   consequence: string,
@@ -550,14 +490,7 @@ export function buildAdvanceOptionV1(
   const openItemsNote = describeOpenPlanItemsNoteV1(planItemsOpen, nextStageName);
   return {
     optionId: "advance",
-    // review1 Step 57: while plan items are open, the move out of High-Level Code Review is offered only as the
-    // labelled override, and choosing it asks the same pop-up as Complete Stage & Move On.
-    label:
-      planItemsOpen !== undefined &&
-      planItemsOpen > 0 &&
-      advanceNeedsOpenItemsConfirmationV1(expectedSourceStage, nextStage)
-        ? advanceOverOpenItemsLabelV1(planItemsOpen)
-        : `Advance to ${nextStageName}`,
+    label: `Advance to ${nextStageName}`,
     consequence:
       (resumeFastForward
         ? `${consequence} Continues fast-forwarding at ${nextStageName}.`
@@ -622,134 +555,6 @@ function buildBuildRemainingOptionV1(
 }
 
 /**
- * bugs8 item 3 (Step 13): the evidence path for open plan items that are built but not yet checked. It is the same
- * "Run Publish Checks now" the withheld-evidence card offers: one run, no model round, and a passing report is
- * recorded for every item whose test file the output names.
- */
-function buildProvisionalEvidenceOptionV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  itemTexts: readonly string[]
-): WorkflowDecisionOptionV1 {
-  const count = itemTexts.length;
-  return {
-    optionId: "checkBuiltItems",
-    label: `Check the ${count} built ${count === 1 ? "item" : "items"} (run Publish Checks)`,
-    resumeKind: "continue",
-    consequence:
-      `Runs the project's Publish Checks once, in this window, with no model round. A passing report is recorded for each ` +
-      `of the ${count} built-but-unchecked ${count === 1 ? "item" : "items"} whose test file the output names. Nothing ` +
-      "is built; items it cannot match stay as they are and are listed.",
-    effect: {
-      kind: "command",
-      command: RUN_CHECKS_FOR_WITHHELD_ITEMS_COMMAND_V1,
-      args: [{ taskFolderPath, stage, itemTexts: [...itemTexts] }],
-    },
-    recordedNext: "Publish Checks run",
-  };
-}
-
-const deferralLinesWrittenV1 = new Set<string>();
-
-/** @internal tests only */
-export function __resetOwnerDecisionDeferralLinesV1(): void {
-  deferralLinesWrittenV1.clear();
-}
-
-/**
- * bugs8 item 3 (Step 14): the can't-progress card was not posted because an owner-decision card for this stage is
- * waiting. The blockers that card does not ask about get one chat line, once per review (`reviewFingerprint`, a
- * digest of the review's own text), written as an ordinary assistant line so the transcript shows it.
- * Returns whether a line was written.
- */
-export async function writeOwnerDecisionDeferralLineV1(
-  taskFolderPath: string,
-  canonicalId: string,
-  stage: TaskStage,
-  blockers: readonly { readonly identity: string; readonly description: string }[],
-  reviewFingerprint: string,
-  ignoreDecisionKey?: string
-): Promise<boolean> {
-  const cards = listPendingWorkflowDecisionsForTaskV1(canonicalId).filter(
-    (card) =>
-      card.stage === stage && card.decisionKey.startsWith("ownerPlanDecision:") && card.decisionKey !== ignoreDecisionKey
-  );
-  // A card that recorded no identities (older) asks about the whole stage.
-  if (cards.length === 0 || cards.some((card) => card.blockerIdentities === undefined)) return false;
-  const asked = new Set(cards.flatMap((card) => card.blockerIdentities ?? []));
-  const waiting = blockers.filter((blocker) => !asked.has(blocker.identity));
-  if (waiting.length === 0) return false;
-  const key = `${canonicalId}|${stage}|${reviewFingerprint}`;
-  if (deferralLinesWrittenV1.has(key)) return false;
-  deferralLinesWrittenV1.add(key);
-  const list = waiting.map((blocker) => `"${blocker.description.replace(/\s+/g, " ").trim().slice(0, 160)}"`).join("; ");
-  await appendChatMessageV1(
-    taskFolderPath,
-    {
-      role: "assistant",
-      text:
-        `${waiting.length} other blocker${waiting.length === 1 ? "" : "s"} wait${waiting.length === 1 ? "s" : ""} until ` +
-        `you answer the decision card: ${list}.`,
-      stage,
-      at: new Date().toISOString(),
-    },
-    canonicalId
-  ).catch(() => undefined);
-  return true;
-}
-
-/** bugs8 item 3: the choices the owner-decision card for a blocker already offers; the can't-progress card never repeats them. */
-const OWNER_DECISION_CARD_CHOICE_IDS_V1: ReadonlySet<string> = new Set([
-  "settleWithRule",
-  "acceptNarrowing",
-  "keepItemOpen",
-  "reconsiderRequirement",
-]);
-/** bugs8 item 3: one stop, at most four options, one recommendation. */
-const PLATEAU_OPTION_CAP_V1 = 4;
-
-/**
- * bugs8 item 3 (Step 14): the can't-progress card raised for a stop whose review has an owner-decision blocker. It
- * drops the owner-decision card's choices and caps what is left at four, in this order: the recommended action, the
- * evidence or move-on options, "Keep iterating", "Leave it paused". The recommendation moves to "Keep iterating" (or
- * "Leave it paused") when the option it named was one of the dropped choices.
- */
-export function shapePlateauAfterOwnerDecisionV1(
-  options: readonly WorkflowDecisionOptionV1[],
-  recommendation: WorkflowDecisionRecommendationV1
-): { options: WorkflowDecisionOptionV1[]; recommendation: WorkflowDecisionRecommendationV1 } {
-  const kept = options.filter((option) => !OWNER_DECISION_CARD_CHOICE_IDS_V1.has(option.optionId));
-  const isTail = (option: WorkflowDecisionOptionV1): boolean =>
-    option.optionId === "keepIterating" || option.optionId === "handleMyself";
-  let recommended =
-    recommendation.kind === "option" ? kept.find((option) => option.optionId === recommendation.optionId) : undefined;
-  let nextRecommendation = recommendation;
-  if (recommendation.kind === "option" && recommended === undefined) {
-    recommended = kept.find((option) => option.optionId === "keepIterating") ?? kept.find((option) => option.optionId === "handleMyself");
-    if (recommended !== undefined) {
-      nextRecommendation = {
-        kind: "option",
-        optionId: recommended.optionId,
-        reasoning:
-          "The decision this stop needs from you is on its own card; the choices for it are not repeated here. " +
-          (recommended.optionId === "keepIterating"
-            ? "What is left is work another round can do."
-            : "Nothing else here can move the task, so it stays paused until you have dealt with it."),
-      };
-    }
-  }
-  const tail = ["keepIterating", "handleMyself"]
-    .map((id) => kept.find((option) => option.optionId === id))
-    .filter((option): option is WorkflowDecisionOptionV1 => option !== undefined && option !== recommended);
-  const head = kept.filter((option) => !isTail(option) && option !== recommended);
-  const room = Math.max(0, PLATEAU_OPTION_CAP_V1 - (recommended ? 1 : 0) - tail.length);
-  return {
-    options: [...(recommended ? [recommended] : []), ...head.slice(0, room), ...tail].slice(0, PLATEAU_OPTION_CAP_V1),
-    recommendation: nextRecommendation,
-  };
-}
-
-/**
  * Shared "reconsiderRequirement" option shape — same rationale as
  * {@link buildAdvanceOptionV1}: both callers open plan-final.md's Accepted
  * Non-Goals section for the same reason (the requirement itself, not the
@@ -759,21 +564,18 @@ export function shapePlateauAfterOwnerDecisionV1(
  */
 function buildReconsiderRequirementOptionV1(
   taskFolderPath: string,
-  consequence: string,
-  stage?: TaskStage
+  consequence: string
 ): WorkflowDecisionOptionV1 {
-  // review1 Step 38: at a plan stage plan-final.md does not exist; the plan the owner edits is plan.md.
-  const planFile = planFileNameForStageV1(stage);
   return {
     optionId: "reconsiderRequirement",
     label: "Change the plan instead",
-    consequence: planFile === "plan.md" ? consequence.replace(/plan-final\.md/g, "plan.md") : consequence,
+    consequence,
     // The user edits Accepted Non-Goals themselves; Ensemble dispatches nothing.
     resumeKind: "unpause",
     effect: {
       kind: "command",
       command: "vs-code-ai-helper.openPlanNonGoals",
-      args: [{ taskFolderPath, ...openPlanStageArgV1(stage) }],
+      args: [{ taskFolderPath }],
     },
   };
 }
@@ -812,11 +614,9 @@ function buildPlateauKeepIteratingOptionV1(
         `Keep iterating: resume Fast Forward (iteration ${fastForwardState.attemptNumber} of ` +
         `${fastForwardState.maxAttempts}) from Apply Review`,
       consequence:
-        `Resumes the task and continues Fast Forward from Apply Review (a round that ${fixClause}) against the ` +
-        `${taskFixableCount} task-fixable ${taskFixableCount === 1 ? "blocker" : "blockers"}, then re-reviews ${stageName} ` +
-        `after each round, at iteration ${fastForwardState.attemptNumber} of ${fastForwardState.maxAttempts} — it keeps ` +
-        `iterating through the remaining attempt budget this run already committed to, rather than running just one ` +
-        `more round. ${KEEP_ITERATING_SEQUENCE_NOTE_V1}`,
+        `Resumes the task and continues Fast Forward from Apply Review (a round that ${fixClause}), at iteration ` +
+        `${fastForwardState.attemptNumber} of ${fastForwardState.maxAttempts} — it keeps iterating through the ` +
+        `remaining attempt budget this run already committed to, rather than running just one more round. ${KEEP_ITERATING_SEQUENCE_NOTE_V1}`,
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
@@ -889,22 +689,6 @@ export interface EscalationPlateauContextV1 {
    * the requirement calls for. Empty when `blockersCount === 0`.
    */
   readonly allBlockerDescriptions: readonly string[];
-  /**
-   * review1 Step 50: the descriptions of the `needs-toolchain` blockers: commands the stage cannot run and the
-   * owner runs outside the task. Each gets an "I ran it — record the result" option.
-   */
-  readonly needsToolchainBlockers?: readonly string[];
-  /**
-   * review1 Step 50: the stable identity (`blockerOwnerIdentityV1`, the lineage id when the review declared one) of
-   * each entry of `needsToolchainBlockers`, same order. The owner's record is bound to it, so a reworded re-raise
-   * still finds the record.
-   */
-  readonly needsToolchainBlockerIdentities?: readonly string[];
-  /**
-   * review1 Step 58: true when task.md, plan.md or plan-final.md changed since the review (Step 27's digest). The
-   * card then offers "I've made changes — re-check" beside Keep iterating.
-   */
-  readonly reviewInputsChanged?: boolean;
   /** Appended immediately after the quoted blocker description; empty string when not narrowed. */
   readonly narrowedNote: string;
   readonly progressNote: string;
@@ -943,12 +727,6 @@ export interface EscalationPlateauContextV1 {
    * plan were finished; see `buildEscalationDecisionV1`'s plateau branch.
    */
   readonly planItemsOpen: number;
-  /**
-   * bugs8 item 3: the latest review carries at least one owner-decision blocker, which has (or had) its own card.
-   * This card then repeats none of that card's choices ("Settle it with a rule", "Accept this narrowing", "Keep
-   * the item open", "Change the plan instead"), and offers at most four options with one recommendation.
-   */
-  readonly ownerDecisionBlockersPresent?: boolean;
   /**
    * RC7 item 1: at least one blocker remains and every one clears only
    * through an owner decision (a narrowing, or owner evidence). The card
@@ -989,8 +767,6 @@ export interface EscalationPlateauContextV1 {
   readonly applyReviewRoundsClosedNone?: number;
   /** Plan items ticked by a model but not yet verified; with a flat count this is a verification stall. */
   readonly provisionalTicks?: number;
-  /** bugs8 item 3: the texts of those built-but-unchecked items, for the evidence option. */
-  readonly provisionalItemTexts?: readonly string[];
   /**
    * bugs4 item 53: the latest review's own `## Verified Complete` block names every provisional
    * ticked item as built. A model tick alone is a claim, not evidence, so "nothing left to build"
@@ -1002,16 +778,6 @@ export interface EscalationPlateauContextV1 {
   readonly unbuiltWorkReferences?: readonly string[];
   /** Deferrable, excluded owner checks offered the post-install move-on route. */
   readonly ownerChecksOwed?: readonly string[];
-  /**
-   * review2 Steps 18-19: how much of the change a review has read, from the per-file coverage record. Shown as
-   * "Reviewed: N of M changed files"; when files are unreviewed the card offers "Review the remaining N files".
-   */
-  readonly coverage?: ReviewCoverageSummaryV1;
-  /**
-   * review2 Step 33: a blocker whose fixes have each closed part of it (see `detectNarrowedBlockerV1`). The card says
-   * the rule may be missing and offers "Settle it with a rule".
-   */
-  readonly narrowedBlockerRule?: NarrowedBlockerV1;
   /**
    * RC4 item 3: set when a blocker asks the owner to narrow a plan item
    * (`findNarrowingBlockerV1`). Adds the item, the round's reason and its
@@ -1049,19 +815,10 @@ export function describeFixableSplitV1(fixable: number, total: number): string {
  * assertion that the work is built, so it is the only thing that lets a card say "nothing left
  * to build".
  */
-export function reviewNamesAllItemsBuiltV1(
-  reviewContent: string,
-  itemTexts: readonly string[],
-  planText?: string
-): boolean {
+export function reviewNamesAllItemsBuiltV1(reviewContent: string, itemTexts: readonly string[]): boolean {
   if (itemTexts.length === 0) return false;
-  // review1 (owner decision 2026-11-05): an entry citing an issued `[item:<id>]` (or a `Step N` naming one item)
-  // names that item; with the plan text available it is read as the item's own text.
-  const entries = parseReviewVerifiedCompleteV1(reviewContent).entries;
   const named = new Set(
-    (planText ? resolveVerifiedCompleteEntryTextsV1(planText, entries).entries : entries).map((entry) =>
-      normalizeChecklistItemTextV1(entry.text)
-    )
+    parseReviewVerifiedCompleteV1(reviewContent).items.map((text) => normalizeChecklistItemTextV1(text))
   );
   return itemTexts.every((text) => named.has(normalizeChecklistItemTextV1(text)));
 }
@@ -1138,168 +895,6 @@ function buildBreakerVerifiedTicksOptionV1(taskFolderPath: string): WorkflowDeci
 }
 
 /**
- * review1 Step 48: reads the recorded Verified Checks (the stage's review file, then publish-review.md) for the
- * failing check and the environment, and builds the environmental-failure card. Undefined when the latest review
- * recorded no environmental blocker, so an environmental stop with no blocker behind it keeps the generic card.
- */
-async function buildEnvironmentalFailureCardForStageV1(
-  folderUri: vscode.Uri,
-  stage: TaskStage,
-  reason: string,
-  taskName: string | undefined,
-  blockers: readonly EnvironmentalEvidenceBlockerV1[],
-  planItemsOpen: number
-): Promise<PostWorkflowDecisionInputV1 | undefined> {
-  try {
-    if (!blockers.some((b) => b.resolver === "environmental" || b.resolver === "environmental-fixable")) {
-      return undefined;
-    }
-    let recorded: ReturnType<typeof parseRecordedCompletionChecksEvidenceV1>;
-    for (const fileName of [STAGE_ARTIFACT_FILENAMES[stage], STAGE_ARTIFACT_FILENAMES.publish]) {
-      if (!fileName) continue;
-      const content = await readTextIfExists(vscode.Uri.joinPath(folderUri, fileName));
-      const parsed = content ? parseRecordedCompletionChecksEvidenceV1(content) : undefined;
-      if (parsed && (parsed.failedChecks?.length ?? 0) > 0) {
-        recorded = parsed;
-        break;
-      }
-      recorded ??= parsed?.verificationEnvironment ? parsed : undefined;
-    }
-    const evidence = extractEnvironmentalFailureEvidenceV1({
-      blockers,
-      failedChecks: recorded?.failedChecks?.map((check) => ({
-        command: check.command,
-        exitCode: check.exitCode,
-        output: check.output,
-      })),
-      environment: recorded?.verificationEnvironment,
-    });
-    const readOnly = resolveReadOnlyDiagnosisAvailabilityV1();
-    return buildEnvironmentalFailureDecisionV1({
-      stage,
-      reason,
-      target: { canonicalId: normalizePath(folderUri.fsPath), taskFolderPath: folderUri.fsPath, taskName },
-      evidence,
-      planItemsOpen,
-      ...(readOnly.available ? {} : { investigateUnavailableReason: readOnly.reason }),
-    });
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * review1 Step 48: the card for the first review whose only blockers are ones no in-plan round can clear
- * (`environmental` / `environmental-fixable`). It names the broken check and shows Ensemble's own environment for
- * the run, and offers: "Investigate it for me" (a read-only diagnostic round, Step 49; recommended when a bounded
- * code change may resolve it), "I'll look at it myself", and "Accept it as environmental and continue".
- */
-export function buildEnvironmentalFailureDecisionV1(input: {
-  readonly stage: TaskStage;
-  readonly reason: string;
-  readonly target: { canonicalId: string; taskFolderPath: string; taskName?: string };
-  readonly evidence: EnvironmentalFailureEvidenceV1;
-  readonly planItemsOpen?: number;
-  /**
-   * Set when no model in Implementation's chain can run in the provider's enforced read-only mode (owner decision
-   * 2026-11-05). "Investigate it for me" is then shown disabled with this reason, and never recommended.
-   */
-  readonly investigateUnavailableReason?: string;
-}): PostWorkflowDecisionInputV1 {
-  const { stage, reason, target, evidence } = input;
-  const investigateBlockedBy = input.investigateUnavailableReason;
-  const stageName = STAGE_DISPLAY_NAMES[stage];
-  const nextStage = nextStageInOrderV1(stage);
-  const failureReport = formatFailureReportV1(evidence);
-  const environmentReport = formatEnvironmentReportV1(evidence.environment);
-  const canInvestigate = IMPL_REVIEW_STAGES.includes(stage);
-
-  const investigate: WorkflowDecisionOptionV1 = {
-    optionId: "investigateFailure",
-    label: "Investigate it for me",
-    resumeKind: "continue",
-    consequence:
-      investigateBlockedBy !== undefined
-        ? `Not available: ${investigateBlockedBy}.`
-        : "Resumes the task and runs one diagnostic round that reads the failure and the code and explains it. It runs " +
-          "in the provider's enforced read-only mode, so it cannot change any of your files, and it cannot run tests " +
-          "itself: it works from the failure output above. Ensemble saves its findings to evidence/diagnosis-<n>.md. " +
-          "You then choose whether a separate round applies the fix it suggests.",
-    ...(investigateBlockedBy !== undefined ? { disabled: true } : {}),
-    effect: {
-      kind: "command",
-      command: "vs-code-ai-helper.resumeAndApplyCurrentStageAction",
-      args: [{ taskFolderPath: target.taskFolderPath, investigate: { failure: failureReport, environmentReport } }],
-      recordedNext: "A diagnostic round is investigating the failure; it runs read-only and Ensemble saves its diagnosis.",
-    },
-  };
-  const lookMyself: WorkflowDecisionOptionV1 = {
-    optionId: "lookMyself",
-    label: "I'll look at it myself",
-    resumeKind: "unpause",
-    consequence:
-      "Leaves the task paused and dispatches nothing. Resume it, or choose Keep iterating, once you've dealt with the failure.",
-    effect: { kind: "doNothing", recordedNext: "The task stays paused while you look at the failure." },
-  };
-  const accept: WorkflowDecisionOptionV1 | undefined = nextStage
-    ? withEnvironmentalAcceptLabelV1(
-        buildAdvanceOptionV1(
-          nextStage,
-          target.taskFolderPath,
-          `Accepts that this failure is environmental and moves the task to ${STAGE_DISPLAY_NAMES[nextStage]}. ` +
-            "It stays on record and will gate Publish until it is fixed or you publish over it.",
-          stage,
-          input.planItemsOpen
-        ),
-        nextStage,
-        input.planItemsOpen
-      )
-    : undefined;
-
-  const options: WorkflowDecisionOptionV1[] = [
-    ...(canInvestigate ? [investigate] : []),
-    lookMyself,
-    ...(accept ? [accept] : []),
-  ];
-  const recommendation: WorkflowDecisionRecommendationV1 =
-    canInvestigate && evidence.fixable && investigateBlockedBy === undefined
-      ? {
-          kind: "option",
-          optionId: "investigateFailure",
-          reasoning:
-            "The reviewer marked this fixable by a bounded code change outside the plan, and a diagnosis is the " +
-            "smallest step that finds out which. It runs read-only, so it changes none of your files.",
-        }
-      : {
-          kind: "none",
-          reasoning:
-            "This is marked as something no code change resolves, so whether to look at it, accept it or investigate " +
-            "anyway is your judgement.",
-        };
-
-  return {
-    decisionKey: "reviewEscalation:environmental",
-    taskCanonicalId: target.canonicalId,
-    stage,
-    whatHappened: `${stageName} found a failing check that no implementation round can clear: ${reason}`,
-    whyUserNeeded:
-      "Automation has nothing it can dispatch against this, so another round would only repeat the stall. " +
-      "It needs your decision on how to proceed.",
-    options,
-    recommendation,
-    evidence: [
-      { label: "The failing check", detail: failureReport },
-      { label: "Ensemble's own environment for that run", detail: environmentReport },
-    ],
-    gating: {
-      holdsTaskPaused: true,
-      unblocksProgress: true,
-      detail: "This decision is holding the task paused until you choose how to proceed.",
-    },
-  };
-}
-
-/**
  * The bounded, durable escalation shape every `EscalationKind` posts through
  * — the plain generic card (no `plateauContext`) for implementation-side and
  * environmental escalations, and the same rich, evidence-led
@@ -1336,9 +931,6 @@ export function buildEscalationDecisionV1(
       blockersCount,
       primaryBlockerDescription,
       allBlockerDescriptions,
-      needsToolchainBlockers = [],
-      needsToolchainBlockerIdentities,
-      reviewInputsChanged,
       narrowedNote,
       progressNote,
       taskFixableCount,
@@ -1351,7 +943,6 @@ export function buildEscalationDecisionV1(
       planItemsOpen,
       narrowing,
       allBlockersNeedOwnerDecision = false,
-      ownerDecisionBlockersPresent = false,
       allBlockersCarriedGates = false,
       taskFixableAllUnbuiltWork = false,
       taskFixableIncludesUnbuiltWork = false,
@@ -1359,15 +950,10 @@ export function buildEscalationDecisionV1(
       runProgressNote,
       applyReviewRoundsClosedNone = 0,
       provisionalTicks = 0,
-      provisionalItemTexts = [],
       reviewAffirmsOpenItemsBuilt = false,
       unbuiltWorkReferences = [],
       ownerChecksOwed = [],
-      coverage,
-      narrowedBlockerRule,
     } = plateauContext;
-    // review2 Step 19: files no review has read at their current content.
-    const unreviewedCount = coverage ? coverage.changedCount - coverage.reviewedCount : 0;
     // bugs4 item 18: unbuilt work is among the task-fixable blockers and recent Apply Reviews closed
     // no open item, so another Apply Review is not the step that moves this task. Specific defects
     // are carried into the Implementation round's guidance or left to the review that follows.
@@ -1389,21 +975,7 @@ export function buildEscalationDecisionV1(
       provisional: provisionalTicks,
       roundsClosedNone: applyReviewRoundsClosedNone,
     });
-    // bugs8 item 3 (Step 13): "Build the N open plan items" counts only the items with nothing built, from the same
-    // split the stop card shows ("N to build, M built but not yet checked", `planItemsLine` in `automationStopV1.ts`):
-    // the gate's open count minus the provisional items. Open items that are built but not yet checked need
-    // evidence, not a build round; a blocker naming unbuilt work still makes Build honest when the ticks alone say
-    // everything is built.
-    const builtNotChecked = Math.min(Math.max(0, provisionalTicks), planItemsOpen);
-    const unbuiltOpenCount = Math.max(0, planItemsOpen - builtNotChecked);
-    // Owner decision build-count-precedence (2026-11-12): the shared split is the only count. A blocker that names
-    // unbuilt work never turns a zero "to build" count into a positive one; "Keep iterating" is the way on for it.
-    const buildCount = unbuiltOpenCount;
     const options: WorkflowDecisionOptionV1[] = [
-      // bugs8 item 3 (Step 13): built but unchecked items get the evidence path, not a build round.
-      ...(builtNotChecked > 0 && provisionalItemTexts.length > 0 && !isPlanReviewStage(stage)
-        ? [buildProvisionalEvidenceOptionV1(target.taskFolderPath, stage, provisionalItemTexts)]
-        : []),
       ...(nextStage
         ? [
             buildAdvanceOptionV1(
@@ -1423,32 +995,8 @@ export function buildEscalationDecisionV1(
       // checklist items, regardless of whether anything remaining is
       // task-fixable — this is the "build the next items" alternative to
       // Advance the requirement calls for.
-      ...(buildCount > 0 ? [buildBuildRemainingOptionV1(target.taskFolderPath, buildCount, stage)] : []),
+      ...(planItemsOpen > 0 ? [buildBuildRemainingOptionV1(target.taskFolderPath, planItemsOpen, stage)] : []),
       buildPlateauKeepIteratingOptionV1(target.taskFolderPath, stageName, taskFixableCount, blockersCount, stage),
-      ...(coverage && unreviewedCount > 0 && IMPL_REVIEW_STAGES.includes(stage)
-        ? [buildReviewRemainingOptionV1(target.taskFolderPath, stage, coverage)]
-        : []),
-      ...(narrowedBlockerRule ? [buildSettleWithRuleOptionV1(target.taskFolderPath, stage, narrowedBlockerRule)] : []),
-      // review1 Step 58: offered only when the review's inputs (task.md, plan.md, plan-final.md) changed since the
-      // review, i.e. the owner made a change the review has not seen.
-      ...(reviewInputsChanged === true
-        ? [
-            {
-              optionId: "recheckAfterMyChanges",
-              label: "I've made changes — re-check",
-              resumeKind: "continue" as const,
-              consequence:
-                `Resumes the task and re-runs ${stageName}'s review only, because task.md, plan.md or plan-final.md ` +
-                "changed after the last review. It runs no Apply Review and edits no code; the new verdict says whether " +
-                "your change settled the blockers.",
-              effect: {
-                kind: "command" as const,
-                command: "vs-code-ai-helper.resumeAndRerunReview",
-                args: [{ taskFolderPath: target.taskFolderPath }],
-              },
-            },
-          ]
-        : []),
       {
         optionId: "handleMyself",
         label: "Leave it paused — I'll fix it",
@@ -1470,8 +1018,7 @@ export function buildEscalationDecisionV1(
             "dispatched. No remaining blocker this round is classified spec-defect, so there is no specific " +
             "evidence the requirement itself is unsound in this instance — pick this only if you have reason to " +
             "believe otherwise despite that. Once you've updated the plan, resume the task (or choose Keep " +
-            "Iterating) to continue.",
-        stage
+            "Iterating) to continue."
       ),
       ...(ownerChecksOwed.length > 0
         ? [{
@@ -1494,9 +1041,7 @@ export function buildEscalationDecisionV1(
       // is the exact same kind that will gate Publish later — leaving the
       // owner to discover the override for the first time in a modal at
       // publish time. Only offered when such a blocker is actually present.
-      ...(hasNonFixableBlocker && optionAppliesAtStageV1("publishAnyway", stage)
-        ? [buildPublishAnywayOptionV1(target.taskFolderPath)]
-        : []),
+      ...(hasNonFixableBlocker ? [buildPublishAnywayOptionV1(target.taskFolderPath)] : []),
       ...(narrowing
         ? [
             {
@@ -1532,35 +1077,6 @@ export function buildEscalationDecisionV1(
             },
           ]
         : []),
-      // review1 Step 50: a command the stage cannot run is run by the owner; recording the result is how the
-      // blocker can ever be met on the record.
-      ...needsToolchainBlockers.slice(0, 2).map((desc, index): WorkflowDecisionOptionV1 => {
-        const shortName = desc.replace(/\s+/g, " ").trim().slice(0, 48);
-        return {
-          optionId: index === 0 ? "recordOwnerRun" : `recordOwnerRun${index + 1}`,
-          label:
-            needsToolchainBlockers.length > 1
-              ? `I ran it — record the result: ${shortName}${desc.length > shortName.length ? "…" : ""}`
-              : "I ran it — record the result",
-          resumeKind: "continue",
-          consequence:
-            `Asks for the command you ran, its exit code and the end of its output for "${shortName}${desc.length > shortName.length ? "…" : ""}", ` +
-            "saves them under Owner evidence in task.md as your own run bound to this blocker, then resumes the task and re-runs the review. " +
-            "The review may still disagree, but it has to cite your record.",
-          effect: {
-            kind: "command",
-            command: RECORD_OWNER_RUN_COMMAND_V1,
-            args: [
-              {
-                taskFolderPath: target.taskFolderPath,
-                stage,
-                blocker: desc,
-                blockerLineageId: needsToolchainBlockerIdentities?.[index] ?? blockerOwnerIdentityV1({ description: desc }),
-              },
-            ],
-          },
-        };
-      }),
       ...(() => {
         const gatherable = allBlockerDescriptions?.filter((desc) => AGENT_CAN_GATHER_RE.test(desc)) ?? [];
         return gatherable.map((desc, index) => {
@@ -1598,19 +1114,7 @@ export function buildEscalationDecisionV1(
     // everywhere.
     const taskFixableCountLabel = `${taskFixableCount} of the ${blockersCount} remaining ` +
       `${blockersCount === 1 ? "blocker" : "blockers"}`;
-    const recommendation: WorkflowDecisionRecommendationV1 =
-      // review2 Step 19: a stage with changed files no review has read recommends reading them. A spec defect or a
-      // narrowing is a decision for the owner first, so those keep their own recommendation.
-      unreviewedCount > 0 && !hasSpecDefect && !narrowing && IMPL_REVIEW_STAGES.includes(stage)
-      ? {
-          kind: "option",
-          optionId: "reviewRemaining",
-          reasoning:
-            `${coverage ? describeReviewedLineV1(coverage) : "Some changed files"}; ${unreviewedCount} ` +
-            `${unreviewedCount === 1 ? "file has" : "files have"} not been read by any review at its current ` +
-            "content, so a verdict here says nothing about them.",
-        }
-      : hasSpecDefect
+    const recommendation: WorkflowDecisionRecommendationV1 = hasSpecDefect
       ? {
           kind: "option",
           optionId: "reconsiderRequirement",
@@ -1651,35 +1155,14 @@ export function buildEscalationDecisionV1(
           allBlockersNeedOwnerDecision
         ? {
             kind: "option",
-            // review1 Step 38: "Leave it paused" does nothing, so it is never recommended while an option that
-            // records the decision exists. "Change the plan instead" opens the file the decision is written in
-            // (Accepted Non-Goals); a narrowing the owner can accept in one click comes first.
-            //
-            // review1 Step 38 (owner, 2026-11-05; bugs6 item 19): "Accept this narrowing" is recommended only when
-            // the narrowing's reason is checked (a reason on file with evidence). A narrowing the round left no
-            // reason for is a request nobody has backed, so the plan is kept and the work goes on, matching the
-            // owner-decision card for the same blocker.
-            optionId:
-              narrowing && narrowingReasonIsCheckedV1(narrowing)
-                ? "acceptNarrowing"
-                : // At a plan stage "Keep iterating" would dispatch an implementation round; the plan-stage way on is
-                  // changing the plan (which opens plan.md), so that is what is recommended there.
-                  narrowing &&
-                  !isPlanReviewStage(stage) &&
-                  options.some((option) => option.optionId === "keepIterating")
-                ? "keepIterating"
-                : "reconsiderRequirement",
+            optionId: narrowing ? "acceptNarrowing" : "handleMyself",
             reasoning:
-              narrowing && !narrowingReasonIsCheckedV1(narrowing)
-                ? "The narrowing has no reason or evidence on file, so there is nothing to accept yet. Keep the plan " +
-                  "as written and let the next round either build the item or file the reason and evidence for " +
-                  "leaving part of it out."
-                : "Every remaining blocker clears only through an owner decision, so advancing would skip the " +
-                  "decision and the same blocker would block Publish later.",
+              "Every remaining blocker clears only through an owner decision, so advancing would skip the " +
+              "decision and the same blocker would block Publish later.",
           }
         : // RC7 item 3: open plan items and only unbuilt-work completion
           // blockers — another review-driven round cannot build them.
-          buildCount > 0 && taskFixableCount > 0 && taskFixableAllUnbuiltWork
+          planItemsOpen > 0 && taskFixableCount > 0 && taskFixableAllUnbuiltWork
         ? {
             kind: "option",
             optionId: "buildRemaining",
@@ -1694,7 +1177,7 @@ export function buildEscalationDecisionV1(
           }
         : // bugs5 Step 22: the grouped blocker names many unbuilt items. An Apply Review builds one or two
           // per round; Implementation builds them all in one.
-          buildCount > 0 &&
+          planItemsOpen > 0 &&
           taskFixableCount > 0 &&
           taskFixableIncludesUnbuiltWork &&
           unbuiltItemsNamedCount >= MANY_UNBUILT_ITEMS_THRESHOLD_V1
@@ -1705,7 +1188,7 @@ export function buildEscalationDecisionV1(
               `The blocker names ${unbuiltItemsNamedCount} unbuilt plan items. An Apply Review builds one or two ` +
               "per round, while Implementation builds them all in one round.",
           }
-        : applyReviewNotMoving && buildCount > 0
+        : applyReviewNotMoving
         ? {
             kind: "option",
             optionId: "buildRemaining",
@@ -1733,8 +1216,8 @@ export function buildEscalationDecisionV1(
         : // RC2 item 3: with open plan items and nothing task-fixable here,
           // recommend building them rather than Advance or "leave it paused" —
           // advancing (or merely waiting) would leave those items unbuilt
-          // behind a stage that treats implementation as done. bugs8 item 3: only items with nothing built.
-          buildCount > 0
+          // behind a stage that treats implementation as done.
+          planItemsOpen > 0
           ? {
               kind: "option",
               optionId: "buildRemaining",
@@ -1759,9 +1242,6 @@ export function buildEscalationDecisionV1(
                 `Every remaining blocker is non-task-fixable${nextStage ? ` and ${nextStageName} has already run` : ""}` +
                 ", so this needs a human decision or action, not more automated iteration.",
             };
-    const shaped = ownerDecisionBlockersPresent
-      ? shapePlateauAfterOwnerDecisionV1(options, recommendation)
-      : { options, recommendation };
 
     return {
       decisionKey: "reviewPlateauEscalation",
@@ -1784,32 +1264,18 @@ export function buildEscalationDecisionV1(
           : `Automation has done what it can here — ${progressNote} ${taskFixableCount} of the ` +
             `${blockersCount} remaining blocker(s) are task-fixable.`) +
         (hasNonFixableBlocker
-          ? narrowing
-            ? // A narrowing is the owner's to settle on this card, which is different from a blocker no one can
-              // act on, so it is not described as outside automation's control.
-              " A remaining blocker here is a narrowing only you can approve — the same issue will also block " +
-              "Publish later until you accept it or the item is built."
-            : " A remaining blocker here is outside automation's control — the same issue will also block Publish " +
-              "later, until it clears or you choose \"I'll publish over it\" below to override it there."
+          ? " A remaining blocker here is outside automation's control — the same issue will also block Publish " +
+            "later, until it clears or you choose \"I'll publish over it\" below to override it there."
           : "") +
         (hasDeclinedBlocker
           ? " The last implementation round already declined this same removal as needing a human decision — " +
             "no owner approval is recorded in the task's own Task Description, so another round will decline it " +
             "again."
           : ""),
-      options: shaped.options,
-      recommendation: shaped.recommendation,
+      options,
+      recommendation,
       evidence: [
         { label: "What clears this", detail: clearingNote },
-        ...(coverage ? [{ label: "Review coverage", detail: describeReviewedLineV1(coverage) }] : []),
-        ...(narrowedBlockerRule
-          ? [
-              {
-                label: "Pattern",
-                detail: `Two fixes have each closed part of this; the rule may be missing: ${narrowedBlockerRule.description.slice(0, 200)}`,
-              },
-            ]
-          : []),
         ...(verificationStall
           ? [
               {
@@ -1928,18 +1394,17 @@ export function buildEscalationDecisionV1(
       optionId: "handleMyself",
       label: "Leave it paused — I'll fix it",
       resumeKind: "unpause",
-      consequence: `Leaves the task paused and opens ${planFileNameForStageV1(stage)} so you can review the plan and make the needed change yourself.`,
+      consequence: "Leaves the task paused and opens plan-final.md so you can review the plan and make the needed change yourself.",
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.openPlanFinal",
-        args: [{ taskFolderPath: target.taskFolderPath, ...openPlanStageArgV1(stage) }],
+        args: [{ taskFolderPath: target.taskFolderPath }],
       },
     },
     buildReconsiderRequirementOptionV1(
       target.taskFolderPath,
       "Opens plan-final.md's Accepted Non-Goals section. The task stays paused while you review it — " +
-        "resume it (or choose Keep Iterating) once you've made the change.",
-      stage
+        "resume it (or choose Keep Iterating) once you've made the change."
     ),
   ];
   const recommendation: WorkflowDecisionRecommendationV1 = breakerContext
@@ -2049,71 +1514,6 @@ export function buildEscalationDecisionV1(
  * that accurately via its own stage-eligibility message instead of silently
  * doing nothing.
  */
-/**
- * review2 Step 19: "Review the remaining N files". Until batched review exists (Part 6) it adds the unreviewed files
- * to the review's scope and runs one review through the partial-scope path; the label and record stay when Part 6
- * makes it batched.
- */
-function buildReviewRemainingOptionV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  coverage: ReviewCoverageSummaryV1
-): WorkflowDecisionOptionV1 {
-  const count = coverage.changedCount - coverage.reviewedCount;
-  return {
-    optionId: "reviewRemaining",
-    label: `Review the remaining ${filesPhraseV1(count)}`,
-    resumeKind: "continue",
-    consequence:
-      `Adds the ${filesPhraseV1(count)} no review has read at their current content to ${STAGE_DISPLAY_NAMES[stage]}'s ` +
-      "scope and runs the review. Its verdict then covers them.",
-    effect: {
-      kind: "command",
-      command: "vs-code-ai-helper.resolvePartialReviewScopeV1",
-      args: [{ taskFolderPath, stage, action: "addAndRereview", missingFiles: [...coverage.unreviewed], hash: "" }],
-    },
-  };
-}
-
-/**
- * review2 Step 34: "Settle it with a rule". The answer goes through the own-words entry point (recorded in task.md under
- * Owner decisions, naming the blocker), and exactly one Apply Review follows it (`thenApplyReview`), which treats the
- * rule as the specification for that blocker. The next review judges the fix against it.
- */
-function buildSettleWithRuleOptionV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  narrowed: NarrowedBlockerV1
-): WorkflowDecisionOptionV1 {
-  const subject = narrowed.description.slice(0, 120);
-  return {
-    optionId: "settleWithRule",
-    label: "Settle it with a rule",
-    resumeKind: "continue",
-    consequence:
-      `${narrowed.fixes} fixes have each closed part of "${subject}${narrowed.description.length > 120 ? "…" : ""}", so the ` +
-      "rule may be missing. Type the rule in the message box below; it is recorded in task.md under Owner decisions naming this " +
-      "blocker, then runs exactly one Apply Review that treats your rule as the specification. The next review judges the " +
-      "fix against it.",
-    effect: {
-      kind: "command",
-      command: "vs-code-ai-helper.recordOwnerPlanDecisionV1",
-      args: [
-        {
-          taskFolderPath,
-          stage,
-          blockerId: narrowed.blockerId,
-          optionId: "settleWithRule",
-          optionLabel: "Settle it with a rule",
-          ownWords: true,
-          thenApplyReview: true,
-          blockerText: narrowed.description,
-        },
-      ],
-    },
-  };
-}
-
 function buildPublishAnywayOptionV1(taskFolderPath: string): WorkflowDecisionOptionV1 {
   return {
     optionId: "publishAnyway",
@@ -2161,7 +1561,7 @@ export async function postEnvironmentalAdvanceNoticeV1(
     ? 0
     : Math.max(
         0,
-        ((await readPlanItemCountsV1(folderUri, { mode: "display" }))?.gate.remaining ?? 0) -
+        ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0) -
           (await readDeferredOpenPlanItemCountV1(folderUri))
       );
   // 1.0.0 gate, Part 4 / Step 14 (B4), review finding 2026-09-06: quote every
@@ -2225,15 +1625,14 @@ export async function postEnvironmentalAdvanceNoticeV1(
       optionId: "handleMyself",
       label: "Fix it yourself first",
       resumeKind: "unpause",
-      consequence: `Opens ${planFileNameForStageV1(stage)} so you can address the blocker before it reaches Publish.`,
+      consequence: "Opens plan-final.md so you can address the blocker before it reaches Publish.",
       effect: {
         kind: "command",
         command: "vs-code-ai-helper.openPlanFinal",
-        args: [{ taskFolderPath: target.taskFolderPath, ...openPlanStageArgV1(stage) }],
+        args: [{ taskFolderPath: target.taskFolderPath }],
       },
     },
-    // review1 Step 38: "publish over it" only exists once there is code to publish.
-    ...(optionAppliesAtStageV1("publishAnyway", stage) ? [buildPublishAnywayOptionV1(target.taskFolderPath)] : []),
+    buildPublishAnywayOptionV1(target.taskFolderPath),
   ];
 
   // Review fix (2026-09-23, narrowed blocker c2453680-fe42-461b-9652-1f87445cb9d3-0):
@@ -2313,17 +1712,11 @@ export async function postEnvironmentalAdvanceNoticeV1(
   });
   if (posted) {
     const ownerEvidenceBlocker = nonFixable.find(({ description, resolver }) =>
-      (isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") &&
+      (resolver === "environmental" || resolver === "needs-toolchain") &&
       OWNER_EVIDENCE_PREFIX_RE.test(description)
-    );
+    )?.description;
     if (ownerEvidenceBlocker) {
-      await postOwnerEvidenceQuestionV1(
-        folderUri,
-        stage,
-        ownerEvidenceBlocker.description,
-        target.taskName,
-        blockerOwnerIdentityV1(ownerEvidenceBlocker)
-      );
+      await postOwnerEvidenceQuestionV1(folderUri, stage, ownerEvidenceBlocker, target.taskName);
     }
   }
   return posted !== undefined;
@@ -2340,41 +1733,6 @@ const VERIFICATION_ITEM_RE =
 
 export function isVerificationChecklistItemV1(itemText: string): boolean {
   return VERIFICATION_ITEM_RE.test(itemText.trim());
-}
-
-/**
- * review2 Step 7 (bugs6 item 26): which exit the latched clean-review card recommends. "Back to Implementation" is
- * recommended only when a round can act on the open items: the review did not say nothing is left to build, and at
- * least one open item is build work (not a verification item, and not waiting on test evidence an editing round
- * cannot produce). Otherwise the way on is to settle the items or move on, and the reason says why.
- */
-export function latchedOpenItemsRecommendationV1(
-  open: { readonly items: readonly string[]; readonly total: number },
-  reviewSaysNothingLeftToBuild: boolean
-): { readonly kind: "option"; readonly optionId: "moveOn" | "backToImplementation"; readonly reasoning: string } {
-  const complete = open.items.length > 0 && open.items.length === open.total;
-  if (complete && open.items.every(isVerificationChecklistItemV1)) {
-    return { kind: "option", optionId: "moveOn", reasoning: "Every open item is a verification item, which a build round cannot complete." };
-  }
-  if (complete && open.items.every((item) => isVerificationChecklistItemV1(item) || isTestDependentChecklistItemV1(item))) {
-    return {
-      kind: "option",
-      optionId: "moveOn",
-      reasoning:
-        "Every open item is a verification item or waits on test evidence; an Implementation round cannot produce either. " +
-        "Settle them from the open-items card (tick, exclude, or record a test run) or move on.",
-    };
-  }
-  if (reviewSaysNothingLeftToBuild) {
-    return {
-      kind: "option",
-      optionId: "moveOn",
-      reasoning:
-        "The review is clean and names no plan step still to build, so another Implementation round would have nothing to act on. " +
-        "The open items need your tick or evidence: settle them from the open-items card, or move on.",
-    };
-  }
-  return { kind: "option", optionId: "backToImplementation", reasoning: "At least one open item asks for work to be built, and the review did not say otherwise." };
 }
 
 /**
@@ -2400,13 +1758,12 @@ export async function postLatchedOpenItemsDecisionV1(
    */
   carried?: { readonly deferred: ScopedItemListV1; readonly gated: ScopedItemListV1 },
   /** bugs4 item 30: the plan's "N open, of which M are owner hand-offs" line. */
-  openSummary?: string,
-  /** review2 Step 7: the review is clean and names no plan step still to build, so a round has nothing to act on. */
-  reviewSaysNothingLeftToBuild?: boolean
+  openSummary?: string
 ): Promise<boolean> {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   const nextStageName = STAGE_DISPLAY_NAMES[nextStage];
   const resumeFastForward = isFastForwardRunActiveV1(target.taskFolderPath);
+  const allVerification = open.items.length > 0 && open.items.length === open.total && open.items.every(isVerificationChecklistItemV1);
   const noun = open.total === 1 ? "plan item is" : "plan items are";
   const listed = open.items.map((item) => `- ${item}`).join("\n");
   const more = open.total > open.items.length ? `\n- …and ${open.total - open.items.length} more` : "";
@@ -2448,15 +1805,23 @@ export async function postLatchedOpenItemsDecisionV1(
       taskCanonicalId: target.canonicalId,
       stage,
       whatHappened:
-        // review2 Step 16: one word for the checklist's state across adjacent cards ("unreliable"), the one the
-        // latch-cleared line and the idle card use, so two cards a second apart never read as a contradiction.
-        `${stageName} is clean, but this task's plan checklist is flagged unreliable and ${open.total} ${noun} still open${openSummary ? ` (plan-wide: ${openSummary})` : ""}:\n\n` +
+        `${stageName} is clean, but this task's plan checklist is flagged as behind and ${open.total} ${noun} still open${openSummary ? ` (plan-wide: ${openSummary})` : ""}:\n\n` +
         `${listed}${more}${carriedSections}`,
       whyUserNeeded:
-        "A clean review no longer holds the stage while the checklist is flagged unreliable, but moving on with plan items " +
+        "A clean review no longer holds the stage while the checklist is flagged as behind, but moving on with plan items " +
         "still open should be your decision, not the default.",
       options,
-      recommendation: latchedOpenItemsRecommendationV1(open, reviewSaysNothingLeftToBuild === true),
+      recommendation: allVerification
+        ? {
+            kind: "option",
+            optionId: "moveOn",
+            reasoning: "Every open item is a verification item, which a build round cannot complete.",
+          }
+        : {
+            kind: "option",
+            optionId: "backToImplementation",
+            reasoning: "At least one open item asks for work to be built.",
+          },
       gating: {
         holdsTaskPaused: false,
         unblocksProgress: true,
@@ -2686,7 +2051,7 @@ export function resolveDeferrableOwnerChecksV1(
     handoff: resolveExcludedOwnerHandoffV1(description, planOfRecord),
   }));
   if (!matches.every(({ description, resolver, handoff }) =>
-    (isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") &&
+    (resolver === "environmental" || resolver === "needs-toolchain") &&
     classifyEnvironmentalBlockerV1(description) === "owner-evidence" &&
     handoff !== undefined && !handoff.isPrerequisite
   )) {
@@ -2719,20 +2084,20 @@ function describeResolverClearingActionV1(
   // RC4 item 3: a narrowing is an owner decision answered on the card itself.
   // RC7 item 1: only when the card really offers the two options; otherwise
   // say how to record the decision instead of naming options that are absent.
-  if ((isEnvironmentalResolverV1(resolver) || resolver === "task-fixable") && hasNarrowingPrefixV1(description)) {
+  if ((resolver === "environmental" || resolver === "task-fixable") && hasNarrowingPrefixV1(description)) {
     return narrowingOffered
       ? 'an owner decision on the plan item named above — choose "Accept this narrowing" or ' +
           '"Keep the item open" on this card'
-      : "an owner decision on the plan item this blocker names — answer it on the owner-decision card in this " +
-          "chat; the answer is recorded in task.md under Owner decisions and in the plan's Accepted Non-Goals, " +
-          `and ${stageName} re-reviews it`;
+      : "an owner decision on the plan item this blocker names — write the decision under `## Accepted " +
+          "Non-Goals` in plan.md (or plan-final.md once Implementation has started), quoting the blocker, " +
+          `then choose "Keep iterating" to have ${stageName} re-review`;
   }
   // RC4 item 4: a blocker filed with the literal "Owner evidence needed"
   // prefix names evidence rounds cannot gather. It is an owner decision
   // whichever resolver the reviewer used (needs-toolchain is the defensive
   // case), and the record goes in task.md directly — never the stage chat,
   // whose file write is confirmed by a modal.
-  if ((isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") && classifyEnvironmentalBlockerV1(description) === "owner-evidence") {
+  if ((resolver === "environmental" || resolver === "needs-toolchain") && classifyEnvironmentalBlockerV1(description) === "owner-evidence") {
     // Owner evidence is typically a live provider CLI probe (`claude --model …`),
     // which the generic command-prefix list does not recognise, so the first
     // backtick-quoted span in the blocker is offered instead.
@@ -2745,7 +2110,6 @@ function describeResolverClearingActionV1(
     );
   }
   switch (resolver) {
-    case "environmental-fixable":
     case "environmental": {
       const kind = classifyEnvironmentalBlockerV1(description);
       if (kind === "external-status") {
@@ -2784,11 +2148,6 @@ function describeResolverClearingActionV1(
       );
     case "task-fixable":
       return `another implementation round — use "Keep iterating" below.`;
-    case "unknown":
-      return (
-        "a decision on what kind of blocker this is — the review wrote the line without saying who can resolve it. " +
-        `Read it above; if building the named plan steps clears it, use "Keep iterating" to have ${stageName} re-verify.`
-      );
   }
 }
 
@@ -2840,80 +2199,6 @@ export function describeBlockerLineageV1(blockers: readonly ReviewBlocker[]): st
   return ` Lineage: ${parts.join("; ")}.`;
 }
 
-/** Pause states `postPausedNothingOpenLineV1` has already spoken for (task + the pause's own identity). */
-const pausedNothingOpenLinesV1 = new Set<string>();
-
-/**
- * bugs8 Step 7: a card closed without starting anything. When the task is still paused with no card pending and no round
- * live, nothing on screen says why it is paused or what resumes it, so one chat line does: the pause reason and the click.
- * Said once per pause state (keyed on the escalation's own timestamp, or the pause text when there is none), so the same
- * answer repeated in the same state adds nothing. Returns whether a line was written.
- */
-export async function postPausedNothingOpenLineV1(taskFolderPath: string, stage: TaskStage): Promise<boolean> {
-  const read = await readTaskProgressStrictV1(vscode.Uri.file(taskFolderPath), {
-    expectedTaskFolder: path.basename(taskFolderPath),
-  }).catch(() => undefined);
-  const progress = read?.ok ? read.decoded.progress : undefined;
-  if (progress?.status !== "paused") return false;
-  const canonicalId = normalizePath(taskFolderPath);
-  if (listPendingWorkflowDecisionsForTaskV1(canonicalId).length > 0) return false;
-  if (getLiveTaskOperationV1(taskFolderPath) !== undefined || hasLiveWorkAdmissionBestEffortV1(taskFolderPath)) return false;
-  const reason = (progress.escalation?.reason ?? progress.pausedReason ?? "it was paused and nothing has resumed it").trim();
-  const stateKey = `${canonicalId}|${progress.escalation?.at ?? ""}|${reason}`;
-  if (pausedNothingOpenLinesV1.has(stateKey)) return false;
-  pausedNothingOpenLinesV1.add(stateKey);
-  const name = progress.displayName ?? path.basename(taskFolderPath);
-  await appendChatMessageV1(taskFolderPath, {
-    role: "assistant",
-    text: `"${name}" is paused: ${reason.replace(/[.\s]+$/, "")}. Nothing is open and nothing is running. Click Resume Task to carry on.`,
-    stage,
-    at: new Date().toISOString(),
-    // A plain assistant line: `outcome` lines are hidden from the conversation, and this is the line that tells the owner
-    // why the task is paused and which click resumes it.
-  }).catch(() => undefined);
-  return true;
-}
-
-/**
- * bugs8 item 3 (Step 14, after the decision): the last owner-decision card for the stage closed and the answer started
- * no round, so the stop still needs its one card. It is rebuilt from the latest review (nothing is stored for it), with
- * the answered decision card not counted as waiting. Returns whether a card was posted or one was already waiting.
- */
-export async function repostPlateauCardAfterOwnerDecisionV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  answeredDecisionKey: string
-): Promise<boolean> {
-  const folderUri = vscode.Uri.file(taskFolderPath);
-  const reviewFilename = STAGE_ARTIFACT_FILENAMES[stage];
-  if (!reviewFilename) return false;
-  // Only a stop that is still held by this stage's plateau gets its card back; a task that is not paused on it has no stop.
-  const read = await readTaskProgressStrictV1(folderUri, { expectedTaskFolder: path.basename(taskFolderPath) }).catch(() => undefined);
-  const escalation = read?.ok ? read.decoded.progress.escalation : undefined;
-  if (escalation?.kind !== "plateau" || escalation.stage !== stage) return false;
-  const content = await readTextIfExists(vscode.Uri.joinPath(folderUri, reviewFilename));
-  if (content === undefined) return false;
-  const blockers = parseReviewBlockers(content);
-  if (blockers.length === 0) return false;
-  const canonicalId = normalizePath(taskFolderPath);
-  const alreadyWaiting = listPendingWorkflowDecisionsForTaskV1(canonicalId).some(
-    (card) => card.stage === stage && card.decisionKey === "reviewPlateauEscalation"
-  );
-  if (alreadyWaiting) return true;
-  return postReviewPlateauDecisionV1(
-    folderUri,
-    stage,
-    "An owner decision on this stage was answered and started no round.",
-    {
-      content,
-      blockers,
-      taskFixableCount: blockers.filter((blocker) => blocker.resolver === "task-fixable").length,
-    },
-    { canonicalId, taskFolderPath, stage },
-    answeredDecisionKey
-  );
-}
-
 /**
  * Build and post the `reviewPlateauEscalation` decision (item 7b's target
  * shape): quote the blocker verbatim rather than its category taxonomy, show
@@ -2935,9 +2220,7 @@ async function postReviewPlateauDecisionV1(
   stage: TaskStage,
   reason: string,
   evidence: ReviewPlateauEvidenceV1,
-  target: { canonicalId: string; taskFolderPath: string; stage: TaskStage; taskName?: string },
-  /** bugs8 item 3: an owner-decision card being answered right now; it is not counted as waiting. */
-  ignoreOwnerCardKey?: string
+  target: { canonicalId: string; taskFolderPath: string; stage: TaskStage; taskName?: string }
 ): Promise<boolean> {
   const stageName = STAGE_DISPLAY_NAMES[stage];
   // Review-flagged (2026-08-25, new architectural blocker): `evidence.blockers`
@@ -3193,39 +2476,15 @@ async function postReviewPlateauDecisionV1(
   } catch {
     runProgressNote = undefined;
   }
-  // review2 Steps 18-19: how much of the change a review has read, for "Reviewed: N of M changed files".
-  let coverage: ReviewCoverageSummaryV1 | undefined;
-  if (IMPL_REVIEW_STAGES.includes(stage)) {
-    try {
-      const coverageRead = await readTaskProgressStrictV1(folderUri, {
-        expectedTaskFolder: path.basename(target.taskFolderPath),
-      });
-      const coverageRoot = vscode.workspace.getWorkspaceFolder(folderUri)?.uri.fsPath;
-      coverage =
-        coverageRead.ok && coverageRoot !== undefined
-          ? await readReviewCoverageSummaryV1(coverageRoot, coverageRead.decoded.progress)
-          : undefined;
-    } catch {
-      coverage = undefined;
-    }
-  }
   let applyReviewRoundsClosedNone = 0;
   let provisionalTicks = 0;
-  let provisionalItemTexts: string[] = [];
   let reviewAffirmsOpenItemsBuilt = false;
-  let narrowedBlockerRule: NarrowedBlockerV1 | undefined;
   try {
     const progressForMotion = await readTaskProgressStrictV1(folderUri, {
       expectedTaskFolder: path.basename(target.taskFolderPath),
     });
     if (progressForMotion.ok && !isPlanReviewStage(stage)) {
       const motion = progressForMotion.decoded.progress;
-      // review2 Step 33: a blocker whose fixes keep closing one path and missing the next may need a rule the plan never stated.
-      narrowedBlockerRule = detectNarrowedBlockerV1({
-        stage,
-        history: motion.reviewScoreHistory ?? [],
-        ledger: motion.roundLedger,
-      });
       applyReviewRoundsClosedNone = applyReviewRoundsClosedNoneV1({
         stage,
         ledger: motion.roundLedger,
@@ -3234,19 +2493,21 @@ async function postReviewPlateauDecisionV1(
         ownerDecisions: motion.planItemOwnerDecisions,
       });
       if (planOfRecordText !== undefined) {
-        // review1 Step 5: the shared plan-item counts.
-        provisionalTicks = computePlanItemCountsV1({ planText: planOfRecordText, progress: motion })?.provisional ?? 0;
+        provisionalTicks =
+          countChecklistEvidenceProgressV1(
+            planOfRecordText,
+            motion.planItemEvidence ?? [],
+            motion.planItemOwnerDecisions ?? []
+          )?.provisional ?? 0;
         // bugs4 item 53: only the reviewer's own Verified Complete block can say "built".
         const provisionalItems = listProvisionalTickedItemsV1(
           planOfRecordText,
           motion.planItemEvidence ?? [],
           motion.planItemOwnerDecisions ?? []
         );
-        provisionalItemTexts = provisionalItems.map((item) => item.text);
         reviewAffirmsOpenItemsBuilt = reviewNamesAllItemsBuiltV1(
           evidence.content,
-          provisionalItems.map((item) => item.text),
-          planOfRecordText
+          provisionalItems.map((item) => item.text)
         );
       }
     }
@@ -3264,20 +2525,15 @@ async function postReviewPlateauDecisionV1(
         ),
       ].join("; and ")
     : undefined;
-  // Owner decision build-count-precedence: the card names "Build the N open plan items" only when N unbuilt items exist,
-  // the same split the stop card shows.
-  const unbuiltToBuildCount = Math.max(0, planItemsOpen - Math.min(Math.max(0, provisionalTicks), planItemsOpen));
   const clearingNote =
     ownerDecisionClearing !== undefined
       ? `Clears via: ${ownerDecisionClearing}`
-      : taskFixableAllUnbuiltWork && unbuiltToBuildCount > 0
-        ? `Clears via: choose "Build the ${unbuiltToBuildCount} open plan ${unbuiltToBuildCount === 1 ? "item" : "items"}" ` +
+      : taskFixableAllUnbuiltWork
+        ? `Clears via: choose "Build the ${planItemsOpen} open plan ${planItemsOpen === 1 ? "item" : "items"}" ` +
           `below — the remaining ${evidence.taskFixableCount === 1 ? "blocker is" : "blockers are"} work not yet ` +
           `built, which Implementation does and another ${stageName} round does not.`
-    : taskFixableIncludesUnbuiltWork &&
-        unbuiltToBuildCount > 0 &&
-        applyReviewRoundsClosedNone >= APPLY_REVIEW_NO_PROGRESS_ROUNDS_V1
-      ? `Clears via: choose "Build the ${unbuiltToBuildCount} open plan ${unbuiltToBuildCount === 1 ? "item" : "items"}" ` +
+    : taskFixableIncludesUnbuiltWork && applyReviewRoundsClosedNone >= APPLY_REVIEW_NO_PROGRESS_ROUNDS_V1
+      ? `Clears via: choose "Build the ${planItemsOpen} open plan ${planItemsOpen === 1 ? "item" : "items"}" ` +
         `below. ${describeApplyReviewNoProgressV1(planItemsOpen, applyReviewRoundsClosedNone)}, so another ` +
         `Apply Review will not close them; any specific defect is left to the review that follows.`
     : evidence.taskFixableCount > 0
@@ -3325,54 +2581,11 @@ async function postReviewPlateauDecisionV1(
   // `buildEscalationDecisionV1` (review blocker, 2026-08-30) — this function's
   // remaining job is exactly the async evidence-gathering above, which the
   // synchronous builder cannot do itself (it has no `folderUri`).
-  // review1 Step 37: one card per owner-only blocker. When the owner-decision card for this stage is already
-  // waiting and every blocker is an owner decision, it IS the question; a second plateau card would ask the same
-  // thing with different options.
-  if (
-    allBlockersNeedOwnerDecision &&
-    hasPendingOwnerDecisionCardV1(
-      target.canonicalId,
-      stage,
-      normalized.blockers.map(blockerOwnerIdentityV1),
-      ignoreOwnerCardKey
-    )
-  ) {
-    return true;
-  }
-  // bugs8 item 3 (Step 14): one card per stop. While any owner-decision card for this stage is waiting, it is the
-  // card; this one is not posted. The blockers that card does not ask about get one line saying they wait for it.
-  if (hasPendingOwnerDecisionCardV1(target.canonicalId, stage, undefined, ignoreOwnerCardKey)) {
-    await writeOwnerDecisionDeferralLineV1(
-      folderUri.fsPath,
-      target.canonicalId,
-      stage,
-      normalized.blockers.map((blocker) => ({ identity: blockerOwnerIdentityV1(blocker), description: blocker.description })),
-      createHash("sha256").update(evidence.content).digest("hex").slice(0, 16),
-      ignoreOwnerCardKey
-    );
-    return true;
-  }
-  // review1 Step 58: has the owner changed the review's inputs since it ran? Only then is "I've made changes —
-  // re-check" an honest option.
-  const plateauReviewArtifactName = STAGE_ARTIFACT_FILENAMES[stage];
-  const reviewInputsChanged = plateauReviewArtifactName
-    ? (
-        await reviewInputsChangedSinceV1(folderUri.fsPath, path.join(folderUri.fsPath, plateauReviewArtifactName)).catch(() => ({
-          changed: false,
-        }))
-      ).changed
-    : false;
   const decision = await postWorkflowDecisionV1(
-    {
-    ...buildEscalationDecisionV1("plateau", stage, reason, target, {
+    buildEscalationDecisionV1("plateau", stage, reason, target, {
       blockersCount: normalized.blockers.length,
       primaryBlockerDescription: primaryBlocker?.description,
       allBlockerDescriptions: normalized.blockers.map((b) => b.description),
-      needsToolchainBlockers: normalized.blockers.filter((b) => b.resolver === "needs-toolchain").map((b) => b.description),
-      needsToolchainBlockerIdentities: normalized.blockers
-        .filter((b) => b.resolver === "needs-toolchain")
-        .map((b) => blockerOwnerIdentityV1(b)),
-      reviewInputsChanged,
       narrowedNote,
       progressNote,
       taskFixableCount: evidence.taskFixableCount,
@@ -3384,18 +2597,6 @@ async function postReviewPlateauDecisionV1(
       dispatchModeEvidence,
       planItemsOpen,
       allBlockersNeedOwnerDecision,
-      // Only a blocker the review wrote an owner-decision block for has its own card; a narrowing or owner evidence
-      // has no such card, so this card keeps its choices.
-      ownerDecisionBlockersPresent:
-        ownerDecisionBlocks.length > 0 &&
-        normalized.blockers.some((b) => {
-          const text = (b.description ?? "").toLowerCase();
-          return ownerDecisionBlocks.some(
-            (block) =>
-              text.includes(block.id.toLowerCase()) ||
-              (block.planPurpose !== undefined && block.planPurpose !== "" && text.includes(block.planPurpose.toLowerCase()))
-          );
-        }),
       allBlockersCarriedGates: carriedEvidence.allCarried,
       taskFixableAllUnbuiltWork,
       taskFixableIncludesUnbuiltWork,
@@ -3403,17 +2604,11 @@ async function postReviewPlateauDecisionV1(
       ...(runProgressNote ? { runProgressNote } : {}),
       applyReviewRoundsClosedNone,
       provisionalTicks,
-      provisionalItemTexts,
       reviewAffirmsOpenItemsBuilt,
       unbuiltWorkReferences,
       ownerChecksOwed,
-      ...(coverage ? { coverage } : {}),
-      ...(narrowedBlockerRule ? { narrowedBlockerRule } : {}),
       ...(narrowing ? { narrowing } : {}),
     }),
-    // review1 Step 37: which blockers this card asks about, so the Fast Forward stop card can tell it covers them.
-    blockerIdentities: normalized.blockers.map(blockerOwnerIdentityV1),
-    },
     target
   );
   return decision !== undefined;
@@ -3569,17 +2764,11 @@ export async function escalateReviewToHuman(
       );
       if (posted) {
         const ownerEvidenceBlocker = reviewPlateauEvidence.blockers.find(({ description, resolver }) =>
-          (isEnvironmentalResolverV1(resolver) || resolver === "needs-toolchain") &&
+          (resolver === "environmental" || resolver === "needs-toolchain") &&
           OWNER_EVIDENCE_PREFIX_RE.test(description)
-        );
+        )?.description;
         if (ownerEvidenceBlocker) {
-          await postOwnerEvidenceQuestionV1(
-            folderUri,
-            stage,
-            ownerEvidenceBlocker.description,
-            progressHint?.displayName,
-            blockerOwnerIdentityV1(ownerEvidenceBlocker)
-          );
+          await postOwnerEvidenceQuestionV1(folderUri, stage, ownerEvidenceBlocker, progressHint?.displayName);
         }
         return true;
       }
@@ -3602,7 +2791,7 @@ export async function escalateReviewToHuman(
     const genericPlanItemsOpen = !isPlanReviewStage(stage)
       ? Math.max(
           0,
-          ((await readPlanItemCountsV1(folderUri, { mode: "display" }))?.gate.remaining ?? 0) -
+          ((await readDisplayPlanChecklistProgressV1(folderUri))?.verifiedCounts.remaining ?? 0) -
             (await readDeferredOpenPlanItemCountV1(folderUri))
         )
       : 0;
@@ -3610,47 +2799,6 @@ export async function escalateReviewToHuman(
       breakerZeroChangeRounds !== undefined
         ? await readBreakerCardContextV1(folderUri, stage, breakerZeroChangeRounds, genericPlanItemsOpen)
         : undefined;
-    // review1 Step 37: an environmental stop for a stage whose owner-decision card is already waiting is the same
-    // question; the owner-decision card is the one to answer.
-    // Only when that card asks about every blocker the latest review for this stage recorded: a card about one
-    // blocker never hides the environmental stop for a different one.
-    if (kind === "environmental") {
-      const recordedProgress = await readTaskProgressStrictV1(folderUri, {
-        expectedTaskFolder: path.basename(folderUri.fsPath),
-      });
-      const recordedHistory = recordedProgress.ok ? recordedProgress.decoded.progress.reviewScoreHistory ?? [] : [];
-      const latestForStage = recordedHistory
-        .filter((entry) => entry.stage === stage)
-        .reduce<(typeof recordedHistory)[number] | undefined>(
-          (latest, entry) => (!latest || entry.at > latest.at ? entry : latest),
-          undefined
-        );
-      const recordedIdentities = (latestForStage?.blockers ?? []).map(blockerOwnerIdentityV1);
-      if (hasPendingOwnerDecisionCardV1(normalizePath(folderUri.fsPath), stage, recordedIdentities)) {
-        return true;
-      }
-      // review1 Step 48: a stop on blockers no in-plan round can clear names the broken check and Ensemble's own
-      // environment for that run, and offers to investigate it. It replaces the generic four-option card.
-      const environmentalCard = await buildEnvironmentalFailureCardForStageV1(
-        folderUri,
-        stage,
-        reason,
-        progressHint?.displayName,
-        (latestForStage?.blockers ?? []) as readonly EnvironmentalEvidenceBlockerV1[],
-        genericPlanItemsOpen
-      );
-      if (environmentalCard !== undefined) {
-        const posted = await postWorkflowDecisionV1(environmentalCard, {
-          canonicalId: normalizePath(folderUri.fsPath),
-          taskFolderPath: folderUri.fsPath,
-          stage,
-          taskName: progressHint?.displayName,
-        });
-        if (posted !== undefined) {
-          return true;
-        }
-      }
-    }
     const genericDecisionInput = buildEscalationDecisionV1(
       kind,
       stage,
@@ -3813,15 +2961,14 @@ async function readBreakerCardContextV1(
     const read = await readTaskProgressStrictV1(folderUri, { expectedTaskFolder: path.basename(folderUri.fsPath) });
     if (planText !== undefined && read.ok) {
       const motion = read.decoded.progress;
-      const counts = computePlanItemCountsV1({ planText, progress: motion });
-      provisional = counts?.provisional ?? 0;
-      if (counts) {
-        // review1 Step 5: the wording of the gap is unchanged; the figures come from the shared counts.
-        const ticked = counts.verified + counts.provisional + counts.ownerSettled;
-        const gapParts = [`${ticked} ticked`, `${counts.verified} verified by review`];
-        if (counts.ownerSettled > 0) gapParts.push(`${counts.ownerSettled} settled by you`);
-        if (counts.provisional > 0) gapParts.push(`${counts.provisional} awaiting review verification`);
-        gateCountNote = `${describeOpenAndHandOffsFromCountsV1(counts) ?? `${planItemsOpen} open`}; ${gapParts.join(", ")}.`;
+      const gate = countChecklistEvidenceProgressV1(
+        planText,
+        motion.planItemEvidence ?? [],
+        motion.planItemOwnerDecisions ?? []
+      );
+      provisional = gate?.provisional ?? 0;
+      if (gate) {
+        gateCountNote = `${describeOpenAndHandOffsV1(planText) ?? `${planItemsOpen} open`}; ${describeChecklistGateGapV1(gate)}.`;
       }
       const filename = STAGE_ARTIFACT_FILENAMES[stage];
       const reviewText = filename ? await readTextIfExists(vscode.Uri.joinPath(folderUri, filename)) : undefined;
@@ -3830,8 +2977,7 @@ async function readBreakerCardContextV1(
           reviewText,
           listProvisionalTickedItemsV1(planText, motion.planItemEvidence ?? [], motion.planItemOwnerDecisions ?? []).map(
             (item) => item.text
-          ),
-          planText
+          )
         );
       }
     }
@@ -3848,243 +2994,7 @@ async function readBreakerCardContextV1(
   };
 }
 
-const OWNER_EVIDENCE_UP_FRONT_ASKED_KEY_V1 = "ensemble.ownerEvidenceUpFrontAsked.v1";
-
-/**
- * review1 Step 44: before Implementation, one chat question listing the plan's "Owner evidence:" steps the owner
- * has not answered in task.md. Never blocks the round (Implementation goes on), asks each distinct set of steps
- * once per task, and posts nothing when every step is answered or the chat is not available. Returns whether a
- * question was posted.
- */
-export async function postOwnerEvidenceUpFrontQuestionV1(options: {
-  readonly folderUri: vscode.Uri;
-  readonly stage: TaskStage;
-  readonly planText: string;
-  readonly taskMd: string;
-  readonly taskName?: string;
-  /**
-   * Set when continuing a form that had no room for every step: only the unanswered steps after this one (the
-   * last field the previous form showed) are asked.
-   */
-  readonly afterEvidence?: string;
-  /** Test seam: where the asked-once record lives; defaults to the extension's workspace state. */
-  readonly memento?: { get<T>(key: string): T | undefined; update(key: string, value: unknown): Thenable<void> | Promise<void> };
-}): Promise<boolean> {
-  const unanswered =
-    options.afterEvidence === undefined
-      ? listUnansweredOwnerEvidenceStepsV1(options.planText, options.taskMd)
-      : listUnansweredOwnerEvidenceStepsAfterV1(options.planText, options.taskMd, options.afterEvidence);
-  const steps = ownerEvidenceFormStepsV1(unanswered);
-  if (steps.length === 0 || !chatTarget) {
-    return false;
-  }
-  const canonicalId = normalizePath(options.folderUri.fsPath);
-  const memento = options.memento ?? getExtensionContextV1()?.workspaceState;
-  const asked = memento?.get<Record<string, string>>(OWNER_EVIDENCE_UP_FRONT_ASKED_KEY_V1) ?? {};
-  const key = ownerEvidenceStepsKeyV1(steps);
-  if (asked[canonicalId] === key) {
-    return false;
-  }
-  // Owner decision 2026-11-04: one field for each step. The chat settles this form by writing every answered
-  // field under `## Owner evidence` in task.md (chatView.ts); no coordinator operation sits behind it.
-  await chatTarget.askInteraction(
-    {
-      canonicalId,
-      taskFolderPath: options.folderUri.fsPath,
-      stage: options.stage,
-      taskName: options.taskName,
-      interactionId: allocateHex128IdV1(),
-      operationId: allocateHex128IdV1(),
-      actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
-      sourceAttemptId: allocateHex128IdV1(),
-      questions: buildOwnerEvidenceUpFrontQuestionsV1(steps),
-    },
-    false,
-    { blocking: false }
-  );
-  await memento?.update(OWNER_EVIDENCE_UP_FRONT_ASKED_KEY_V1, { ...asked, [canonicalId]: key });
-  return true;
-}
-
-/**
- * review1 Step 44: a form holds at most 16 fields, so after one is submitted, the steps it had no room for are
- * asked in the next form. `lastShownEvidence` is the evidence text of the last field the submitted form showed.
- * Reads the plan and task.md fresh, so answers just saved are taken into account. Returns whether a further form
- * was posted.
- */
-export async function postRemainingOwnerEvidenceStepsV1(options: {
-  readonly folderUri: vscode.Uri;
-  readonly stage: TaskStage;
-  readonly lastShownEvidence: string;
-  readonly taskName?: string;
-}): Promise<boolean> {
-  const planText = await readTextIfExists(getCanonicalImplementationUri(options.folderUri));
-  if (!planText) {
-    return false;
-  }
-  const taskMd = (await readTextIfExists(vscode.Uri.joinPath(options.folderUri, "task.md"))) ?? "";
-  return postOwnerEvidenceUpFrontQuestionV1({
-    folderUri: options.folderUri,
-    stage: options.stage,
-    planText,
-    taskMd,
-    taskName: options.taskName,
-    afterEvidence: options.lastShownEvidence,
-  });
-}
-
-/**
- * review1 Step 45: when an owner-evidence request quotes a command on the read-only allowlist, the offer to run it.
- * The prompt shows the exact command; choosing "Run it for me" is the owner's confirmation, in the chat, and is
- * the only thing that runs it. A request that quotes nothing on the allowlist gets no offer.
- */
-export function buildRunItForMeOfferV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  blocker: string
-): { readonly question: StructuredQuestionV1; readonly optionEffects: Record<string, WorkflowDecisionOptionEffectV1> } | undefined {
-  const command = findAllowlistedCommandInTextV1(blocker);
-  if (!command) {
-    return undefined;
-  }
-  const runId = allocateHex128IdV1();
-  const pasteId = allocateHex128IdV1();
-  return {
-    question: {
-      questionId: allocateHex128IdV1(),
-      kind: "singleChoice",
-      prompt:
-        `Ensemble can run this read-only command for you: \`${command.display}\`\n\n` +
-        "It runs in your workspace with a 60 second limit, and nothing runs until you choose below. Anything that " +
-        "looks like a secret is removed from the output before it is saved under `## Owner evidence`.",
-      required: true,
-      options: [
-        {
-          optionId: runId,
-          label: `Run it for me: ${command.display}`,
-          description: "Runs this one command, saves its exit status and output as your evidence, and re-runs the review.",
-        },
-        {
-          optionId: pasteId,
-          label: "I'll paste it myself",
-          description: "Runs nothing. Answer the question above with what you find.",
-        },
-      ],
-    },
-    optionEffects: {
-      [runId]: {
-        kind: "command",
-        command: RUN_OWNER_EVIDENCE_COMMAND_V1,
-        args: [{ taskFolderPath, stage, blocker, commandLine: command.display }],
-        recordedNext: `runs \`${command.display}\`, saves the result under Owner evidence and re-runs the review`,
-      },
-      [pasteId]: { kind: "doNothing", recordedNext: "runs nothing; paste the evidence into the question above" },
-    },
-  };
-}
-
-/**
- * review1 Step 50: the "I ran it — record the result" choice for a blocker whose evidence is a command the owner
- * runs outside the task. The effect opens the record prompts (command, exit code, output tail), writes the run under
- * `## Owner evidence` bound to the blocker's lineage id, and re-runs the review.
- */
-export function buildRecordOwnerRunOptionV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  blocker: string,
-  /** The blocker's stable lineage identity (`blockerOwnerIdentityV1`); absent only when the caller has the text alone. */
-  blockerLineageId?: string
-): { readonly option: QuestionOptionV1; readonly effect: WorkflowDecisionOptionEffectV1 } {
-  const optionId = allocateHex128IdV1();
-  return {
-    option: {
-      optionId,
-      label: "I ran it — record the result",
-      description:
-        "Asks for the command, its exit code and the end of its output, saves them under Owner evidence as your own " +
-        "run, bound to this blocker, and re-runs the review. A review may still disagree, but it has to cite your record.",
-    },
-    effect: {
-      kind: "command",
-      command: RECORD_OWNER_RUN_COMMAND_V1,
-      args: [{ taskFolderPath, stage, blocker, blockerLineageId: blockerLineageId ?? blockerOwnerIdentityV1({ description: blocker }) }],
-      recordedNext: "asks what you ran and how it ended, saves it under Owner evidence and re-runs the review",
-    },
-  };
-}
-
-/**
- * The offer an owner-evidence request carries: "Run it for me" when it quotes an allowlisted command, and always
- * "I ran it — record the result" (review1 Step 50). Never undefined.
- */
-export function buildOwnerEvidenceActionsOfferV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  blocker: string,
-  blockerLineageId?: string
-): { readonly question: StructuredQuestionV1; readonly optionEffects: Record<string, WorkflowDecisionOptionEffectV1> } {
-  const record = buildRecordOwnerRunOptionV1(taskFolderPath, stage, blocker, blockerLineageId);
-  const run = buildRunItForMeOfferV1(taskFolderPath, stage, blocker);
-  if (run && run.question.kind === "singleChoice") {
-    // Between "Run it for me" and "I'll paste it myself".
-    const options = [...run.question.options];
-    options.splice(options.length - 1, 0, record.option);
-    return {
-      question: { ...run.question, options },
-      optionEffects: { ...run.optionEffects, [record.option.optionId]: record.effect },
-    };
-  }
-  const pasteId = allocateHex128IdV1();
-  return {
-    question: {
-      questionId: allocateHex128IdV1(),
-      kind: "singleChoice",
-      prompt:
-        "If you ran the command this blocker asks for outside the task, you can record the result here instead of " +
-        "pasting it into the question above.",
-      required: true,
-      options: [
-        record.option,
-        { optionId: pasteId, label: "I'll paste it myself", description: "Records nothing. Answer the question above with what you find." },
-      ],
-    },
-    optionEffects: {
-      [record.option.optionId]: record.effect,
-      [pasteId]: { kind: "doNothing", recordedNext: "records nothing; paste the evidence into the question above" },
-    },
-  };
-}
-
 async function postOwnerEvidenceQuestionV1(
-  folderUri: vscode.Uri,
-  stage: TaskStage,
-  blocker: string,
-  taskName?: string,
-  blockerLineageId?: string
-): Promise<void> {
-  await postOwnerEvidenceQuestionTextV1(folderUri, stage, blocker, taskName);
-  const offer = buildOwnerEvidenceActionsOfferV1(folderUri.fsPath, stage, blocker, blockerLineageId);
-  if (offer && chatTarget) {
-    await chatTarget.askInteraction(
-      {
-        canonicalId: normalizePath(folderUri.fsPath),
-        taskFolderPath: folderUri.fsPath,
-        stage,
-        taskName,
-        interactionId: allocateHex128IdV1(),
-        operationId: allocateHex128IdV1(),
-        actionKey: LOCAL_ONLY_INTERACTION_ACTION_KEY_V1,
-        sourceAttemptId: allocateHex128IdV1(),
-        questions: [offer.question],
-        optionEffects: offer.optionEffects,
-      },
-      false,
-      { blocking: false }
-    );
-  }
-}
-
-async function postOwnerEvidenceQuestionTextV1(
   folderUri: vscode.Uri,
   stage: TaskStage,
   blocker: string,

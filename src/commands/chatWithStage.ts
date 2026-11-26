@@ -34,7 +34,7 @@ import { checkAndConfirmPromptSize } from "../utils/promptSizeGuard";
 import { ChatViewProvider } from "../views/chatView";
 import { NotificationRouter } from "../utils/notificationRouter";
 import { askChatChoiceV1 } from "../utils/chatChoiceV1";
-import { notificationTaskDisplayNameV1, runWithNotificationTaskContextV1 } from "../utils/notificationTaskContextV1";
+import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { showPausedTaskRefusalV1 } from "../utils/pausedTaskRefusalV1";
 import { runTrackedOperation, resolveWorkflowRootTaskName, linkCancellationTokens, runResumedRoundOperationV1 } from "../utils/taskOperations";
 import {
@@ -70,9 +70,7 @@ import {
   ChatSendActionInputV1,
   validateChatSendInputV1,
   writeMarkdownUpdateV1,
-  writeOwnerDecisionFileV1,
 } from "../actions/rows/chatSendRowV1";
-import { describeOwnerDecisionRecordResultV1, recordOwnerDecisionFromChatV1 } from "../utils/chatOwnerDecisionV1";
 import { resolveMarkdownUpdateTarget as resolveMarkdownUpdateTargetV1 } from "../utils/chatFileUpdateEnvelope";
 import { ChatInteractionRefV1, ChatInteractionResumeResultV1 } from "../views/chatView";
 import { patchTaskProgressStrictV1 } from "../services/taskProgressWriterV1";
@@ -100,21 +98,10 @@ import { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeResumeNotSettledV1 } from "../utils/storedAnswerResumeV1";
 import { reconcileWatchdogPauseAgainstAdmissionV1 } from "../state/workAdmissionReconciliationV1";
 import { normalizePath, resolveTaskRootCandidates } from "../utils/taskRoot";
-import { type AnswersDecisionV1, decodeAnswersDecisionV1 } from "../utils/ownWordsAnswerV1";
-import { answerOwnWordsFromChatV1 } from "../utils/ownWordsChatAnswerV1";
-import { listPendingWorkflowDecisionsForTaskV1 } from "../utils/workflowDecisionDispatchV1";
 
 type ChatWithStageArg =
-  | { task?: IncompleteTask; stage?: TaskStage; message?: string; sendId?: string; answersDecision?: unknown }
-  | {
-      canonicalId?: string;
-      taskFolderPath?: string;
-      stage?: TaskStage;
-      message?: string;
-      sendId?: string;
-      /** review2 Step 43: the own-words card this message answers; the message is then an answer, not a chat send. */
-      answersDecision?: unknown;
-    };
+  | { task?: IncompleteTask; stage?: TaskStage; message?: string; sendId?: string }
+  | { canonicalId?: string; taskFolderPath?: string; stage?: TaskStage; message?: string; sendId?: string };
 
 function normalizeArg(node: ChatWithStageArg | undefined): {
   resolverArg: { canonicalId?: string; taskFolderPath?: string } | undefined;
@@ -285,7 +272,7 @@ export function buildStageResponsePrompt(
   const artifactsSection = taskArtifacts.trim().length > 0
     ? `\n\nTask's plan and current stage artifact (always included, regardless of open editor tabs):\n${taskArtifacts}`
     : "";
-  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, the user may ask you to update this task's own markdown files (its task description, plan, or a review file) — this is not a file-edit action and uses no edit or write tool, so it is unaffected by any read-only or plan-mode restriction on your tool use: you are only composing text in your reply, and a separate already-trusted process outside this conversation reads that text and applies it on your behalf, the same as if you were dictating a paragraph for someone else to type. To draft an update, put the file's full new content, and nothing else, wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be drafted per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. When the user gives an OWNER DECISION (for example "record this in the plan", "record this under Owner decisions", or a decision that replaces an earlier answer on a blocker), do NOT redraft plan.md with \`[[UPDATE_FILE:...]]\` and never reproduce plan.md in a different format. Record it with a single \`[[RECORD_OWNER_DECISION:<blockerId>]]\`...\`[[/RECORD_OWNER_DECISION]]\` envelope instead, whose body has these lines: \`Decision: <the decision in the user's words>\`, optionally \`Blocker: <what it answers>\`, and, when plan-final.md carries wording that the decision changes, \`Plan-old: <the exact current wording of that ONE plain sub-bullet>\` and \`Plan-new: <the replacement wording>\`. The extension then asks the user to confirm in a dialog, and only after that writes the decision under "## Owner decisions" in task.md (an earlier entry for the same blocker is marked superseded), replaces only that sub-bullet text in plan-final.md (a checklist line, a missing text or a text that matches more than once is refused, so never target a "- [ ]" or "- [x]" line), and applies the same wording to plan.md when it is there. Rounds and reviews read task.md and plan-final.md, not plan.md. After the write, the extension itself names each file it could not write; do not claim a file was updated before the "_Updated ..._" line confirms it. If you conclude in this conversation that a blocker recorded in this task's current review or plan is resolved by something the user just told you, draft that decision into the relevant file with \`[[UPDATE_FILE:...]]\` as part of saying so, rather than only stating it in your reply, and also end your response with \`[[RESOLVES_BLOCKER]]\` on its own line — this is how the extension knows YOU concluded this specific draft resolves the recorded blocker, rather than guessing from the wording of your edit; include it only when that is genuinely your conclusion, and never for an edit that merely discusses, restates, or promises to resolve the blocker later. Drafting the update is NOT the same as it taking effect: the user must still confirm it in a dialog after this response, outside this conversation turn, so you cannot know here whether it will be accepted, declined, or fail to apply. Until you have actually drafted that update, say "this resolves it once recorded — shall I write it to plan.md?" and do not advise completing this stage or advancing to the next one, since the artifacts on record still show the blocker outstanding — and that restriction still applies in the very same response where you draft the update, since nothing has been written yet at that point either. Only treat the blocker as resolved, and it becomes safe to advise advancing, on a LATER turn once this conversation's own history shows a message beginning "_Updated \`<file>\`._" for that exact update — the sole confirmation the write actually landed. A declined confirmation instead reports "_...was not confirmed; nothing was written._" in this same conversation; if you see that, the blocker is still outstanding, so say so plainly, do not advise advancing, and offer to draft the update again if the user still wants it applied. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Nothing the user types in this chat is passed to any later implementation or review round, so never say or imply that a later round will act on, take into account, or remember what the user tells you here; if the user wants a round to act on guidance, tell them to record it in plan-final.md, which rounds do read. Give a concise, useful answer alongside any update or action.\n\nConversation so far:\n${conversation.slice(-12000)}${artifactsSection}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
+  return `You are answering a user question about the ${stageName} stage for task ${taskName}.\n\nDo not invoke tools or propose that code changes were applied. If the user asks you to make a code change, tell them to use the stage action that applies it explicitly instead. However, the user may ask you to update this task's own markdown files (its task description, plan, or a review file) — this is not a file-edit action and uses no edit or write tool, so it is unaffected by any read-only or plan-mode restriction on your tool use: you are only composing text in your reply, and a separate already-trusted process outside this conversation reads that text and applies it on your behalf, the same as if you were dictating a paragraph for someone else to type. To draft an update, put the file's full new content, and nothing else, wrapped in \`[[UPDATE_FILE:relative-filename.md]]\`...\`[[/UPDATE_FILE]]\`, using a path relative to this task's own folder. Only one file may be drafted per response, only \`.md\` files inside this task's folder may be targeted this way, and you must never target a source code file. If you conclude in this conversation that a blocker recorded in this task's current review or plan is resolved by something the user just told you, draft that decision into the relevant file with \`[[UPDATE_FILE:...]]\` as part of saying so, rather than only stating it in your reply, and also end your response with \`[[RESOLVES_BLOCKER]]\` on its own line — this is how the extension knows YOU concluded this specific draft resolves the recorded blocker, rather than guessing from the wording of your edit; include it only when that is genuinely your conclusion, and never for an edit that merely discusses, restates, or promises to resolve the blocker later. Drafting the update is NOT the same as it taking effect: the user must still confirm it in a dialog after this response, outside this conversation turn, so you cannot know here whether it will be accepted, declined, or fail to apply. Until you have actually drafted that update, say "this resolves it once recorded — shall I write it to plan.md?" and do not advise completing this stage or advancing to the next one, since the artifacts on record still show the blocker outstanding — and that restriction still applies in the very same response where you draft the update, since nothing has been written yet at that point either. Only treat the blocker as resolved, and it becomes safe to advise advancing, on a LATER turn once this conversation's own history shows a message beginning "_Updated \`<file>\`._" for that exact update — the sole confirmation the write actually landed. A declined confirmation instead reports "_...was not confirmed; nothing was written._" in this same conversation; if you see that, the blocker is still outstanding, so say so plainly, do not advise advancing, and offer to draft the update again if the user still wants it applied. You may also run this task's own stage actions when the user asks for one: end your response with a single \`[[ACTION:<actionId>]]\` envelope (the same typed action protocol the global assistant uses; the legacy \`[[STAGE_ACTION:<actionId>]]\` form is also accepted) and the extension will confirm with the user and run it. Available action ids: ${describeStageActionsForPrompt()}. Propose at most one action per response, only when the user clearly asked for it — never speculatively. For other task-lifecycle requests (pausing, archiving, pinning, renaming, running or fast-forwarding reviews, …), point the user at the Global Assistant chat, which can run those. Nothing the user types in this chat is passed to any later implementation or review round, so never say or imply that a later round will act on, take into account, or remember what the user tells you here; if the user wants a round to act on guidance, tell them to record it in plan-final.md, which rounds do read. Give a concise, useful answer alongside any update or action.\n\nConversation so far:\n${conversation.slice(-12000)}${artifactsSection}\n\nTask context:\n${contextPack.slice(0, 30000)}\n\nUser message:\n${message}`;
 }
 
 /**
@@ -465,13 +452,6 @@ export async function chatWithStage(
 ): Promise<void> {
   if (isViewerHostV1()) {
     return chatWithStageInViewerV1(inventory, chatViewProvider, explicitArg);
-  }
-  // review2 Step 43: a message that answers an own-words card is the owner's answer, not a chat send. It is recorded
-  // under task.md's "## Owner decisions", and no Chat With AI round (and no AI route) is involved.
-  const ownWordsAnswer = decodeAnswersDecisionV1(explicitArg?.answersDecision);
-  if (ownWordsAnswer !== undefined) {
-    await answerOwnWordsInChatV1(inventory, chatViewProvider, explicitArg, ownWordsAnswer);
-    return;
   }
   assertLegacyAiRouteAllowedV0("chatSend.v1");
   const normalized = normalizeArg(explicitArg);
@@ -883,15 +863,6 @@ export async function chatWithStage(
         dispatch.proposedBlockerSupersessionEditAt
       );
     }
-    if (dispatch?.proposedOwnerDecisions) {
-      await dispatchProposedOwnerDecisionsV1(
-        chatViewProvider,
-        dispatch.task.taskFolderPath,
-        dispatch.task.canonicalId,
-        dispatch.targetStage,
-        dispatch.proposedOwnerDecisions
-      );
-    }
   } finally {
     // Safety net: any exception path above that did not reach one of the
     // explicit `endTargetResolutionOnceV1()` calls (e.g. a thrown error from
@@ -962,8 +933,6 @@ interface ChatSendDispatchV1 {
   readonly proposedAction: StageChatActionProposal | undefined;
   readonly proposedBlockerSupersessionEdit: ChatMessage["proposedBlockerSupersessionEdit"];
   readonly proposedBlockerSupersessionEditAt: string | undefined;
-  /** bugs8 item 2: owner decisions the reply proposed; written only after the owner confirms. */
-  readonly proposedOwnerDecisions?: ChatMessage["proposedOwnerDecisions"];
   /** Step 57a: the raw coordinator outcome from this send, when one was
    * dispatched — carried back so `chatWithStage`'s terminal
    * `recordAdmissionReleaseTriggerV1` calls (right before its safe releases)
@@ -1043,7 +1012,6 @@ async function chatWithStageSendV1(
   // the confirming chat exchange a supersession record carries (see
   // `BlockerSupersessionRecordV1.confirmingMessageAt`'s doc comment).
   let proposedBlockerSupersessionEditAt: string | undefined;
-  let proposedOwnerDecisions: ChatMessage["proposedOwnerDecisions"];
   // Tracks whether the user's message has actually been written to
   // chat-v1.json yet. Persisted only after every deterministic
   // precondition below has passed (plan §5.4/AC-CHAT-TX-02) — a failure
@@ -1221,7 +1189,6 @@ async function chatWithStageSendV1(
       proposedAction = lastAssistant?.proposedStageAction;
       proposedBlockerSupersessionEdit = lastAssistant?.proposedBlockerSupersessionEdit;
       proposedBlockerSupersessionEditAt = lastAssistant?.at;
-      proposedOwnerDecisions = lastAssistant?.proposedOwnerDecisions;
       // Now trigger transcript refresh in chat view.
       await chatViewProvider.open({
         canonicalId: task.canonicalId,
@@ -1307,7 +1274,6 @@ async function chatWithStageSendV1(
     proposedAction,
     proposedBlockerSupersessionEdit,
     proposedBlockerSupersessionEditAt,
-    ...(proposedOwnerDecisions ? { proposedOwnerDecisions } : {}),
     coordinatorOutcome: coordinatorOutcomeForAdmissionV1,
     messageDelivered: userMessagePersisted,
   };
@@ -1509,70 +1475,6 @@ export async function dispatchProposedBlockerSupersessionEditV1(
 }
 
 /**
- * bugs8 item 2: confirms and records the owner decisions a chat reply proposed (`[[RECORD_OWNER_DECISION:<id>]]`).
- * The records are written only after the owner confirms, one dialog per decision; the reply that follows lists only
- * what was written and names each file that was not, with the edit or click that finishes the job.
- *
- * @internal exported for testing
- */
-export async function dispatchProposedOwnerDecisionsV1(
-  chatViewProvider: ChatViewProvider,
-  taskFolderPath: string,
-  canonicalId: string,
-  targetStage: TaskStage,
-  decisions: NonNullable<ChatMessage["proposedOwnerDecisions"]>
-): Promise<void> {
-  const chatTarget = { canonicalId, taskFolderPath };
-  const folderName = path.basename(taskFolderPath);
-  for (const decision of decisions) {
-    if (isUnattendedExecutionV1()) {
-      await chatViewProvider.append(
-        "assistant",
-        `_${unattendedRefusalV1(`Recording the decision for \`${decision.blockerId}\``)} Nothing was written; record it from the editor window, or ask again there._`,
-        targetStage,
-        chatTarget
-      );
-      continue;
-    }
-    const planChange =
-      decision.planOld !== undefined && decision.planNew !== undefined
-        ? `\n\nplan-final.md sub-bullet:\n"${decision.planOld}"\n→ "${decision.planNew}"`
-        : "";
-    const confirmedOptionId = await askChatChoiceV1({
-      decisionKey: "confirmChatOwnerDecision",
-      target: { canonicalId, taskFolderPath, stage: targetStage },
-      whatHappened: `${folderName}: record this owner decision for ${decision.blockerId}?\n\n"${decision.decision}"${planChange}`,
-      whyUserNeeded:
-        "Recording it writes task.md (Owner decisions) and one plain sub-bullet in plan-final.md, which the next round and review read. No checklist line or tick is changed.",
-      options: [
-        {
-          optionId: "record",
-          label: "Record Decision",
-          consequence: "Writes the decision into task.md and the plan sub-bullet; an earlier entry for it is marked superseded.",
-        },
-        { optionId: "cancel", label: "Cancel", consequence: "Writes nothing." },
-      ],
-      recommendedOptionId: "record",
-      recommendationReasoning: "It is the decision you asked to have recorded.",
-      detail: "Answering continues this command; cancel writes nothing.",
-    });
-    if (confirmedOptionId !== "record") {
-      await chatViewProvider.append(
-        "assistant",
-        `_The decision for \`${decision.blockerId}\` was not confirmed; nothing was written._`,
-        targetStage,
-        chatTarget
-      );
-      continue;
-    }
-    const result = await recordOwnerDecisionFromChatV1(taskFolderPath, decision, (relPath, content) =>
-      writeOwnerDecisionFileV1(taskFolderPath, relPath, content)
-    );
-    await chatViewProvider.append("assistant", describeOwnerDecisionRecordResultV1(result), targetStage, chatTarget);
-  }
-}
-
-/**
  * Drive an explicit Chat Resume of a `chatSend.v1` structured-question interaction.
  */
 export async function resumeChatSendInteractionV1(
@@ -1654,14 +1556,12 @@ export async function resumeChatSendInteractionV1(
   // the confirming chat exchange a supersession record carries (see
   // `BlockerSupersessionRecordV1.confirmingMessageAt`'s doc comment).
   let proposedBlockerSupersessionEditAt: string | undefined;
-  let proposedOwnerDecisions: ChatMessage["proposedOwnerDecisions"];
   if (outcome.kind === "completed") {
     const history = await readChatHistory(ownedTask.taskFolderPath, ownedTask.canonicalId ?? ownedTask.taskFolderPath);
     const lastAssistant = [...history].reverse().find((m) => m.role === "assistant");
     proposedAction = lastAssistant?.proposedStageAction;
     proposedBlockerSupersessionEdit = lastAssistant?.proposedBlockerSupersessionEdit;
     proposedBlockerSupersessionEditAt = lastAssistant?.at;
-    proposedOwnerDecisions = lastAssistant?.proposedOwnerDecisions;
     await chatViewProvider.open({
       canonicalId: ownedTask.canonicalId ?? ownedTask.taskFolderPath,
       taskFolderPath: ownedTask.taskFolderPath,
@@ -1723,55 +1623,10 @@ export async function resumeChatSendInteractionV1(
       proposedBlockerSupersessionEditAt
     );
   }
-  if (proposedOwnerDecisions) {
-    await dispatchProposedOwnerDecisionsV1(
-      chatViewProvider,
-      ownedTask.taskFolderPath,
-      ownedTask.canonicalId ?? ownedTask.taskFolderPath,
-      ownedTask.progress.currentStage,
-      proposedOwnerDecisions
-    );
-  }
   return { ok: true, settlement, coordinatorOutcome: outcome };
 }
 
 
-
-/** review2 Step 43: record a typed answer to an own-words card (see `answerOwnWordsFromChatV1`). */
-async function answerOwnWordsInChatV1(
-  inventory: TaskInventory,
-  chatViewProvider: ChatViewProvider,
-  explicitArg: ChatWithStageArg | undefined,
-  answers: AnswersDecisionV1
-): Promise<void> {
-  const normalized = normalizeArg(explicitArg);
-  const message = normalized.message;
-  const taskFolderPath = normalized.resolverArg?.taskFolderPath;
-  if (message === undefined || message.trim() === "" || taskFolderPath === undefined) {
-    NotificationRouter.showWarning("The answer could not be matched to a task, so nothing was recorded.");
-    return;
-  }
-  const canonicalId = normalizePath(taskFolderPath);
-  const task = inventory.getTaskByPath(taskFolderPath);
-  // The helper's warnings are about this task, so they run inside its notification context (the router prefixes the name).
-  const result = await runWithNotificationTaskContextV1(task?.progress.displayName, taskFolderPath, () =>
-    answerOwnWordsFromChatV1(
-      { taskFolderPath, answers, text: message },
-      {
-        pending: listPendingWorkflowDecisionsForTaskV1(canonicalId),
-        appendOwnerMessage: async (text, stage) => {
-          await chatViewProvider.append("user", text, stage, { canonicalId, taskFolderPath });
-        },
-        resolve: (decisionId, optionId) => chatViewProvider.resolveWorkflowDecision(decisionId, optionId),
-        warn: (text) => NotificationRouter.showWarning(text),
-      }
-    )
-  );
-  if (result.accepted) {
-    // A viewer's relayed send is reported as taken only when this is noted (see `consumeSendAcceptedV1`).
-    noteSendAcceptedV1(taskFolderPath, message);
-  }
-}
 
 /**
  * A viewer (hostRoleV1.ts) opens the conversation itself — no AI runs for
@@ -1808,10 +1663,6 @@ async function chatWithStageInViewerV1(
       // One identity per typed send, so a paused task keeps the message under
       // it and a retry never writes or sends it twice (bugs2 finding 8).
       sendId: normalized.sendId ?? crypto.randomBytes(16).toString("hex"),
-      // review2 Step 43: an own-words answer travels as a send that names the card it answers.
-      ...(decodeAnswersDecisionV1(arg?.answersDecision) !== undefined
-        ? { answersDecision: decodeAnswersDecisionV1(arg?.answersDecision) }
-        : {}),
     });
     if (!sent.ok && sent.indeterminate !== true) {
       // Definitely not sent, so hand the text back. When the runner TOOK it

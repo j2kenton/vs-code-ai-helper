@@ -3,16 +3,6 @@ import * as path from "path";
 import * as crypto from "crypto";
 import { ADMISSION_DIRNAME_V1 } from "../services/workflowPrivacyClassifierV1";
 import { resolveHostIdentityV1 } from "./hostIdentityV1";
-import {
-  currentHeldDispatchGateV1,
-  currentHeldDispatchIdV1,
-  hasAutomaticOriginV1,
-  hasOwnerOriginV1,
-  hasPassedAutomaticGateV1,
-  runWithHeldDispatchIdV1,
-  type HeldDispatchGateV1,
-} from "./automationDispatchContextV1";
-import { evaluateProgressWatchV1, readAutomaticGateLimitsV1 } from "./progressWatchGateV1";
 import { readOtherProcessStartEpochMsV1, isProcessStartTimeMismatchV1 } from "./processStartTimeProbeV1";
 import { decodeTaskProgressTextV1 } from "../services/taskProgressDecoderV1";
 import { deriveTaskBindingV1 } from "../types/taskBindingV1";
@@ -126,15 +116,6 @@ export interface WorkAdmissionClaimInfoV1 {
   readonly hostId: string;
   readonly commandId: string;
   readonly startedAt: string;
-  /**
-   * review1 Step 24: who started the work this claim admits. `"automatic"` for anything the owner did not click
-   * (an automation chain, Fast Forward's own rounds, the recovery sweep, a scheduled or backup retry), and for any
-   * path that cannot be classified; `"owner"` only for a call tree marked as owner-started with no automatic origin. Absent on claims
-   * written before this field existed.
-   */
-  readonly origin?: "owner" | "automatic";
-  /** run1 Step 26: the dispatch id of the held owner answer that started this work, when one did. */
-  readonly heldDispatchId?: string;
 }
 
 export interface WorkAdmissionHandleV1 {
@@ -1557,33 +1538,6 @@ export function workAdmissionRenewalAgeMsV1(taskFolderPath: string, now = Date.n
 }
 
 /**
- * run1 Step 26: what the task's admission markers show about a held-answer dispatch. `live` is a claim renewed
- * within the likely-stale window, `stale` one that has not been; `claimCarriesDispatchId` says whether any marker
- * was written under that dispatch id. Read-only, synchronous, and never throws.
- */
-export function readAdmissionTraceForDispatchV1(
-  taskFolderPath: string,
-  dispatchId: string,
-  now = Date.now()
-): { readonly claim: "none" | "live" | "stale"; readonly claimCarriesDispatchId: boolean } {
-  let carries = false;
-  try {
-    for (const marker of listMarkersSyncV1(admissionDirV1(taskFolderPath))) {
-      if (readClaimInfoSyncV1(marker.filePath)?.heldDispatchId === dispatchId) {
-        carries = true;
-      }
-    }
-  } catch {
-    // An unreadable directory reads as no marker; the age check below says the same.
-  }
-  const age = workAdmissionRenewalAgeMsV1(taskFolderPath, now);
-  if (age === undefined) {
-    return { claim: "none", claimCarriesDispatchId: carries };
-  }
-  return { claim: age < WORK_ADMISSION_LIKELY_STALE_MS_V1 ? "live" : "stale", claimCarriesDispatchId: carries };
-}
-
-/**
  * Generous upper bound for every string field on a claim/marker record. This
  * module's own writer ({@link acquireWorkAdmissionCoreV1}) only ever produces
  * short, fixed-shape values — a UUID `claimId`/`ownerToken` suffix, a
@@ -2695,59 +2649,6 @@ function markerBlocksAcquisitionV1(
   return true;
 }
 
-/** review1 Step 24: the error an automatic claim is refused with while the task's progress gate says to ask the owner. */
-export class AutomaticDispatchRefusedErrorV1 extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "AutomaticDispatchRefusedErrorV1";
-  }
-}
-
-/**
- * Internal markers that use an `admission` claim but start no work, so they never pass through the gate:
- * `resolutionInFlight` is held while an owner's decision answer is being resolved.
- */
-const GATE_EXEMPT_COMMAND_IDS_V1: ReadonlySet<string> = new Set(["resolutionInFlight"]);
-
-/**
- * review1 Step 24: the admission layer's own backstop. The caller has already established that the claim is
- * automatic (not owner-started, or started by a path nobody marked) and did not go through
- * `admitAutomaticDispatchV1`, so the claim is refused, whatever the task's progress watch says: a new automatic path
- * that forgets the gate is stopped here instead of slipping through while the task is still under its limits. The
- * message tells a task the gate has stopped (the owner's card is waiting) from a path that skipped the gate.
- *
- * The one case that admits is no registered limits: the extension registers them at activation, and unit tests that
- * exercise admission alone (or a host without the extension's settings) run without the gate installed.
- */
-export function automaticDispatchRefusalV1(
-  taskFolderPath: string,
-  commandId?: string
-): AutomaticDispatchRefusedErrorV1 | undefined {
-  const limits = readAutomaticGateLimitsV1();
-  if (!limits) return undefined;
-  if (commandId !== undefined && GATE_EXEMPT_COMMAND_IDS_V1.has(commandId)) return undefined;
-  try {
-    const text = fs.readFileSync(path.join(taskFolderPath, TASK_PROGRESS_FILENAME), "utf8");
-    const decoded = decodeTaskProgressTextV1(text, { expectedTaskFolder: path.basename(taskFolderPath) });
-    if (decoded.ok) {
-      const decision = evaluateProgressWatchV1(decoded.decoded.progress.progressWatch, limits);
-      if (decision.trip) {
-        return new AutomaticDispatchRefusedErrorV1(
-          decision.reason === "failed"
-            ? "Automatic work was not started: the last automatic rounds in a row failed, so Ensemble is waiting for your decision (see the card in Chat With AI)."
-            : "Automatic work was not started: automation has run many rounds with no sign of progress, so Ensemble is waiting for your decision (see the card in Chat With AI)."
-        );
-      }
-    }
-  } catch {
-    // An unreadable progress file does not excuse a claim that skipped the gate.
-  }
-  return new AutomaticDispatchRefusedErrorV1(
-    `Automatic work was not started: it did not go through the "is this working?" check (${commandId ?? "unnamed claim"}). ` +
-      "This is an Ensemble fault, not something to fix in the task; start the work yourself from the task."
-  );
-}
-
 /**
  * Acquire durable work admission for `taskFolderPath`, running the genesis
  * flow described in the module doc comment. Never throws — filesystem
@@ -2766,12 +2667,6 @@ export async function acquireWorkAdmissionV1(params: {
   readonly purpose: WorkAdmissionPurposeV1;
   readonly commandId: string;
 }): Promise<WorkAdmissionResultV1> {
-  // run1 Step 28: a held answer's dispatch owns the task's claim for its whole run. The command it dispatches
-  // joins that claim instead of racing it, whether or not the command takes admission of its own.
-  const ownedByDispatch = heldDispatchOwnedClaimV1(params.taskFolderPath, params.purpose);
-  if (ownedByDispatch !== undefined) {
-    return { outcome: "acquired", handle: createAdoptedViewV1(params.taskFolderPath, ownedByDispatch) };
-  }
   const ownerToken = `${process.pid.toString(36)}-${crypto.randomBytes(6).toString("hex")}`;
   registerPendingIntentV1(params.taskFolderPath, ownerToken);
   try {
@@ -2779,68 +2674,6 @@ export async function acquireWorkAdmissionV1(params: {
   } finally {
     clearPendingIntentV1(params.taskFolderPath, ownerToken);
   }
-}
-
-/**
- * run1 Step 28: the claim a held answer's dispatch took for its task, keyed by the dispatch id. Only the call
- * tree of that dispatch (`currentHeldDispatchIdV1`) joins it, and only for work-starting `admission` claims, so
- * Pause's own `pauseCommit` claim still queues behind it.
- */
-const heldDispatchClaimsV1 = new Map<string, { readonly taskFolderPath: string; readonly handle: WorkAdmissionHandleV1 }>();
-
-function heldDispatchOwnedClaimV1(
-  taskFolderPath: string,
-  purpose: WorkAdmissionPurposeV1
-): WorkAdmissionHandleV1 | undefined {
-  if (purpose !== "admission") return undefined;
-  const dispatchId = currentHeldDispatchIdV1();
-  if (dispatchId === undefined) return undefined;
-  const owned = heldDispatchClaimsV1.get(dispatchId);
-  if (owned === undefined || owned.taskFolderPath !== taskFolderPath) return undefined;
-  // Still the task's live local handle: a claim that was released or displaced is never joined.
-  return localHandlesV1.get(taskFolderPath) === owned.handle ? owned.handle : undefined;
-}
-
-export type HeldDispatchUnderAdmissionV1<T> =
-  | { readonly kind: "refused"; readonly result: WorkAdmissionBusyV1 | WorkAdmissionWriteFailedV1 }
-  | { readonly kind: "ran"; readonly value: T };
-
-/**
- * run1 Step 28: carry out a held answer's command under the task's work admission, always. The claim is taken
- * here, before the command starts, and `gate` (the status re-read and the held-to-dispatching swap) runs once
- * under it, ordered against Pause's `pauseCommit` claim. The claim carries `dispatchId`, stays alive with a
- * heartbeat while `body` runs, and is released afterwards. A command that takes admission itself joins this
- * claim; one that takes none is covered all the same. A refusal (busy, or the gate declining) starts nothing.
- */
-export async function runHeldDispatchUnderAdmissionV1<T>(params: {
-  readonly taskFolderPath: string;
-  readonly dispatchId: string;
-  readonly commandId: string;
-  readonly gate: HeldDispatchGateV1;
-  readonly body: () => Promise<T>;
-}): Promise<HeldDispatchUnderAdmissionV1<T>> {
-  const { taskFolderPath, dispatchId, commandId, gate, body } = params;
-  return runWithHeldDispatchIdV1(
-    dispatchId,
-    async (): Promise<HeldDispatchUnderAdmissionV1<T>> => {
-      const acquired = await acquireWorkAdmissionV1({ taskFolderPath, purpose: "admission", commandId });
-      if (acquired.outcome !== "acquired") {
-        return { kind: "refused", result: acquired };
-      }
-      heldDispatchClaimsV1.set(dispatchId, { taskFolderPath, handle: acquired.handle });
-      const heartbeatTimer = setInterval(() => {
-        void acquired.handle.heartbeat();
-      }, WORK_ADMISSION_HEARTBEAT_INTERVAL_MS_V1);
-      try {
-        return { kind: "ran", value: await body() };
-      } finally {
-        clearInterval(heartbeatTimer);
-        heldDispatchClaimsV1.delete(dispatchId);
-        await acquired.handle.release();
-      }
-    },
-    gate
-  );
 }
 
 async function acquireWorkAdmissionCoreV1(
@@ -2853,16 +2686,6 @@ async function acquireWorkAdmissionCoreV1(
 ): Promise<WorkAdmissionResultV1> {
   const { taskFolderPath, purpose, commandId } = params;
   const dir = admissionDirV1(taskFolderPath);
-
-  // review1 Step 24: record who started this work, and refuse an automatic claim for work-starting purposes that
-  // did not pass the "is this working?" gate when the task's progress watch says it must stop and ask the owner.
-  // A path that cannot be classified as the owner's counts as automatic: "owner" needs an explicit owner marker
-  // (`asOwnerEntryPointV1` on commands and webview handlers) and no automatic origin inside it.
-  const origin: "owner" | "automatic" = hasOwnerOriginV1() && !hasAutomaticOriginV1() ? "owner" : "automatic";
-  if (purpose === "admission" && origin === "automatic" && !hasPassedAutomaticGateV1()) {
-    const refusal = automaticDispatchRefusalV1(taskFolderPath, commandId);
-    if (refusal) return { outcome: "writeFailed", error: refusal };
-  }
 
   // Part 1b step 12 ("Require every later claimant to complete the barrier
   // ... before publishing admission or starting another pause"): fully
@@ -2939,8 +2762,6 @@ async function acquireWorkAdmissionCoreV1(
     hostId,
     commandId,
     startedAt: new Date().toISOString(),
-    origin,
-    ...(currentHeldDispatchIdV1() !== undefined ? { heldDispatchId: currentHeldDispatchIdV1() as string } : {}),
   };
   const claimPath = path.join(dir, CLAIM_FILENAME_V1);
 
@@ -3381,23 +3202,6 @@ async function acquireWorkAdmissionCoreV1(
 
   localHandlesV1.set(taskFolderPath, handle);
   localReleaseFinalizersV1.set(taskFolderPath, decrementHoldersAndMaybeUnlinkV1);
-  // run1 Step 28: a held owner answer is checked while it holds the claim, so Pause (which commits through the
-  // same claim) and the dispatch are ordered: the status is re-read, and the answer is swapped from held to
-  // dispatching, under the claim. A refusal gives the claim back and starts nothing.
-  const heldGate = purpose === "admission" ? currentHeldDispatchGateV1() : undefined;
-  if (heldGate !== undefined) {
-    heldGate.ran = true;
-    let refusal: string | undefined;
-    try {
-      refusal = await heldGate.run();
-    } catch (error) {
-      refusal = error instanceof Error ? error.message : String(error);
-    }
-    if (refusal !== undefined) {
-      await handle.release().catch(() => undefined);
-      return { outcome: "writeFailed", error: new Error(refusal) };
-    }
-  }
   return { outcome: "acquired", handle };
 }
 

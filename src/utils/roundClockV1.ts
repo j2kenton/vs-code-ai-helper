@@ -1,20 +1,18 @@
 /**
- * bugs6 item 41: what an editing round's prompt says about time. A round told "this round has a wall-clock budget of
- * roughly 60 minutes" with no start time and no way to read the clock stopped after 12 of them (bugs6 item 41) and, in
- * another case, after 6 (item 46). The prompt now carries the start and the stop in UTC, says how to read the real time
- * where the round may, and says what to do where it cannot: never stop for time on a guess. The time named is the end
- * of the round's own 60-minute budget, not a kill by the runner (the runner's limit is the far-off backstop), so the
- * prompt calls it the end of the budget and never says Ensemble will end the round then (owner decision
- * step-12-hard-stop, 2026-11-11).
+ * bugs6 item 41 (1.18 backport of 70e250a): what an editing round's prompt says about time. A round told "this round
+ * has a wall-clock budget of roughly 60 minutes" with no start time and no way to read the clock stopped after 12 of
+ * them (bugs6 item 41) and, in another case, after 6 (item 46). The prompt now carries the start and the end of the
+ * budget in UTC, says how to read the real time where the round may, and says what to do where it cannot: never stop
+ * for time on a guess.
+ *
+ * In 1.18 the 60 minutes is also the CLI runner's own wall-clock limit (`RUN_TIMEOUT_MS` in `cliAgentRunner.ts`), so
+ * the end the prompt names is never later than the limit that is enforced. The prompt is rendered just before the
+ * round starts, so the time it names is, if anything, slightly early.
  */
-import { getResilienceSettings } from "../config/settings";
-import { roundAdapterAllowsClockCommandV1, ROUND_CLOCK_COMMAND_V1 } from "./roundShellAllowlistV1";
+import { roundAdapterAllowsClockCommandV1, ROUND_CLOCK_COMMAND_V1 } from "./roundClockCommandV1";
 
-/** The time budget the editing-round prompts state ("roughly 60 minutes"). */
+/** The time budget the editing-round prompts state ("roughly 60 minutes"); equal to the CLI runner's limit. */
 export const ROUND_PROMPT_BUDGET_MINUTES_V1 = 60;
-
-/** A round that ends with less than this fraction of its budget used, and says it stopped for time, is flagged. */
-export const ROUND_EARLY_STOP_FRACTION_V1 = 0.5;
 
 /** The minutes left at which stopping for time is right. */
 export const ROUND_STOP_FOR_TIME_MINUTES_LEFT_V1 = 10;
@@ -25,24 +23,9 @@ export interface RoundClockV1 {
   readonly budgetMinutes: number;
 }
 
-/**
- * The round's clock: it starts at `startedAt` and its budget is {@link ROUND_PROMPT_BUDGET_MINUTES_V1} minutes, capped
- * by the runner's own far-off backstop (`ensemble.resilience.roundBackstopHours`, the limit that actually kills a
- * process) when a lower one is configured, so the end the prompt names is never later than the limit that is enforced.
- */
-export function buildRoundClockV1(startedAt: Date = new Date(), backstopHours?: number): RoundClockV1 {
-  let backstop = backstopHours;
-  if (backstop === undefined) {
-    try {
-      backstop = getResilienceSettings().roundBackstopHours;
-    } catch {
-      backstop = undefined;
-    }
-  }
-  const budgetMinutes =
-    backstop !== undefined && Number.isFinite(backstop) && backstop > 0
-      ? Math.min(ROUND_PROMPT_BUDGET_MINUTES_V1, Math.floor(backstop * 60))
-      : ROUND_PROMPT_BUDGET_MINUTES_V1;
+/** The round's clock: it starts at `startedAt` and its budget is {@link ROUND_PROMPT_BUDGET_MINUTES_V1} minutes. */
+export function buildRoundClockV1(startedAt: Date = new Date()): RoundClockV1 {
+  const budgetMinutes = ROUND_PROMPT_BUDGET_MINUTES_V1;
   return { startedAt, budgetEndsAt: new Date(startedAt.getTime() + budgetMinutes * 60_000), budgetMinutes };
 }
 
@@ -81,10 +64,10 @@ export const ROUND_CLOCK_PROMPT_FILES_V1: ReadonlySet<string> = new Set(["run-im
 export function appendRoundClockPolicyV1(
   templateFileName: string,
   prompt: string,
-  options: { readonly modelId?: string; readonly now?: Date; readonly backstopHours?: number } = {}
+  options: { readonly modelId?: string; readonly now?: Date } = {}
 ): string {
   if (!ROUND_CLOCK_PROMPT_FILES_V1.has(templateFileName)) {
     return prompt;
   }
-  return `${prompt}${formatRoundClockPromptBlockV1(buildRoundClockV1(options.now, options.backstopHours), options.modelId)}`;
+  return `${prompt}${formatRoundClockPromptBlockV1(buildRoundClockV1(options.now), options.modelId)}`;
 }

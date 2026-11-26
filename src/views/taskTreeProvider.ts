@@ -4,7 +4,6 @@ import * as fs from "fs";
 import {
   DEFAULT_HIDDEN_STATUSES,
   ImplRecoveryV1,
-  IMPL_REVIEW_STAGES,
   IMPLEMENTATION_FILENAME,
   isReviewStage,
   MAX_INCOMPLETE_ROUND_CONTINUATIONS_V1,
@@ -15,8 +14,6 @@ import {
   TaskStage,
 } from "../types/taskProgress";
 import { IncompleteTask } from "../types/incompleteTask";
-import { readReviewCoverageSummaryForTreeV1 } from "../utils/reviewCoverageIoV1";
-import { appendReviewedLineV1, describeReviewedLineV1 } from "../utils/reviewCoverageV1";
 import { taskOperations, taskKey, hasActiveOperationTargetingStage } from "../utils/taskOperations";
 import { hasLiveWorkAdmissionBestEffortV1 } from "../state/workAdmissionV1";
 import { resolveCurrentPlanUri, statIfExists } from "../utils/fileUtils";
@@ -33,13 +30,7 @@ import {
   completedRoundAttributionV1,
   readCompletedRoundFallbackReasonFromRunLogV1,
 } from "../utils/completedRoundAttributionV1";
-import { effectiveReviewProgressV1, readPlanItemCountsV1 } from "../utils/effectiveReviewProgress";
-import {
-  describeContinueTheWorkLabelV1,
-  planItemsLeftFromCountsV1,
-  type PlanItemsLeftV1
-} from "../utils/continueTheWorkLabelV1";
-import { describeSettlementDropForTooltipV1 } from "../commands/planItemSettlementNoticeV1";
+import { effectiveReviewProgressV1, readDisplayPlanChecklistProgressV1 } from "../utils/effectiveReviewProgress";
 import {
   computeReviewFreshness,
   parseReadiness,
@@ -67,6 +58,7 @@ import {
   formatChecklistItemGlyphV1,
   formatChecklistPercentV1,
   formatImplementationProgressLabelV1,
+  implementationDisplayCountsV1,
   listOutstandingManualVerificationItemsV1,
   listUncheckedChecklistItemTextsV1,
 } from "../utils/implementationChecklist";
@@ -455,7 +447,7 @@ export function describeOwedContinuationRowIndicatorV1(
     // automated recovery has stopped, so there is no "next attempt" time to
     // show — the task needs a human decision instead.
     return {
-      description: "Continuation owed — Ensemble stopped trying, needs your input",
+      description: "Continuation owed — budget exhausted, needs your input",
       iconId: "warning",
       colorId: "charts.red",
     };
@@ -789,7 +781,7 @@ export class StageNode extends vscode.TreeItem {
      * `staleReviewedSha` is set when the review's recorded commit is no
      * longer HEAD (review freshness — display-side only, the artifact itself
      * is never mutated here). */
-    readiness?: { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string; planItemsLeft?: PlanItemsLeftV1 },
+    readiness?: { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string },
     isScheduled: boolean = false,
     isMetaManaged: boolean = false,
     hasBackup: boolean = false,
@@ -814,16 +806,12 @@ export class StageNode extends vscode.TreeItem {
       provisional?: number;
       /** Excluded items still waiting on a person (owner / post-deploy hand-offs), shown apart from unbuilt work (bugs4 item 49). */
       openHandOffs?: number;
-      /** Ticks a running round recorded that no review has seen yet (review1 Step 5): detail, never in the count. */
-      roundTicks?: number;
       unverified?: boolean;
       /** Items closed without doing before Implementation first started,
        * already left out of `complete`/`total` (RC8 item 6) — named in the tooltip. */
       closedBeforeImplementation?: number;
       /** Display line naming deferred / gated plan items (bugs3 Step 7), or "". */
       deferredNote?: string;
-      /** Why items went back to the review after a plan change (review1 Step 8), or undefined. */
-      settlementDropNote?: string;
     },
     /**
      * How many pending workflow decisions are scoped to THIS stage — the
@@ -852,9 +840,7 @@ export class StageNode extends vscode.TreeItem {
      * comment.
      */
     offerRunImplementationForUnusableSummary: boolean = false,
-    modelAttribution?: { readonly modelId: string; readonly providerLabel?: string; readonly providerId?: string; readonly fallbackReason?: string },
-    /** review2 Step 18: "Reviewed: N of M changed files" for the implementation review stages and Publish, or undefined. */
-    reviewedLine?: string
+    modelAttribution?: { readonly modelId: string; readonly providerLabel?: string; readonly providerId?: string; readonly fallbackReason?: string }
   ) {
     super(STAGE_DISPLAY_NAMES[stage], vscode.TreeItemCollapsibleState.None);
 
@@ -998,10 +984,7 @@ export class StageNode extends vscode.TreeItem {
               implementationProgress.unverified === true
             )
           : undefined;
-      // A review row shows its score only. "N of M plan items left" stays in the tooltip's "Next:" line and on the
-      // cards: next to a review score it read as a third progress figure beside the Implementation percentage
-      // (owner, 2026-11-06).
-      const statusLabel = readinessLabel ? readinessLabel : percentLabel;
+      const statusLabel = readinessLabel ?? percentLabel;
       switch (status) {
         case "done":
           // Completed stages always render with the done/tick icon, regardless
@@ -1117,10 +1100,6 @@ export class StageNode extends vscode.TreeItem {
     // to ignore the mark everywhere else. Nothing actionable is lost: the
     // inline "Review Pending Decision" BUTTON is not gated at all, so a
     // stranded decision on a finished task is still reachable and answerable.
-    // review2 Step 18: how much of the change a review has read, after the score and before any "needs your decision".
-    if (reviewedLine !== undefined) {
-      this.description = appendReviewedLineV1(this.description, reviewedLine);
-    }
     const taskStatusShowsDecisions = !isTaskStatusHiddenFromDecisionsV1(task.progress.status);
     if (pendingDecisionCount > 0 && !isRunning && taskStatusShowsDecisions) {
       this.iconPath = new vscode.ThemeIcon("comment-unresolved", new vscode.ThemeColor("charts.yellow"));
@@ -1196,10 +1175,6 @@ export class StageNode extends vscode.TreeItem {
     // `readiness.progress` is the reviewer's own invented tally (Step 13
     // retires it in favor of the plan checklist's fixed denominator, which
     // is what the implementation row already shows).
-    if (status === "current" && isReviewStage(stage) && readiness?.planItemsLeft) {
-      // review1 Step 56: the next action is continuing the work, never "going back" a stage.
-      tooltipStr += `\n\nNext: ${describeContinueTheWorkLabelV1(readiness.planItemsLeft)}`;
-    }
     if (readiness && isReviewStage(stage)) {
       // Reviewer/mechanical split (wf10 continuation item 12): the newest
       // recorded history entry for this stage carries `taskFixableCount` plus
@@ -1251,9 +1226,6 @@ export class StageNode extends vscode.TreeItem {
       tooltipStr += `\n\n${implementationProgress!.verified ?? 0} reviewer-verified, ` +
         `${ownerSettledText}${provisionalCount} provisional checklist item${provisionalCount === 1 ? "" : "s"}.`;
     }
-    if (stage === "impl" && (implementationProgress?.roundTicks ?? 0) > 0) {
-      tooltipStr += `\n\n${implementationProgress!.roundTicks} ticked this round, awaiting review.`;
-    }
     if (stage === "impl" && (implementationProgress?.openHandOffs ?? 0) > 0) {
       // bugs4 item 49: waiting on a person is not the same as not built.
       const handOffs = implementationProgress!.openHandOffs!;
@@ -1262,9 +1234,6 @@ export class StageNode extends vscode.TreeItem {
     }
     if (stage === "impl" && implementationProgress?.deferredNote) {
       tooltipStr += `\n\n${implementationProgress.deferredNote}`;
-    }
-    if (stage === "impl" && implementationProgress?.settlementDropNote) {
-      tooltipStr += `\n\n${implementationProgress.settlementDropNote}`;
     }
     if (missingPrerequisite) {
       tooltipStr +=
@@ -1289,9 +1258,6 @@ export class StageNode extends vscode.TreeItem {
         "\n\nRuns Publish Checks, then the Publish review. \"Fix Linting & Code Errors\" (the wand) fixes what the " +
         "last Publish Checks reported, and does nothing if they passed or have not run. The separate Run Publish " +
         "Checks and Review with AI actions are in this row's right-click menu.";
-    }
-    if (reviewedLine !== undefined) {
-      tooltipStr += `\n\n${reviewedLine}. A file counts once a review read it in full at its current content.`;
     }
     this.tooltip = new vscode.MarkdownString(tooltipStr, true);
 
@@ -2236,21 +2202,11 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // N/10)" line. The extra file read and git-freshness check per
       // completed review stage is the accepted cost of the visibility
       // requirement, not gated on an in-flight operation any more.
-      let readiness:
-        | { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string; planItemsLeft?: PlanItemsLeftV1 }
-        | undefined;
+      let readiness: { label: string; progress?: { complete: number; total: number }; staleReviewedSha?: string } | undefined;
       if (isReviewStage(stage) && (status === "current" || status === "done")) {
         readiness = await tryReadReadiness(artifactUri, stage, task.folderUri, () =>
           this.resolveHeadShaShared(task.folderUri)
         );
-        // review1 Step 56: a current review stage with a review on record names the plan items left, from the one
-        // shared counter (the Implementation row reads the same figures).
-        if (readiness && status === "current" && artifactUri !== undefined) {
-          const counts = await readPlanItemCountsV1(task.folderUri, { policy: "lenient", mode: "display" });
-          if (counts && counts.total > 0) {
-            readiness = { ...readiness, planItemsLeft: planItemsLeftFromCountsV1(counts) };
-          }
-        }
       }
 
       // Implementation row's live checklist percentage (A3 Part 3 / Step 12)
@@ -2258,19 +2214,19 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
       // stays visible after the workflow advances past it (the same "at any
       // moment" requirement as the review score above; a done implementation
       // row previously fell back to a bare tick with no number).
-      // `readPlanItemCountsV1` (review1 Step 5, the one read every surface
-      // shares) never throws under the lenient policy, so no extra try/catch
-      // is needed here. In display mode it reads the durable file only (via
-      // `readPlanOfRecordForDisplayV1`): this render fires while a run ticks
-      // boxes, and must never save a `plan-final.md` editor the user is
-      // mid-edit in. A latched task still reports its count, flagged
-      // `unverified`, so the tree qualifies the number instead of hiding it.
+      // `readDisplayPlanChecklistProgressV1` applies the same stand-down
+      // rules as the advance gates' reader and never throws (lenient policy),
+      // so no extra try/catch is needed here. It reads the durable file only
+      // (via `readPlanOfRecordForDisplayV1`): this render fires while a run
+      // ticks boxes, and must never save a `plan-final.md` editor the user is
+      // mid-edit in. Unlike the ForDisplay twin it still reports a latched
+      // task's count, flagged `unverified`, so the tree qualifies the number
+      // instead of hiding it (merge of `ui 12` into `v1 f2`, 2026-09-21).
       let implementationProgress:
-        | { complete: number; total: number; verified?: number; ownerSettled?: number; provisional?: number; openHandOffs?: number; roundTicks?: number; unverified?: boolean; closedBeforeImplementation?: number; deferredNote?: string; settlementDropNote?: string }
+        | { complete: number; total: number; verified?: number; ownerSettled?: number; provisional?: number; openHandOffs?: number; unverified?: boolean; closedBeforeImplementation?: number; deferredNote?: string }
         | undefined;
       if (stage === "impl") {
-        // review1 Step 5: the shared counts (display mode: durable file only, live round ticks as a detail).
-        const display = await readPlanItemCountsV1(task.folderUri, { policy: "lenient", mode: "display" });
+        const display = await readDisplayPlanChecklistProgressV1(task.folderUri);
         if (display) {
           // RC8 item 6: items already closed without doing when Implementation
           // first started are left out of both sides, so a task's first
@@ -2282,27 +2238,23 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
           // (`verifiedCounts`), the same figure the review marker and the cards
           // use. Live in-round ticks and other provisional ticks are explained
           // by the tooltip's "N provisional" line instead of moving the figure.
+          const shown = implementationDisplayCountsV1(display.verifiedCounts);
           implementationProgress = {
-            complete: display.shown.complete,
-            total: display.shown.total,
+            complete: shown.complete,
+            total: shown.total,
             verified: display.verified,
             ...(display.ownerSettled > 0 ? { ownerSettled: display.ownerSettled } : {}),
             provisional: display.provisional,
-            ...(display.handOffs > 0 ? { openHandOffs: display.handOffs } : {}),
-            ...(display.roundTicks > 0 ? { roundTicks: display.roundTicks } : {}),
-            ...(display.latched ? { unverified: true } : {}),
-            ...(display.closedBeforeImplementation > 0
-              ? { closedBeforeImplementation: display.closedBeforeImplementation }
+            ...(display.openHandOffs > 0 ? { openHandOffs: display.openHandOffs } : {}),
+            ...(display.unverified ? { unverified: true } : {}),
+            ...(shown.closedBeforeImplementation > 0
+              ? { closedBeforeImplementation: shown.closedBeforeImplementation }
               : {})
           };
           const deferredScope = await readDeferredPlanScopeV1(task.folderUri);
           const deferredNote = deferredScope ? describeDeferredChecklistCountsV1(deferredScope.counts) : "";
           if (deferredNote) {
             implementationProgress.deferredNote = deferredNote;
-          }
-          const dropNote = describeSettlementDropForTooltipV1(task.progress.lastPlanItemSettlement);
-          if (dropNote) {
-            implementationProgress.settlementDropNote = dropNote;
           }
         }
       }
@@ -2376,17 +2328,6 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
         ? { ...modelAttribution, ...(fallbackReason ? { fallbackReason } : {}) }
         : undefined;
 
-      // review2 Step 18: "Reviewed: N of M changed files" on the implementation review rows and Publish.
-      let reviewedLine: string | undefined;
-      if ((IMPL_REVIEW_STAGES.includes(stage) || stage === "publish") && status !== "outstanding") {
-        const coverageRoot = vscode.workspace.getWorkspaceFolder(task.folderUri)?.uri.fsPath;
-        const coverageSummary =
-          coverageRoot === undefined
-            ? undefined
-            : await readReviewCoverageSummaryForTreeV1(coverageRoot, task.progress).catch(() => undefined);
-        reviewedLine = coverageSummary === undefined ? undefined : describeReviewedLineV1(coverageSummary);
-      }
-
       nodes.push(
         new StageNode(
           task,
@@ -2407,8 +2348,7 @@ export class TaskTreeProvider implements vscode.TreeDataProvider<TaskTreeNode>, 
             unresolvedInteractions
           ),
           offerRunImplementationOnThisStageRow,
-          completedModelAttribution,
-          reviewedLine
+          completedModelAttribution
         )
       );
     }

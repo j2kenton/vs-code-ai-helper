@@ -5,15 +5,12 @@ import {
   createWorkflowDecisionV1,
   normalizeWorkflowDecisionV1,
   WorkflowDecisionCompletionReasonV1,
-  WorkflowDecisionAutoContinueV1,
   WorkflowDecisionDeferredAnswerV1,
-  HeldAnswerStateV1,
   WorkflowDecisionOptionV1,
   WorkflowDecisionV1,
 } from "../types/workflowDecisionV1";
 import { awaitedRestartGuidanceV1, isAwaitedWaiterLiveV1 } from "../utils/awaitedDecisionWaitersV1";
 import {
-  adaptVerifiedTicksCardToFastForwardStateV1,
   holdDispatchingOptionsWhileOperationLiveV1,
   liveOperationBlockingOptionV1,
   refreshFastForwardResumeOptionLabelsV1,
@@ -22,7 +19,6 @@ import {
   buildHeldTicksAnswerOptionsV1,
   carryDeferredAnswerOverV1,
   computeDeferredAnswerCarryOverV1,
-  offeredTickItemIdsOfV1,
   offeredTickItemsOfV1,
   type DeferredAnswerCarryOverV1,
 } from "../commands/verifiedTicksHeldOptionsV1";
@@ -33,10 +29,7 @@ import {
   viewEndedLiveReferenceV1,
 } from "../utils/liveReferenceCardV1";
 
-import type { KeepGoingRecordV1, RunBindingV1 } from "../utils/autoContinueKeepGoingV1";
-
 const STORAGE_KEY = "workflowDecisions";
-const KEEP_GOING_STORAGE_KEY_V1 = "workflowDecisionKeepGoing";
 /** The Memento key holding every decision (hostDecisionMirrorV1.ts mirrors it into viewers). */
 export const WORKFLOW_DECISIONS_STORAGE_KEY_V1 = STORAGE_KEY;
 
@@ -289,10 +282,7 @@ export class WorkflowDecisionStoreV1 {
    * lifts by itself when the operation ends.
    */
   private view(): WorkflowDecisionV1[] {
-    return this.all()
-      .map(adaptVerifiedTicksCardToFastForwardStateV1)
-      .map(holdDispatchingOptionsWhileOperationLiveV1)
-      .map(viewEndedLiveReferenceV1);
+    return this.all().map(holdDispatchingOptionsWhileOperationLiveV1).map(viewEndedLiveReferenceV1);
   }
 
   private async saveAll(decisions: readonly WorkflowDecisionV1[]): Promise<void> {
@@ -351,12 +341,7 @@ export class WorkflowDecisionStoreV1 {
       const keptAnswer = existing[keepIndex]!.deferredAnswer;
       const carryOver =
         keptAnswer !== undefined && keptAnswer.kind === "applyAndDispatch"
-          ? computeDeferredAnswerCarryOverV1(
-              keptAnswer.itemKeys,
-              keptAnswer.itemIds,
-              offeredTickItemsOfV1(created.decision),
-              offeredTickItemIdsOfV1(created.decision)
-            )
+          ? computeDeferredAnswerCarryOverV1(keptAnswer.itemKeys, offeredTickItemsOfV1(created.decision))
           : undefined;
       const carriedAnswer =
         keptAnswer !== undefined && carryOver !== undefined
@@ -536,14 +521,8 @@ export class WorkflowDecisionStoreV1 {
           "would start another action beside it. Choose it again when that ends.",
       };
     }
-    // run1 Step 28: choosing the card again is the owner's go-ahead for an answer that was waiting for them (or
-    // uncertain after a restart). That record is spent, so it is not left attached to the new resolution.
-    const spentHeld =
-      answerable.deferredAnswer?.kind === "heldOption" &&
-      (answerable.deferredAnswer.heldState === "waitingForOwner" || answerable.deferredAnswer.heldState === "uncertain");
-    const { deferredAnswer: _spentAnswer, ...answerableRest } = answerable;
     const resolved: WorkflowDecisionV1 = {
-      ...(spentHeld ? answerableRest : answerable),
+      ...answerable,
       state: "resolved",
       resolvedOptionId: optionId,
       resolvedAt: new Date().toISOString(),
@@ -561,21 +540,11 @@ export class WorkflowDecisionStoreV1 {
    * the click and the dispatch — bugs3 Step 2). Only the matching resolution
    * is undone; a decision already settled any other way is left alone.
    */
-  async reopenResolved(
-    decisionId: string,
-    optionId: string,
-    options?: { readonly keepHeldAnswer?: boolean }
-  ): Promise<boolean> {
-    return serializeDecisionWriteV1(this.state, () =>
-      this.reopenResolvedLockedV1(decisionId, optionId, options?.keepHeldAnswer === true)
-    );
+  async reopenResolved(decisionId: string, optionId: string): Promise<boolean> {
+    return serializeDecisionWriteV1(this.state, () => this.reopenResolvedLockedV1(decisionId, optionId));
   }
 
-  private async reopenResolvedLockedV1(
-    decisionId: string,
-    optionId: string,
-    keepHeldAnswer: boolean
-  ): Promise<boolean> {
+  private async reopenResolvedLockedV1(decisionId: string, optionId: string): Promise<boolean> {
     const existing = this.all();
     const index = existing.findIndex((decision) => decision.decisionId === decisionId);
     const decision = index === -1 ? undefined : existing[index]!;
@@ -583,15 +552,9 @@ export class WorkflowDecisionStoreV1 {
       return false;
     }
     // A kept answer that could not be carried out is not kept: the card is back for a fresh choice.
-    // run1 Steps 26 and 28: a held answer waiting for the owner, or one a restart left uncertain, stays on the
-    // decision as a durable record while its card is back. Nothing runs it by itself from there.
-    const { resolvedOptionId: _optionId, resolvedAt: _resolvedAt, deferredAnswer: kept, ...rest } = decision;
-    const keep =
-      keepHeldAnswer &&
-      kept?.kind === "heldOption" &&
-      (kept.heldState === "waitingForOwner" || kept.heldState === "uncertain");
+    const { resolvedOptionId: _optionId, resolvedAt: _resolvedAt, deferredAnswer: _kept, ...rest } = decision;
     const next = [...existing];
-    next[index] = { ...rest, state: "pending", ...(keep ? { deferredAnswer: kept } : {}) };
+    next[index] = { ...rest, state: "pending" };
     await this.saveAll(next);
     return true;
   }
@@ -614,85 +577,6 @@ export class WorkflowDecisionStoreV1 {
     });
   }
 
-  /**
-   * review1 Step 53: store the countdown on a pending decision (persisted, so it survives a reload). Returns false
-   * when the decision is gone or no longer pending. A countdown that was cancelled is never re-armed here: the card
-   * that replaces it arms its own.
-   */
-  async armAutoContinue(decisionId: string, autoContinue: WorkflowDecisionAutoContinueV1): Promise<boolean> {
-    return serializeDecisionWriteV1(this.state, async () => {
-      const existing = this.all();
-      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
-      const current = index === -1 ? undefined : existing[index]!;
-      if (!current || current.state !== "pending" || current.autoContinue !== undefined) {
-        return false;
-      }
-      const next = [...existing];
-      next[index] = { ...current, autoContinue };
-      await this.saveAll(next);
-      return true;
-    });
-  }
-
-  /** Marks a countdown cancelled (an answer, Wait for me, a state change). The card itself is left as it is. */
-  async cancelAutoContinue(decisionId: string, reason: string): Promise<void> {
-    await serializeDecisionWriteV1(this.state, async () => {
-      const existing = this.all();
-      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
-      const current = index === -1 ? undefined : existing[index]!;
-      if (!current?.autoContinue || current.autoContinue.cancelledAt !== undefined) {
-        return;
-      }
-      const next = [...existing];
-      next[index] = {
-        ...current,
-        autoContinue: { ...current.autoContinue, cancelledAt: new Date().toISOString(), cancelledReason: reason },
-      };
-      await this.saveAll(next);
-    });
-  }
-
-  /** review1 Step 54: the run-scoped "and keep going" answers (see autoContinueKeepGoingV1). */
-  listKeepGoing(): readonly KeepGoingRecordV1[] {
-    const raw: unknown = this.state.get<unknown>(KEEP_GOING_STORAGE_KEY_V1, []);
-    if (!Array.isArray(raw)) return [];
-    return (raw as readonly Partial<KeepGoingRecordV1>[]).filter(
-      (record): record is KeepGoingRecordV1 => typeof record?.key === "string" && typeof record?.recordedAt === "string"
-    );
-  }
-
-  async recordKeepGoing(key: string, binding: RunBindingV1): Promise<void> {
-    await serializeDecisionWriteV1(this.state, async () => {
-      const others = this.listKeepGoing().filter((record) => record.key !== key);
-      await this.state.update(
-        KEEP_GOING_STORAGE_KEY_V1,
-        [...others, { key, recordedAt: new Date().toISOString(), binding }].slice(-50)
-      );
-    });
-  }
-
-  async clearKeepGoing(key: string): Promise<void> {
-    await serializeDecisionWriteV1(this.state, async () => {
-      const all = this.listKeepGoing();
-      if (all.some((record) => record.key === key)) {
-        await this.state.update(
-          KEEP_GOING_STORAGE_KEY_V1,
-          all.filter((record) => record.key !== key)
-        );
-      }
-    });
-  }
-
-  /** Pending decisions whose countdown is armed and not cancelled, for the periodic sweep. */
-  listWithArmedAutoContinue(): readonly WorkflowDecisionV1[] {
-    return this.all().filter(
-      (decision) =>
-        decision.state === "pending" &&
-        decision.autoContinue !== undefined &&
-        decision.autoContinue.cancelledAt === undefined
-    );
-  }
-
   /** Drops a kept answer (carried out, replaced away, or the owner chose again). */
   async clearDeferredAnswer(decisionId: string, markCarriedOut = false): Promise<void> {
     await serializeDecisionWriteV1(this.state, async () => {
@@ -708,38 +592,6 @@ export class WorkflowDecisionStoreV1 {
         ? { ...rest, deferredAnswer: { ...kept, carriedOutAt: new Date().toISOString() } }
         : rest;
       await this.saveAll(next);
-    });
-  }
-
-  /**
-   * run1 Step 26: moves a held option answer from `expected` to a new state in one serialized read-and-write,
-   * so two callers racing for the swap cannot both win. Returns the answer as written, or undefined when the
-   * decision is gone, holds no held option answer, or the answer is no longer in the `expected` state.
-   */
-  async swapHeldAnswerState(
-    decisionId: string,
-    expected: HeldAnswerStateV1,
-    patch: Partial<Pick<WorkflowDecisionDeferredAnswerV1, "dispatchId" | "runNowRequestedAt" | "commandStartedAt">> & {
-      readonly heldState: HeldAnswerStateV1;
-    }
-  ): Promise<WorkflowDecisionDeferredAnswerV1 | undefined> {
-    return serializeDecisionWriteV1(this.state, async () => {
-      const existing = this.all();
-      const index = existing.findIndex((decision) => decision.decisionId === decisionId);
-      const current = index === -1 ? undefined : existing[index]!;
-      const answer = current?.deferredAnswer;
-      if (!current || !answer || answer.kind !== "heldOption" || answer.heldState !== expected) {
-        return undefined;
-      }
-      const written: WorkflowDecisionDeferredAnswerV1 = {
-        ...answer,
-        ...patch,
-        ...(patch.heldState === "ran" || patch.heldState === "dropped" ? { carriedOutAt: new Date().toISOString() } : {}),
-      };
-      const next = [...existing];
-      next[index] = { ...current, deferredAnswer: written };
-      await this.saveAll(next);
-      return written;
     });
   }
 

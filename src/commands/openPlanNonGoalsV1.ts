@@ -3,22 +3,14 @@ import * as path from "path";
 // plan-final.md's constant is (confusingly) named IMPLEMENTATION_FILENAME —
 // PLAN_FILENAME is plan.md, the pre-review draft. See taskProgress.ts's doc
 // comment on IMPLEMENTATION_FILENAME.
-import { IMPLEMENTATION_FILENAME as PLAN_FINAL_FILENAME, PLAN_FILENAME, TaskStage } from "../types/taskProgress";
-import { isBeforePlanFinalStageV1 } from "../utils/optionAppliesAtStageV1";
+import { IMPLEMENTATION_FILENAME as PLAN_FINAL_FILENAME } from "../types/taskProgress";
 import { readTextIfExists, safeOpenTextDocument } from "../utils/fileUtils";
 import { NotificationRouter } from "../utils/notificationRouter";
 
 const ACCEPTED_NON_GOALS_HEADING_RE = /^##\s+Accepted Non-Goals\s*$/m;
 
-/** The plan file to open for a card raised at `stage`: plan.md at the plan stages, plan-final.md after. */
-function planFileNameForArgV1(arg: OpenPlanNonGoalsArg): string {
-  return arg.stage !== undefined && isBeforePlanFinalStageV1(arg.stage) ? PLAN_FILENAME : PLAN_FINAL_FILENAME;
-}
-
 export interface OpenPlanNonGoalsArg {
   readonly taskFolderPath: string;
-  /** review1 Step 38: at a plan stage the plan is plan.md; plan-final.md does not exist yet. */
-  readonly stage?: TaskStage;
 }
 
 /**
@@ -34,21 +26,20 @@ export async function openPlanNonGoalsV1(arg?: OpenPlanNonGoalsArg): Promise<voi
   }
   const folderName = path.basename(arg.taskFolderPath);
   const folderUri = vscode.Uri.file(arg.taskFolderPath);
-  const planFileName = planFileNameForArgV1(arg);
-  const planUri = vscode.Uri.joinPath(folderUri, planFileName);
+  const planUri = vscode.Uri.joinPath(folderUri, PLAN_FINAL_FILENAME);
   const content = await readTextIfExists(planUri);
   if (content === undefined) {
-    NotificationRouter.showInformation(`${folderName}: ${planFileName} does not exist yet for this task.`);
+    NotificationRouter.showInformation(`${folderName}: ${PLAN_FINAL_FILENAME} does not exist yet for this task.`);
     return;
   }
-  const opened = await safeOpenTextDocument(planUri, planFileName);
+  const opened = await safeOpenTextDocument(planUri, PLAN_FINAL_FILENAME);
   if (!opened) {
     return;
   }
   const match = ACCEPTED_NON_GOALS_HEADING_RE.exec(content);
   if (!match) {
     NotificationRouter.showInformation(
-      `${folderName}: ${planFileName} has no "## Accepted Non-Goals" section yet — showing the top of the file.`
+      `${folderName}: ${PLAN_FINAL_FILENAME} has no "## Accepted Non-Goals" section yet — showing the top of the file.`
     );
     return;
   }
@@ -77,14 +68,13 @@ export async function openPlanFinalV1(arg?: OpenPlanNonGoalsArg): Promise<void> 
   }
   const folderName = path.basename(arg.taskFolderPath);
   const folderUri = vscode.Uri.file(arg.taskFolderPath);
-  const planFileName = planFileNameForArgV1(arg);
-  const planUri = vscode.Uri.joinPath(folderUri, planFileName);
+  const planUri = vscode.Uri.joinPath(folderUri, PLAN_FINAL_FILENAME);
   const content = await readTextIfExists(planUri);
   if (content === undefined) {
-    NotificationRouter.showInformation(`${folderName}: ${planFileName} does not exist yet for this task.`);
+    NotificationRouter.showInformation(`${folderName}: ${PLAN_FINAL_FILENAME} does not exist yet for this task.`);
     return;
   }
-  await safeOpenTextDocument(planUri, planFileName);
+  await safeOpenTextDocument(planUri, PLAN_FINAL_FILENAME);
 }
 
 export function registerOpenPlanNonGoalsCommand(context: vscode.ExtensionContext): void {

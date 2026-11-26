@@ -27,7 +27,6 @@ import {
   StructuredQuestionV1,
 } from "../types/structuredQuestionV1";
 import { WorkflowDecisionOptionEffectV1 } from "../types/workflowDecisionV1";
-import type { OwnerDecisionEnvelopeV1 } from "./chatOwnerDecisionV1";
 
 export { CHAT_HISTORY_FILENAME, CHAT_HISTORY_CORRUPT_FILENAME };
 export { GLOBAL_ASSISTANT_CANONICAL_ID };
@@ -322,13 +321,6 @@ export interface ChatMessage {
     reviewStage: TaskStage;
   };
   /**
-   * bugs8 item 2: owner decisions this reply proposes to record (`[[RECORD_OWNER_DECISION:<id>]]`). Nothing is
-   * written during promotion: `chatWithStage.ts` reads these back once the message is persisted, asks for
-   * confirmation, and only then writes task.md "## Owner decisions" and the plan sub-bullet. Never read a second
-   * time for the same message.
-   */
-  proposedOwnerDecisions?: OwnerDecisionEnvelopeV1[];
-  /**
    * Classifies a message for rendering (wf "make the stage chat a record of
    * work" Part 4 / item 1): `"activity"` for a dispatch-log line an
    * auto-start/redirect/drop announces (collapsed into an "Activity" group
@@ -535,16 +527,6 @@ export interface OpenPlanItemsFormItemV1 {
   /** 1-based count of this exact text among the plan's checklist items, in plan order. */
   readonly occurrence: number;
   readonly reason: string;
-  /**
-   * review1 Step 10: the item was already ticked in plan-final.md when the form was posted, but no review or owner
-   * had settled it. "Tick" on it confirms the existing tick as an owner decision and writes no plan line.
-   */
-  readonly alreadyTicked?: boolean;
-  /**
-   * review2 Step 6: the round claimed this item done but its report contradicted itself, so the claim was not used.
-   * The item is not owner work: the form words its tick as accepting the round's claim, not "I did it".
-   */
-  readonly roundClaimDropped?: boolean;
 }
 
 export type OpenPlanItemsFormStateV1 = "open" | "applied" | "stale" | "dismissed";
@@ -584,24 +566,6 @@ interface ChatDocumentV1 {
 
 
 const VALID_STAGES = new Set<string>(STAGE_ORDER);
-
-function isProposedOwnerDecisionListV1(value: unknown): value is OwnerDecisionEnvelopeV1[] {
-  if (!Array.isArray(value) || value.length === 0) return false;
-  return value.every((item) => {
-    if (item === null || typeof item !== "object") return false;
-    const entry = item as Record<string, unknown>;
-    const optionalText = (name: string): boolean => entry[name] === undefined || typeof entry[name] === "string";
-    return (
-      typeof entry.blockerId === "string" &&
-      entry.blockerId.length > 0 &&
-      typeof entry.decision === "string" &&
-      entry.decision.length > 0 &&
-      optionalText("blockerText") &&
-      optionalText("planOld") &&
-      optionalText("planNew")
-    );
-  });
-}
 const HEX128_RE = /^[0-9a-f]{32}$/;
 
 function sha256Hex(text: string): string {
@@ -911,9 +875,6 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
         return undefined;
       }
     }
-    if (e.proposedOwnerDecisions !== undefined && !isProposedOwnerDecisionListV1(e.proposedOwnerDecisions)) {
-      return undefined;
-    }
     if (e.stage === null || e.stage === undefined) {
       // A null stage snapshot is legal only on a migrated legacy recovery
       // record (plan §5.2's "Missing stage → snapshot null").
@@ -997,9 +958,6 @@ function validateMessages(raw: unknown): ChatMessage[] | undefined {
             },
           }
         : {}),
-      ...(e.proposedOwnerDecisions !== undefined
-        ? { proposedOwnerDecisions: e.proposedOwnerDecisions }
-        : {}),
       ...(e.kind !== undefined ? { kind: e.kind as "activity" | "outcome" | "decision" } : {}),
       ...(typeof e.roundId === "string" ? { roundId: e.roundId } : {}),
       ...(typeof e.intentId === "string" ? { intentId: e.intentId } : {}),
@@ -1042,16 +1000,7 @@ export function decodeOpenPlanItemsFormsV1(raw: unknown): OpenPlanItemsFormV1[] 
       ) {
         return undefined;
       }
-      if (i.alreadyTicked !== undefined && typeof i.alreadyTicked !== "boolean") return undefined;
-      if (i.roundClaimDropped !== undefined && typeof i.roundClaimDropped !== "boolean") return undefined;
-      items.push({
-        itemId: i.itemId,
-        itemText: i.itemText,
-        occurrence: i.occurrence,
-        reason: i.reason,
-        ...(i.alreadyTicked === true ? { alreadyTicked: true } : {}),
-        ...(i.roundClaimDropped === true ? { roundClaimDropped: true } : {}),
-      });
+      items.push({ itemId: i.itemId, itemText: i.itemText, occurrence: i.occurrence, reason: i.reason });
     }
     let resume: { attemptNumber: number; maxAttempts: number } | undefined;
     if (e.resumeFastForwardV1 !== undefined) {

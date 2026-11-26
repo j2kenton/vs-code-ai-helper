@@ -37,7 +37,7 @@ const ALL_SETTING_KEYS = [
   LARGE_TOKEN_REQUEST_WARNING_KEY, ENABLED_PROVIDERS_KEY,
   FAST_FORWARD_MAX_ITERATIONS_KEY, AUTO_ADVANCE_ENABLED_KEY,
   COMPLETE_AND_MOVE_ON_TRIGGERS_AI_KEY, AUTO_ADVANCE_SCORE_KEY,
-  "fastForwardStopLevel", "fastForwardUseAcceptanceThreshold", "fastForwardActOnSuggestions",
+  "fastForwardStopLevel", "fastForwardUseAcceptanceThreshold",
   "autoReviewAfterPlan", "autoReviewAfterImplementation",
   "maxImplementationIterations",
   "allowDirtyWorktreeChanges", "desktopNotifications",
@@ -502,14 +502,6 @@ export interface ResilienceSettings {
    * stdout/stderr/raw-transport bytes for this many minutes, distinct from
    * the flat RUN_TIMEOUT_MS wall clock (0 disables the watchdog). */
   inactivityTimeoutMinutes: number;
-  /** run1 Step 12: a round that is still running after this many hours is stopped as a far-off safety net. */
-  roundBackstopHours: number;
-  /** run1 Step 18: the running row warns "no activity" after this many minutes without a sign of life. */
-  noActivityWarningMinutes: number;
-  /** review1 Step 24: ask the owner after this many automatic rounds since the last progress (0 = off). */
-  askOwnerAfterRounds: number;
-  /** review1 Step 24: ask the owner after this many automatic rounds in a row that failed (0 = off). */
-  askOwnerAfterFailedRounds: number;
 }
 
 const RESILIENCE_FF_SURVIVES_ESCALATION_KEY = "resilience.fastForwardSurvivesEscalation";
@@ -522,10 +514,6 @@ const RESILIENCE_NO_PROGRESS_BREAKER_ROUNDS_KEY = "resilience.noProgressBreakerR
 const RESILIENCE_FALLBACK_PROVIDER_BREAKER_ROUNDS_KEY = "resilience.fallbackProviderBreakerRounds";
 const RESILIENCE_QUOTA_RESET_NEAR_THRESHOLD_HOURS_KEY = "resilience.quotaResetNearThresholdHours";
 const RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY = "resilience.inactivityTimeoutMinutes";
-const RESILIENCE_ROUND_BACKSTOP_HOURS_KEY = "resilience.roundBackstopHours";
-const RESILIENCE_NO_ACTIVITY_WARNING_MINUTES_KEY = "resilience.noActivityWarningMinutes";
-const RESILIENCE_ASK_OWNER_AFTER_ROUNDS_KEY = "resilience.askOwnerAfterRounds";
-const RESILIENCE_ASK_OWNER_AFTER_FAILED_ROUNDS_KEY = "resilience.askOwnerAfterFailedRounds";
 
 /**
  * Fallbacks for the `ensemble.resilience.*` flags, mirroring the defaults
@@ -570,30 +558,15 @@ export const RESILIENCE_DEFAULTS = {
   // means rerunning into the same known-broken candidate one extra round.
   fallbackProviderBreakerRounds: 2,
   quotaResetNearThresholdHours: 24,
-  // 0 = off. Shipped enabled at 15 on 2026-08-16 (judged on output bytes alone) and disabled the
-  // same day: it killed healthy rounds that had gone quiet while editing a large file. run1 Step 12
-  // turns it back on at 20, for providers that stream events only, and judged on what the round
-  // provably did (its own tool and edit events, see roundActivityFeedV1), not on bytes alone.
-  inactivityTimeoutMinutes: 20,
-  roundBackstopHours: 4,
-  noActivityWarningMinutes: 10,
-  askOwnerAfterRounds: 8,
-  askOwnerAfterFailedRounds: 3,
+  // 0 = off. Shipped enabled at 15 on 2026-08-16 and disabled the same day:
+  // it fired 6 times in one afternoon, every one killing a healthy round that
+  // had simply gone quiet while editing a 7,865-line file, and caught zero
+  // wedged processes. For scale, the 60-minute wall clock has fired 9 times in
+  // 3,320 runs. Losing a round's work is worse than losing 45 minutes, so the
+  // default is biased against firing. See the setting's description in
+  // package.json, and the note at readInactivityTimeoutMinutes.
+  inactivityTimeoutMinutes: 0,
 } as const;
-
-/**
- * review1 Step 53: minutes a safe card waits before its recommended option runs by itself (default 2, 0 = off).
- * bugs7 item 7: 2, not 15; a step that needs no judgement and can lose nothing must not stall a task. VS Code gives the
- * new default to anyone who never set the value and keeps a value someone set, so no migration is needed.
- */
-export const AUTO_CONTINUE_MINUTES_DEFAULT_V1 = 2;
-
-export function readAutoContinueMinutes(): number {
-  const value = readSetting<unknown>("decisions.autoContinueMinutes", AUTO_CONTINUE_MINUTES_DEFAULT_V1);
-  const numeric =
-    typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : AUTO_CONTINUE_MINUTES_DEFAULT_V1;
-  return Math.max(0, Math.min(1440, numeric));
-}
 
 function readResilienceRounds(key: string, fallback: number): number {
   const value = readSetting<unknown>(key, fallback);
@@ -635,18 +608,6 @@ function readInactivityTimeoutMinutes(key: string, fallback: number): number {
   const numeric =
     typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
   return Math.max(0, Math.min(180, numeric));
-}
-
-function readRoundBackstopHours(key: string, fallback: number): number {
-  const value = readSetting<unknown>(key, fallback);
-  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
-  return Math.max(1, Math.min(48, numeric));
-}
-
-function readNoActivityWarningMinutes(key: string, fallback: number): number {
-  const value = readSetting<unknown>(key, fallback);
-  const numeric = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
-  return Math.max(1, Math.min(240, numeric));
 }
 
 export function getResilienceSettings(): ResilienceSettings {
@@ -695,22 +656,6 @@ export function getResilienceSettings(): ResilienceSettings {
     inactivityTimeoutMinutes: readInactivityTimeoutMinutes(
       RESILIENCE_INACTIVITY_TIMEOUT_MINUTES_KEY,
       RESILIENCE_DEFAULTS.inactivityTimeoutMinutes
-    ),
-    roundBackstopHours: readRoundBackstopHours(
-      RESILIENCE_ROUND_BACKSTOP_HOURS_KEY,
-      RESILIENCE_DEFAULTS.roundBackstopHours
-    ),
-    noActivityWarningMinutes: readNoActivityWarningMinutes(
-      RESILIENCE_NO_ACTIVITY_WARNING_MINUTES_KEY,
-      RESILIENCE_DEFAULTS.noActivityWarningMinutes
-    ),
-    askOwnerAfterRounds: readResilienceRounds(
-      RESILIENCE_ASK_OWNER_AFTER_ROUNDS_KEY,
-      RESILIENCE_DEFAULTS.askOwnerAfterRounds
-    ),
-    askOwnerAfterFailedRounds: readResilienceRounds(
-      RESILIENCE_ASK_OWNER_AFTER_FAILED_ROUNDS_KEY,
-      RESILIENCE_DEFAULTS.askOwnerAfterFailedRounds
     ),
   };
 }
@@ -1152,14 +1097,6 @@ export function getFastForwardStopLevel(): number {
 
 export function usesAcceptanceThresholdForFastForward(): boolean {
   return readSetting(FAST_FORWARD_USE_ACCEPTANCE_KEY, false);
-}
-
-/**
- * review1 Step 16: whether Apply Review keeps acting on a review's non-blocking suggestions under Fast Forward
- * after the score meets the stop level. Default false: once the score is good enough, suggestions are left alone.
- */
-export function actsOnSuggestionsAfterStopLevelV1(): boolean {
-  return readSetting("fastForwardActOnSuggestions", false);
 }
 
 /** Mode for auto-review after AI drafts a plan. */

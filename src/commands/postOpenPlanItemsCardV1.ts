@@ -6,19 +6,13 @@ import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
 import { readTextIfExists } from "../utils/fileUtils";
 import {
   collectPlanItemReasonsV1,
-  countOpenNestedChecklistItemsV1,
-  indexPlanItemRowsV1,
-  listDroppedDoneClaimsUnderNoChangeMarkerV1,
-  listPlanItemContentHashesV1,
-  listOpenPlanItemRecordsV1,
+  describeOpenAndHandOffsV1,
+  getPlanRevisionV1,
+  listUncheckedChecklistItemTextsV1,
   normalizeChecklistItemTextV1,
-  resolveVerifiedCompleteEntryTextsV1,
 } from "../utils/implementationChecklist";
-import { computePlanItemCountsV1, describeOpenAndHandOffsFromCountsV1 } from "../utils/effectiveReviewProgress";
 import { parseReviewVerifiedCompleteV1 } from "../utils/reviewReadiness";
-import { pickLatestEditingRunFileV1 } from "../utils/openPlanItemClassificationV1";
 import { detectTestsRefusedV1 } from "../utils/testsRefusedV1";
-import { optionAppliesAtStageV1 } from "../utils/optionAppliesAtStageV1";
 import { postWorkflowDecisionV1 } from "../utils/workflowDecisionDispatchV1";
 import type { ChatTarget } from "../views/chatView";
 import { buildOpenPlanItemsNeedDecisionCardInputV1 } from "./decideOpenPlanItemsV1";
@@ -43,21 +37,13 @@ export async function postOpenPlanItemsCardV1(input: {
   readonly roundSummary?: string;
 }): Promise<{ readonly posted: boolean; readonly openItemCount: number }> {
   const { folderUri, planChecklist } = input;
-  // review1 Step 38: the open-items form acts on plan-final.md's checklist, which a plan stage does not have yet.
-  if (!optionAppliesAtStageV1("settleChecklistItem", input.stage)) {
-    return { posted: false, openItemCount: 0 };
-  }
   const target: ChatTarget = {
     canonicalId: folderUri.fsPath,
     taskFolderPath: folderUri.fsPath,
     stage: input.stage,
     taskName: input.displayName,
   };
-  // review1 Step 6: the card lists exactly what the form can settle (top-level items, the same records the form
-  // resolves); open nested sub-items are counted and explained on the card instead of listed.
-  const openItemTexts = listOpenPlanItemRecordsV1(planChecklist)
-    .filter((record) => !record.settled)
-    .map((record) => record.itemText);
+  const openItemTexts = listUncheckedChecklistItemTextsV1(planChecklist, Number.MAX_SAFE_INTEGER).items;
   const lastEditingSummary = await readTextIfExists(
     vscode.Uri.joinPath(folderUri, IMPLEMENTATION_SUMMARY_FILENAME)
   ).catch(() => undefined);
@@ -81,42 +67,22 @@ export async function postOpenPlanItemsCardV1(input: {
     const mtime = await vscode.workspace.fs.stat(reviewUri).then((stat) => stat.mtime, () => 0);
     if (!newestReview || mtime > newestReview.mtime) newestReview = { text: reviewText, mtime };
   }
-  // review1 (owner decision 2026-11-05): entries citing an issued `[item:<id>]` count as that item's own text.
-  const verifiedEntries = newestReview ? parseReviewVerifiedCompleteV1(newestReview.text).entries : [];
-  for (const verified of resolveVerifiedCompleteEntryTextsV1(planChecklist, verifiedEntries).entries) {
-    reviewVerifiedKeys.add(normalizeChecklistItemTextV1(verified.text));
+  for (const verifiedText of newestReview ? parseReviewVerifiedCompleteV1(newestReview.text).items : []) {
+    reviewVerifiedKeys.add(normalizeChecklistItemTextV1(verifiedText));
   }
   // The built signal for test-dependent items: a durable round claim for the current plan
   // revision. No claim, no "waiting for a test report".
   const builtClaimedKeys = new Set<string>();
-  // review1 Step 2: a claim counts while the item it was made for is unchanged, whatever the plan revision.
-  const claimsFor = indexPlanItemRowsV1(input.planItemEvidence ?? []);
-  for (const entry of listPlanItemContentHashesV1(planChecklist)) {
-    if (claimsFor(entry).some((row) => row.claims.length > 0)) builtClaimedKeys.add(entry.key);
+  const claimRevision = getPlanRevisionV1(planChecklist);
+  for (const entry of input.planItemEvidence ?? []) {
+    if (entry.planRevision === claimRevision && entry.claims.length > 0) builtClaimedKeys.add(entry.itemKey);
   }
-  // review2 Step 11: items the last round's report claimed done while also declaring no checklist change. They
-  // are open because the report contradicted itself, so the card says that instead of "not reached".
-  const droppedClaimKeys = new Set(
-    listDroppedDoneClaimsUnderNoChangeMarkerV1(input.roundSummary ?? lastEditingSummary ?? "", planChecklist, planChecklist)
-      .itemTexts.map((text) => normalizeChecklistItemTextV1(text))
-  );
-  const droppedClaimRunFile =
-    droppedClaimKeys.size > 0
-      ? pickLatestEditingRunFileV1(
-          (await vscode.workspace.fs.readDirectory(vscode.Uri.joinPath(folderUri, "runs")).then(
-            (entries) => entries.map(([name]) => name),
-            () => [] as string[]
-          ))
-        )
-      : undefined;
   // bugs4 Step 20: did the last editing round report its test commands refused? The newest
   // implementation summary says so; the card then points at the permission or tool setup
   // instead of recommending another round that would be refused the same way.
   const lastRoundTestsRefused = lastEditingSummary ? detectTestsRefusedV1(lastEditingSummary) : undefined;
   const allowedTestCommand = resolveAllowedTargetedTestCommandV1(input.workspaceRootFsPath);
-  const openSummary = describeOpenAndHandOffsFromCountsV1(
-    computePlanItemCountsV1({ planText: planChecklist, progress: { planItemEvidence: input.planItemEvidence } })
-  );
+  const openSummary = describeOpenAndHandOffsV1(planChecklist);
   const cardInput = buildOpenPlanItemsNeedDecisionCardInputV1({
     ...(lastRoundTestsRefused
       ? { testsRefused: lastRoundTestsRefused, ...(allowedTestCommand ? { allowedTestCommand } : {}) }
@@ -131,10 +97,7 @@ export async function postOpenPlanItemsCardV1(input: {
     })),
     reviewVerifiedKeys,
     builtClaimedKeys,
-    droppedClaimKeys,
-    ...(droppedClaimRunFile ? { droppedClaimRunFile } : {}),
     ...(openSummary ? { openSummary } : {}),
-    openNestedItems: countOpenNestedChecklistItemsV1(planChecklist),
     createdAt: new Date().toISOString(),
     // RC2 item 13, Step 52: captured NOW, at card-build time, because by the time the owner
     // answers the "Decide item by item" form the Fast Forward call stack that may have raised

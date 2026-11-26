@@ -23,8 +23,7 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { countNestedChecklistItemsV1, stripPlanItemAnnotationsV1 } from "./implementationChecklist";
-import { PARTIAL_SCOPE_ACCEPTANCE_FILE_V1 } from "./reviewPartialScopeV1";
+import { countNestedChecklistItemsV1 } from "./implementationChecklist";
 
 /**
  * `plan-final.md` is the plan of record: its substantive text (items, their
@@ -35,34 +34,7 @@ import { PARTIAL_SCOPE_ACCEPTANCE_FILE_V1 } from "./reviewPartialScopeV1";
  */
 export const PLAN_OF_RECORD_FILENAME_V1 = "plan-final.md";
 
-/**
- * review2 Step 9 (bugs6 item 31): the review's own scope is an input. The file list a review is given
- * (`implReviewFiles` in task-progress.json), the owner's partial-scope acceptance, and the task's `evidence/`
- * folder (where the review prompts tell agents to save gathered owner evidence) all change what the review should
- * say while the code tree stays exactly as it was.
- */
-export const REVIEW_SCOPE_INPUT_V1 = "implReviewFiles";
-export const REVIEW_SCOPE_ACCEPTANCE_INPUT_V1 = PARTIAL_SCOPE_ACCEPTANCE_FILE_V1;
-export const REVIEW_EVIDENCE_INPUT_V1 = "evidence/";
-
-export const REVIEW_INPUT_FILENAMES_V1: readonly string[] = [
-  "task.md",
-  "plan.md",
-  PLAN_OF_RECORD_FILENAME_V1,
-  REVIEW_SCOPE_INPUT_V1,
-  REVIEW_SCOPE_ACCEPTANCE_INPUT_V1,
-  REVIEW_EVIDENCE_INPUT_V1,
-];
-
-/** Inputs added after the first records were written: a record without one vouches for nothing about it and is not read as "changed". */
-const INPUTS_ADDED_LATER_V1: ReadonlySet<string> = new Set([
-  REVIEW_SCOPE_INPUT_V1,
-  REVIEW_SCOPE_ACCEPTANCE_INPUT_V1,
-  REVIEW_EVIDENCE_INPUT_V1,
-]);
-
-const EVIDENCE_DIGEST_MAX_FILES_V1 = 500;
-const EVIDENCE_DIGEST_MAX_DEPTH_V1 = 4;
+export const REVIEW_INPUT_FILENAMES_V1: readonly string[] = ["task.md", "plan.md", PLAN_OF_RECORD_FILENAME_V1];
 
 export const REVIEW_INPUTS_RECORD_FILENAME_V1 = "review-inputs-v1.json";
 
@@ -79,18 +51,7 @@ const LATEST_ROUND_SUMMARY_HEADING_V1 = "\n---\n\n## Latest implementation round
 export function normalizePlanOfRecordForDigestV1(text: string): string {
   const summaryAt = text.indexOf(LATEST_ROUND_SUMMARY_HEADING_V1);
   const body = summaryAt >= 0 ? text.slice(0, summaryAt) : text;
-  // review1 Step 31: Ensemble's own settle notes (`— Checked: …`, `— Excluded by you: …`, owner-decision and
-  // narrowing notes) and the exclusion marker are written when the owner ticks or excludes an item. They are not
-  // an edit to the plan's wording, so they must not make the review on record look stale (an owner tick with a
-  // note would otherwise suppress the "stage is done" card). Item lines only; the strip is per line.
-  return body
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => {
-      const item = /^(\s*(?:[-*]|\d+\.)\s+)\[[xX ]\](.*)$/.exec(line);
-      return item ? `${item[1]}[ ]${stripPlanItemAnnotationsV1(item[2] ?? "")}` : line;
-    })
-    .join("\n");
+  return body.replace(/^(\s*(?:[-*]|\d+\.)\s+)\[[xX ]\]/gm, "$1[ ]").replace(/\r\n/g, "\n");
 }
 
 /**
@@ -108,54 +69,11 @@ interface ReviewInputsRecordEntryV1 {
   readonly workspace?: ReviewWorkspaceIdentityV1;
   /** Nested plan items at dispatch (bugs4 item 39); absent on records that predate it. */
   readonly nestedItemCount?: number;
-  /** review2 Step 10: how many files the review's scope held at dispatch, so a changed scope can say "40 → 199". */
-  readonly scopeFileCount?: number;
-}
-
-async function readScopeFilesV1(taskFolderPath: string): Promise<readonly string[] | undefined> {
-  try {
-    const parsed: unknown = JSON.parse(await fs.readFile(path.join(taskFolderPath, "task-progress.json"), "utf8"));
-    const files = (parsed as { implReviewFiles?: unknown } | null)?.implReviewFiles;
-    return Array.isArray(files) ? files.filter((file): file is string => typeof file === "string") : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** File names and content hashes under the task's `evidence/` folder, in a stable order. */
-async function digestEvidenceFolderV1(taskFolderPath: string): Promise<string> {
-  const lines: string[] = [];
-  const walk = async (relative: string, depth: number): Promise<void> => {
-    const entries = await fs.readdir(path.join(taskFolderPath, relative), { withFileTypes: true });
-    for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
-      if (lines.length >= EVIDENCE_DIGEST_MAX_FILES_V1) return;
-      const child = path.posix.join(relative.replace(/\\/g, "/"), entry.name);
-      if (entry.isDirectory()) {
-        if (depth < EVIDENCE_DIGEST_MAX_DEPTH_V1) await walk(child, depth + 1);
-      } else if (entry.isFile()) {
-        const bytes = await fs.readFile(path.join(taskFolderPath, child));
-        lines.push(`${child}:${crypto.createHash("sha256").update(bytes).digest("hex")}`);
-      }
-    }
-  };
-  await walk("evidence", 0);
-  return lines.length === 0 ? ABSENT_DIGEST_V1 : crypto.createHash("sha256").update(lines.join("\n")).digest("hex");
 }
 
 type ReviewInputsRecordV1 = Readonly<Record<string, ReviewInputsRecordEntryV1>>;
 
 async function digestInputV1(taskFolderPath: string, name: string): Promise<string> {
-  if (name === REVIEW_SCOPE_INPUT_V1) {
-    const files = await readScopeFilesV1(taskFolderPath);
-    return files === undefined ? ABSENT_DIGEST_V1 : crypto.createHash("sha256").update([...files].sort().join("\n")).digest("hex");
-  }
-  if (name === REVIEW_EVIDENCE_INPUT_V1) {
-    try {
-      return await digestEvidenceFolderV1(taskFolderPath);
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === "ENOENT" ? ABSENT_DIGEST_V1 : UNREADABLE_DIGEST_V1;
-    }
-  }
   try {
     const bytes = await fs.readFile(path.join(taskFolderPath, name));
     const hashed = name === PLAN_OF_RECORD_FILENAME_V1 ? normalizePlanOfRecordForDigestV1(bytes.toString("utf8")) : bytes;
@@ -196,7 +114,6 @@ export async function recordReviewInputsV1(
     } catch {
       nestedItemCount = undefined;
     }
-    const scopeFileCount = (await readScopeFilesV1(taskFolderPath))?.length;
     const record = await readRecordV1(taskFolderPath);
     const next: ReviewInputsRecordV1 = {
       ...record,
@@ -204,7 +121,6 @@ export async function recordReviewInputsV1(
         recordedAtMs: Date.now(),
         digests,
         ...(nestedItemCount !== undefined ? { nestedItemCount } : {}),
-        ...(scopeFileCount !== undefined ? { scopeFileCount } : {}),
         ...(workspace !== undefined ? { workspace } : {}),
       },
     };
@@ -217,12 +133,7 @@ export async function recordReviewInputsV1(
 export async function reviewInputsChangedSinceV1(
   taskFolderPath: string,
   reviewArtifactPath: string
-): Promise<{
-  readonly changed: boolean;
-  readonly changedFiles: readonly string[];
-  /** review2 Step 10: set when the review's file scope changed and both counts are known ("40 → 199"). */
-  readonly scopeChange?: { readonly from: number; readonly to: number };
-}> {
+): Promise<{ readonly changed: boolean; readonly changedFiles: readonly string[] }> {
   let reviewedAtMs: number;
   try {
     reviewedAtMs = (await fs.stat(reviewArtifactPath)).mtimeMs;
@@ -245,8 +156,6 @@ export async function reviewInputsChangedSinceV1(
       // A record written before the plan of record was an input vouches for nothing about
       // it: "unknown" is not "the same", so an existing plan of record counts as changed.
       const was = recorded[name] ?? (name === PLAN_OF_RECORD_FILENAME_V1 ? "unrecorded" : undefined);
-      // An input added after this record was written: the record says nothing about it, so it is not "changed".
-      if (was === undefined && INPUTS_ADDED_LATER_V1.has(name)) continue;
       const now = await digestInputV1(taskFolderPath, name);
       if (was === "unrecorded" && now === ABSENT_DIGEST_V1) {
         continue;
@@ -275,12 +184,7 @@ export async function reviewInputsChangedSinceV1(
       }
     }
   }
-  let scopeChange: { readonly from: number; readonly to: number } | undefined;
-  if (changedFiles.includes(REVIEW_SCOPE_INPUT_V1) && typeof entry?.scopeFileCount === "number") {
-    const nowFiles = await readScopeFilesV1(taskFolderPath);
-    if (nowFiles !== undefined) scopeChange = { from: entry.scopeFileCount, to: nowFiles.length };
-  }
-  return { changed: changedFiles.length > 0, changedFiles, ...(scopeChange ? { scopeChange } : {}) };
+  return { changed: changedFiles.length > 0, changedFiles };
 }
 
 /**

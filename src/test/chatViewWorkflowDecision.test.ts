@@ -87,8 +87,6 @@ import {
 } from "../utils/chatHistoryStore";
 import * as chatHistoryStoreModule from "../utils/chatHistoryStore";
 import * as effectiveReviewProgressModule from "../utils/effectiveReviewProgress";
-import { currentRunBindingV1, keepGoingKeyV1, withKeepGoingOptionV1 } from "../utils/autoContinueKeepGoingV1";
-import { WAIT_FOR_ME_OPTION_ID_V1, withWaitForMeOptionV1 } from "../utils/autoContinueV1";
 import { StructuredAnswerV1, StructuredQuestionV1 } from "../types/structuredQuestionV1";
 import { formatDisplayTimestampPairV1 } from "../utils/timeFormat";
 import { GLOBAL_ASSISTANT_CANONICAL_ID } from "../utils/chatHistoryConstants";
@@ -795,132 +793,6 @@ void describe("Chat With AI — WorkflowDecisionV1 rendering and dispatch", () =
     }
   });
 
-  void describe("review1 Steps 53-55: the countdown and 'and keep going' through the real chat answer path", () => {
-    const SAFE_OPTION = {
-      optionId: "doIt",
-      label: "Do it",
-      consequence: "Applies the change immediately.",
-      resumeKind: "unpause" as const,
-      unattendedSafe: true,
-      effect: { kind: "command" as const, command: "ensemble.doIt", args: ["arg1"] },
-    };
-    function safeCardInput(folder: string): CreateWorkflowDecisionInputV1 {
-      return decisionInput(folder, {
-        options: withKeepGoingOptionV1(withWaitForMeOptionV1([SAFE_OPTION]), "doIt"),
-      });
-    }
-    const KEEP_GOING_KEY = (folder: string): string => keepGoingKeyV1(folder, "exampleDecision", "doIt");
-
-    void it("'and keep going' records the answer bound to the current run, and only after the answer is accepted", async () => {
-      const folder = makeFolder();
-      const provider = new ChatViewProvider(makeMemento());
-      const fake = makeFakeWebviewView();
-      const notify = installNotificationRouterCapture();
-      const cmds = installExecuteCommandCapture();
-      try {
-        await provider.workflowDecisionStore.post(safeCardInput(folder));
-        provider.resolveWebviewView(fake.view);
-        await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
-        await waitForStateMessage(fake);
-        await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt:keepGoing" });
-        const records = provider.workflowDecisionStore.listKeepGoing();
-        assert.equal(records.length, 1);
-        assert.equal(records[0]!.key, KEEP_GOING_KEY(folder));
-        assert.deepEqual(records[0]!.binding, currentRunBindingV1(folder));
-      } finally {
-        notify.restore();
-        cmds.restore();
-        provider.dispose();
-        safeRemoveDir(folder);
-      }
-    });
-
-    void it("a stale 'and keep going' answer (the card was already answered) records no permission", async () => {
-      const folder = makeFolder();
-      const provider = new ChatViewProvider(makeMemento());
-      const fake = makeFakeWebviewView();
-      const notify = installNotificationRouterCapture();
-      const cmds = installExecuteCommandCapture();
-      try {
-        await provider.workflowDecisionStore.post(safeCardInput(folder));
-        provider.resolveWebviewView(fake.view);
-        await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
-        await waitForStateMessage(fake);
-        await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
-        cmds.calls.length = 0;
-        await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt:keepGoing" });
-        assert.deepEqual(provider.workflowDecisionStore.listKeepGoing(), []);
-        assert.deepEqual(cmds.calls, [], "a refused answer must not run the option again");
-      } finally {
-        notify.restore();
-        cmds.restore();
-        provider.dispose();
-        safeRemoveDir(folder);
-      }
-    });
-
-    void it("'Wait for me' stops the countdown, runs nothing and ends keep going for that kind of card", async () => {
-      const folder = makeFolder();
-      const provider = new ChatViewProvider(makeMemento());
-      const fake = makeFakeWebviewView();
-      const notify = installNotificationRouterCapture();
-      const cmds = installExecuteCommandCapture();
-      try {
-        await provider.workflowDecisionStore.post(safeCardInput(folder));
-        await provider.workflowDecisionStore.armAutoContinue("decision-1", {
-          optionId: "doIt",
-          minutes: 15,
-          deadline: new Date(Date.now() + 15 * 60_000).toISOString(),
-        });
-        await provider.workflowDecisionStore.recordKeepGoing(KEEP_GOING_KEY(folder), currentRunBindingV1(folder));
-        provider.resolveWebviewView(fake.view);
-        await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
-        await waitForStateMessage(fake);
-        cmds.calls.length = 0;
-        await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: WAIT_FOR_ME_OPTION_ID_V1 });
-        const card = provider.workflowDecisionStore.get("decision-1");
-        assert.equal(card?.state, "pending", "the card stays open");
-        assert.ok(card?.autoContinue?.cancelledAt, "the countdown is cancelled");
-        assert.match(card?.autoContinue?.cancelledReason ?? "", /Wait for me/);
-        assert.deepEqual(provider.workflowDecisionStore.listKeepGoing(), []);
-        assert.deepEqual(cmds.calls, []);
-      } finally {
-        notify.restore();
-        cmds.restore();
-        provider.dispose();
-        safeRemoveDir(folder);
-      }
-    });
-
-    void it("answering the plain option by hand cancels nothing else but ends keep going for that kind of card", async () => {
-      const folder = makeFolder();
-      const provider = new ChatViewProvider(makeMemento());
-      const fake = makeFakeWebviewView();
-      const notify = installNotificationRouterCapture();
-      const cmds = installExecuteCommandCapture();
-      try {
-        await provider.workflowDecisionStore.post(safeCardInput(folder));
-        await provider.workflowDecisionStore.armAutoContinue("decision-1", {
-          optionId: "doIt",
-          minutes: 15,
-          deadline: new Date(Date.now() + 15 * 60_000).toISOString(),
-        });
-        await provider.workflowDecisionStore.recordKeepGoing(KEEP_GOING_KEY(folder), currentRunBindingV1(folder));
-        provider.resolveWebviewView(fake.view);
-        await provider.open({ canonicalId: folder, taskFolderPath: folder, stage: "impl" });
-        await waitForStateMessage(fake);
-        await fake.send({ type: "resolveWorkflowDecision", decisionId: "decision-1", optionId: "doIt" });
-        assert.deepEqual(provider.workflowDecisionStore.listKeepGoing(), []);
-        assert.equal(provider.workflowDecisionStore.get("decision-1")?.state, "resolved");
-      } finally {
-        notify.restore();
-        cmds.restore();
-        provider.dispose();
-        safeRemoveDir(folder);
-      }
-    });
-  });
-
   void it("a second resolve of an already-settled decision is informational, not an error, and does not re-dispatch", async () => {
     const folder = makeFolder();
     const provider = new ChatViewProvider(makeMemento());
@@ -1239,9 +1111,7 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       const entries = await storedStatusLines(folder);
       const ack = entries.find((e) => e.text.includes("Do it"));
       assert.ok(ack, "expected a stored entry acknowledging the resolved decision");
-      // bugs8 Step 6: the acknowledgement says only what is true (the choice is recorded), never that it is applying.
-      assert.match(ack.text, /^Recorded: "Do it"/);
-      assert.doesNotMatch(ack.text, /applying now/i);
+      assert.match(ack.text, /applying now/i);
     } finally {
       notify.restore();
       cmds.restore();
@@ -1591,9 +1461,8 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         ...(await storedStatusLines(folder)),
         ...((lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? []),
       ];
-      const applyingAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /^Recorded: /.test(e.text));
-      assert.ok(applyingAck, "expected the immediate 'Recorded' acknowledgement before the command resolves");
-      assert.doesNotMatch(applyingAck.text, /applying now/i, "the acknowledgement must not claim a start the command has not confirmed");
+      const applyingAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /applying now/i.test(e.text));
+      assert.ok(applyingAck, "expected the immediate 'applying now' acknowledgement before the command resolves");
       const failureAck = entries.find((e) => e.text.includes("Go to Review & Apply") && /did not complete/i.test(e.text));
       assert.ok(failureAck, "expected a follow-up acknowledgement that the command did not actually complete");
     } finally {
@@ -2029,11 +1898,10 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
       await provider.answerQuestion(target, question.id ?? question.at, "Installed UI output\nline two", "impl-high-review");
 
       assert.deepEqual(cmds.calls.map(({ id }) => id), ["vs-code-ai-helper.resumeAndRerunReview"]);
-      const [target0, options0] = cmds.calls[0]!.args as [unknown, { skipUnchangedTreeGuardV1?: boolean; onDispatchingV1?: unknown }];
-      assert.deepEqual(target0, { taskFolderPath: folder });
-      assert.equal(options0.skipUnchangedTreeGuardV1, true);
-      // review1 Step 41: the chat line "Saved; re-running …" is posted at dispatch, through this callback.
-      assert.equal(typeof options0.onDispatchingV1, "function");
+      assert.deepEqual(cmds.calls[0]!.args, [
+        { taskFolderPath: folder },
+        { skipUnchangedTreeGuardV1: true },
+      ]);
       assert.match(fs.readFileSync(path.join(folder, "task.md"), "utf8"), /Installed UI output\nline two/);
       assert.equal(provider.workflowDecisionStore.listPending().length, 0, "the superseded plateau card should be withdrawn");
     } finally {
@@ -2095,9 +1963,8 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
         "the chosen option's bound command must actually be dispatched"
       );
       const entries = await storedStatusLines(folder);
-      const ack = entries.find((e) => e.role === "assistant" && /^Recorded: /.test(e.text));
-      assert.ok(ack, "expected a 'Recorded' acknowledgement, matching the decision-card effect path");
-      assert.doesNotMatch(ack.text, /applying now/i);
+      const ack = entries.find((e) => e.role === "assistant" && /applying now/i.test(e.text));
+      assert.ok(ack, "expected an 'applying now' acknowledgement, matching the decision-card effect path");
 
       const interactions = await readChatInteractions(folder, folder);
       const settled = interactions.find((i) => i.interactionId === interactionId);
@@ -3459,10 +3326,10 @@ void describe("Chat With AI — PART 4: rendered state is derived from persisted
           `run-status plumbing ("${goneMarker}") no longer belongs in Chat With AI`
         );
       }
-      // run1 Step 20: "is it running?" is answered in Notifications only. The chat keeps one banner
-      // element, for a question waiting on the owner, and no run strip.
-      assert.equal(html.split('id="busy-indicator"').length - 1, 1, "one banner element");
-      assert.equal(html.includes("runStrip"), false, "the chat has no run strip");
+      // chat1 Step 6: "is it running?" has exactly one answer, the strip: a single element, replaced
+      // in place by `runStrip` messages and never appended to the transcript.
+      assert.equal(html.split('id="busy-indicator"').length - 1, 1, "one strip element");
+      assert.match(html, /s\.type==='runStrip'/, "progress ticks arrive as their own message");
       assert.equal(html.includes("Progress:"), false, "the webview writes no Progress line of its own");
     } finally {
       provider.dispose();
@@ -4157,11 +4024,10 @@ void describe("Chat With AI — implementation checklist percentage in the heade
       const state = lastState(fake);
       const label = String(state?.label ?? "");
       // Ticks with no reviewer verification on file read as provisional
-      // (Part 3), and review1 Step 5 makes the percentage the gate's settled count (as in the Tasks pane), so
-      // four unverified ticks read 0% with the split spelled out.
+      // (Part 3), so the percentage carries that split.
       assert.match(
         label,
-        /— 0% \(0 verified, 4 provisional\)$/,
+        /— 80% \(0 verified, 4 provisional\)$/,
         `expected the header label to end with the checklist percentage, got "${label}"`
       );
     } finally {
@@ -4647,14 +4513,20 @@ void describe("Chat With AI — RC2 item 8, Step 38: the real three-card scenari
         await waitForStateMessage(fake);
 
         const pending = provider.workflowDecisionStore.listPending(canonicalId);
-        // review1 Step 10: one checklist card per task, so the reconcile post added no second card.
-        assert.equal(pending.length, 2, "the ticks card and the plateau card are pending; no second checklist card");
+        assert.equal(pending.length, 3, "all three cards must be pending before either is answered");
         const ticksDecision = pending.find((d) => d.decisionKey === "applyReviewerVerifiedTicks");
         assert.ok(ticksDecision, "the reviewer-verified-ticks card must be pending");
-        assert.equal(pending.some((d) => d.decisionKey === "reconcilePlanChecklist"), false);
-        assert.ok(
-          ticksDecision.options.some((o) => o.optionId === "settleRest"),
-          "the one checklist card offers settling the rest item by item"
+        const reconcileDecision = pending.find((d) => d.decisionKey === "reconcilePlanChecklist");
+        assert.ok(reconcileDecision, "the reconcile card must be pending");
+
+        // Step 36: the reconcile card's duplicate option must already point
+        // at the ticks card above, before either is answered.
+        const reconcileApplyOption = reconcileDecision.options.find((o) => o.optionId === "applyVerifiedTicks");
+        assert.ok(reconcileApplyOption, "the reconcile card must offer applyVerifiedTicks");
+        assert.match(
+          reconcileApplyOption.label,
+          /Same as the reviewer-verified ticks card above/,
+          "Step 36: the duplicate option must be relabeled to point at the pending ticks card"
         );
 
         // Click Apply on the ticks card.
@@ -4676,6 +4548,31 @@ void describe("Chat With AI — RC2 item 8, Step 38: the real three-card scenari
         assert.match(finalPlan, /- \[x\] Add the retry button/);
         assert.equal(resumeCalls.length, 1, "the ticks card's Apply must dispatch resumeAndApplyCurrentStageAction once");
 
+        // Click Apply on the reconcile card's duplicate option — both items
+        // are already ticked via card 1 above, so this must report
+        // "Already done", not the generic failure line, and must not tick
+        // anything a second time or dispatch resume again.
+        await fake.send({
+          type: "resolveWorkflowDecision",
+          decisionId: reconcileDecision.decisionId,
+          optionId: "applyVerifiedTicks",
+        });
+
+        const entriesAfterReconcile =
+          (lastState(fake)?.entries as Array<{ role: string; text: string }> | undefined) ?? [];
+        const alreadyDoneAck = entriesAfterReconcile.find((e) =>
+          e.text.includes("Already done: the 2 reviewer-verified ticks are applied.")
+        );
+        assert.ok(alreadyDoneAck, "expected the structured 'Already done' message on the reconcile card's own thread");
+        assert.ok(
+          !entriesAfterReconcile.some((e) => e.text.includes("did not complete")),
+          "the duplicate Apply must never render the generic failure line"
+        );
+        assert.equal(
+          resumeCalls.length,
+          1,
+          "the already-done reconcile duplicate must not dispatch resumeAndApplyCurrentStageAction again"
+        );
       } finally {
         realFs.restore();
         workspace.restore();

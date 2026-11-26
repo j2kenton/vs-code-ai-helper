@@ -1,7 +1,5 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { installOwnerOriginCommandRegistrationV1 } from "./state/ownerCommandRegistrationV1";
-import { runWithOwnerOriginV1 } from "./state/automationDispatchContextV1";
 import { resolveEnsembleHostRoleV1, VIEWER_HOST_REFUSAL_MESSAGE_V1 } from "./state/hostRoleV1";
 import type { TaskActionOutcomeV1 } from "./types/taskActionOutcomeV1";
 import { allocateHostRelayIdV1, createHostRelayV1, HOST_RELAY_DIRNAME_V1, HostRelayRequestV1 } from "./services/hostRelayV1";
@@ -100,24 +98,11 @@ import { registerViewArtifactCommands } from "./commands/viewArtifacts";
 import { registerOpenRetainedPromptCommand } from "./commands/openRetainedPromptV1";
 import { registerOpenPlanNonGoalsCommand } from "./commands/openPlanNonGoalsV1";
 import { registerDecideOpenPlanItemsCommandV1 } from "./commands/decideOpenPlanItemsV1";
-import { observeDisplayedPlanItemCountsV1 } from "./commands/planItemSettlementNoticeV1";
-import { setPlanItemCountsObserverV1 } from "./utils/effectiveReviewProgress";
 import { registerOwnerTestRunCommandsV1 } from "./commands/ownerTestRunCardV1";
-import { registerTickEvidenceGapItemsCommandV1 } from "./commands/evidenceGapChecksV1";
-import { registerWithheldTestEvidenceCommandsV1 } from "./commands/withheldTestEvidenceCommandsV1";
-import { registerAcceptRoundTestRunsCommandV1 } from "./commands/acceptRoundTestRunsV1";
 import { registerOwnerPlanDecisionCommandV1 } from "./commands/ownerPlanDecisionCommandV1";
-import { registerAutomaticDispatchGateV1 } from "./commands/automaticDispatchGateV1";
-import { startAutoContinueSweepV1 } from "./commands/autoContinueSweepWiringV1";
 import { registerPartialScopeDecisionCommandV1 } from "./commands/partialScopeDecisionV1";
-import { registerDeclinedStepDecisionCommandV1 } from "./commands/declinedStepDecisionV1";
-import { openAiModelsV1, type OpenAiModelsResultV1 } from "./commands/openAiModelsV1";
-import { registerTurnOnFallbackAndRetryCommandV1 } from "./commands/turnOnFallbackAndRetryV1";
 import { registerEnablePublishBackupCommandV1 } from "./commands/enablePublishBackupV1";
 import { registerAcceptPlanItemNarrowingCommandV1 } from "./commands/acceptPlanItemNarrowingV1";
-import { registerRunOwnerEvidenceCommandV1 } from "./commands/runOwnerEvidenceCommandV1";
-import { registerRecordOwnerRunCommandV1 } from "./commands/recordOwnerRunCommandV1";
-import { registerRunPublishChecksNowCommandV1 } from "./commands/runPublishChecksNowV1";
 import {
   registerDraftTaskWithAICommand,
   resumeDraftInteractionV1,
@@ -134,7 +119,6 @@ import { registerRetryReviewWithBackupCommandV1 } from "./commands/retryReviewWi
 import { registerRerunReviewAfterUnchangedTreeCardCommandV1 } from "./commands/rerunReviewAfterUnchangedTreeCardV1";
 import { registerOpenAndStartNewTaskCommand } from "./commands/openAndStartNewTask";
 import { registerReviewCurrentTaskCommand } from "./commands/reviewCurrentTask";
-import { registerWidenReviewScopeCommandV1 } from "./commands/widenReviewScopeCurrentTaskV1";
 import { registerFastForwardCurrentTaskReviewCommand } from "./commands/fastForwardCurrentTaskReview";
 import { registerRecoverLastAiResponseCommand } from "./commands/recoverLastAiResponse";
 import { registerPauseTaskCommand } from "./commands/pauseTask";
@@ -149,12 +133,10 @@ import {
   rearmAcceptedTicksV1,
   registerApplyReviewerVerifiedTicksCommands,
 } from "./commands/applyReviewerVerifiedTicks";
-import { registerApplyReviewerVerifiedNarrowingsCommandV1 } from "./commands/applyReviewerVerifiedNarrowingsV1";
 import { registerPlanRevisionCommandsV1 } from "./commands/planRevisionV1";
 import { registerTaskCreationRecoveryCommands, resumeStrandedTaskDeletionsV1 } from "./commands/taskCreationRecovery";
 import { registerApplyHighLevelReviewChangesCommand } from "./commands/applyHighLevelReviewChanges";
 import { askChatChoiceV1 } from "./utils/chatChoiceV1";
-import { recordLocalEditorSaveV1 } from "./utils/localEditorSavesV1";
 import { resolveGlobalChatTargetOrDefaultV1 } from "./utils/globalChatTargetV1";
 import { registerApplyLowLevelReviewChangesCommand } from "./commands/applyLowLevelReviewChanges";
 import { registerCommitAndPushTaskCommand } from "./commands/commitAndPushTask";
@@ -220,7 +202,6 @@ import { installOperationNotificationBridge } from "./utils/operationNotificatio
 import { ENSEMBLE_NOTIFICATION_SCHEME, NotificationContentProvider } from "./utils/notificationContentProvider";
 import { ViewProgressBinder } from "./utils/viewProgressBinder";
 import { taskOperations } from "./utils/taskOperations";
-import { setOwnerCancelStoreV1 } from "./utils/ownerCancelRecordV1";
 import { readPublishChecksOutcomeV1, recoverAbandonedPublishChecksRunV1 } from "./utils/publishChecksOutcomeV1";
 import { announceInterruptedChecksRunV1 } from "./utils/interruptedChecksNoticeV1";
 import { retireFreeTextQuestionsFromEarlierActivationV1 } from "./utils/cardLifecycleV1";
@@ -305,8 +286,6 @@ class CurrentTaskDecorationProvider implements vscode.FileDecorationProvider {
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log("Ensemble is now active!");
-  // Before any command is registered: every command a person runs is an owner-origin call tree (review1 Step 24).
-  installOwnerOriginCommandRegistrationV1(vscode.commands);
   setExtensionContextV1(context);
   // The last readable major of each CLI (devpass-code 1.x vs 2.x) survives a
   // window reload, so a failed `--version` probe keeps the contract in use.
@@ -446,8 +425,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // read, or the panel and tree never learn about them (the change signal is
   // keyed by Memento identity).
   configureWorkflowDecisionStateV1(decisionsState);
-  // run1 Step 28: an owner's Cancel is kept on disk, so a held answer recovered after a restart still knows about it.
-  setOwnerCancelStoreV1(context.workspaceState);
   const chatViewProvider = new ChatViewProvider(decisionsState);
   context.subscriptions.push(chatViewProvider);
   // bugs5 Steps 2-3 / item 10: answers the owner gave while a round was running live on the
@@ -459,12 +436,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }, 3_000);
     rearmTimer.unref?.();
     context.subscriptions.push({ dispose: () => clearTimeout(rearmTimer) });
-  }
-  // review1 Step 53: a safe card's countdown ends in its recommended option running by itself. The deadline is on
-  // the decision record, so this also covers a card armed before a reload.
-  // A viewer window never runs it: the runner that owns the decisions does.
-  if (!viewerHost) {
-    context.subscriptions.push(startAutoContinueSweepV1(chatViewProvider.workflowDecisionStore, chatViewProvider));
   }
   // With no stage conversation selected, the Chat With AI panel defaults to
   // the global assistant instead of a "select a task first" blocked state.
@@ -709,7 +680,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     "vs-code-ai-helper.runLintingFixes": "Fix Linting & Code Errors",
     "vs-code-ai-helper.renameTaskWithAI": "Rename Task with AI",
     "vs-code-ai-helper.chatWithStage": "Chat reply",
-    "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1": "Review again anyway",
   };
   const RELAYED_ACTION_TIMEOUT_MS_V1 = 30 * 60 * 1000;
   const relayRoot = resolveTaskRootCandidates()[0]?.absolutePath;
@@ -877,14 +847,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       if (task === undefined) {
         return { ok: false, reason: "the runner does not know this task" };
       }
-      // A relayed answer is the owner's click on the viewer, so its claim is owner-origin.
-      const admission = await runWithOwnerOriginV1(() =>
-        acquireWorkAdmissionV1({
-          taskFolderPath: task.taskFolderPath,
-          purpose: "admission",
-          commandId: "relayResumeInteractionV1",
-        })
-      );
+      const admission = await acquireWorkAdmissionV1({
+        taskFolderPath: task.taskFolderPath,
+        purpose: "admission",
+        commandId: "relayResumeInteractionV1",
+      });
       if (admission.outcome !== "acquired") {
         return {
           ok: false,
@@ -950,17 +917,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           return runUnattendedV1(() =>
             chatViewProvider.resolveWorkflowDecisionForRelayV1(request.decisionId, request.optionId)
           );
-        }
-        if (request.kind === "heldAnswerAction") {
-          if (typeof request.decisionId !== "string" || (request.action !== "runNow" && request.action !== "drop")) {
-            throw new Error("the held-answer request is malformed");
-          }
-          const outcome =
-            request.action === "runNow"
-              ? await chatViewProvider.runHeldAnswerNowV1(request.decisionId)
-              : await chatViewProvider.dropHeldAnswerV1(request.decisionId);
-          if (!outcome.ok) throw new Error(outcome.message);
-          return undefined;
         }
         if (request.kind === "cancelOperation") {
           // A viewer's Stop button on a row it mirrors from this runner. The
@@ -1486,51 +1442,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   ));
   context.subscriptions.push(vscode.commands.registerCommand(
     "vs-code-ai-helper.openAiModels",
-    async (stage?: TaskStage): Promise<OpenAiModelsResultV1> => {
-      // bugs6 items 22 and 3: await the focus, check the view is visible (re-revealing the container when it is
-      // hidden, collapsed or never opened), and return a result the card can check.
-      const result = await openAiModelsV1(
-        {
-          focusView: () => Promise.resolve(vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus")),
-          revealContainer: () => Promise.resolve(vscode.commands.executeCommand("workbench.view.extension.ai-helper")),
-          isVisible: () => settingsViewProvider.isViewVisible(),
-          hasResolved: () => settingsViewProvider.hasResolvedView(),
-          focusStage: (target) => settingsViewProvider.focusStage(target),
-          sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-        },
-        stage
-      );
-      // The Command Palette run has no card to report to: say so in a notification.
-      if (!result.opened && stage === undefined && result.message !== undefined) {
-        NotificationRouter.showWarning(result.message);
+    (stage?: TaskStage) => {
+      void vscode.commands.executeCommand("vs-code-ai-helper.settingsView.focus");
+      if (stage) {
+        settingsViewProvider.focusStage(stage);
       }
-      return result;
     }
   ));
   registerViewArtifactCommands(context);
   registerOpenRetainedPromptCommand(context);
   registerOpenPlanNonGoalsCommand(context);
   registerDecideOpenPlanItemsCommandV1(context);
-  // review1 Step 8: a count a surface displays also refreshes the settlement snapshot (names items a plan change
-  // sent back, keeps the tooltip note current). The read itself stays pure.
-  setPlanItemCountsObserverV1((folderUri) => {
-    void observeDisplayedPlanItemCountsV1(folderUri);
-  });
-  context.subscriptions.push({ dispose: () => setPlanItemCountsObserverV1(undefined) });
   registerOwnerTestRunCommandsV1(context);
-  registerTickEvidenceGapItemsCommandV1(context);
-  registerWithheldTestEvidenceCommandsV1(context);
-  registerAcceptRoundTestRunsCommandV1(context);
   registerOwnerPlanDecisionCommandV1(context);
-  registerAutomaticDispatchGateV1(context);
   registerPartialScopeDecisionCommandV1(context);
-  registerDeclinedStepDecisionCommandV1(context);
-  registerTurnOnFallbackAndRetryCommandV1(context);
   registerEnablePublishBackupCommandV1(context);
   registerAcceptPlanItemNarrowingCommandV1(context, inventory, currentTaskStore);
-  registerRunOwnerEvidenceCommandV1(context, inventory, currentTaskStore);
-  registerRecordOwnerRunCommandV1(context, inventory, currentTaskStore, chatViewProvider);
-  registerRunPublishChecksNowCommandV1(context);
   registerHeldAdmissionMarkerCommandsV1(context);
   registerDraftTaskWithAICommand(context, inventory, chatViewProvider);
   registerApplyCurrentStageActionCommand(context, inventory, currentTaskStore);
@@ -1539,7 +1466,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerRerunReviewAfterUnchangedTreeCardCommandV1(context, chatViewProvider);
   registerOpenAndStartNewTaskCommand(context, inventory, currentTaskStore);
   registerReviewCurrentTaskCommand(context, inventory, currentTaskStore);
-  registerWidenReviewScopeCommandV1(context, inventory, currentTaskStore);
   registerFastForwardCurrentTaskReviewCommand(context, inventory, currentTaskStore);
   registerRecoverLastAiResponseCommand(context);
   registerPauseTaskCommand(context, inventory, currentTaskStore);
@@ -1551,7 +1477,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   registerHandoffChecksCommandsV1(context, inventory);
   registerSettleChecklistItemCommandV1(context, inventory, currentTaskStore);
   registerApplyReviewerVerifiedTicksCommands(context, inventory, currentTaskStore);
-  registerApplyReviewerVerifiedNarrowingsCommandV1(context);
   registerPlanRevisionCommandsV1(context, inventory, currentTaskStore);
   registerTaskCreationRecoveryCommands(context, inventory, currentTaskStore);
   registerApplyHighLevelReviewChangesCommand(context, inventory);
@@ -1687,51 +1612,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }),
     vscode.commands.registerCommand("vs-code-ai-helper.clearNotificationsSearch", () => applyNotificationsSearch(""))
   );
-  // run1 Step 11: remember saves made from an editor on this host, so a round's activity feed never
-  // counts the owner saving the round's own round-progress.md as the round being alive.
-  context.subscriptions.push(
-    vscode.workspace.onDidSaveTextDocument((document) => {
-      if (document.uri.scheme === "file") recordLocalEditorSaveV1(document.uri.fsPath);
-    })
-  );
-  // run1 Step 18: Wait on a row that warns "no activity". It hides the warning for another warning
-  // period and changes nothing else; the round is neither stopped nor extended.
-  context.subscriptions.push(vscode.commands.registerCommand(
-    "vs-code-ai-helper.waitOnOperation",
-    (node?: { id?: string }) => {
-      if (typeof node?.id === "string") statusTreeProvider.waitOnOperation(node.id);
-    }
-  ));
-  // run1 Step 30: the row's "Run it now" and "Drop it" for an owner answer held while a round runs. The
-  // runner holds the answer; a viewer window asks it through the relay, like Stop.
-  for (const action of ["runNow", "drop"] as const) {
-    context.subscriptions.push(vscode.commands.registerCommand(
-      action === "runNow" ? "vs-code-ai-helper.runHeldAnswerNow" : "vs-code-ai-helper.dropHeldAnswer",
-      async (node?: { taskName?: string; heldAnswerV1?: { decisionId?: string } }) => {
-        const decisionId = node?.heldAnswerV1?.decisionId;
-        if (typeof decisionId !== "string") return;
-        const taskName = node?.taskName;
-        try {
-          if (viewerHost) {
-            if (!hostRelay) throw new Error("this window has no connection to the runner");
-            const response = await hostRelay.send({ kind: "heldAnswerAction", decisionId, action }, { timeoutMs: 60 * 1000 });
-            if (!response.ok) throw new Error(response.reason ?? "the runner could not do that");
-            return;
-          }
-          const outcome =
-            action === "runNow"
-              ? await chatViewProvider.runHeldAnswerNowV1(decisionId)
-              : await chatViewProvider.dropHeldAnswerV1(decisionId);
-          if (!outcome.ok) throw new Error(outcome.message);
-        } catch (error) {
-          const failure = `Could not ${action === "runNow" ? "run" : "drop"} your held answer: ${error instanceof Error ? error.message : String(error)}`;
-          NotificationRouter.showWarning(
-            taskName !== undefined ? `${formatTaskNameForDisplay(taskName)} — ${failure}` : failure
-          );
-        }
-      }
-    ));
-  }
   // Inline cancel button on cancellable running-operation rows in the
   // Notifications view. Cancellation is a request: it fires the operation's
   // token (cascading to running children) and the row shows "cancelling…"
@@ -1854,11 +1734,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           ...(op.activity !== undefined ? { activity: op.activity } : {}),
           ...(op.activityStartedAt !== undefined ? { activityStartedAt: op.activityStartedAt } : {}),
           ...(op.resultTargetUri !== undefined ? { resultTargetUri: op.resultTargetUri } : {}),
-          ...(op.proofOfLifeV1 !== undefined ? { proofOfLifeV1: op.proofOfLifeV1 } : {}),
-          // run1 Step 30: the held owner answer rides on the task's root operation, so a viewer's row shows it.
-          ...(op.parentId === undefined && taskOperations.heldAnswerForTaskV1(op.key) !== undefined
-            ? { heldAnswerV1: taskOperations.heldAnswerForTaskV1(op.key) }
-            : {}),
         }));
       void writeRunnerOperationsSnapshotV1(relayDir, {
         writtenAt: Date.now(),

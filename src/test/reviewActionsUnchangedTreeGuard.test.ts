@@ -57,7 +57,6 @@ import {
   setChatInteractionTransactionStoreV1,
 } from "../services/workflowRuntimeServicesV1";
 import { safeRemoveDir } from "./testFsUtils";
-import { recordReviewInputsV1 } from "../utils/reviewInputsChangedV1";
 import { computePublishScopeId, renderPublishChecksFreshnessStamp } from "../utils/publishChecksFreshness";
 import { PUBLISH_CHECKS_FILENAME, STAGE_ARTIFACT_FILENAMES } from "../types/taskProgress";
 import { installOperationNotificationBridge } from "../utils/operationNotificationBridge";
@@ -120,9 +119,6 @@ async function makeUnchangedTreeTaskFolder(name: string): Promise<{ folderPath: 
     status: "active",
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
-    // The review's scope preflight (resolved before the unchanged-tree guard) needs a tracked change list; without
-    // one it refuses for a missing scope and the guard is never reached.
-    implReviewFiles: ["src/a.ts"],
     ownership: {
       metaRoot: path.dirname(folderPath),
       projectRoot: path.dirname(folderPath),
@@ -144,11 +140,6 @@ async function makeUnchangedTreeTaskFolder(name: string): Promise<{ folderPath: 
   // artifact itself (about to be written below) is excluded, mirroring the
   // production guard's own exclusion of its self-referential output.
   const reviewPath = path.join(folderPath, "impl-high-review.md");
-  // review1 Step 27: a review is only "unchanged" while its other inputs (task.md, plan.md, plan-final.md) are too, so
-  // the fixture records them the way a dispatched review does. The record is a file in the tree, so it is written
-  // before the fingerprint is taken, and the review after both.
-  await recordReviewInputsV1(folderPath, reviewPath);
-  await new Promise((resolve) => setTimeout(resolve, 25));
   const fingerprint =
     (await computeWorkingTreeFingerprintV1(REAL_ROOT, {
       excludeAbsolutePaths: [
@@ -592,7 +583,6 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
       assert.equal(modalCalls, 0, "no modal must ever be shown for the unchanged-tree case");
       assert.equal(askInteractionCalls.length, 1, "exactly one chat card must be posted");
       const posted = askInteractionCalls[0] as {
-        interactionId?: string;
         questions: readonly { prompt: string; options: readonly { optionId: string; label: string }[] }[];
         optionEffects?: Record<string, { kind: string; command?: string; args?: readonly unknown[] }>;
       };
@@ -602,17 +592,11 @@ void describe("runReviewForFolder — unchanged-tree guard at the command bounda
       const optionIds = question.options.map((o) => o.optionId);
       assert.deepEqual(optionIds, ["keepLastReview", "reviewAgainAnyway"]);
       assert.deepEqual(posted.optionEffects?.keepLastReview, { kind: "doNothing" });
-      const rerunEffect = posted.optionEffects?.reviewAgainAnyway;
-      assert.equal(rerunEffect?.kind, "command");
-      assert.equal(rerunEffect?.kind === "command" ? rerunEffect.command : "", "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1");
-      // bugs6 item 32: the answer carries its own key (interaction id + option) so one answer starts one review.
-      const rerunArg = (rerunEffect?.kind === "command" ? rerunEffect.args?.[0] : undefined) as
-        | { taskFolderPath: string; stage: string; answerKey: string }
-        | undefined;
-      assert.equal(rerunArg?.taskFolderPath, vscode.Uri.file(folderPath).fsPath);
-      assert.equal(rerunArg?.stage, "impl-high-review");
-      assert.match(rerunArg?.answerKey ?? "", /^[0-9a-f]{32}:reviewAgainAnyway$/);
-      assert.equal(rerunArg?.answerKey.split(":")[0], posted.interactionId);
+      assert.deepEqual(posted.optionEffects?.reviewAgainAnyway, {
+        kind: "command",
+        command: "vs-code-ai-helper.rerunReviewAfterUnchangedTreeCardV1",
+        args: [{ taskFolderPath: vscode.Uri.file(folderPath).fsPath, stage: "impl-high-review" }],
+      });
 
       assert.equal(
         modelResolutionCalled,

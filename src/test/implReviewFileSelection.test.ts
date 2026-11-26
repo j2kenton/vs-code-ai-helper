@@ -7,6 +7,7 @@ import {
   buildChangedRegionsStanzaV1,
   buildOversizedFilePagingStanzaV1,
   extractLineRangesExcerptV1,
+  IMPL_REVIEW_MAX_TOTAL_CHARS,
   IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS,
   isMachineMaintainedArtifactPathV1,
   mapSourceToTestPath,
@@ -14,11 +15,6 @@ import {
   parseUnifiedDiffHunkRangesV1,
 } from "../utils/implReviewFileSelection";
 import { MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 } from "../types/chatInteractionTransactionV1";
-import {
-  guaranteedImplReviewCodeBudgetCharsV1,
-  IMPL_REVIEW_BYTES_PER_CODE_CHAR_V1,
-  IMPL_REVIEW_INPUT_HEADROOM_BYTES_V1,
-} from "../utils/implReviewBudgetV1";
 
 // ---------------------------------------------------------------------------
 // Basic inclusion
@@ -293,18 +289,14 @@ void test("total embed cap stays anchored under the chat-transaction input snaps
   // plan.md 73,859, impl-summary.md 48,418, template 8,804 — is consistent with
   // it, and impl-summary.md grows every round, so treat this floor as still
   // rising rather than finally correct.
-  //
-  // review1 Step 59 retired the fixed constant this guard once checked. The default is now derived: the code is
-  // guaranteed the half of the limit the non-code input does not use, so the guard states that arithmetic instead of
-  // a number inferred from past rejections.
-  const guaranteed = guaranteedImplReviewCodeBudgetCharsV1();
-  const guaranteedBytes = Math.ceil(guaranteed * IMPL_REVIEW_BYTES_PER_CODE_CHAR_V1);
+  const WORST_OBSERVED_NON_CONTENT_BYTES = 225_000;
+  const ESCAPE_OVERHEAD = 1.045;
   assert.ok(
-    guaranteedBytes + MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 / 2 + IMPL_REVIEW_INPUT_HEADROOM_BYTES_V1 <=
-      MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 + 1,
-    "the default code budget plus the other half of the limit and the headroom must fit the transaction cap"
+    (IMPL_REVIEW_MAX_TOTAL_CHARS + WORST_OBSERVED_NON_CONTENT_BYTES) * ESCAPE_OVERHEAD <
+      MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1,
+    `IMPL_REVIEW_MAX_TOTAL_CHARS=${IMPL_REVIEW_MAX_TOTAL_CHARS} no longer fits inside the ` +
+      `${MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1}-byte transaction cap with the observed fixed overhead`
   );
-  assert.ok(guaranteedBytes >= MAX_INPUT_SNAPSHOT_CANONICAL_BYTES_V1 / 2 - IMPL_REVIEW_INPUT_HEADROOM_BYTES_V1 - 2);
 });
 
 // ---------------------------------------------------------------------------
@@ -383,7 +375,7 @@ void test("aggregate size: several oversized files stay well under the total bud
   const results = applyContentCapsWithPagingV1(files);
   const totalChars = results.reduce((sum, r) => sum + (typeof r.content === "string" ? r.content.length : 0), 0);
   assert.ok(
-    totalChars < guaranteedImplReviewCodeBudgetCharsV1(),
+    totalChars < IMPL_REVIEW_MAX_TOTAL_CHARS,
     "ten oversized files' stanzas together must still fit comfortably under the total pack budget"
   );
   assert.ok(

@@ -21,12 +21,11 @@ import {
 import { loadLatchingClaimsV1 } from "../utils/latchingClaimsFromRunLogV1";
 import { offerActionInChatV1 } from "../utils/chatActionOfferV1";
 import { readTextIfExists, statIfExists, writeTextFileIfUnchangedV1 } from "../utils/fileUtils";
-import { computePlanItemCountsV1 } from "../utils/effectiveReviewProgress";
 import {
+  countChecklistEvidenceProgressV1,
   describeChecklistGateGapV1,
   listUncheckedChecklistItemTextsV1,
   filterAlreadyCheckedPlanItemsV1,
-  listPlanItemIdsV1,
   normalizeChecklistItemTextV1,
   MergeChecklistProgressResultV1,
   truncateChecklistItemTextV1,
@@ -44,7 +43,6 @@ import {
 } from "../types/taskProgress";
 import { postWorkflowDecisionV1, withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { withdrawStaleOpenItemsCardV1 } from "../utils/withdrawStaleOpenItemsCardV1";
-import { appendChatMessageV1 } from "../utils/chatHistoryStore";
 import { normalizePath } from "../utils/taskRoot";
 import {
   WorkflowDecisionCommandResultV1,
@@ -53,7 +51,6 @@ import {
 } from "../types/workflowDecisionV1";
 import { WorkflowDecisionStoreV1 } from "../state/workflowDecisionStoreV1";
 import { getExtensionContextV1 } from "../utils/extensionContextV1";
-import { APPLY_TICKS_DECISION_KEY_V1, SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1 } from "./verifiedTicksHeldOptionsV1";
 import { taskOperations, TaskOperationHandle } from "../utils/taskOperations";
 import { ChatTarget } from "../views/chatView";
 import { deriveApplicableVerifiedTicksV1, writeVerifiedTicksToPlanV1 } from "./applyReviewerVerifiedTicks";
@@ -70,7 +67,6 @@ import {
   parseChecklistItemPriorityV1,
   parseChecklistItemStepNumberV1,
   areAllUnmatchedChecklistClaimsAlreadySettledV1,
-  resolveVerifiedCompleteEntryTextsV1,
 } from "../utils/implementationChecklist";
 import { ReviewBlocker } from "../utils/reviewReadiness";
 import { getFastForwardRunStateV1 } from "../utils/activeFastForwardRunsV1";
@@ -195,12 +191,6 @@ type ReconcileArg =
        * unrelated to this card or newly surfaced after it was posted.
        */
       offeredItems?: readonly string[];
-      /**
-       * review2 Step 2: the issued item id of each entry in `offeredItems` (same index; `null` for an entry the
-       * review named by its wording only). The apply scopes by these ids, never by the wording of an id-bearing
-       * item, so a card offering the first of two same-worded items can never tick the second.
-       */
-      offeredItemIds?: readonly (string | null)[];
       /** RC3 item 4, Step 3 — see {@link fastForwardResumeSuffixV1}'s doc
        * comment: captured at post time, forwarded verbatim to the final
        * `resumeAndApplyCurrentStageAction` dispatch. */
@@ -213,7 +203,6 @@ function normalizeArg(arg: ReconcileArg | undefined):
       taskFolderPath?: string;
       decisionId?: string;
       offeredItems?: readonly string[];
-      offeredItemIds?: readonly (string | null)[];
       resumeFastForwardV1?: FastForwardResumeStateV1;
     }
   | undefined {
@@ -228,7 +217,6 @@ function normalizeArg(arg: ReconcileArg | undefined):
     taskFolderPath?: string;
     decisionId?: string;
     offeredItems?: readonly string[];
-    offeredItemIds?: readonly (string | null)[];
     resumeFastForwardV1?: FastForwardResumeStateV1;
   };
   if (explicit.canonicalId || explicit.taskFolderPath) {
@@ -237,7 +225,6 @@ function normalizeArg(arg: ReconcileArg | undefined):
       taskFolderPath: explicit.taskFolderPath,
       decisionId: explicit.decisionId,
       offeredItems: explicit.offeredItems,
-      offeredItemIds: explicit.offeredItemIds,
       resumeFastForwardV1: explicit.resumeFastForwardV1,
     };
   }
@@ -323,8 +310,6 @@ async function computeReviewVerifiedCoverageV1(
   blockerSupersessions?: readonly BlockerSupersessionRecordV1[]
 ): Promise<{
   coveredItems: string[];
-  /** review2 Step 2: the issued id of each entry in `coveredItems` (same index; `null` where the review named it by wording only). */
-  coveredItemIds: (string | null)[];
   /**
    * RC2 item 8, Step 37 (implementation-review follow-up, 2026-09-28): the
    * union (deduped) of every item ANY review names verified complete that
@@ -359,7 +344,6 @@ async function computeReviewVerifiedCoverageV1(
 }> {
   const coveredKeys = new Set<string>();
   const coveredItems: string[] = [];
-  const coveredItemIds: (string | null)[] = [];
   const verifiedKeys = new Set<string>();
   const perStage: {
     stage: TaskStage;
@@ -382,20 +366,14 @@ async function computeReviewVerifiedCoverageV1(
     const verified = parseReviewVerifiedCompleteV1(content);
     const derived = await deriveApplicableVerifiedTicksV1(folderUri, stage);
     const matches = derived.kind === "ok" ? [...derived.derivation.applicable] : [];
-    const matchIds = derived.kind === "ok" ? (derived.derivation.applicableItemIds ?? []) : [];
-    matches.forEach((item, index) => {
-      // An item with an issued id is one item whatever its wording, so two same-worded items stay two; only an
-      // id-less entry (named by wording) is deduplicated by its text.
-      const itemId = matchIds[index] ?? null;
-      const key = itemId !== null ? `id:${itemId}` : normalizeChecklistItemTextV1(item);
+    for (const item of matches) {
+      const key = normalizeChecklistItemTextV1(item);
       if (!coveredKeys.has(key)) {
         coveredKeys.add(key);
         coveredItems.push(item);
-        coveredItemIds.push(itemId);
       }
-    });
-    const namedItems = resolveVerifiedCompleteEntryTextsV1(planOfRecord, verified.entries).entries.map((entry) => entry.text);
-    for (const item of filterAlreadyCheckedPlanItemsV1(planOfRecord, namedItems)) {
+    }
+    for (const item of filterAlreadyCheckedPlanItemsV1(planOfRecord, verified.items)) {
       verifiedKeys.add(normalizeChecklistItemTextV1(item));
     }
     // Review-flagged (2026-08-25, new architectural blocker): a supersession
@@ -411,7 +389,7 @@ async function computeReviewVerifiedCoverageV1(
     );
     perStage.push({ stage, readiness: readiness.label, matches, hasArtifact: true, evidence, mtimeMs: stat?.mtime });
   }
-  return { coveredItems, coveredItemIds, verifiedItemCount: verifiedKeys.size, perStage };
+  return { coveredItems, verifiedItemCount: verifiedKeys.size, perStage };
 }
 
 /**
@@ -534,8 +512,6 @@ async function gatherReconcileEvidenceV1(
    * aggregate that can disagree with what this card promised.
    */
   coveredItems: string[];
-  /** review2 Step 2: the issued id of each entry in `coveredItems` (same index), carried on the card's Apply option. */
-  coveredItemIds: (string | null)[];
   /** Item 18: newest-per-stage blocker/progress evidence, so the caller can
    * decide whether the sole outstanding item coincides with the review's
    * sole remaining (environmental) blocker without a second file read. */
@@ -591,7 +567,7 @@ async function gatherReconcileEvidenceV1(
     });
   }
 
-  const { coveredItems, coveredItemIds, perStage } = await computeReviewVerifiedCoverageV1(
+  const { coveredItems, perStage } = await computeReviewVerifiedCoverageV1(
     folderUri,
     planOfRecord,
     blockerSupersessions
@@ -642,7 +618,6 @@ async function gatherReconcileEvidenceV1(
     allUncheckedCovered,
     coveredItemsCount: coveredItems.length,
     coveredItems,
-    coveredItemIds,
     perStage: perStage.map(({ stage, hasArtifact, evidence: stageEvidence, mtimeMs }) => ({
       stage,
       hasArtifact,
@@ -1572,17 +1547,6 @@ export async function runAutomaticChecklistReconciliationV1(
  * only recommends "Mark reconciled" when that evidence covers every
  * outstanding item.
  */
-/** True when a pending decision with `decisionKey` exists for the task (workspace state; false with no context). */
-export function hasPendingChecklistCardV1(canonicalId: string, decisionKey: string): boolean {
-  const context = getExtensionContextV1();
-  if (!context) {
-    return false;
-  }
-  return new WorkflowDecisionStoreV1(context.workspaceState)
-    .listPending(canonicalId)
-    .some((d) => d.decisionKey === decisionKey);
-}
-
 export type ReconcileDecisionPostResultV1 =
   | { readonly kind: "posted" }
   | { readonly kind: "noChecklist" }
@@ -1647,11 +1611,6 @@ export async function postReconcilePlanChecklistDecisionV1(
    */
   rejectionLeadNote?: string
 ): Promise<ReconcileDecisionPostResultV1> {
-  // review1 Step 10: one checklist card per task. While the reviewer-verified ticks card is pending it is that
-  // card (apply the ticks, settle the rest item by item, not yet), so no second checklist card is posted.
-  if (hasPendingChecklistCardV1(canonicalId, APPLY_TICKS_DECISION_KEY_V1)) {
-    return { kind: "posted" };
-  }
   // bugs4 item 15: with no triggering summary in scope, the claims that set the latch
   // are read back from the latching round's run log (complete lists only), so the card
   // judges the real claims instead of "not available for this invocation".
@@ -1673,9 +1632,12 @@ export async function postReconcilePlanChecklistDecisionV1(
     return { kind: "noChecklist" };
   }
 
-  // review1 Step 5: the gate figures come from the shared counts.
-  const gateEvidence = computePlanItemCountsV1({ planText: plan.text, progress });
-  const { evidence, allUncheckedCovered, coveredItemsCount, coveredItems, coveredItemIds, perStage } = await gatherReconcileEvidenceV1(
+  const gateEvidence = countChecklistEvidenceProgressV1(
+    plan.text,
+    progress.planItemEvidence ?? [],
+    progress.planItemOwnerDecisions ?? []
+  );
+  const { evidence, allUncheckedCovered, coveredItemsCount, coveredItems, perStage } = await gatherReconcileEvidenceV1(
     folderUri,
     plan.text,
     progress.pendingImplReviewFiles,
@@ -2040,9 +2002,24 @@ export async function postReconcilePlanChecklistDecisionV1(
   // caching the plan's CONTENT into args — only the reference travels.
   const decisionId = crypto.randomUUID();
 
-  // review1 Step 10: the early return above means no reviewer-verified ticks card is pending here, so this card's
-  // own apply option is the only one and needs no "same as the card above" wording.
-  const pendingApplyTicksCardV1 = false;
+  // RC2 item 8, Step 36: when an `applyReviewerVerifiedTicks` card is
+  // already pending for this task, this card's own "applyVerifiedTicks"
+  // option offers the exact same effect under a different label — that is
+  // what let one card's Apply silently withdraw the other's plateau card
+  // while the duplicate on THIS card kept doing nothing when pressed
+  // afterward (RC1, 2026-09-26). The v1 fix (deliberately limited — merging
+  // or removing the duplicate is workflow 12's): point the label at the
+  // other card instead of restating it, while keeping this option's real,
+  // idempotent command effect untouched.
+  const pendingApplyTicksCardV1 = ((): boolean => {
+    const context = getExtensionContextV1();
+    if (!context) {
+      return false;
+    }
+    return new WorkflowDecisionStoreV1(context.workspaceState)
+      .listPending(canonicalId)
+      .some((d) => d.decisionKey === "applyReviewerVerifiedTicks");
+  })();
 
   // RC3 item 4, Step 3: captured now, at post time — see
   // `fastForwardResumeSuffixV1`'s doc comment for why this can't be
@@ -2076,7 +2053,7 @@ export async function postReconcilePlanChecklistDecisionV1(
         // bugs4 item 14: the counts are the completeness gate's own, with ticked and
         // verified apart, so this card never calls provisional ticks "settled".
         (gateEvidence
-          ? `${gateEvidence.settled}/${gateEvidence.total} items settled for the completeness gate ` +
+          ? `${gateEvidence.gate.settled}/${gateEvidence.gate.total} items settled for the completeness gate ` +
             `(${describeChecklistGateGapV1(gateEvidence)}` +
             (counted.closedWithoutDoing > 0 ? `, ${counted.closedWithoutDoing} closed without doing` : "") +
             `), with ${counted.remaining} unticked. `
@@ -2149,15 +2126,7 @@ export async function postReconcilePlanChecklistDecisionV1(
                 effect: {
                   kind: "command" as const,
                   command: "vs-code-ai-helper.applyReconciliationReviewVerifiedTicksConfirmed",
-                  args: [
-                    {
-                      taskFolderPath,
-                      canonicalId,
-                      offeredItems: coveredItems,
-                      offeredItemIds: coveredItemIds,
-                      ...ffResume.extraArgs,
-                    },
-                  ],
+                  args: [{ taskFolderPath, canonicalId, offeredItems: coveredItems, ...ffResume.extraArgs }],
                 },
               },
             ]
@@ -2191,36 +2160,6 @@ export async function postReconcilePlanChecklistDecisionV1(
                       ...ffResume.extraArgs,
                       blockerStage: soleBlockerGuidance.stage,
                       blockerDescription: soleBlockerGuidance.blocker.description,
-                    },
-                  ],
-                },
-              },
-            ]
-          : []),
-        // review1 Step 10: this is the task's one checklist card, so it offers the same item-by-item settlement as
-        // the reviewer-verified ticks card. The form reads the plan at choice time, so it carries no stale list.
-        ...(counted.remaining > 0 || (gateEvidence?.provisional ?? 0) > 0
-          ? [
-              {
-                optionId: "settleRest",
-                label: "Settle the open items one by one",
-                resumeKind: "unpause" as const,
-                consequence:
-                  "Shows a form in this chat with every plan item that is still open or ticked without a review " +
-                  "check, so you can tick, confirm or exclude each one. Nothing is changed or run until you press " +
-                  "Apply on that form.",
-                effect: {
-                  kind: "command" as const,
-                  command: SETTLE_REST_ITEM_BY_ITEM_COMMAND_V1,
-                  args: [
-                    {
-                      taskFolderPath,
-                      ...(progress.displayName ? { displayName: progress.displayName } : {}),
-                      stage: progress.currentStage,
-                      exceptItems: [] as string[],
-                      ...(ffResume.extraArgs.resumeFastForwardV1
-                        ? { resumeFastForwardV1: ffResume.extraArgs.resumeFastForwardV1 }
-                        : {}),
                     },
                   ],
                 },
@@ -2566,19 +2505,7 @@ export async function autoClearUnreliableChecklistLatchAfterReviewV1(
   }
 }
 
-/** review2 Step 2: an item the card offered by issued id that this apply did not tick, and why. */
-export interface SkippedOfferedItemV1 {
-  readonly item: string;
-  readonly itemId: string;
-  readonly reason: "alreadyTicked" | "notOpenOrVerified";
-}
-
-export type ApplyReconciliationTicksResultV1 = ApplyReconciliationTicksOutcomeV1 & {
-  /** Offered ids that were not ticked (no longer open, ticked since, or no longer verified by a review). */
-  readonly skipped?: readonly SkippedOfferedItemV1[];
-};
-
-type ApplyReconciliationTicksOutcomeV1 =
+export type ApplyReconciliationTicksResultV1 =
   | { readonly kind: "applied"; readonly count: number }
   | { readonly kind: "noCandidates" }
   /**
@@ -2644,69 +2571,28 @@ type ApplyReconciliationTicksOutcomeV1 =
  */
 export async function applyReconciliationReviewVerifiedTicksV1(
   folderUri: vscode.Uri,
-  offeredItems?: readonly string[],
-  offeredItemIds?: readonly (string | null | undefined)[]
+  offeredItems?: readonly string[]
 ): Promise<ApplyReconciliationTicksResultV1> {
   const plan = await readPlanOfRecordV1(folderUri);
   if (!plan.hasChecklist || plan.text === undefined) {
     return { kind: "noChecklist" };
   }
-  const {
-    coveredItems: coveredItemsFromReviews,
-    coveredItemIds: coveredIdsFromReviews,
-    verifiedItemCount,
-  } = await computeReviewVerifiedCoverageV1(folderUri, plan.text);
+  const { coveredItems: coveredItemsFromReviews, verifiedItemCount } = await computeReviewVerifiedCoverageV1(
+    folderUri,
+    plan.text
+  );
   // Scope to exactly what this card offered, when it offered anything — see
   // this function's doc comment for the race this closes.
-  //
-  // review2 Step 2: an offered entry that carries an issued id is matched by that id alone. Only an entry the
-  // card offered without an id (a review that named the item by wording) is matched by wording, and only against
-  // a covered item that has no id either.
-  const idsAligned =
-    offeredItems !== undefined && offeredItemIds !== undefined && offeredItemIds.length === offeredItems.length;
-  const offeredIdSet = new Set<string>();
-  const offeredTextBudget = new Map<string, number>();
-  (offeredItems ?? []).forEach((offered, index) => {
-    const offeredId = idsAligned ? offeredItemIds[index] : undefined;
-    if (offeredId) {
-      offeredIdSet.add(offeredId);
-      return;
-    }
-    const key = normalizeChecklistItemTextV1(offered);
-    offeredTextBudget.set(key, (offeredTextBudget.get(key) ?? 0) + 1);
-  });
-  const coveredItems: string[] = [];
-  const coveredItemIds: (string | null)[] = [];
-  coveredItemsFromReviews.forEach((item, index) => {
-    const itemId = coveredIdsFromReviews[index] ?? null;
-    if (offeredItems === undefined) {
-      coveredItems.push(item);
-      coveredItemIds.push(itemId);
-      return;
-    }
-    if (idsAligned && itemId !== null) {
-      if (offeredIdSet.has(itemId)) {
-        coveredItems.push(item);
-        coveredItemIds.push(itemId);
-      }
-      return;
-    }
-    const key = normalizeChecklistItemTextV1(item);
-    const left = offeredTextBudget.get(key) ?? 0;
-    if (left > 0) {
-      offeredTextBudget.set(key, left - 1);
-      coveredItems.push(item);
-      coveredItemIds.push(itemId);
-    }
-  });
-  const skipped = describeSkippedOfferedItemsV1(plan.text, offeredItems, offeredItemIds, idsAligned, coveredItemIds);
-  const skippedField = skipped.length > 0 ? { skipped } : {};
+  const offeredKeys = offeredItems ? new Set(offeredItems.map(normalizeChecklistItemTextV1)) : undefined;
+  const coveredItems = offeredKeys
+    ? coveredItemsFromReviews.filter((item) => offeredKeys.has(normalizeChecklistItemTextV1(item)))
+    : coveredItemsFromReviews;
   if (coveredItems.length === 0) {
     if (offeredItems !== undefined) {
       const stillAppliedCount = filterAlreadyCheckedPlanItemsV1(plan.text, offeredItems).length;
       return stillAppliedCount > 0
-        ? { kind: "alreadyTicked", count: stillAppliedCount, ...skippedField }
-        : { kind: "noCandidates", ...skippedField };
+        ? { kind: "alreadyTicked", count: stillAppliedCount }
+        : { kind: "noCandidates" };
     }
     return verifiedItemCount > 0
       ? { kind: "alreadyTicked", count: verifiedItemCount }
@@ -2714,7 +2600,7 @@ export async function applyReconciliationReviewVerifiedTicksV1(
   }
   let applied = 0;
   for (const stage of IMPL_REVIEW_STAGES) {
-    const derived = await deriveApplicableVerifiedTicksV1(folderUri, stage, coveredItems, coveredItemIds);
+    const derived = await deriveApplicableVerifiedTicksV1(folderUri, stage, coveredItems);
     if (derived.kind !== "ok") continue;
     const result = await writeVerifiedTicksToPlanV1(folderUri, derived.derivation);
     if (result.kind === "refused") {
@@ -2722,72 +2608,7 @@ export async function applyReconciliationReviewVerifiedTicksV1(
     }
     if (result.kind === "applied") applied += result.count;
   }
-  return applied > 0 ? { kind: "applied", count: applied, ...skippedField } : { kind: "noCandidates", ...skippedField };
-}
-
-/**
- * review2 Step 2: the offered items (by issued id) this apply will not tick, each with why: ticked since the card
- * was raised, or no longer open or no longer named verified by a review. Nothing here falls back to wording.
- */
-function describeSkippedOfferedItemsV1(
-  planText: string,
-  offeredItems: readonly string[] | undefined,
-  offeredItemIds: readonly (string | null | undefined)[] | undefined,
-  idsAligned: boolean,
-  appliedIds: readonly (string | null)[]
-): readonly SkippedOfferedItemV1[] {
-  if (offeredItems === undefined || !idsAligned || offeredItemIds === undefined) return [];
-  const applying = new Set(appliedIds.filter((id): id is string => id !== null));
-  const byId = new Map(listPlanItemIdsV1(planText).map((entry) => [entry.itemId, entry]));
-  const skipped: SkippedOfferedItemV1[] = [];
-  offeredItems.forEach((item, index) => {
-    const itemId = offeredItemIds[index];
-    if (!itemId || applying.has(itemId)) return;
-    const entry = byId.get(itemId);
-    skipped.push({ item, itemId, reason: entry !== undefined && entry.checked ? "alreadyTicked" : "notOpenOrVerified" });
-  });
-  return skipped;
-}
-
-async function postSkippedOfferedItemsChatLineV1(
-  taskFolderPath: string,
-  stage: TaskStage,
-  skippedLine: string
-): Promise<void> {
-  if (skippedLine === "") return;
-  try {
-    await appendChatMessageV1(taskFolderPath, {
-      role: "assistant",
-      text: `The card offered items this answer did not tick.${skippedLine}`,
-      stage,
-      at: new Date().toISOString(),
-    });
-  } catch {
-    // Best-effort: the notification above already says it.
-  }
-}
-
-/** The chat/notification sentence for skipped offered items, or `""`. */
-export function describeSkippedOfferedItemsLineV1(skipped: readonly SkippedOfferedItemV1[] | undefined): string {
-  if (skipped === undefined || skipped.length === 0) return "";
-  const flat = (text: string): string => {
-    const one = text.replace(/\s+/g, " ").trim();
-    return one.length > 70 ? `${one.slice(0, 69)}…` : one;
-  };
-  return (
-    " Not ticked: " +
-    skipped
-      .map(
-        (entry) =>
-          `"${flat(entry.item)}" [item:${entry.itemId}] (${
-            entry.reason === "alreadyTicked"
-              ? "already ticked"
-              : "no longer open, or no longer named verified by a review"
-          })`
-      )
-      .join(", ") +
-    "."
-  );
+  return applied > 0 ? { kind: "applied", count: applied } : { kind: "noCandidates" };
 }
 
 /**
@@ -2833,11 +2654,7 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
   let result: ApplyReconciliationTicksResultV1;
   let settled: "succeeded" | "refused" | "failed" = "failed";
   try {
-    result = await applyReconciliationReviewVerifiedTicksV1(
-      folderUri,
-      normalized?.offeredItems,
-      normalized?.offeredItemIds
-    );
+    result = await applyReconciliationReviewVerifiedTicksV1(folderUri, normalized?.offeredItems);
     settled = result.kind === "applied" || result.kind === "alreadyTicked" ? "succeeded" : "refused";
   } finally {
     endTaskAdmissionV1(admission.held, settled, settled === "refused" ? "no ticks were written" : undefined);
@@ -2862,9 +2679,7 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     // (`verifiedItemCount`) that the claimed ticks actually exist, never for
     // a task with no review coverage at all (see `noCandidates` below).
     const n = result.count;
-    const message =
-      `Already done: the ${n} reviewer-verified tick${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} applied.` +
-      describeSkippedOfferedItemsLineV1(result.skipped);
+    const message = `Already done: the ${n} reviewer-verified tick${n === 1 ? "" : "s"} ${n === 1 ? "is" : "are"} applied.`;
     NotificationRouter.showInformation(
       `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — ${message}`
     );
@@ -2875,11 +2690,9 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     // matches a real plan item — never claim "Already done" here, since
     // nothing was ever offered to apply (see `alreadyTicked` above for the
     // genuinely-already-applied case).
-    const skippedLine = describeSkippedOfferedItemsLineV1(result.skipped);
     NotificationRouter.showInformation(
-      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — No implementation review on file currently names an unticked plan item as verified complete.${skippedLine}`
+      `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — No implementation review on file currently names an unticked plan item as verified complete.`
     );
-    await postSkippedOfferedItemsChatLineV1(resolved.taskFolderPath, resolved.progress.currentStage, skippedLine);
     return;
   }
   if (result.kind === "changedUnderneath") {
@@ -2905,11 +2718,9 @@ export async function applyReconciliationReviewVerifiedTicksConfirmedV1(
     if (planAfterTicks !== undefined) await withdrawStaleOpenItemsCardV1(folderUri, planAfterTicks);
   }
   await inventory.refresh();
-  const skippedAfterApply = describeSkippedOfferedItemsLineV1(result.skipped);
   NotificationRouter.showInformation(
-    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Applied ${result.count} reviewer-verified tick(s) to plan-final.md.${skippedAfterApply}`
+    `${formatNotificationTaskLabelV1(resolved.progress.displayName, resolved.folderName)} — Applied ${result.count} reviewer-verified tick(s) to plan-final.md.`
   );
-  await postSkippedOfferedItemsChatLineV1(resolved.taskFolderPath, resolved.progress.currentStage, skippedAfterApply);
   // Part 3, Step 5 — see reconcilePlanChecklistConfirmedV1's identical note.
   // RC3 item 4, Step 3 — see that same note.
   await vscode.commands.executeCommand("vs-code-ai-helper.resumeAndApplyCurrentStageAction", {

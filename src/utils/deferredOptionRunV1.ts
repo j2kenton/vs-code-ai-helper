@@ -26,51 +26,20 @@ export interface DeferredOptionRunInputV1 {
   readonly pollMs?: number;
   /** A stuck round must not hold an answer forever. */
   readonly maxWaitMs?: number;
-  /** The waiter table this window arms in; defaults to the process-wide one. */
-  readonly registry?: DeferredRunRegistryV1;
 }
 
-/** One window's table of armed waiters. Two windows each have their own; nothing is shared between them. */
-export type DeferredRunRegistryV1 = Map<string, { cancel(): void }>;
-
-export function createDeferredRunRegistryV1(): DeferredRunRegistryV1 {
-  return new Map();
-}
-
-const defaultRegistryV1 = createDeferredRunRegistryV1();
-
-/**
- * review2 Step 13: the answers this window has already carried out and reported as run, per table.
- * A held answer's "has now run" line is written once, when it runs: a second arming of the same
- * answer (an activation re-arm, a second signal) neither runs nor reports it again.
- */
-const reportedRunKeysV1 = new WeakMap<DeferredRunRegistryV1, Set<string>>();
-
-function reportedRunKeysForV1(registry: DeferredRunRegistryV1): Set<string> {
-  let keys = reportedRunKeysV1.get(registry);
-  if (!keys) {
-    keys = new Set<string>();
-    reportedRunKeysV1.set(registry, keys);
-  }
-  return keys;
-}
-
-/** True when this window already carried out and reported the answer under `key`. */
-export function hasDeferredOptionRunReportedV1(key: string, registry: DeferredRunRegistryV1 = defaultRegistryV1): boolean {
-  return reportedRunKeysForV1(registry).has(key);
-}
+const armed = new Map<string, { cancel(): void }>();
 
 export const DEFERRED_OPTION_POLL_MS_V1 = 3_000;
 export const DEFERRED_OPTION_MAX_WAIT_MS_V1 = 6 * 60 * 60 * 1000;
 
-export function isDeferredOptionRunArmedV1(key: string, registry: DeferredRunRegistryV1 = defaultRegistryV1): boolean {
-  return registry.has(key);
+export function isDeferredOptionRunArmedV1(key: string): boolean {
+  return armed.has(key);
 }
 
 /** Returns false when this answer is already waiting (nothing new is armed). */
 export function armDeferredOptionRunV1(input: DeferredOptionRunInputV1): boolean {
-  const armed = input.registry ?? defaultRegistryV1;
-  if (armed.has(input.key) || reportedRunKeysForV1(armed).has(input.key)) {
+  if (armed.has(input.key)) {
     return false;
   }
   let settled = false;
@@ -113,9 +82,6 @@ export function armDeferredOptionRunV1(input: DeferredOptionRunInputV1): boolean
       }))
       .then((outcome) => {
         armed.delete(input.key);
-        if (outcome.kind === "done") {
-          reportedRunKeysForV1(armed).add(input.key);
-        }
         return input.report(outcome);
       });
   }
@@ -130,9 +96,25 @@ export function armDeferredOptionRunV1(input: DeferredOptionRunInputV1): boolean
   return true;
 }
 
-export function cancelDeferredOptionRunV1(key: string, registry: DeferredRunRegistryV1 = defaultRegistryV1): void {
-  registry.get(key)?.cancel();
+export function cancelDeferredOptionRunV1(key: string): void {
+  armed.get(key)?.cancel();
 }
+
+/**
+ * bugs6 item 29 (backport of run1 Step 28's dispatch rule, `decideHeldDispatchV1` in abd1aca): Pause wins
+ * over a held answer. When the round it waited for ends and the task is paused (the owner paused it, or a
+ * stop paused it), the answer does not run by itself: the card comes back and the owner chooses again.
+ */
+export type HeldDispatchVerdictV1 =
+  | { readonly kind: "dispatch" }
+  | { readonly kind: "waitForOwner"; readonly reason: "paused" };
+
+export function decideHeldDispatchV1(facts: { readonly taskStatus: string | undefined }): HeldDispatchVerdictV1 {
+  return facts.taskStatus === "paused" ? { kind: "waitForOwner", reason: "paused" } : { kind: "dispatch" };
+}
+
+/** The reason given in chat when a pause kept a held answer from running. */
+export const HELD_ANSWER_PAUSED_REASON_V1 = "the task is paused, so it did not run by itself.";
 
 /** The one chat sentence for what happened to a held answer. */
 export function describeDeferredOptionOutcomeV1(optionLabel: string, outcome: DeferredRunOutcomeV1): string {

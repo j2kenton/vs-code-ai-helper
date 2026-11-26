@@ -1265,11 +1265,9 @@ export function describeTransportFaultClassV1(evidence: string | undefined): str
   const code = /^[A-Za-z0-9_.]+/.exec(evidence)?.[0] ?? "";
   switch (code) {
     case "cliRunTimeout":
-      return "Ensemble stopped the round at its own time limit (the wall-clock time limit)";
+      return "the round was stopped by its wall-clock time limit";
     case "cliRunInactivityTimeout":
-      return "Ensemble stopped the round because the model had not replied for too long (the inactivity watchdog)";
-    case "cliRunRepeatStop":
-      return "Ensemble stopped the round because the model kept repeating itself";
+      return "the round was stopped by the inactivity watchdog (no output for too long)";
     case "copilotRequestTimedOut":
     case "copilotModelSelectionTimedOut":
       return "Copilot did not finish within its time limit";

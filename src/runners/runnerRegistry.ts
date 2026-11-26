@@ -23,7 +23,6 @@ import {
   cliProviderSupportsV1StdoutCapture,
   ConfiguredCheckCommandV1,
   createCliTextTransportV1,
-  isCliTextModeGuaranteedReadOnlyV1,
   isCliTextModeSummaryOnlyCapableV1,
   runImplementationWithCli,
 } from "./cliAgentRunner";
@@ -71,12 +70,6 @@ import {
   describeMidRoundOutcomeV1,
   type BackupAttemptRecordV1,
 } from "../utils/stopBehaviourV1";
-import {
-  classifyRoundStopV1,
-  describeStopLeadV1,
-  type RoundStopCauseV1,
-  type RoundStopKindV1,
-} from "../utils/roundStopCauseV1";
 import {
   authFailureRescueNoteV1,
   crossProviderAuthCandidatesV1,
@@ -150,31 +143,6 @@ type EffectiveProvider =
  * additionally opens the AI Models view; this one is the last line of
  * defense for paths that never went through a guarded command entry point.
  */
-/** run1 Step 5: the named cause of a failed implementation result (see roundStopCauseV1). */
-function stopCauseOfImplementationResultV1(result: {
-  readonly failureKind?: "quota" | "temporarily-unavailable" | "model-entitlement" | "payment-required" | "generic";
-  readonly errorMessage?: string;
-  readonly authFailure?: boolean;
-  readonly providerCapacity?: boolean;
-  readonly timeoutReason?: "wall-clock" | "inactivity";
-  readonly timedOut?: boolean;
-  readonly providerTimeCapV1?: boolean;
-  /** The cause the runner's one settlement recorded; it is read, not re-derived from the text. */
-  readonly stopCauseV1?: RoundStopKindV1;
-}): RoundStopCauseV1 {
-  return classifyRoundStopV1({
-    status: "failed",
-    ...(result.stopCauseV1 ? { recordedCause: result.stopCauseV1 } : {}),
-    ...(result.failureKind ? { failureKind: result.failureKind } : {}),
-    ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
-    ...(result.authFailure === true ? { authFailure: true } : {}),
-    ...(result.providerCapacity === true ? { providerCapacity: true } : {}),
-    ...(result.timeoutReason ? { timeoutReason: result.timeoutReason } : {}),
-    ...(result.timedOut === true ? { timedOut: true } : {}),
-    ...(result.providerTimeCapV1 === true ? { providerTimeCap: true } : {}),
-  });
-}
-
 function isModelProviderDisabled(modelId: string | undefined): boolean {
   // Copilot is not exempt: isProviderEnabled treats it as enabled unless the
   // user explicitly disables it in Provider Selection.
@@ -1546,17 +1514,12 @@ export async function runImplementationForModel(options: {
             ? { failure: { modelId: options.modelId, ...(result.errorMessage ? { reason: result.errorMessage } : {}) } }
             : {}
         );
-        // run1 Step 5: "usage limit" only when the provider's own output said so; any other
-        // cause (its own turn cap, Ensemble's time limit, a plain failure) keeps its own name.
-        const rescueCause = stopCauseOfImplementationResultV1(result);
         const rescueNote = authFailure
           ? authFailureRescueNoteV1(primaryProviderLabel, result.errorMessage, labelForBackup(backupModel))
           : (result.providerCapacity === true
               ? `${primaryProviderLabel}: the model was at capacity (a temporary overload at OpenAI)`
-              : describeStopLeadV1(rescueCause, primaryProviderLabel)) +
-            (result.errorMessage && (result.providerCapacity === true || rescueCause.kind === "providerUsageLimit" || rescueCause.kind === "providerQuota" || rescueCause.kind === "providerPayment")
-              ? ` (${result.errorMessage})`
-              : "") +
+              : `${primaryProviderLabel} hit a usage limit`) +
+            (result.errorMessage ? ` (${result.errorMessage})` : "") +
             `; this round ran on ${labelForBackup(backupModel)}.`;
         // An earlier backup's own sign-in failure is part of the story too (bugs4 item 28).
         const rescueNoteWithBackupAuth =
@@ -1713,12 +1676,10 @@ export async function runImplementationForModel(options: {
           : result.failureKind === "payment-required"
             ? `an HTTP 402 payment requirement for ${options.modelId ?? "the configured model"} (add credits or choose a free model)`
           : result.timeoutReason === "inactivity"
-            ? "Ensemble's own inactivity stop (no output for too long)"
+            ? "the inactivity watchdog (no output for too long)"
             : result.timeoutReason === "wall-clock" || result.timedOut === true
-              ? "Ensemble's own time limit for a round"
-              : result.providerTimeCapV1 === true
-                ? "the provider's own time cap on a single turn"
-                : "the provider being temporarily unavailable";
+              ? "the wall-clock time limit"
+              : "the provider being temporarily unavailable";
     // Part 15 / item 7b: resolve (never dispatch) the first enabled backup
     // that is currently available, applying the SAME skip rules the clean-
     // tree cascade loop above applies (recent zero-file breaker, cross-
@@ -2239,7 +2200,6 @@ export async function runImplementationForModel(options: {
         : backupRecords.length > 0
           ? describeMidRoundOutcomeV1(primaryProviderLabel, result.errorMessage, {
               kind: "backupsExhausted",
-              cause: stopCauseOfImplementationResultV1(result),
               ...(result.providerCapacity === true ? { capacity: true } : {}),
               backups: backupRecords.map((record) =>
                 record.label === stagePrimaryLabelV1 ? { ...record, isPrimary: true } : record
@@ -2512,19 +2472,10 @@ export function openV1RunnerSelection(options: {
    * of ever reserving an unqualified provider under a summary-only mandate.
    */
   requireSummaryOnlyCapableText?: boolean;
-  /**
-   * `text` mode only (review1 Step 49): reject every candidate whose text mode does not vendor-enforce read-only
-   * (`isCliTextModeGuaranteedReadOnlyV1`: Claude plan mode, Codex read-only sandbox, ...), but, unlike
-   * `requireSummaryOnlyCapableText`, accept one that repurposes an interactive flow, because the caller reads the
-   * answer as free text. Used by the diagnostic round, which must not be able to edit the shared working tree. A
-   * rejected candidate is an explicit settled attempt, so the ranked selection moves on to the next model in the
-   * chain that can enforce it, and settles `providerModeUnavailable` when none can.
-   */
-  requireReadOnlyText?: boolean;
   /** Do not fall back to another configured model for a same-model report correction. */
   restrictToPrimaryModel?: boolean;
 }): V1RunnerSelectionV1 {
-  const { session, mode, workspaceCwd, requireSummaryOnlyCapableText = false, requireReadOnlyText = false } = options;
+  const { session, mode, workspaceCwd, requireSummaryOnlyCapableText = false } = options;
 
   type RankedEntryV1 =
     | { readonly supported: true; readonly candidate: V1CandidateV1 }
@@ -2594,8 +2545,7 @@ export function openV1RunnerSelection(options: {
     if (
       mode !== "text" ||
       !cliProviderSupportsV1StdoutCapture(effective.def) ||
-      (requireSummaryOnlyCapableText && !isCliTextModeSummaryOnlyCapableV1(effective.def)) ||
-      (requireReadOnlyText && !isCliTextModeGuaranteedReadOnlyV1(effective.def))
+      (requireSummaryOnlyCapableText && !isCliTextModeSummaryOnlyCapableV1(effective.def))
     ) {
       // CLI providers are unsupported for preflight/edit (plan product
       // decisions), and a last-message-file CLI cannot satisfy AC-RUNNER-02
@@ -2798,8 +2748,6 @@ export function createV1RunnerSelectionOpener(options: {
   };
   /** Forwarded verbatim to every `openV1RunnerSelection` call — see its doc comment. */
   requireSummaryOnlyCapableText?: boolean;
-  /** Forwarded verbatim to every `openV1RunnerSelection` call — see its doc comment. */
-  requireReadOnlyText?: boolean;
   /** Do not use a backup candidate; used when correction must use the original model. */
   restrictToPrimaryModel?: boolean;
 }): (request: {
@@ -2816,7 +2764,6 @@ export function createV1RunnerSelectionOpener(options: {
       stage: resolved.stage,
       workspaceCwd: options.workspaceCwd,
       requireSummaryOnlyCapableText: options.requireSummaryOnlyCapableText,
-      requireReadOnlyText: options.requireReadOnlyText,
       restrictToPrimaryModel: options.restrictToPrimaryModel,
     });
   };

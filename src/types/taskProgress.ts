@@ -458,21 +458,6 @@ export interface TaskProgress {
   /** Test runs the owner recorded by hand, as test evidence with owner provenance (bugs4 item 21). */
   planItemOwnerTestRuns?: PlanItemOwnerTestRunV1[];
   /**
-   * review1 Step 8: a bounded snapshot of which plan items were settled at the last count, by content hash, so a
-   * later count can name the items a plan change sent back to the review. Additive and optional.
-   */
-  lastPlanItemSettlement?: PlanItemSettlementSnapshotV1;
-  /**
-   * review1 Step 21: each rejection of a round's report under the summary contract, by kind, so a violation that
-   * repeats is counted, shown in the next round's prompt, and surfaced to the owner. Bounded; additive and optional.
-   */
-  reportContractRejections?: ReportContractRejectionV1[];
-  /**
-   * review1 Step 23: the one measure of "is this task moving?" that the gate in front of every automatic dispatch
-   * reads (`taskProgressWatchV1.ts`). Additive and optional.
-   */
-  progressWatch?: ProgressWatchV1;
-  /**
    * Durable record of a round that tried to add, remove, or renumber a
    * checklist item in `plan-final.md` (wf "make the stage chat a record of
    * work" Part 6 / item 5): "a round never mutates the checklist" is a
@@ -744,45 +729,6 @@ export interface TaskProgress {
    * keep counting up across visits, not restart at each one.
    */
   stageReviewPasses?: Partial<Record<TaskStage, number>>;
-  /**
-   * run1 Step 25 (additive): other tasks' `task.md` edits already said once on one of THIS task's round
-   * end lines, each as `<task folder name>:<sha256 of the content>`. Later end lines skip them, so an
-   * owner edit is noted once per task and content, across reloads. Bounded to the latest 100.
-   */
-  notedForeignEdits?: string[];
-  /**
-   * run1 Step 31 (additive): when the OWNER paused the task (ISO time). Written by Pause in whichever
-   * window took the click, so the runner that owns a Fast Forward run can say "stopped because you
-   * paused the task" even when the click came from a viewer window. Retired by any move away from
-   * `paused`; an escalation's own pause never sets it.
-   */
-  ownerPausedAt?: string;
-  /**
-   * review2 Step 17 (additive): which changed files a review has read in full, and at which content. See
-   * `ReviewCoverageV1`. Preserved by every stage transition: a stage change does not unread a file.
-   */
-  reviewCoverage?: ReviewCoverageV1;
-}
-
-/** The content hash one review read a file at (review2 Step 17). */
-export interface ReviewCoverageEntryV1 {
-  /** Hash of the file's content when the review ended. */
-  hash: string;
-  /** The review run that read it (the review's attempt id). */
-  runId: string;
-  stage: TaskStage;
-}
-
-/**
- * review2 Step 17: the per-task review coverage record. `files` holds, for each changed file, the hash it had when
- * a review last read it in full (a file the reviewer declared it did not inspect is never entered). A file whose
- * current hash differs from its recorded hash counts as unreviewed again. `changedFiles` is the change set the last
- * review ran against, so "N of M" can be shown without recomputing the diff.
- */
-export interface ReviewCoverageV1 {
-  files: Record<string, ReviewCoverageEntryV1>;
-  changedFiles: string[];
-  updatedAt: string;
 }
 
 /**
@@ -1471,28 +1417,9 @@ export const MAX_PLAN_ITEM_EVIDENCE_ENTRIES = 1000;
 
 /** Durable provenance attached to one canonical checklist item and plan revision. */
 export interface PlanItemEvidenceV1 {
-  /** The plan revision the row was recorded at: a record only (review1 Step 2). */
   readonly planRevision: string;
   readonly itemKey: string;
   readonly itemText: string;
-  /**
-   * review1 Step 2: `computePlanItemContentHashV1` of the item (its text and nested children, without checkbox
-   * state or Ensemble's annotations) when the row was recorded. The row applies while the item's hash is
-   * unchanged. Absent on rows recorded before this field existed (those match by `itemKey`).
-   */
-  readonly itemContentHash?: string;
-  /**
-   * review1 Step 2: which copy (1-based, in plan order) of identical items the row was recorded for. Absent on
-   * rows recorded before this field existed, which apply to every copy.
-   */
-  readonly itemOccurrence?: number;
-  /**
-   * review1 (review fix): whether the row was recorded for a nested child (`true`) or a top-level item (`false`).
-   * A top-level leaf and an identically worded child hash alike, so without it a verification of one would settle
-   * the other. Absent on rows recorded before this field existed; those apply to top-level items (and to a child
-   * only when no top-level item shares its wording).
-   */
-  readonly itemNested?: boolean;
   readonly claims: readonly PlanItemClaimEvidenceV1[];
   readonly verifications?: readonly PlanItemReviewerVerificationV1[];
   readonly testReports?: readonly PlanItemTestReportV1[];
@@ -1516,124 +1443,9 @@ export interface PlanItemOwnerDecisionV1 {
   readonly source: "owner";
   readonly at: string;
   readonly formId: string;
-  /** `reword` is Ensemble's own item-scoped rewording (review1 Step 4); it settles nothing. */
-  readonly decision: "tick" | "exclude" | "reword";
-  /** review1 Step 2: the item's content hash when the decision was recorded. */
-  readonly itemContentHash?: string;
-  /** review1 Step 2: which copy of identical items the decision was recorded for (absent: every copy). */
-  readonly itemOccurrence?: number;
-  /** review1 (review fix): whether the decision was recorded for a nested child (`true`) or a top-level item. */
-  readonly itemNested?: boolean;
-  /**
-   * review2 Step 3: the issued id (`[item:<id>]`) of the item the owner decided, when the card or form that took the
-   * decision offered one. `itemText` is the item's own text with Ensemble's display annotations removed.
-   */
-  readonly itemId?: string;
+  readonly decision: "tick" | "exclude";
 }
 export const MAX_PLAN_ITEM_OWNER_DECISIONS = 1000;
-
-/** review1 Step 21: one rejected report (`TaskProgress.reportContractRejections`). */
-export interface ReportContractRejectionV1 {
-  readonly at: string;
-  readonly kind:
-    | "no-summary"
-    | "checkbox-files-changed"
-    | "empty-files-changed"
-    | "empty-verification"
-    | "missing-files-changed"
-    | "missing-verification"
-    | "checklist-claim"
-    | "other";
-  /** The gate's reason, bounded. */
-  readonly reason: string;
-  readonly roundId?: string;
-  readonly stage?: TaskStage;
-}
-export const REPORT_CONTRACT_REJECTION_KINDS_V1 = [
-  "no-summary",
-  "checkbox-files-changed",
-  "empty-files-changed",
-  "empty-verification",
-  "missing-files-changed",
-  "missing-verification",
-  "checklist-claim",
-  "other",
-] as const;
-
-/** How an automatic or manual round ended, for the "This isn't moving" card (review1 Step 23). */
-export type ProgressWatchEndingKindV1 =
-  | "completed"
-  | "cut-off"
-  | "quota"
-  | "provider-error"
-  | "refused"
-  | "rejected"
-  | "cancelled"
-  | "dropped"
-  | "other";
-export const PROGRESS_WATCH_ENDING_KINDS_V1: readonly ProgressWatchEndingKindV1[] = [
-  "completed", "cut-off", "quota", "provider-error", "refused", "rejected", "cancelled", "dropped", "other",
-];
-
-/** One round ending kept in {@link ProgressWatchV1.endings}. */
-export interface ProgressWatchEndingV1 {
-  readonly at: string;
-  readonly kind: ProgressWatchEndingKindV1;
-  /** True when automation (not the owner) started the round. */
-  readonly automatic: boolean;
-  readonly roundId?: string;
-  readonly stage?: TaskStage;
-  /** The stored model id the round ran with, when known. */
-  readonly model?: string;
-  /** ISO instant a quota failure said it resets, when the failure text carried one. */
-  readonly quotaResetAt?: string;
-  /** run1 Step 15: the cause the round's one settlement recorded (a `RoundStopKindV1`), when it recorded one. */
-  readonly stopCause?: string;
-  /** run1 Step 15: how many files the round's own stream shows it changed (never files it could not prove). */
-  readonly attributedFileCount?: number;
-}
-
-/** `TaskProgress.progressWatch` (review1 Step 23). */
-export interface ProgressWatchV1 {
-  /** ISO time of the last sign of progress (or of the first round watched, when nothing has moved yet). */
-  readonly lastProgressAt: string;
-  /** What moved last, in plain words ("plan items settled: 114", "the owner answered a card"). */
-  readonly lastProgressWhat: string;
-  /** Automatic rounds that ended since `lastProgressAt`. */
-  readonly autoRoundsSinceProgress: number;
-  /** Automatic rounds in a row, ending now, that failed, were refused or were cut off. */
-  readonly consecutiveFailedAutoRounds: number;
-  /** The most recent round endings since the last progress, oldest first; bounded. */
-  readonly endings: readonly ProgressWatchEndingV1[];
-  /** The best of each signal seen so far: only beating it counts as progress. */
-  readonly best?: { readonly score?: number; readonly settled?: number; readonly taskFixable?: number };
-  /** The stage `best` was measured on: a score is only compared with earlier scores of the same stage. */
-  readonly bestStage?: TaskStage;
-  /** `at` of the newest review-history entry already compared, so a review is counted once. */
-  readonly signalsSeenAt?: string;
-  /** Set when the gate tripped: all automatic dispatch for the task is refused until the owner answers. */
-  readonly heldAt?: string;
-  readonly heldFor?: "rounds" | "failed";
-}
-export const MAX_PROGRESS_WATCH_ENDINGS_V1 = 40;
-
-/** review1 Step 8: one plan item in a {@link PlanItemSettlementSnapshotV1}. */
-export interface PlanItemSettlementEntryV1 {
-  /** The item's content hash (`computePlanItemContentHashV1`). */
-  readonly hash: string;
-  readonly settled: boolean;
-  /** A short label for chat lines and tooltips (`Step 12`, else the item's first words). */
-  readonly label: string;
-}
-
-/** review1 Step 8: the plan items' settlement at the last count, and the items the latest plan change sent back. */
-export interface PlanItemSettlementSnapshotV1 {
-  readonly at: string;
-  readonly items: readonly PlanItemSettlementEntryV1[];
-  /** Items that lost their settlement at the most recent count that found any, for the Tasks pane tooltip. */
-  readonly lost?: { readonly at: string; readonly labels: readonly string[] };
-}
-export const MAX_PLAN_ITEM_SETTLEMENT_SNAPSHOT_ITEMS_V1 = 400;
 
 /**
  * bugs4 item 21 / Step 19: a test run the owner ran by hand (a Docker drill, a full suite) and
@@ -1652,13 +1464,6 @@ export interface PlanItemOwnerTestRunV1 {
   readonly summary: string;
   /** Normalized keys of the plan items this run covers. */
   readonly itemKeys: readonly string[];
-  /** review1 Step 2: each covered item's content hash (by key) when the run was recorded. */
-  readonly itemContentHashes?: Readonly<Record<string, string>>;
-  /**
-   * review1 Step 2: which copy (1-based, among identical top-level items) each covered item was when the run was
-   * recorded. A run that names an occurrence covers that copy only; a run without one covers every copy.
-   */
-  readonly itemOccurrences?: Readonly<Record<string, number>>;
 }
 export const MAX_PLAN_ITEM_OWNER_TEST_RUNS = 200;
 /** Bound on `checklistProgressUnreliableClaims`; a longer latching list is not stored (it would be partial). */
@@ -1694,14 +1499,6 @@ export interface PlanItemTestReportV1 {
   readonly sourceFileStates?: readonly { readonly path: string; readonly sha256: string }[];
   /** If true, later edits conservatively invalidate this report. */
   readonly sourceFilesTruncated?: boolean;
-  /**
-   * review1 Step 15: SHA-256 of the report's test files, of the files those test files import directly, and of
-   * the project's test-run config files (package.json, lockfile, tsconfig*.json, runner config). When present the
-   * report stays valid in later rounds while all of these are unchanged, whatever other files were edited.
-   */
-  readonly testDependencyStates?: readonly { readonly path: string; readonly sha256: string }[];
-  /** review1 Step 34: where the report came from; absent means a round's own report. */
-  readonly source?: "round" | "publishChecks";
 }
 
 /** `TaskProgress.roundLedger`'s lifecycle states — a strict superset of the
@@ -1740,20 +1537,6 @@ export interface RoundLedgerOutcomeV1 {
    * reconstruction subtracts them.
    */
   unattributedFiles?: readonly string[];
-  /**
-   * run1 Step 11: files the round's own stream named as edited, and files that changed in the
-   * workspace while it ran WITHOUT proof they were this round's (another window, a formatter, a
-   * command's output). Kept apart so the row never calls an unproven change the round's own.
-   */
-  attributedFiles?: readonly string[];
-  observedFiles?: readonly string[];
-  /** run1 Step 25: when the round's model process ran (ISO), the window other windows' changes are judged against. */
-  processStartedAt?: string;
-  processEndedAt?: string;
-  /** run1 Step 8: the cause the runner's single settlement recorded (a `RoundStopKindV1`). */
-  stopCause?: string;
-  /** run1 Step 8: an exhausted provider chain's per-candidate causes, for each candidate invoked. */
-  candidateStopCauses?: readonly string[];
   /** A review round's score out of 10, when this row is a review. */
   score?: number;
   /** A review round's blocker count actually raised by the reviewer
@@ -1763,19 +1546,6 @@ export interface RoundLedgerOutcomeV1 {
   /** A review round's blocker count synthesized from failing checks
    * (`origin: "mechanical"`). */
   mechanicalBlockers?: number;
-  /** bugs6 item 45: how many of the review's blockers it wrote with no resolver tag that lineage could not supply
-   * (counted and shown, never task-fixable). */
-  unclassifiedBlockers?: number;
-  /**
-   * bugs6 items 41 and 46: set when the round ended with under half its time budget used and its own report says it
-   * stopped for time or leaves unblocked steps open ("stopped after 6 of 60 minutes with 9 unblocked steps left").
-   */
-  stoppedEarly?: string;
-  /**
-   * bugs6 item 46: the plan steps this round declined, with the reason from its Remaining Blockers. `kind` is
-   * `full-suite` or `too-large` for the two reasons no round can change on its own.
-   */
-  declinedSteps?: readonly { readonly step: string; readonly kind: string; readonly reason: string }[];
   /** Why a round's summary was rejected, for `state: "rejected"`. */
   rejectionReason?: string;
   /** True when ending this round left a recovery continuation owed —
@@ -1912,24 +1682,6 @@ export interface RoundLedgerEntryV1 {
    * rather than adopted.
    */
   checklistRevisionAdopted?: ChecklistRevisionAdoptedV1;
-  /**
-   * review1 Step 32: set when this round opened while a Fast Forward run was live for the task, with that run's
-   * counters at that moment. The in-memory run state is gone once the run ends or the window reloads, so the
-   * lost-round card reads this to resume the run its lost round belonged to. Absent for a round that was not
-   * part of a Fast Forward run.
-   */
-  fastForwardRunV1?: { attemptNumber: number; maxAttempts: number };
-  /**
-   * review1 Step 32: set on every round opened by an Ensemble that records whether Fast Forward was running. With
-   * it, a row without `fastForwardRunV1` was not part of a Fast Forward run; without it (a row from before this
-   * existed) the record cannot say either way.
-   */
-  fastForwardStampedV1?: true;
-  /**
-   * run1 Step 26: set when the round was started by carrying out a held owner answer; the id the answer's
-   * record wrote before it dispatched. Activation uses it to tell that a dispatch ran.
-   */
-  heldDispatchId?: string;
 }
 
 /** `RoundLedgerEntryV1.checklistRevisionAdopted` — see that field's own doc

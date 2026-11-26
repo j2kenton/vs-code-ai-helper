@@ -183,11 +183,9 @@ void describe("owner-evidence card recommendation (bugs3 Step 7)", () => {
     assert.equal(recommended(card), "advance");
   });
 
-  void it("control: the same blocker without a carried gate still recommends the option that records the owner's decision", () => {
-    // review1 Step 38: "Leave it paused" does nothing, so it is not recommended while "Change the plan instead"
-    // (which opens the file the decision is written in) exists. At a plan stage that is the recommendation.
+  void it("control: the same blocker without a carried gate still recommends the owner's own decision", () => {
     const card = buildEscalationDecisionV1("plateau", "plan-low-review", "plateau", target, base);
-    assert.equal(recommended(card), "reconsiderRequirement");
+    assert.equal(recommended(card), "handleMyself");
   });
 
   void it("control: a carried gate with task-fixable work left keeps the normal recommendation", () => {

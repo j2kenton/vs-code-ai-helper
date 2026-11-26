@@ -290,24 +290,6 @@
         "icon": "images/cancel-red.svg"
       },
       {
-        "command": "vs-code-ai-helper.waitOnOperation",
-        "title": "Wait (hide the no-activity warning)",
-        "category": "Ensemble",
-        "icon": "$(watch)"
-      },
-      {
-        "command": "vs-code-ai-helper.runHeldAnswerNow",
-        "title": "Run my held answer now (stop the running round)",
-        "category": "Ensemble",
-        "icon": "$(play)"
-      },
-      {
-        "command": "vs-code-ai-helper.dropHeldAnswer",
-        "title": "Drop my held answer",
-        "category": "Ensemble",
-        "icon": "$(close)"
-      },
-      {
         "command": "vs-code-ai-helper.releaseStuckAdmissionMarkers",
         "title": "Release Stuck Admission Markers",
         "category": "Ensemble",
@@ -351,21 +333,6 @@
       {
         "command": "vs-code-ai-helper.acceptPlanItemNarrowingV1",
         "title": "Accept Plan Item Narrowing",
-        "category": "Ensemble"
-      },
-      {
-        "command": "vs-code-ai-helper.runOwnerEvidenceCommandV1",
-        "title": "Run Owner Evidence Command",
-        "category": "Ensemble"
-      },
-      {
-        "command": "vs-code-ai-helper.recordOwnerRunCommandV1",
-        "title": "Record a Command You Ran",
-        "category": "Ensemble"
-      },
-      {
-        "command": "vs-code-ai-helper.runPublishChecksNowV1",
-        "title": "Run Publish Checks and Keep the Failing Tests",
         "category": "Ensemble"
       },
       {
@@ -509,11 +476,6 @@
       {
         "command": "vs-code-ai-helper.reviewCurrentTask",
         "title": "Review with AI [Ctrl+Shift+Alt+R]",
-        "category": "Ensemble"
-      },
-      {
-        "command": "vs-code-ai-helper.widenReviewScopeToAllChanged",
-        "title": "Widen Review Scope to All Changed Files",
         "category": "Ensemble"
       },
       {
@@ -677,18 +639,6 @@
     "menus": {
       "commandPalette": [
         {
-          "command": "vs-code-ai-helper.waitOnOperation",
-          "when": "false"
-        },
-        {
-          "command": "vs-code-ai-helper.runHeldAnswerNow",
-          "when": "false"
-        },
-        {
-          "command": "vs-code-ai-helper.dropHeldAnswer",
-          "when": "false"
-        },
-        {
           "command": "vs-code-ai-helper.runOnRunner",
           "when": "vs-code-ai-helper.hostRole == viewer"
         },
@@ -698,18 +648,6 @@
         },
         {
           "command": "vs-code-ai-helper.acceptPlanItemNarrowingV1",
-          "when": "false"
-        },
-        {
-          "command": "vs-code-ai-helper.runOwnerEvidenceCommandV1",
-          "when": "false"
-        },
-        {
-          "command": "vs-code-ai-helper.recordOwnerRunCommandV1",
-          "when": "false"
-        },
-        {
-          "command": "vs-code-ai-helper.runPublishChecksNowV1",
           "when": "false"
         }
       ],
@@ -788,23 +726,8 @@
       "view/item/context": [
         {
           "command": "vs-code-ai-helper.cancelOperation",
-          "when": "view == vs-code-ai-helper.statusView && viewItem =~ /^ensemble-operation-cancellable/",
+          "when": "view == vs-code-ai-helper.statusView && viewItem == ensemble-operation-cancellable",
           "group": "inline@1"
-        },
-        {
-          "command": "vs-code-ai-helper.waitOnOperation",
-          "when": "view == vs-code-ai-helper.statusView && viewItem =~ /^ensemble-operation-cancellable-stuck/",
-          "group": "inline@2"
-        },
-        {
-          "command": "vs-code-ai-helper.runHeldAnswerNow",
-          "when": "view == vs-code-ai-helper.statusView && viewItem =~ /^ensemble-operation-cancellable.*-held$/",
-          "group": "inline@3"
-        },
-        {
-          "command": "vs-code-ai-helper.dropHeldAnswer",
-          "when": "view == vs-code-ai-helper.statusView && viewItem =~ /^ensemble-operation-cancellable.*-held$/",
-          "group": "inline@4"
         },
         {
           "command": "vs-code-ai-helper.cancelOperation",
@@ -1224,12 +1147,6 @@
           "scope": "window",
           "description": "Use the review acceptance threshold for Fast Forward."
         },
-        "ensemble.fastForwardActOnSuggestions": {
-          "type": "boolean",
-          "default": false,
-          "scope": "window",
-          "description": "Under Fast Forward, keep acting on a review's non-blocking suggestions after its score meets the stop level. Off by default: once the score is good enough, Apply Review leaves suggestions alone instead of making polish edits that send test evidence back to provisional."
-        },
         "ensemble.autoReviewAfterPlan": {
           "type": [
             "string",
@@ -1419,53 +1336,13 @@
           "scope": "window",
           "description": "When a quota/rate-limit or model-entitlement failure carries a provider-reported reset time within this many hours, remedy messages say to rerun after that local time; beyond it, messages advise switching the stage's model instead of waiting. When no reset time is known at all, messages keep offering both options (rerun or switch), unchanged from before this setting existed."
         },
-        "ensemble.resilience.askOwnerAfterRounds": {
-          "type": "integer",
-          "default": 8,
-          "minimum": 0,
-          "maximum": 99,
-          "scope": "window",
-          "description": "Stop all automation for a task and ask you what to do after this many automatic rounds (Fast Forward, auto-continue, recovery continuations, scheduled and backup retries) since the last sign of progress: plan items settled, task-fixable blockers down, a higher review score, or something you did. One check in front of every automatic dispatch. 0 turns it off."
-        },
-        "ensemble.resilience.askOwnerAfterFailedRounds": {
-          "type": "integer",
-          "default": 3,
-          "minimum": 0,
-          "maximum": 99,
-          "scope": "window",
-          "description": "Stop all automation for a task and ask you what to do after this many automatic rounds in a row that failed, were refused or were cut off (a quota, a time limit, a provider error). 0 turns it off."
-        },
-        "ensemble.decisions.autoContinueMinutes": {
-          "type": "integer",
-          "default": 2,
-          "minimum": 0,
-          "maximum": 1440,
-          "scope": "window",
-          "description": "A card whose recommended option is safe to run unattended (applying reviewer-verified ticks, or moving to the next review after a clean review) runs that option by itself after this many minutes if you have not answered, dismissed it or pressed Wait for me. The card shows the countdown. If the task changes during the wait, the countdown is cancelled and the card is offered again. Publish Anyway, Commit & Push, exclusions, deviations and owner judgements never continue by themselves. 0 turns it off."
-        },
         "ensemble.resilience.inactivityTimeoutMinutes": {
           "type": "integer",
-          "default": 20,
+          "default": 0,
           "minimum": 0,
           "maximum": 180,
           "scope": "window",
-          "description": "Stop a round when it has shown no sign of life for this many consecutive minutes: no output and nothing it provably did itself (a tool call or command it ran, or a file its own edit named). Files changed by other windows or tasks never count as the round's activity. Applies to providers whose output streams events (such as Claude Code); a provider that prints nothing until it finishes gets a no-activity warning instead. A round that keeps working is never stopped by this. 0 turns it off."
-        },
-        "ensemble.resilience.noActivityWarningMinutes": {
-          "type": "integer",
-          "default": 10,
-          "minimum": 1,
-          "maximum": 240,
-          "scope": "window",
-          "description": "When a running round has shown no sign of life for this many minutes (no output and nothing it provably did itself), its row in Notifications says so and offers Stop or Wait. Files changed by other windows or tasks never count as the round's activity. Nothing is stopped by this warning."
-        },
-        "ensemble.resilience.roundBackstopHours": {
-          "type": "integer",
-          "default": 4,
-          "minimum": 1,
-          "maximum": 48,
-          "scope": "window",
-          "description": "A far-off safety net: a round still running after this many hours is stopped by Ensemble. Rounds are not stopped for being busy; this only catches a process that is somehow still alive long after it should have ended."
+          "description": "Kill a CLI run's process tree when it has produced no stdout/stderr/raw-transport output for this many consecutive minutes, distinct from the flat 60-minute wall-clock cap on a run. OFF BY DEFAULT (0): output silence is a poor proxy for a wedged process — an agentic CLI reading and editing a large file legitimately goes quiet for long stretches, and killing it destroys that round's work. The wall clock already bounds the worst case. Enable it (45 is a reasonable starting point) only if you actually see runs hang; a value near 60 is equivalent to the wall clock and does nothing."
         },
         "vs-code-ai-helper.aiModelDefaults": {
           "deprecationMessage": "Use `ensemble.aiModelDefaults` instead.",

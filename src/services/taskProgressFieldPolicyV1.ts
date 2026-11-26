@@ -143,24 +143,6 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     markTaskDone: "Preserve exactly.",
     reopen: "Preserve exactly — same reasoning as nextStage.",
   },
-  notedForeignEdits: {
-    migration: "Validate a bounded array of non-empty strings; absent on new tasks and on any record predating this field.",
-    nextStage: "Preserve exactly — an edit already said once for a task and content stays said, whatever stage the task is on.",
-    markTaskDone: "Preserve exactly.",
-    reopen: "Preserve exactly.",
-  },
-  ownerPausedAt: {
-    migration: "Validate an ISO time string; absent on new tasks and on any record predating this field.",
-    nextStage: "Preserve exactly — a stage transition is not a resume.",
-    markTaskDone: "Preserve exactly; every reader checks the task is still paused, and any status change away from paused retires it.",
-    reopen: "Preserve exactly; same reasoning as markTaskDone.",
-  },
-  reviewCoverage: {
-    migration: "Validate a bounded record of per-file review hashes; absent on new tasks and on any record predating this field.",
-    nextStage: "Preserve exactly — a stage change does not unread a file; a changed file is caught by its hash.",
-    markTaskDone: "Preserve exactly.",
-    reopen: "Preserve exactly.",
-  },
   nameIsDefault: {
     migration: "Validate exact boolean/current optionality; derive during creation.",
     nextStage: "Preserve.",
@@ -370,24 +352,6 @@ export const TASK_PROGRESS_FIELD_POLICY_V1: Record<
     nextStage: "Preserve the owner-decision audit trail.",
     markTaskDone: "Preserve the owner-decision audit trail.",
     reopen: "Preserve the owner-decision audit trail.",
-  },
-  reportContractRejections: {
-    migration: "Validate the bounded rejection list; absent on new tasks and on any record predating this field.",
-    nextStage: "Preserve (a repeated report-contract violation is counted across the whole task).",
-    markTaskDone: "Preserve.",
-    reopen: "Preserve.",
-  },
-  progressWatch: {
-    migration: "Validate the bounded progress-watch record; absent on new tasks and on any record predating this field.",
-    nextStage: "Preserve (the count of automatic rounds since the owner last saw progress spans stages).",
-    markTaskDone: "Preserve.",
-    reopen: "Preserve.",
-  },
-  lastPlanItemSettlement: {
-    migration: "Validate the bounded settlement snapshot; absent on new tasks and on any record predating this field.",
-    nextStage: "Preserve (it compares plan-item settlement across counts, whatever the stage).",
-    markTaskDone: "Preserve.",
-    reopen: "Preserve.",
   },
   planItemOwnerTestRuns: {
     migration: "Validate bounded owner test-run records; absent on new tasks and on any record predating this field.",
@@ -647,9 +611,6 @@ export function applyNextStagePolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
-    notedForeignEdits: progress.notedForeignEdits,
-    ownerPausedAt: progress.ownerPausedAt,
-    reviewCoverage: progress.reviewCoverage,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
@@ -689,9 +650,6 @@ export function applyNextStagePolicyV1(
     planItemEvidence: progress.planItemEvidence,
     planItemOwnerDecisions: progress.planItemOwnerDecisions,
     planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
-    lastPlanItemSettlement: progress.lastPlanItemSettlement,
-    reportContractRejections: progress.reportContractRejections,
-    progressWatch: progress.progressWatch,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
@@ -750,9 +708,6 @@ export function applyMarkTaskDonePolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
-    notedForeignEdits: progress.notedForeignEdits,
-    ownerPausedAt: progress.ownerPausedAt,
-    reviewCoverage: progress.reviewCoverage,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: input.now,
@@ -795,9 +750,6 @@ export function applyMarkTaskDonePolicyV1(
     planItemEvidence: progress.planItemEvidence,
     planItemOwnerDecisions: progress.planItemOwnerDecisions,
     planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
-    lastPlanItemSettlement: progress.lastPlanItemSettlement,
-    reportContractRejections: progress.reportContractRejections,
-    progressWatch: progress.progressWatch,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
@@ -901,9 +853,6 @@ export function applyReopenPolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
-    notedForeignEdits: progress.notedForeignEdits,
-    ownerPausedAt: progress.ownerPausedAt,
-    reviewCoverage: progress.reviewCoverage,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
@@ -937,9 +886,6 @@ export function applyReopenPolicyV1(
     planItemEvidence: progress.planItemEvidence,
     planItemOwnerDecisions: progress.planItemOwnerDecisions,
     planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
-    lastPlanItemSettlement: progress.lastPlanItemSettlement,
-    reportContractRejections: progress.reportContractRejections,
-    progressWatch: progress.progressWatch,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: progress.checklistChangeProposals,
     overriddenEscalations: progress.overriddenEscalations,
@@ -1049,9 +995,6 @@ export function applyPlanRevisionPolicyV1(
     // strictly increasing numbers rather than restarting at 1 and colliding
     // with an earlier visit's artifact.
     stageReviewPasses: progress.stageReviewPasses,
-    notedForeignEdits: progress.notedForeignEdits,
-    ownerPausedAt: progress.ownerPausedAt,
-    reviewCoverage: progress.reviewCoverage,
     nameIsDefault: progress.nameIsDefault,
     preImageDescription: progress.preImageDescription,
     completedAt: undefined,
@@ -1098,9 +1041,6 @@ export function applyPlanRevisionPolicyV1(
     planItemEvidence: progress.planItemEvidence,
     planItemOwnerDecisions: progress.planItemOwnerDecisions,
     planItemOwnerTestRuns: progress.planItemOwnerTestRuns,
-    lastPlanItemSettlement: progress.lastPlanItemSettlement,
-    reportContractRejections: progress.reportContractRejections,
-    progressWatch: progress.progressWatch,
     blockerSupersessions: progress.blockerSupersessions,
     checklistChangeProposals: marked.proposals,
     overriddenEscalations: progress.overriddenEscalations,

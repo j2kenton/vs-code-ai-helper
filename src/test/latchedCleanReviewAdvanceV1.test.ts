@@ -265,10 +265,8 @@ void describe("RC8 item 4: a clean review advances while the checklist is flagge
     assert.match(card.whatHappened, /3 plan items are still open/);
     assert.match(card.whatHappened, /Item two/);
     assert.deepEqual(card.options.map((o) => o.label).sort(), ["Back to Implementation", "Move on"]);
-    // review2 Step 7 (bugs6 item 26): the review is clean and names no unbuilt step, so a round has nothing to act on;
-    // Back to Implementation is not recommended, and the reason says why.
-    assert.equal(card.recommendation.kind === "option" ? card.recommendation.optionId : undefined, "moveOn");
-    assert.match(card.recommendation.kind === "option" ? card.recommendation.reasoning : "", /nothing to act on|test evidence|verification item/);
+    // An open item asks for a build, so Back to Implementation is recommended.
+    assert.equal(card.recommendation.kind === "option" ? card.recommendation.optionId : undefined, "backToImplementation");
     const moveOn = card.options.find((o) => o.optionId === "moveOn")!;
     assert.equal(moveOn.effect.kind, "command");
     if (moveOn.effect.kind === "command") {
@@ -382,17 +380,14 @@ void describe("RC8 item 4: a clean review advances while the checklist is flagge
     );
     assert.equal(pendingTickCards, 0);
     assert.equal(postedTickDecisions, 0, "no tick card is posted when the ticks were applied");
-    // review1 Step 53 (owner, 2026-11-05): one line says what was ticked and by which review.
-    assert.ok(entries.some((e) => /Ticked 2 items \(verified by /.test(e.message)));
+    assert.ok(entries.some((e) => e.message.includes("Applied 2 reviewer-verified tick(s)")));
   });
 
-  void it("(e) not latched, same review: the verified items are ticked at once too, with no tick card", async () => {
+  void it("(e) not latched, same review: the tick card is offered and plan-final.md is unchanged", async () => {
     const review = reviewText({ verified: ["2. Item two", "3. Item three"] });
     const { planFinal, entries, postedTickDecisions } = await route("unlatched-ticks", { latched: false, review });
-    // review1 Step 53 (owner, 2026-11-05): latched or not, a review's verified ticks apply as soon as it ends.
-    assert.match(planFinal, /- \[x\] 2\. Item two/);
-    assert.match(planFinal, /- \[x\] 3\. Item three/);
-    assert.ok(entries.some((e) => /Ticked 2 items \(verified by /.test(e.message)));
-    assert.equal(postedTickDecisions, 0, "no verified-complete card is posted");
+    assert.equal(planFinal, PLAN_FINAL, "nothing is ticked without the owner's confirmation");
+    assert.ok(!entries.some((e) => e.message.includes("Applied 2 reviewer-verified tick(s)")));
+    assert.equal(postedTickDecisions, 1, "the unlatched review posts the verified-complete card");
   });
 });

@@ -81,11 +81,8 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
   });
 
   void it("reports 'starting' at the top of runReviewForFolder (before its first await), resolves the model once known, and reports 'running' right before the coordinator await", () => {
-    // bugs6 item 32: `runReviewForFolder` is a thin wrapper (the owner-answer chat line); the body that reports
-    // 'starting' is `runReviewForFolderCoreV1`.
-    assert.ok(source.indexOf("export async function runReviewForFolder(") >= 0, "runReviewForFolder must exist");
-    const fnStart = source.indexOf("async function runReviewForFolderCoreV1(");
-    assert.ok(fnStart >= 0, "runReviewForFolderCoreV1 must exist");
+    const fnStart = source.indexOf("export async function runReviewForFolder(");
+    assert.ok(fnStart >= 0, "runReviewForFolder must exist");
     const fnBodyStart = source.indexOf("): Promise<void> {", fnStart);
     assert.ok(fnBodyStart >= 0);
 
@@ -110,13 +107,8 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const setModelCall = source.indexOf("options.operation?.setModel?.(dispatchModelId);", dispatchModelIdDecl);
     assert.ok(setModelCall >= 0, "expected setModel to be called once dispatchModelId is resolved");
 
-    // run1 Step 19: the review's running report is the where-are-we line, passed the same stageToken.
-    const runningCall = source.indexOf("? publishReviewWhereLineV1()", setModelCall);
+    const runningCall = source.indexOf("reportStageRunningV1(options.operation, stageToken);", setModelCall);
     assert.ok(runningCall >= 0, "runReviewForFolder must report a running activity");
-    assert.ok(
-      source.lastIndexOf("options.operation?.reportActivity(", runningCall) > setModelCall,
-      "the running report must go through reportActivity on the review's own operation"
-    );
 
     const executeActionCalls = indexOfAll("coordinator.executeAction({");
     const nextExecuteAction = executeActionCalls.find((idx) => idx > runningCall);
@@ -161,9 +153,7 @@ void describe("reviewActions.ts stage-activity instrumentation", () => {
     const resultGuard = resultGuardMatch.index;
     const countReport = source.indexOf("options.parentOperation?.reportActivity(", resultGuard);
     assert.ok(countReport >= 0, "expected a changed-file-count reportActivity call after result is known");
-    // review1 Step 49 put the diagnostic round's own completion (an early return with its own settlement) between
-    // the failure guard and the count report, so "near" now allows for that branch.
-    assert.ok(countReport - resultGuard < 6000, "the count report must sit near the result boundary, after failure settlement");
+    assert.ok(countReport - resultGuard < 1600, "the count report must sit near the result boundary, after failure settlement");
 
     const guardedBlock = source.slice(resultGuard, countReport + 400);
     assert.match(

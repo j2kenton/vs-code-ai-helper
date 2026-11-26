@@ -3,13 +3,14 @@
  * implementation reviews. Isolated so they can be unit-tested without a
  * VS Code host environment.
  */
-import { guaranteedImplReviewCodeBudgetCharsV1 } from "./implReviewBudgetV1";
 
 /** Per-file and total content caps applied when embedding files in an
  * implementation-review context pack.
  *
- * (History: the total-chars cap was a fixed constant, retired by review1 Step 59 in favour of a computed budget.)
- * At 60000 a task touching two dozen files reliably drops most of them (each
+ * IMPL_REVIEW_MAX_TOTAL_CHARS is the only size guard on the automated
+ * implementation-review prompt (reviewActions.ts does not additionally run
+ * it through checkAndConfirmPromptSize), so it can't grow unbounded — but at
+ * 60000 a task touching two dozen files reliably drops most of them (each
  * omitted file is still listed by name, never silently dropped, but a
  * reviewer working from the pack alone still misses their content). Raised
  * to 150000 chars (~35-40k tokens), comfortably inside modern model context
@@ -81,14 +82,19 @@ export const IMPL_REVIEW_MAX_CHARS_PER_FILE = 8000;
  * working from the pack alone can no longer meaningfully read the diff, and a
  * shallow or hedged review is the expected symptom — not a model failure.
  *
- * review1 Step 59 retired the fixed constant this history led up to
- * (`IMPL_REVIEW_MAX_TOTAL_CHARS`). The budget for embedded file contents is now
- * computed: `reviewActions.ts` measures the assembled input against the
- * transport limit and passes what is left (`implReviewBudgetV1.ts`). A caller
- * that has not measured gets the share the code is guaranteed,
- * `guaranteedImplReviewCodeBudgetCharsV1()`: the limit minus the other half,
- * which the non-code input may use.
+ * TEMPORARY — delete this constant, do not re-tune it. It is the fourth guess
+ * at a number that is not knowable in advance, and the interval between
+ * guesses has collapsed from three weeks to a single day. The fix is item 9 of
+ * workflow 11
+ * (`.ensemble/2026-08-24_task_1`): measure the assembled input against the
+ * canonical limit BEFORE dispatch and shed content until it fits. When that
+ * lands, the budget for embedded file contents is a computed remainder and
+ * this constant has no reason to exist — remove it and its guard test rather
+ * than leaving a second, weaker limit in the path. Until then it is the only
+ * thing standing between a growing task and an undiagnosable
+ * `chatTransaction.chatTransactionRejected`.
  */
+export const IMPL_REVIEW_MAX_TOTAL_CHARS = 15000;
 
 /**
  * Workflow findings round 8, item 1 (fixes 1 and 5): the flat 8 KB
@@ -240,7 +246,7 @@ export interface ImplReviewFileResult {
 export function applyContentCaps(
   files: ReadonlyArray<{ relPath: string; content: string | undefined }>,
   maxCharsPerFile = IMPL_REVIEW_MAX_CHARS_PER_FILE,
-  maxTotalChars = guaranteedImplReviewCodeBudgetCharsV1()
+  maxTotalChars = IMPL_REVIEW_MAX_TOTAL_CHARS
 ): ImplReviewFileResult[] {
   const results: ImplReviewFileResult[] = [];
   let totalChars = 0;
@@ -462,31 +468,6 @@ export function buildChangedRegionsStanzaV1(
   );
 }
 
-/** Most changed-region ranges an overflow stanza lists before it says "and N more". */
-const OVERFLOW_STANZA_MAX_RANGES_V1 = 8;
-
-/**
- * review2 Step 21: the entry for a file the pack's TOTAL size limit left out, for a reviewer that can open files. It is a
- * direction to read the real file natively (never a byte of its content), with the file's changed regions when a git
- * baseline gave them. Short on purpose: many of these can follow one pack and must not eat the code budget again.
- */
-export function buildOverflowNativeReadStanzaV1(
-  relPath: string,
-  content: string,
-  changedRanges: ReadonlyArray<LineRange> | undefined
-): string {
-  const byteSize = Buffer.byteLength(content, "utf8");
-  const head = `${relPath} (${byteSize.toLocaleString("en-US")} bytes) did not fit this pack's total size limit, so it is not embedded. Read it natively.`;
-  if (!changedRanges || changedRanges.length === 0) {
-    return head;
-  }
-  const totalLines = content.split("\n").length;
-  const merged = mergeAndExpandLineRangesV1(changedRanges, IMPL_REVIEW_CHANGED_REGION_CONTEXT_LINES, totalLines);
-  const shown = merged.slice(0, OVERFLOW_STANZA_MAX_RANGES_V1).map((r) => `lines ${r.start}-${r.end}`);
-  const more = merged.length - shown.length;
-  return `${head} Changed regions: ${shown.join(", ")}${more > 0 ? `, and ${more} more` : ""}.`;
-}
-
 /** Every way `applyContentCapsWithRegionsV1` can represent a file's content:
  *  - `whole`                    — the file's real, complete text.
  *  - `changed-regions-excerpt`  — a real excerpt: the file's actual text at
@@ -551,7 +532,7 @@ export function applyContentCapsWithRegionsV1(
   }
 ): ImplReviewFileResultV3[] {
   const inlineWholeMaxChars = options?.inlineWholeMaxChars ?? IMPL_REVIEW_TRUNCATED_FILE_MAX_CHARS;
-  const maxTotalChars = options?.maxTotalChars ?? guaranteedImplReviewCodeBudgetCharsV1();
+  const maxTotalChars = options?.maxTotalChars ?? IMPL_REVIEW_MAX_TOTAL_CHARS;
   const contextLines = options?.contextLines ?? IMPL_REVIEW_CHANGED_REGION_CONTEXT_LINES;
 
   const overBudgetCount = files.filter(

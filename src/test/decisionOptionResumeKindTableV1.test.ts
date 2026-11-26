@@ -118,8 +118,6 @@ const INVENTORY: readonly InventoryRow[] = [
   // record still has open checklist items — moves the task to Implementation
   // (and continues Fast Forward there when one was interrupted).
   { file: "utils/reviewEscalation.ts", optionId: "buildRemaining", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: buildRemaining dispatches resumeAndSetTaskStage to impl" },
-  // bugs8 item 3 (Step 13): built-but-unchecked items get the Publish Checks evidence path, not a build round.
-  { file: "utils/reviewEscalation.ts", optionId: "checkBuiltItems", occurrence: 0, resumeKind: "continue", dispatchProof: "ownerPlanDecisionCommandV1.test.ts: checkBuiltItems runs Publish Checks for the built items and buildRemaining is not offered" },
   { file: "utils/reviewEscalation.ts", optionId: "reconsiderRequirement", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: reconsiderRequirement opens Accepted Non-Goals, dispatches nothing" },
   { file: "utils/reviewEscalation.ts", optionId: "keepIterating", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: keepIterating (task-fixable branch) is continue" },
   { file: "utils/reviewEscalation.ts", optionId: "handleMyself", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: handleMyself leaves task paused" },
@@ -136,18 +134,9 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "utils/reviewEscalation.ts", optionId: "publishAnyway", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: publishAnyway dispatches the publish continuation" },
   { file: "utils/reviewEscalation.ts", optionId: "acknowledgeAdvance", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts: acknowledgeAdvance routes through the Step-3 Advance path, not doNothing" },
   { file: "utils/reviewEscalation.ts", optionId: "handleMyself", occurrence: 2, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: handleMyself variant leaves task paused" },
-  // review1 Step 58: "I've made changes — re-check" re-runs only the review, and only when the inputs changed.
-  { file: "utils/reviewEscalation.ts", optionId: "recheckAfterMyChanges", occurrence: 0, resumeKind: "continue", dispatchProof: "keepIteratingTextV1.test.ts: offers 'I've made changes — re-check' only when the review's inputs changed" },
-  // review1 Step 48: the environmental-failure card's investigate and look-myself options.
-  { file: "utils/reviewEscalation.ts", optionId: "investigateFailure", occurrence: 0, resumeKind: "continue", dispatchProof: "environmentalFailureCardV1.test.ts: Investigate dispatches the diagnostic round with the failure and the environment" },
-  { file: "utils/reviewEscalation.ts", optionId: "lookMyself", occurrence: 0, resumeKind: "unpause", dispatchProof: "environmentalFailureCardV1.test.ts: offers Investigate, look myself and accept" },
   // RC4 item 3: the narrowing card's two options (plateau card, `narrowing` present).
   { file: "utils/reviewEscalation.ts", optionId: "acceptNarrowing", occurrence: 0, resumeKind: "continue", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: the entry is appended once and the re-review is dispatched with skipUnchangedTreeGuard" },
   { file: "utils/reviewEscalation.ts", optionId: "keepItemOpen", occurrence: 0, resumeKind: "unpause", dispatchProof: "acceptPlanItemNarrowingCommandV1.test.ts: keepItemOpen dispatches nothing" },
-  // review2 Step 19: "Review the remaining N files" (plateau card, `coverage` with unreviewed files).
-  { file: "utils/reviewEscalation.ts", optionId: "reviewRemaining", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewCoverageV1.test.ts: the plateau card offers and recommends reviewing the remaining files, and the option adds exactly the unreviewed files" },
-  // review2 Step 34: "Settle it with a rule" (plateau card, a blocker whose fixes keep narrowing).
-  { file: "utils/reviewEscalation.ts", optionId: "settleWithRule", occurrence: 0, resumeKind: "continue", dispatchProof: "blockerRuleNarrowingV1.test.ts: the answer is followed by exactly one Apply Review and no re-review" },
   { file: "utils/reviewEscalation.ts", optionId: "moveOn", occurrence: 0, resumeKind: "continue", dispatchProof: "latchedCleanReviewAdvanceV1.test.ts: Move on dispatches resumeAndSetTaskStage to nextStage" },
   { file: "utils/reviewEscalation.ts", optionId: "backToImplementation", occurrence: 0, resumeKind: "continue", dispatchProof: "latchedCleanReviewAdvanceV1.test.ts: Back to Implementation dispatches resumeAndSetTaskStage to impl" },
   { file: "utils/reviewEscalation.ts", optionId: "backToImplementation", occurrence: 1, resumeKind: "continue", dispatchProof: "latchedCleanReviewAdvanceV1.test.ts: Back to Implementation dispatches resumeAndSetTaskStage to impl" },
@@ -165,25 +154,22 @@ const INVENTORY: readonly InventoryRow[] = [
   { file: "commands/reconcilePlanChecklist.ts", optionId: "reconcile", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: reconcile clears the flag without dispatching the stage" },
   { file: "commands/reconcilePlanChecklist.ts", optionId: "continueStage", occurrence: 0, resumeKind: "continue", dispatchProof: "reconcilePlanChecklistCommand.test.ts: continueStage dispatches the stage action" },
   { file: "commands/reconcilePlanChecklist.ts", optionId: "notYet", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: notYet dispatches nothing" },
-  // review1 Step 10: the merged checklist card's item-by-item option opens the open-items form and dispatches nothing.
-  { file: "commands/reconcilePlanChecklist.ts", optionId: "settleRest", occurrence: 0, resumeKind: "unpause", dispatchProof: "reconcilePlanChecklistCommand.test.ts: settleRest opens the open-items form and dispatches nothing" },
 
   // src/commands/applyReviewerVerifiedTicks.ts
   { file: "commands/applyReviewerVerifiedTicks.ts", optionId: "apply", occurrence: 0, resumeKind: "continue", dispatchProof: "applyReviewerVerifiedTicksCommand.test.ts: apply dispatches the stage's next action after ticking" },
   { file: "commands/applyReviewerVerifiedTicks.ts", optionId: "skip", occurrence: 0, resumeKind: "unpause", dispatchProof: "applyReviewerVerifiedTicksCommand.test.ts: skip dispatches nothing" },
-  { file: "commands/applyReviewerVerifiedTicks.ts", optionId: "settleRest", occurrence: 0, resumeKind: "unpause", dispatchProof: "applyReviewerVerifiedTicksCommand.test.ts: settleRest opens the open-items form and dispatches nothing" },
 
   // src/commands/reviewActions.ts
   { file: "commands/reviewActions.ts", optionId: "retry", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewEscalation.test.ts / reviewRouting.test.ts: retry re-dispatches the stage action" },
   { file: "commands/reviewActions.ts", optionId: "adjustSettings", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: adjustSettings opens settings, dispatches nothing" },
   { file: "commands/reviewActions.ts", optionId: "wait", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: wait dispatches nothing" },
-  // bugs6 item 23: the quota card's "Turn on fallback and retry" turns the box on, then re-runs the failed review.
-  { file: "commands/reviewActions.ts", optionId: "turnOnFallback", occurrence: 0, resumeKind: "continue", dispatchProof: "providerChainExhaustion.test.ts: the card offers turnOnFallbackAndRetryV1 and recommends it when a skipped backup is switched on" },
   { file: "commands/reviewActions.ts", optionId: "stay", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewEscalation.test.ts: stay dispatches nothing" },
   { file: "commands/reviewActions.ts", optionId: "goToReviewAndApply", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts / commandArgNormalization.test.ts: goToReviewAndApply dispatches goToReviewAndApplyV1" },
   { file: "commands/reviewActions.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "reviewRouting.test.ts: notNow dispatches nothing" },
   { file: "commands/reviewActions.ts", optionId: "goToReviewAndApply", occurrence: 1, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: goToReviewAndApply (second card site) dispatches goToReviewAndApplyV1" },
   { file: "commands/reviewActions.ts", optionId: "notNow", occurrence: 1, resumeKind: "unpause", dispatchProof: "reviewRouting.test.ts: notNow (second card site) dispatches nothing" },
+  { file: "commands/reviewActions.ts", optionId: "goToReviewAndApply", occurrence: 2, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: goToReviewAndApply (third card site) dispatches goToReviewAndApplyV1" },
+  { file: "commands/reviewActions.ts", optionId: "letItRun", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewRouting.test.ts: letItRun leaves the running round to finish — the process continues" },
   { file: "commands/reviewActions.ts", optionId: "retrySameModel", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewActions review-degenerate decision test: retrySameModel reruns the review" },
   { file: "commands/reviewActions.ts", optionId: "chooseDifferentModel", occurrence: 0, resumeKind: "continue", dispatchProof: "reviewActions review-degenerate decision test: chooseDifferentModel opens model selection and reruns" },
   { file: "commands/reviewActions.ts", optionId: "commitAndPush", occurrence: 0, resumeKind: "continue", dispatchProof: "publishOwnershipMatrix: clean Publish review offers Commit & Push" },
@@ -226,32 +212,6 @@ const INVENTORY: readonly InventoryRow[] = [
   // src/runners/runnerRegistry.ts
   { file: "runners/runnerRegistry.ts", optionId: "rerunAfterReset", occurrence: 0, resumeKind: "continue", dispatchProof: "runnerRegistry: rerunAfterReset dispatches a fresh round after reset" },
   { file: "runners/runnerRegistry.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "runnerRegistry: notNow dispatches nothing" },
-
-  // src/utils/evidenceGapV1.ts (bugs7 item 5): the evidence-gap card, with "Fix the failing tests" after a failed run.
-  { file: "utils/evidenceGapV1.ts", optionId: "tickThese", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: tickThese runs the tick command for the listed items" },
-  { file: "utils/evidenceGapV1.ts", optionId: "runChecksAgain", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: runChecksAgain runs Publish Checks" },
-  { file: "utils/evidenceGapV1.ts", optionId: "recordRun", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: recordRun opens the owner test-run form" },
-  { file: "utils/evidenceGapV1.ts", optionId: "fixFailingTests", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: fixFailingTests dispatches Apply Review and is recommended for a failure that touches the task" },
-  { file: "utils/evidenceGapV1.ts", optionId: "moveOn", occurrence: 0, resumeKind: "continue", dispatchProof: "evidenceGapV1.test.ts: moveOn advances to the next stage" },
-  // src/utils/automationStopV1.ts (bugs7 items 6 and 7): the automation-stopped / "stage is done" card.
-  { file: "utils/automationStopV1.ts", optionId: "moveOn", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: moveOn runs nextStage" },
-  { file: "utils/automationStopV1.ts", optionId: "moveOnAndFastForward", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: moveOnAndFastForward runs Fast Forward, which crosses the done stage's edge" },
-  { file: "utils/automationStopV1.ts", optionId: "continueTheWork", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: continueTheWork runs the editing round" },
-  { file: "utils/automationStopV1.ts", optionId: "startFastForward", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: startFastForward runs Fast Forward" },
-  { file: "utils/automationStopV1.ts", optionId: "runOneMoreCycle", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: runOneMoreCycle runs one Apply Review" },
-  { file: "utils/automationStopV1.ts", optionId: "runPublishChecksNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: runPublishChecksNow runs Publish Checks once, no model round" },
-  { file: "utils/automationStopV1.ts", optionId: "changeStageModel", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: changeStageModel opens AI Models" },
-  { file: "utils/automationStopV1.ts", optionId: "leaveWithMe", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: leaveWithMe does nothing" },
-  // src/utils/withheldTestEvidenceCardV1.ts (bugs7 item 2): the withheld-test-evidence card.
-  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "runChecks", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: runChecks runs Publish Checks for the items" },
-  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "recordRun", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: recordRun opens the owner test-run form" },
-  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "tickThese", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: tickThese runs the tick command" },
-  { file: "utils/withheldTestEvidenceCardV1.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: notNow does nothing" },
-  // src/commands/ownerPlanDecisionCommandV1.ts (bugs7 item 4): the owner-only / standing blockers card.
-  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "applyReviewToBuild", occurrence: 0, resumeKind: "continue", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: applyReviewToBuild runs Apply Review for the review's named work" },
-  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "settleItem", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: settleItem opens the settle-item form" },
-  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "changePlan", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: changePlan opens the plan's Accepted Non-Goals" },
-  { file: "commands/ownerPlanDecisionCommandV1.ts", optionId: "notNow", occurrence: 0, resumeKind: "unpause", dispatchProof: "bugs7CardOptionDispatchV1.test.ts: notNow does nothing" },
 
   // src/commands/implementationRecoveryV1.ts
   { file: "commands/implementationRecoveryV1.ts", optionId: "keep", occurrence: 0, resumeKind: "unpause", dispatchProof: "implementationRecoveryV1: keep dispatches nothing (user decision recorded, no automation follow-up)" },
@@ -404,7 +364,6 @@ type RowEvidenceV1 = RuntimeTestEvidenceV1 | TrivialNoDispatchEvidenceV1 | Known
 const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvidenceV1>([
   [rowKey("utils/reviewEscalation.ts", "advance", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts", "commandArgNormalization.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "buildRemaining", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
-  [rowKey("utils/reviewEscalation.ts", "checkBuiltItems", 0), { kind: "runtime-test", proofFiles: ["ownerPlanDecisionCommandV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "reconsiderRequirement", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepIterating", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "handleMyself", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],
@@ -419,8 +378,6 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   [rowKey("utils/reviewEscalation.ts", "applyReviewerVerifiedTicks", 0), { kind: "runtime-test", proofFiles: ["breakerCardRecommendationV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "acceptNarrowing", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "keepItemOpen", 0), { kind: "runtime-test", proofFiles: ["acceptPlanItemNarrowingCommandV1.test.ts"] }],
-  [rowKey("utils/reviewEscalation.ts", "reviewRemaining", 0), { kind: "runtime-test", proofFiles: ["reviewCoverageV1.test.ts"] }],
-  [rowKey("utils/reviewEscalation.ts", "settleWithRule", 0), { kind: "runtime-test", proofFiles: ["blockerRuleNarrowingV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "moveOn", 0), { kind: "runtime-test", proofFiles: ["latchedCleanReviewAdvanceV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "backToImplementation", 0), { kind: "runtime-test", proofFiles: ["latchedCleanReviewAdvanceV1.test.ts"] }],
   [rowKey("utils/reviewEscalation.ts", "backToImplementation", 1), { kind: "runtime-test", proofFiles: ["latchedCleanReviewAdvanceV1.test.ts"] }],
@@ -436,42 +393,10 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   // belongs in the trivial (type-guaranteed) bucket, not runtime-test.
   [rowKey("commands/reconcilePlanChecklist.ts", "notYet", 0), { kind: "trivial-no-dispatch" }],
 
-  // bugs7 item 5: the evidence-gap card's options; evidenceGapV1.test.ts asserts each option's real effect.
-  [rowKey("utils/evidenceGapV1.ts", "tickThese", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
-  [rowKey("utils/evidenceGapV1.ts", "runChecksAgain", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
-  [rowKey("utils/evidenceGapV1.ts", "recordRun", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
-  [rowKey("utils/evidenceGapV1.ts", "fixFailingTests", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
-  [rowKey("utils/evidenceGapV1.ts", "moveOn", 0), { kind: "runtime-test", proofFiles: ["evidenceGapV1.test.ts"] }],
-  // bugs7 Step 16: the stop card, the withheld-evidence card and the owner-only-blockers card; the proof file builds each
-  // real card and asserts every option's real `.effect`.
-  [rowKey("utils/automationStopV1.ts", "moveOn", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/automationStopV1.ts", "moveOnAndFastForward", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/automationStopV1.ts", "continueTheWork", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/automationStopV1.ts", "startFastForward", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/automationStopV1.ts", "runOneMoreCycle", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/automationStopV1.ts", "runPublishChecksNow", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/automationStopV1.ts", "changeStageModel", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/automationStopV1.ts", "leaveWithMe", 0), { kind: "trivial-no-dispatch" }],
-  [rowKey("utils/withheldTestEvidenceCardV1.ts", "runChecks", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/withheldTestEvidenceCardV1.ts", "recordRun", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/withheldTestEvidenceCardV1.ts", "tickThese", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("utils/withheldTestEvidenceCardV1.ts", "notNow", 0), { kind: "trivial-no-dispatch" }],
-  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "applyReviewToBuild", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "settleItem", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "changePlan", 0), { kind: "runtime-test", proofFiles: ["bugs7CardOptionDispatchV1.test.ts"] }],
-  [rowKey("commands/ownerPlanDecisionCommandV1.ts", "notNow", 0), { kind: "trivial-no-dispatch" }],
   [rowKey("commands/applyReviewerVerifiedTicks.ts", "apply", 0), { kind: "runtime-test", proofFiles: ["applyReviewerVerifiedTicksCommand.test.ts"] }],
   // Corrected during verification: skip's effect IS doNothing
   // (applyReviewerVerifiedTicks.ts:222), not a command.
   [rowKey("commands/applyReviewerVerifiedTicks.ts", "skip", 0), { kind: "trivial-no-dispatch" }],
-  // review1 Step 10: the merged checklist card's "settle the rest" option opens the open-items form (a command that
-  // only shows the form); both cards build it from the same helper, and reconcilePlanChecklistCommand.test.ts asserts it.
-  [rowKey("commands/reconcilePlanChecklist.ts", "settleRest", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
-  [rowKey("commands/applyReviewerVerifiedTicks.ts", "settleRest", 0), { kind: "runtime-test", proofFiles: ["reconcilePlanChecklistCommand.test.ts"] }],
-  [rowKey("utils/reviewEscalation.ts", "recheckAfterMyChanges", 0), { kind: "runtime-test", proofFiles: ["keepIteratingTextV1.test.ts"] }],
-  // review1 Step 48: Investigate dispatches the diagnostic round; "I'll look at it myself" dispatches nothing.
-  [rowKey("utils/reviewEscalation.ts", "investigateFailure", 0), { kind: "runtime-test", proofFiles: ["environmentalFailureCardV1.test.ts"] }],
-  [rowKey("utils/reviewEscalation.ts", "lookMyself", 0), { kind: "trivial-no-dispatch" }],
 
   [rowKey("commands/reviewActions.ts", "retry", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts", "reviewRouting.test.ts"] }],
   // Both rows below have a genuine runtime
@@ -483,12 +408,6 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
     proofFiles: ["providerChainExhaustion.test.ts"],
   }],
   [rowKey("commands/reviewActions.ts", "wait", 0), {
-    kind: "runtime-test",
-    proofFiles: ["providerChainExhaustion.test.ts"],
-  }],
-  // bugs6 item 23: the effect is the registered turnOnFallbackAndRetryV1 command (sets the strategy, then dispatches
-  // resumeAndRerunReview); providerChainExhaustion.test.ts asserts the card's effect.command.
-  [rowKey("commands/reviewActions.ts", "turnOnFallback", 0), {
     kind: "runtime-test",
     proofFiles: ["providerChainExhaustion.test.ts"],
   }],
@@ -506,7 +425,24 @@ const ROW_EVIDENCE: ReadonlyMap<RowKey, RowEvidenceV1> = new Map<RowKey, RowEvid
   // literal is present, never a dispatch effect.
   [rowKey("commands/reviewActions.ts", "goToReviewAndApply", 1), { kind: "runtime-test", proofFiles: ["reviewRouting.test.ts", "commandArgNormalization.test.ts"], extraAnchors: ["resumeIfPausedThenGoToReviewAndApplyV1"] }],
   [rowKey("commands/reviewActions.ts", "notNow", 1), { kind: "trivial-no-dispatch" }],
-  // review1 Step 18: the third goToReviewAndApply site and `letItRun` (the preImplementationRouting card) are gone.
+  [rowKey("commands/reviewActions.ts", "goToReviewAndApply", 2), { kind: "runtime-test", proofFiles: ["reviewRouting.test.ts", "commandArgNormalization.test.ts"], extraAnchors: ["resumeIfPausedThenGoToReviewAndApplyV1"] }],
+  // letItRun: re-verified 2026-09-24. Unlike copilotImplementationRunner.ts's
+  // "continue" and quota.ts's original "resume" (both AWAITED by their caller,
+  // which then branches on the returned optionId — a real fork only a runtime
+  // test can prove), this decision is posted via a bare, un-awaited
+  // `postWorkflowDecisionV1(...)` (reviewActions.ts, the preImplementationRouting
+  // card) — fire-and-forget, never `awaitWorkflowDecisionAnswerV1`. The
+  // calling code checks only whether `decision` is `undefined` (no extension
+  // context to post through) and unconditionally "falls through to run
+  // Implementation" either way — see the comment immediately after the
+  // `postWorkflowDecisionV1` call ("this must not gate the current run").
+  // No production code path ever reads WHICH option the user chooses, so
+  // there is no fork left for a runtime test to exercise: the type system
+  // (effect: doNothing) plus this call-shape fact together already guarantee
+  // the already-running round is genuinely left alone whichever option is
+  // picked, or before it is even answered. This is the same "genuinely
+  // nothing to test" bar the trivial-no-dispatch bucket exists for.
+  [rowKey("commands/reviewActions.ts", "letItRun", 0), { kind: "trivial-no-dispatch" }],
   [rowKey("commands/reviewActions.ts", "retrySameModel", 0), { kind: "runtime-test", proofFiles: ["reviewRoutingMalformedBlockers.test.ts"] }],
   [rowKey("commands/reviewActions.ts", "chooseDifferentModel", 0), { kind: "runtime-test", proofFiles: ["reviewRoutingMalformedBlockers.test.ts"] }],
   [rowKey("commands/reviewActions.ts", "commitAndPush", 0), { kind: "runtime-test", proofFiles: ["reviewEscalation.test.ts"] }],

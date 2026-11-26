@@ -218,7 +218,7 @@ export function assessImplementationSummarySectionsV1(
 ): ImplementationSummarySectionPresenceV1 {
   const scope =
     expectations.planChecklist !== undefined
-      ? splitSummaryAtEchoV1(trimmed, expectations.planChecklist).own
+      ? splitSummaryAtEchoV1(trimmed).own
       : trimmed;
 
   const all = headingsV1(scope);
@@ -230,7 +230,7 @@ export function assessImplementationSummarySectionsV1(
     // Only the echo region counts. Searching the whole response let a
     // `## Verification` box whose text happened to match a plan item satisfy
     // the echo requirement with no echo present at all.
-    echoesPlanChecklist(splitSummaryAtEchoV1(trimmed, expectations.planChecklist).echo, expectations.planChecklist) ||
+    echoesPlanChecklist(splitSummaryAtEchoV1(trimmed).echo, expectations.planChecklist) ||
     // A round that fixed a review blocker without ticking any checkbox has
     // nothing to echo — the marker is its explicit, reasoned statement of
     // that, and is accepted in place of the echo rather than rejected as a
@@ -703,14 +703,7 @@ function findClosingBracketV1(text: string): number {
 }
 
 type FileEntryParseV1 =
-  | {
-      readonly kind: "path";
-      readonly token: string;
-      readonly candidate: string;
-      readonly decode: boolean;
-      /** review2 Step 21: further backticked paths the same bullet joins to the first with "and", a comma or a slash. */
-      readonly more?: readonly string[];
-    }
+  | { readonly kind: "path"; readonly token: string; readonly candidate: string; readonly decode: boolean }
   | { readonly kind: "rejected"; readonly token: string; readonly reason: string }
   | { readonly kind: "skip" };
 
@@ -755,28 +748,7 @@ function parseFileEntryV1(entry: string): FileEntryParseV1 {
   if (candidate.length === 0) {
     return { kind: "skip" };
   }
-  const more = backticked ? collectJoinedBacktickedPathsV1(entry.slice(backticked[0].length)) : [];
-  return { kind: "path", token: candidate, candidate, decode: false, ...(more.length > 0 ? { more } : {}) };
-}
-
-/**
- * review2 Step 21 (the 2026-11-06 linkedin-linker occurrence): a bullet may name several files, as
- * "`src/popup.ts` and `src/popup.store.ts`", "`a`, `b`", "`a` / `b`", "`a` & `b`" or "`a` + `b`". After the first
- * backticked path, each further backticked span joined by one of those connectors is another path of the same
- * bullet. Reading stops at the first text that is not such a connector, so a path mentioned in the description
- * ("— rewrote `helper.ts`'s callers") is never taken for a changed file.
- */
-function collectJoinedBacktickedPathsV1(rest: string): string[] {
-  const found: string[] = [];
-  let remaining = rest;
-  for (;;) {
-    const joined = /^\s*(?:,\s*(?:and\s+)?|\/|&|\+|and\s+)\s*`([^`]+)`/i.exec(remaining);
-    if (!joined) break;
-    const path = (joined[1] ?? "").trim();
-    if (path.length > 0) found.push(path);
-    remaining = remaining.slice(joined[0].length);
-  }
-  return found;
+  return { kind: "path", token: candidate, candidate, decode: false };
 }
 
 /**
@@ -810,7 +782,7 @@ export function parseReportedFilesChangedV1(
   }
   const scope =
     expectations.planChecklist !== undefined
-      ? splitSummaryAtEchoV1(trimmed, expectations.planChecklist).own
+      ? splitSummaryAtEchoV1(trimmed).own
       : trimmed;
   const all = headingsV1(scope);
   const index = findLastHeadingV1(all, "Files Changed");
@@ -857,16 +829,14 @@ export function parseReportedFilesChangedV1(
       rejected.push({ entry: parsed.token, reason: parsed.reason });
       continue;
     }
-    for (const candidate of [parsed.candidate, ...(parsed.more ?? [])]) {
-      const resolved = resolveReportedDestinationV1(candidate, {
-        decode: parsed.decode,
-        workspaceRoot: expectations.workspaceRoot,
-      });
-      if ("reject" in resolved) {
-        rejected.push({ entry: candidate === parsed.candidate ? parsed.token : candidate, reason: resolved.reject });
-      } else {
-        paths.push(resolved.path);
-      }
+    const resolved = resolveReportedDestinationV1(parsed.candidate, {
+      decode: parsed.decode,
+      workspaceRoot: expectations.workspaceRoot,
+    });
+    if ("reject" in resolved) {
+      rejected.push({ entry: parsed.token, reason: resolved.reject });
+    } else {
+      paths.push(resolved.path);
     }
   }
   return { paths, rejected, entryCount };

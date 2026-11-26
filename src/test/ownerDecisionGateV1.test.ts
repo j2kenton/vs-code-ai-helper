@@ -123,20 +123,11 @@ void describe("owner decisions in the completeness gate (bugs4 Step 11, item 7)"
     assert.equal(counted.gate.remaining, 1);
   });
 
-  void it("an owner decision recorded at an older plan revision still applies while its item is unchanged (review1 Step 2)", () => {
+  void it("ignores an owner decision recorded against a different plan revision", () => {
     const plan = incidentPlan();
     const ticked = withOwnerTicks(plan, 63);
-    const older = (ticked.planItemOwnerDecisions ?? []).map((row) => ({ ...row, planRevision: "0".repeat(64) }));
-    const counted = gateOf(plan, { planItemEvidence: ticked.planItemEvidence, planItemOwnerDecisions: older });
-    assert.ok(counted);
-    assert.equal(counted.ownerSettled, 63);
-  });
-
-  void it("ignores an owner decision whose item has since changed (its content hash no longer matches)", () => {
-    const plan = incidentPlan();
-    const ticked = withOwnerTicks(plan, 63);
-    const changed = (ticked.planItemOwnerDecisions ?? []).map((row) => ({ ...row, itemContentHash: "f".repeat(32) }));
-    const counted = gateOf(plan, { planItemEvidence: ticked.planItemEvidence, planItemOwnerDecisions: changed });
+    const stale = (ticked.planItemOwnerDecisions ?? []).map((row) => ({ ...row, planRevision: "0".repeat(64) }));
+    const counted = gateOf(plan, { planItemEvidence: ticked.planItemEvidence, planItemOwnerDecisions: stale });
     assert.ok(counted);
     assert.equal(counted.ownerSettled, 0);
   });

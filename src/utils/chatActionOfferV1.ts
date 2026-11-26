@@ -46,8 +46,6 @@ export interface ChatActionOfferInputV1 {
     readonly target: "none" | "action" | { readonly alternativeIndex: number };
     readonly reasoning: string;
   };
-  /** Replaces the generic "<action> is the next step for <task>" line, for an action that is not the next step. */
-  readonly whyUserNeeded?: string;
   /** Consequence text for the action option, replacing the generic "Runs …" line. */
   readonly actionConsequence?: string;
   /** True only for a "Resume" offer: the task stays paused until the action is chosen. */
@@ -103,7 +101,7 @@ export async function offerActionInChatV1(
       taskCanonicalId: input.taskFolderPath,
       stage: progress.currentStage,
       whatHappened: input.noticeText,
-      whyUserNeeded: input.whyUserNeeded ?? `${input.actionLabel} is the next step for ${taskLabel}; choose it here to run it now.`,
+      whyUserNeeded: `${input.actionLabel} is the next step for ${taskLabel}; choose it here to run it now.`,
       options: [
         {
           optionId: "runAction",

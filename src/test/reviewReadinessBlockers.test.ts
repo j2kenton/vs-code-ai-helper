@@ -50,7 +50,7 @@ void describe("parseReviewBlockers", () => {
     ]);
   });
 
-  void it("counts bullets without a valid resolver as unknown-resolver blockers instead of throwing", () => {
+  void it("excludes malformed lines from .blockers instead of throwing", () => {
     const content = [
       "<!-- blockers:start -->",
       "- [completion] missing the resolver bracket entirely",
@@ -59,14 +59,9 @@ void describe("parseReviewBlockers", () => {
       "- [completion] [task-fixable] the one valid line",
       "<!-- blockers:end -->",
     ].join("\n");
-    // bugs6 item 45: the three untagged bullets are counted, none is task-fixable, and only the valid line is.
-    const parsed = parseReviewBlockers(content);
-    assert.strictEqual(parsed.length, 4);
-    assert.deepStrictEqual(
-      parsed.filter((b) => b.resolver === "task-fixable"),
-      [{ category: "completion", resolver: "task-fixable", description: "the one valid line", origin: "reviewer" }]
-    );
-    assert.strictEqual(parsed.filter((b) => b.resolver === "unknown").length, 3);
+    assert.deepStrictEqual(parseReviewBlockers(content), [
+      { category: "completion", resolver: "task-fixable", description: "the one valid line", origin: "reviewer" },
+    ]);
   });
 
   void it("returns an empty array for an empty blockers block (reviewer found nothing)", () => {
@@ -294,16 +289,10 @@ void describe("parseReviewBlockersDetailed.malformedLines (fail-closed)", () => 
       "<!-- blockers:end -->",
     ].join("\n");
     const evidence = parseReviewBlockersDetailed(content);
-    // bugs6 item 45: a bullet with no resolver tag is counted (resolver unknown), never dropped.
-    assert.strictEqual(evidence.blockers.length, 2);
-    assert.deepStrictEqual(evidence.blockers[0], {
-      category: "completion",
-      resolver: "task-fixable",
-      description: "the one valid line",
-      origin: "reviewer",
-    });
-    assert.strictEqual(evidence.blockers[1]?.resolver, "unknown");
-    assert.deepStrictEqual(evidence.malformedLines, []);
+    assert.deepStrictEqual(evidence.blockers, [
+      { category: "completion", resolver: "task-fixable", description: "the one valid line", origin: "reviewer" },
+    ]);
+    assert.deepStrictEqual(evidence.malformedLines, ["- this is not a blocker line at all"]);
     assert.strictEqual(hasZeroTaskFixableEvidence(content), false);
   });
 
@@ -314,22 +303,20 @@ void describe("parseReviewBlockersDetailed.malformedLines (fail-closed)", () => 
       "<!-- blockers:end -->",
     ].join("\n");
     const evidence = parseReviewBlockersDetailed(content);
-    assert.strictEqual(evidence.blockers.length, 1);
-    assert.strictEqual(evidence.blockers[0]?.resolver, "unknown");
+    assert.deepStrictEqual(evidence.blockers, []);
+    assert.strictEqual(evidence.malformedLines.length, 1);
     assert.strictEqual(hasZeroTaskFixableEvidence(content), false);
   });
 
-  void it("a category-only line (no resolver) is counted with the resolver unknown, not malformed", () => {
+  void it("a category-only line (no resolver) lands in malformedLines, not .blockers", () => {
     const content = [
       "<!-- blockers:start -->",
       "- [completion] category but no resolver bracket",
       "<!-- blockers:end -->",
     ].join("\n");
     const evidence = parseReviewBlockersDetailed(content);
-    assert.deepStrictEqual(evidence.malformedLines, []);
-    assert.strictEqual(evidence.blockers.length, 1);
-    assert.strictEqual(evidence.blockers[0]?.category, "completion");
-    assert.strictEqual(evidence.blockers[0]?.resolver, "unknown");
+    assert.deepStrictEqual(evidence.blockers, []);
+    assert.deepStrictEqual(evidence.malformedLines, ["- [completion] category but no resolver bracket"]);
   });
 
   void it("an explicitly empty block still yields zero-fixable evidence, with malformedLines empty", () => {

@@ -14,12 +14,8 @@ import {
   describeSchedulingPostureV1,
 } from "../state/schedulingIntentV1";
 import { renderRequiredHandoffFieldsV1 } from "../types/handoffGuidanceV1";
-import {
-  formatPlanItemCountsLineV1,
-  readEffectivePlanChecklistProgressForDisplayV1,
-  readPlanItemCountsV1,
-} from "../utils/effectiveReviewProgress";
-import { describeContinueTheWorkMenuEntryV1, planItemsLeftFromCountsV1 } from "../utils/continueTheWorkLabelV1";
+import { readEffectivePlanChecklistProgressForDisplayV1 } from "../utils/effectiveReviewProgress";
+import { formatChecklistPercentV1 } from "../utils/implementationChecklist";
 import { resolveHeadCommitSha } from "../utils/gitRepoInfo";
 import { escapeTooltipHtmlV1, renderTooltipInfoTextV1, tooltipLiteralTextV1 } from "./tooltipInfoTextV1";
 import { normalizePath } from "../utils/taskRoot";
@@ -205,8 +201,8 @@ export class TaskStatusBar implements vscode.Disposable {
     if (generation !== this.renderGeneration || !counted) {
       return;
     }
-    // review1 Step 5: the same shared counts and line the chat header shows.
-    this.renderActiveTask(task, icon, formatPlanItemCountsLineV1(counted));
+    this.renderActiveTask(task, icon, `${formatChecklistPercentV1(counted.settled, counted.total)}%` +
+      ` · ${counted.verified} verified · ${counted.provisional} provisional`);
   }
 
   /**
@@ -280,7 +276,7 @@ export class TaskStatusBar implements vscode.Disposable {
     const quarantinedFiles = taskToShow.progress.pendingImplReviewFiles ?? [];
     const quarantinedFilesLine =
       owedIndicator && quarantinedFiles.length > 0
-        ? `$(files) ${quarantinedFiles.length} changed file(s) kept for the next round:${escapeTooltipHtmlV1(quarantinedFiles.join(", "))}`
+        ? `$(files) ${quarantinedFiles.length} file(s) quarantined behind it: ${escapeTooltipHtmlV1(quarantinedFiles.join(", "))}`
         : undefined;
 
     // General scheduling posture (task item 11's five-value vocabulary:
@@ -445,32 +441,6 @@ export class TaskStatusBar implements vscode.Disposable {
           arg: { task: taskToShow },
         });
       } else {
-        // review1 Step 56: on a review stage with a review on record the next action is continuing the work, named
-        // with the plan items left from the one shared counter. It is the same stage action, not a stage change.
-        const stage = taskToShow.progress.currentStage;
-        if (isReviewStage(stage)) {
-          const hasReview = await describeReviewStageScoreV1(
-            taskToShow.canonicalId ?? taskToShow.folderUri.fsPath,
-            stage,
-            taskToShow.folderUri,
-            () => resolveHeadCommitSha(taskToShow.folderUri.fsPath)
-          ).catch(() => undefined);
-          if (hasReview) {
-            const counts = await readPlanItemCountsV1(taskToShow.folderUri, { policy: "lenient", mode: "display" }).catch(
-              () => undefined
-            );
-            const entry = describeContinueTheWorkMenuEntryV1(
-              counts && counts.total > 0 ? planItemsLeftFromCountsV1(counts) : undefined
-            );
-            items.push({
-              label: entry.label,
-              description: taskToShow.folderName,
-              detail: entry.detail,
-              command: "vs-code-ai-helper.applyCurrentStageAction",
-              arg: { taskFolderPath: taskToShow.folderUri.fsPath },
-            });
-          }
-        }
         items.push({
           label: `$(file-text) Open shown task`,
           description: taskToShow.folderName,

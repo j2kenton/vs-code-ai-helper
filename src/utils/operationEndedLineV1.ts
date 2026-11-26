@@ -19,7 +19,6 @@
  */
 import type { TaskActionOutcomeV1 } from "../types/taskActionOutcomeV1";
 import { describeTaskActionFailureV1 } from "./taskActionOutcomeTextV1";
-import { describeRefusalReasonV1 } from "./refusalGuidanceV1";
 import { claimTerminalLineV1, ledgerOwnsTerminalLineV1, reserveLedgerTerminalLineV1 } from "./terminalLineEmitterV1";
 
 export type EndedOperationStateV1 =
@@ -38,8 +37,6 @@ export interface TrackedOperationV1 {
 
 export interface EndedOperationV1 extends TrackedOperationV1 {
   readonly state: string;
-  /** The operation's kind; a refused review always gets a stated reason and next click (review2 Step 13). */
-  readonly kind?: string;
   /** Why the operation settled the way it did, when its owner said. */
   readonly endReasonV1?: string;
   readonly cancelReasonV1?: string;
@@ -85,24 +82,6 @@ export function recordOperationTerminalOutcomeV1(operationId: string, outcome: O
   if (outcome.ledgerSpeaks) {
     reserveLedgerTerminalLineV1(operationId);
   }
-}
-
-const stoppedBeforeAnyRoundV1 = new Map<string, string>();
-
-/**
- * bugs6 item 42: marks an operation that ended without dispatching a single round, so its Notifications entry says
- * "stopped before any round: <reason>" instead of "completed". The operation's own state stays `succeeded` (the
- * command returned); only the words change.
- */
-export function markOperationStoppedBeforeAnyRoundV1(operationId: string, reason: string): void {
-  stoppedBeforeAnyRoundV1.set(operationId, reason);
-}
-
-/** Reads and clears the mark; called once, when the operation's Notifications entry is built. */
-export function takeOperationStoppedBeforeAnyRoundV1(operationId: string): string | undefined {
-  const reason = stoppedBeforeAnyRoundV1.get(operationId);
-  stoppedBeforeAnyRoundV1.delete(operationId);
-  return reason;
 }
 
 /** Drop a recorded outcome (tests, and an operation that never ends). */
@@ -196,11 +175,7 @@ export class OperationEndedLineTrackerV1 {
     // that failed under it is what actually happened.
     const carried = this.inherited.get(operation.id);
     this.inherited.delete(operation.id);
-    const carriedOrOwn = own.state === "succeeded" && carried ? carried : own;
-    const effective: SettledOutcomeV1 =
-      carriedOrOwn.state === "refused"
-        ? { state: "refused", reason: describeRefusalReasonV1(carriedOrOwn.reason, operation.kind) }
-        : carriedOrOwn;
+    const effective = own.state === "succeeded" && carried ? carried : own;
     const parent = operation.parentId !== undefined ? this.registered.get(operation.parentId) : undefined;
     if (parent !== undefined && parent.label === operation.label && !this.emitted.has(parent.id)) {
       if (effective.state !== "succeeded" && !this.inherited.has(parent.id)) {

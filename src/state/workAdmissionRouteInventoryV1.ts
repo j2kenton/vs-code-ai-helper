@@ -115,15 +115,6 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
   clearNotificationsSearch: { kind: "notWatchdogSusceptible", reason: "UI filter state only" },
   clearNotifications: { kind: "notWatchdogSusceptible", reason: "UI state only" },
   cancelOperation: { kind: "notWatchdogSusceptible", reason: "cancels in-flight work; never starts a provider round itself" },
-  waitOnOperation: { kind: "notWatchdogSusceptible", reason: "hides a no-activity warning for another warning period; starts, stops and changes nothing" },
-  runHeldAnswerNow: {
-    kind: "delegatesDynamically",
-    evidence:
-      "src/views/chatView.ts — runHeldAnswerNowV1 re-arms the owner's held answer through holdOptionUntilTaskFreeV1 " +
-      "(dispatched through the task's work admission, so a Pause or Cancel wins) and cancels the running round; the " +
-      "command the held answer then runs is itself one of the already-classified commands in this table",
-  },
-  dropHeldAnswer: { kind: "notWatchdogSusceptible", reason: "marks a held answer dropped and says so in the chat; dispatches no provider round" },
   runNotificationAction: {
     kind: "delegatesDynamically",
     evidence:
@@ -143,23 +134,6 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
       "src/commands/acceptPlanItemNarrowingV1.ts — records the owner decision in plan-final.md (no provider call), then " +
       "re-runs the review through resumeAndRerunReviewV1, which resumes under admission and dispatches runReviewWithAI " +
       "with admissionHandoffTokenV1",
-  },
-  runOwnerEvidenceCommandV1: {
-    kind: "delegatesTo",
-    to: "runReviewWithAI",
-    evidence:
-      "src/commands/runOwnerEvidenceCommandV1.ts — runs an allowlisted read-only command (no provider call, no task " +
-      "write beyond task.md's Owner evidence), then re-runs the review through resumeAndRerunReviewV1, which resumes " +
-      "under admission and dispatches runReviewWithAI with admissionHandoffTokenV1",
-  },
-  runPublishChecksNowV1: { kind: "notWatchdogSusceptible", reason: "deterministic checks run for the owner; no provider dispatch" },
-  recordOwnerRunCommandV1: {
-    kind: "delegatesTo",
-    to: "runReviewWithAI",
-    evidence:
-      "src/commands/recordOwnerRunCommandV1.ts — records the command the owner ran under Owner evidence in task.md (no " +
-      "provider call), then re-runs the review through resumeAndRerunReviewV1, which resumes under admission and " +
-      "dispatches runReviewWithAI with admissionHandoffTokenV1",
   },
   applyHighLevelReviewChanges: {
     kind: "delegatesTo",
@@ -230,11 +204,6 @@ export const WORK_ADMISSION_ROUTE_INVENTORY_V1: Readonly<Record<string, WorkAdmi
     kind: "delegatesTo",
     to: "runReviewWithAI",
     evidence: "src/commands/reviewCurrentTask.ts — resolves the current task and executes vs-code-ai-helper.runReviewWithAI",
-  },
-  widenReviewScopeToAllChanged: {
-    kind: "delegatesTo",
-    to: "runReviewWithAI",
-    evidence: "src/commands/widenReviewScopeCurrentTaskV1.ts — adds the task's changed files to the review scope, then executes vs-code-ai-helper.runReviewWithAI via resolvePartialReviewScopeV1",
   },
   fastForwardCurrentTaskReview: {
     kind: "delegatesTo",

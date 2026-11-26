@@ -266,58 +266,31 @@ import {
   type ForeignTaskArtifactSnapshotV1,
 } from "./foreignTaskArtifactContainmentV1";
 import { normalizePath } from "./taskRoot";
-import { taskOperations } from "./taskOperations";
-import { currentHeldDispatchIdV1, hasAutomaticOriginV1 } from "../state/automationDispatchContextV1";
-import { fastForwardRoundFieldsV1, isFastForwardRunActiveV1 } from "./activeFastForwardRunsV1";
-import { recordRoundEndedInWatchV1 } from "./taskProgressWatchV1";
-import { formatRepeatedRejectionLineV1 } from "./reportContractRejectionsV1";
-
-/** run1 Step 26: a round opened by carrying out a held owner answer records the answer's dispatch id. */
-function heldDispatchFieldV1(): { heldDispatchId?: string } {
-  const id = currentHeldDispatchIdV1();
-  return id !== undefined ? { heldDispatchId: id } : {};
-}
+import { getLiveTaskOperationV1, isOperationLiveByIdV1 } from "./liveTaskOperationLookupV1";
 
 /**
- * run1 Step 25: other-task `task.md` edits already said once on an end line (task folder name and
- * content hash), so later end lines skip them. The record is the running task's own
- * `notedForeignEdits` progress field, so it survives a reload.
+ * bugs6 item 21 (backport of run1 Step 25): other-task `task.md` edits already said once on an end
+ * line, keyed by running task, other task folder name and content hash, so later end lines skip them.
+ * Kept in memory for this extension host only (run1 keeps it in task progress); after a reload the
+ * same edit may be said once more.
  */
-const NOTED_FOREIGN_EDITS_LIMIT_V1 = 100;
+const NOTED_FOREIGN_EDITS_LIMIT_V1 = 500;
+const notedForeignEditsV1 = new Set<string>();
 
-function notedForeignEditKeyV1(taskFolderPath: string, sha256: string): string {
-  return `${path.basename(path.resolve(taskFolderPath))}:${sha256}`;
+function notedForeignEditKeyV1(runningTaskFolderPath: string, otherTaskFolderPath: string, sha256: string): string {
+  return `${normalizePath(path.resolve(runningTaskFolderPath))}|${path.basename(path.resolve(otherTaskFolderPath))}:${sha256}`;
 }
 
-async function readNotedForeignEditsV1(taskFolderPath: string): Promise<ReadonlySet<string>> {
-  try {
-    const parsed = JSON.parse(await fs.promises.readFile(path.join(taskFolderPath, "task-progress.json"), "utf8")) as {
-      notedForeignEdits?: unknown;
-    };
-    return new Set(Array.isArray(parsed.notedForeignEdits) ? parsed.notedForeignEdits.filter((e): e is string => typeof e === "string") : []);
-  } catch {
-    return new Set();
+function rememberNotedForeignEditV1(key: string): void {
+  notedForeignEditsV1.add(key);
+  while (notedForeignEditsV1.size > NOTED_FOREIGN_EDITS_LIMIT_V1) {
+    const oldest = notedForeignEditsV1.values().next().value;
+    if (oldest === undefined) {
+      break;
+    }
+    notedForeignEditsV1.delete(oldest);
   }
 }
-
-/** Best-effort: a failed write only means the same edit may be said once more on a later end line. */
-async function recordNotedForeignEditsV1(
-  taskFolderUri: vscode.Uri,
-  keys: readonly string[]
-): Promise<void> {
-  if (keys.length === 0) {
-    return;
-  }
-  try {
-    await patchTaskProgressStrictV1(taskFolderUri, (current) => {
-      const merged = [...new Set([...(current.notedForeignEdits ?? []), ...keys])].slice(-NOTED_FOREIGN_EDITS_LIMIT_V1);
-      return { ...current, notedForeignEdits: merged };
-    });
-  } catch {
-    // Never blocks the round's end line.
-  }
-}
-import { getLiveTaskOperationV1, isOperationLiveByIdV1 } from "./liveTaskOperationLookupV1";
 import { logChatStatusToNotificationsV1 } from "./chatStatusLogV1";
 import {
   claimRoundNotificationV1,
@@ -661,11 +634,7 @@ export function formatRoundOutcomeMessageV1(
     } else if (outcome.score !== undefined) {
       const reviewer = outcome.reviewerBlockers ?? 0;
       const mechanical = outcome.mechanicalBlockers ?? 0;
-      const unclassified = outcome.unclassifiedBlockers ?? 0;
-      // bugs6 item 45: a line the review wrote with no resolver is counted, with the gap said aloud.
-      const reviewerText =
-        unclassified > 0 ? `${reviewer + unclassified} (${unclassified} whose kind the review didn't state)` : `${reviewer}`;
-      parts.push(`score ${outcome.score} · ${reviewerText} reviewer / ${mechanical} mechanical blocker(s)`);
+      parts.push(`score ${outcome.score} · ${reviewer} reviewer / ${mechanical} mechanical blocker(s)`);
     } else if (outcome.filesChangedUnknown) {
       parts.push("files changed (exact set unknown)");
     } else if (outcome.filesChanged !== undefined) {
@@ -673,17 +642,6 @@ export function formatRoundOutcomeMessageV1(
         outcome.filesChanged.length > 0
           ? `${outcome.filesChanged.length} file(s) changed`
           : "no files changed"
-      );
-    }
-    // bugs6 items 41 and 46: a round that ended with most of its budget unused says so on its own Ended line.
-    if (outcome.stoppedEarly) {
-      parts.push(outcome.stoppedEarly);
-    }
-    // A stop sentence from `describeRoundStopV1` already says it; do not repeat it on the same line.
-    if (outcome.observedFiles?.length && !outcome.rejectionReason?.includes("while it ran")) {
-      const count = outcome.observedFiles.length;
-      parts.push(
-        `${count} file${count === 1 ? "" : "s"} changed in the workspace while it ran, not proven to be this round's`
       );
     }
     if (outcome.reviewerChallengedNonGoal?.length) {
@@ -881,17 +839,6 @@ export async function terminalizeRoundV1(
     if (options.postTerminalizePatch) {
       next = options.postTerminalizePatch(next, nextEntry);
     }
-    // review1 Step 23: every ledger ending feeds the one "is this task moving?" record the gate in front of
-    // every automatic dispatch reads. A round is automatic when automation started it: an automatic-origin call
-    // tree, a scheduling intent, a recovery continuation, or a Fast Forward run in progress for the task.
-    next = recordRoundEndedInWatchV1(next, nextEntry, {
-      automatic:
-        hasAutomaticOriginV1() ||
-        nextEntry.intentId !== undefined ||
-        nextEntry.continuationOf !== undefined ||
-        isFastForwardRunActiveV1(options.taskFolderUri.fsPath),
-      ...(options.roundOutcomeClassification?.modelId !== undefined ? { model: options.roundOutcomeClassification.modelId } : {}),
-    });
     // v1 fixes 2, item 8: a completed round that arranged nothing further
     // hands the task back to the human (see the transform's doc comment).
     return handBackToHumanAfterCompletedRoundV1(next, nextEntry);
@@ -946,28 +893,20 @@ export async function terminalizeRoundV1(
             .map((line) => line.replace(/^\s*-\s*\[[ xX]\]\s+/, "").replace(/^\*\*(.*?)\*\*$/, "$1").trim())
             .filter(Boolean)
         );
-        const alreadyNotedEdits = await readNotedForeignEditsV1(currentTaskFolderPath);
-        // run1 Step 25: the window is when the round's model process ran, as its runner recorded it. The
-        // ledger's own start and end include preparation and bookkeeping, where other writes land too, so
-        // a round with no recorded process window (a review, a round that never spawned) offers no advice.
-        const roundStartMs = Date.parse(entry.outcome?.processStartedAt ?? "");
-        const roundEndMs = Date.parse(entry.outcome?.processEndedAt ?? "");
+        // bugs6 items 21 (backport of run1 Step 25, abd1aca): a task folder New Task made at any point
+        // in the round's span is Ensemble's own (no note, never "move it into this task"); an owner edit
+        // of another task's task.md, with no round running there, is said once per task and content.
+        // No process window is passed (this release does not record one), so move advice is not offered.
         const ledgerStartMs = Date.parse(entry.startedAt);
         const ledgerEndMs = entry.endedAt !== undefined ? Date.parse(entry.endedAt) : Date.now();
         const result = await containForeignTaskArtifactChangesV1(changes, currentTaskFolderPath, {
-          // A task folder New Task made at any point in the round's whole span is Ensemble's own.
           ...(Number.isFinite(ledgerStartMs) && Number.isFinite(ledgerEndMs)
             ? { createdWithinWindow: { startMs: ledgerStartMs, endMs: ledgerEndMs } }
             : {}),
-          // run1 Step 25: this round's process window, and the names its own content would carry, so
-          // "move it into this task" is offered only with that evidence. A round running in the other
-          // task makes its writes that round's own; an owner edit is said once per task and content.
-          ...(Number.isFinite(roundStartMs) && Number.isFinite(roundEndMs)
-            ? { roundWindow: { startMs: roundStartMs, endMs: roundEndMs } }
-            : {}),
           currentTaskNames: [path.basename(currentTaskFolderPath)],
-          isRoundRunningInTask: (folder) => taskOperations.hasRootOperationForTask(folder),
-          isEditAlreadyNoted: (folder, sha256) => alreadyNotedEdits.has(notedForeignEditKeyV1(folder, sha256)),
+          isRoundRunningInTask: (folder) => getLiveTaskOperationV1(folder) !== undefined,
+          isEditAlreadyNoted: (folder, sha256) =>
+            notedForeignEditsV1.has(notedForeignEditKeyV1(currentTaskFolderPath, folder, sha256)),
           isConcurrentForeignUpdate: [...foreignFolders].some((folder) => {
             try {
               const state = JSON.parse(fs.readFileSync(path.join(folder, "task-progress.json"), "utf8")) as { status?: unknown };
@@ -992,10 +931,9 @@ export async function terminalizeRoundV1(
             );
           },
         });
-        await recordNotedForeignEditsV1(
-          options.taskFolderUri,
-          (result.notedEdits ?? []).map((edit) => notedForeignEditKeyV1(edit.taskFolderPath, edit.sha256))
-        );
+        for (const edit of result.notedEdits ?? []) {
+          rememberNotedForeignEditV1(notedForeignEditKeyV1(currentTaskFolderPath, edit.taskFolderPath, edit.sha256));
+        }
         foreignArtifactNote = result.chatNotices.length > 0
           ? [
               "Task-artifact changes were detected under another task folder. Recovery was limited to artifacts whose ownership could be established:",
@@ -1031,12 +969,6 @@ export async function terminalizeRoundV1(
   }
   const mayPostOutcomeLine = claimTerminalLineV1(terminalLineKey, "ledger") && !observerLinePersisted;
   let outcomeText: string | undefined;
-  // review1 Step 35: the third rejection of the same kind in a task is a pattern. While automation is still running
-  // there is no stop card to carry it, so the round-end line says how many times it has happened and what to do.
-  const repeatedRejectionNote =
-    entry.state === "rejected" && (hasAutomaticOriginV1() || isFastForwardRunActiveV1(options.taskFolderUri.fsPath))
-      ? formatRepeatedRejectionLineV1(patched.reportContractRejections) || undefined
-      : undefined;
   try {
     outcomeText = formatRoundOutcomeMessageV1(
       entry,
@@ -1044,7 +976,7 @@ export async function terminalizeRoundV1(
         ? patched.roundLedger?.find((candidate) => candidate.roundId === entry.continuationOf)?.startedAt
         : undefined,
       patched,
-      [options.chatAttributionNote, foreignArtifactNote, repeatedRejectionNote].filter(Boolean).join("\n\n") || undefined
+      [options.chatAttributionNote, foreignArtifactNote].filter(Boolean).join("\n\n") || undefined
     );
     if (mayPostOutcomeLine) {
       await appendChatMessageV1(
@@ -1441,8 +1373,6 @@ export async function claimImplementationRoundLedgerV1(
           stage,
           mode,
           state: "open",
-          ...fastForwardRoundFieldsV1(folderUri.fsPath),
-          ...heldDispatchFieldV1(),
         }
       : {
           roundId: candidateRoundId,
@@ -1451,8 +1381,6 @@ export async function claimImplementationRoundLedgerV1(
           mode,
           startedAt: new Date().toISOString(),
           state: "open",
-          ...fastForwardRoundFieldsV1(folderUri.fsPath),
-          ...heldDispatchFieldV1(),
           ...(pendingIntentId && !resolvedPending ? { intentId: pendingIntentId } : {}),
         };
     finalRoundId = openRow.roundId;

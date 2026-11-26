@@ -70,7 +70,7 @@ void describe("partial review scope", () => {
     assert.deepEqual(
       input.options.map((o) => o.label),
       [
-        "Add the 63 missing files and review again",
+        "Add the 63 missing files and review again (Recommended)",
         "Accept the partial scope (63 files not reviewed)",
         "Not now",
       ]

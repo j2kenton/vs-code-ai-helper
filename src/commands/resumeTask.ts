@@ -3,7 +3,6 @@ import { TaskInventory } from "../state/taskInventory";
 import { describeWorkAdmissionRefusalForUserV1 } from "../utils/busyAdmissionTextV1";
 import { recordStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
 import { offerBusyRefusalChoicesOnceV1 } from "../utils/busyRefusalChoicesV1";
-import { acquireWaitingForYoungHolderV1 } from "../utils/youngAdmissionHolderWaitV1";
 import { CurrentTaskStore } from "../utils/currentTaskStore";
 import { resolveTaskContext, ResolvedTaskContext } from "../utils/resolveTaskContext";
 import { clearEscalationRecordingPlateauOverrideV1, pauseTaskWithReason, setNextActorV1 } from "../utils/taskProgressTransforms";
@@ -13,7 +12,7 @@ import { STAGE_DISPLAY_NAMES, TaskStage } from "../types/taskProgress";
 import { ESCALATION_DECISION_KEYS_V1 } from "../utils/reviewEscalation";
 import { withdrawWorkflowDecisionsByKeyV1 } from "../utils/workflowDecisionDispatchV1";
 import { retirePendingQuestionsV1 } from "../utils/cardLifecycleV1";
-import { appendOwnerDecisionV1, OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "../utils/ownerEvidenceV1";
+import { OWNER_EVIDENCE_ANSWER_MARKER_V1 } from "../utils/ownerEvidenceV1";
 import {
   acquireWorkAdmissionV1,
   authorizeWorkAdmissionHandoffV1,
@@ -33,40 +32,22 @@ import { readChatInteractions } from "../utils/chatHistoryStore";
 import { notificationTaskDisplayNameV1 } from "../utils/notificationTaskContextV1";
 import { activateTask } from "../state/taskActivationCoordinator";
 import { pickReopenStage, reopenCompletedTask } from "../utils/reopenTask";
-import { CancelRunningOperationsResultV1, runTrackedOperation, taskKey, taskOperations } from "../utils/taskOperations";
-import { STARTUP_ANNOUNCER_MAX_AGE_MS_V1 } from "../utils/startupAnnouncerLinesV1";
-import { peekRecentStageActionRefusalReasonV1 } from "../utils/stageActionRefusalV1";
-import { RESUME_TASK_CLICK_V1, StageDispatchOutcomeV1 } from "../types/stageDispatchOutcomeV1";
+import { CancelRunningOperationsResultV1, runTrackedOperation, taskKey } from "../utils/taskOperations";
 import { clearApplyReviewFocusV1, setApplyReviewFocusV1 } from "../utils/applyReviewFocusV1";
-import {
-  clearApprovedFixRequestV1,
-  clearInvestigationRequestV1,
-  collectProtectedFilesV1,
-  describeOutOfPlanApprovalV1,
-  InvestigationRequestV1,
-  nextDiagnosisPathV1,
-  sanitizeApprovedFixFilesV1,
-  setApprovedFixRequestV1,
-  setInvestigationRequestV1,
-} from "../utils/investigateFailureV1";
 import { clearPendingEndedLineNoteV1, setPendingEndedLineNoteV1 } from "../utils/operationEndedLineV1";
 import { TaskCreationStartupReconcilerV1 } from "../state/taskCreationStartupReconcilerV1";
 import { readTaskProgressStrictV1 } from "../services/taskProgressReaderV1";
 import { goToReviewAndApplyV1 } from "./goToReviewAndApplyV1";
-import { confirmAdvanceOverOpenItemsV1 } from "./confirmAdvanceOverOpenItemsV1";
-import { confirmUnreviewedFilesV1 } from "./confirmUnreviewedFilesV1";
 import { loadResumeActionPlanV1, preflightFixedDispatchV1 } from "../utils/resumeActionPlanV1";
 import {
   FastForwardResumeStateV1,
   buildFastForwardResumeDispatchV1,
   decideDurableFastForwardResumeV1,
-  decideLedgerBackedFastForwardResumeV1,
   describeKeepIteratingStandInEndedNoteV1,
   isFastForwardResumeStateTrustedV1,
 } from "./fastForwardResumeSuffixV1";
-import { getFastForwardSessionIdV1, isFastForwardRunActiveV1 } from "../utils/activeFastForwardRunsV1";
+import { getFastForwardSessionIdV1 } from "../utils/activeFastForwardRunsV1";
 import { getLiveTaskOperationV1 } from "../utils/liveTaskOperationLookupV1";
-import { clearOwnerPauseV1 } from "../utils/ownerPauseRecordV1";
 
 /**
  * Accepted argument shapes for resumeTask.
@@ -329,15 +310,11 @@ export async function resumePausedTask(
   // (`hasLiveWorkAdmissionBestEffortV1`), so the sweep now finds a task
   // under active protection instead of one that silently went active with
   // nothing running.
-  // review1 Step 41: a refusal caused only by the task's own chain having started an operation seconds ago waits
-  // (bounded) for that operation instead of dropping this resume with a busy card.
-  const admission = await acquireWaitingForYoungHolderV1(() =>
-    acquireWorkAdmissionV1({
-      taskFolderPath: resolvedTask.taskFolderPath,
-      purpose: "admission",
-      commandId: "resumeTask",
-    })
-  );
+  const admission = await acquireWorkAdmissionV1({
+    taskFolderPath: resolvedTask.taskFolderPath,
+    purpose: "admission",
+    commandId: "resumeTask",
+  });
   if (admission.outcome !== "acquired") {
     const busyRefusalWithTaskLabel = describeWorkAdmissionRefusalForUserV1(admission, taskLabel);
     // Recorded so a caller that dispatched this resume (the open-items form's
@@ -496,8 +473,6 @@ export async function resumePausedTask(
         // one write. Never overwrites an existing `scheduledRun` — e.g. a
         // quota-park's own future rerun — which is a deliberate future
         // intent, not a stand-in for "nothing is arranged yet".
-        // run1 Step 31: resuming ends the owner's pause.
-        clearOwnerPauseV1(resolvedTask.taskFolderPath);
         const activated = await activateTask(
           inventory, currentTaskStore, resolvedTask.taskFolderPath, resolvedTask.canonicalId,
           {
@@ -1035,78 +1010,6 @@ async function resumeCompletedTask(
 }
 
 /**
- * bugs8 Step 4: watches for the CONFIRMED start of a dispatch. A start is confirmed by exactly one of: an operation that
- * was not live when the watch began registers for the task (the signal the chat's startup announcer and the operation
- * mirror use), or the downstream command resolving `true` under its own contract (`confirm()`). Calling a command or
- * entering a wrapper never counts. `onStarted` runs once, at the moment of confirmation. The listener is removed at
- * confirmation, when the dispatch settles (`dispose()`), and after the startup announcer's age limit, so a later round's
- * operation can never count as this dispatch's start.
- */
-interface DispatchStartWatchV1 {
-  readonly confirmed: () => boolean;
-  readonly confirm: () => void;
-  readonly dispose: () => void;
-}
-
-function watchDispatchStartV1(taskFolderPath: string, onStarted?: () => void): DispatchStartWatchV1 {
-  const liveBefore = new Set(taskOperations.getTaskOperations(taskFolderPath).map((operation) => operation.id));
-  let isConfirmed = false;
-  let subscription: vscode.Disposable | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const dispose = (): void => {
-    subscription?.dispose();
-    subscription = undefined;
-    if (timer !== undefined) {
-      clearTimeout(timer);
-      timer = undefined;
-    }
-  };
-  const confirm = (): void => {
-    if (isConfirmed) {
-      return;
-    }
-    isConfirmed = true;
-    dispose();
-    try {
-      onStarted?.();
-    } catch {
-      // A status-line callback must never block the dispatch.
-    }
-  };
-  subscription = taskOperations.onDidChange(() => {
-    if (!isConfirmed && taskOperations.getTaskOperations(taskFolderPath).some((operation) => !liveBefore.has(operation.id))) {
-      confirm();
-    }
-  });
-  timer = setTimeout(dispose, STARTUP_ANNOUNCER_MAX_AGE_MS_V1);
-  // Never keep the extension host alive for this timer.
-  (timer as { unref?: () => void }).unref?.();
-  return { confirmed: () => isConfirmed, confirm, dispose };
-}
-
-/** A dispatch that did not start: the reason the stage action recorded, or `fallback`, and the click that carries on. */
-function refusedDispatchOutcomeV1(taskFolderPath: string, fallback: string, click = RESUME_TASK_CLICK_V1): StageDispatchOutcomeV1 {
-  return { kind: "refused", reason: peekRecentStageActionRefusalReasonV1(taskFolderPath) ?? fallback, click };
-}
-
-/** Options for `resumeAndRerunReviewV1`. The command is awaited for the whole review, so progress is signalled by callback. */
-export interface ResumeAndRerunReviewOptionsV1 {
-  /**
-   * bugs8 Step 4: called once, at the moment the review's start is CONFIRMED (an operation registered for the task, or
-   * `runReviewWithAI` resolved `true`), never before. The command is awaited for the whole review, so this is how a
-   * caller learns of the start in time. In-process only.
-   */
-  readonly onStartedV1?: () => void;
-  /** RC4 item 3: `acceptPlanItemNarrowingV1` and the owner-evidence path pass this (review input changed, tree did not). */
-  readonly skipUnchangedTreeGuardV1?: true;
-  /**
-   * review1 Step 41: called once the resume has completed and the review is about to be dispatched, so a caller can tell
-   * the owner "re-running now" while the review runs, not after it has ended. In-process only.
-   */
-  readonly onDispatchingV1?: () => void;
-}
-
-/**
  * Resume a paused task and immediately re-dispatch its stage review — the
  * `WorkflowDecisionOptionEffectV1` shape only carries one command, and
  * `runReviewWithAI` itself refuses on a paused task (`reviewActions.ts`'s
@@ -1128,7 +1031,8 @@ export async function resumeAndRerunReviewV1(
   inventory: TaskInventory,
   currentTaskStore: CurrentTaskStore,
   explicitArg?: ResumeTaskArg,
-  reviewOptionsV1?: ResumeAndRerunReviewOptionsV1
+  /** RC4 item 3: only `acceptPlanItemNarrowingV1` passes this (review input changed, tree did not). */
+  reviewOptionsV1?: { readonly skipUnchangedTreeGuardV1?: true }
 ): Promise<boolean> {
   // Resolved BEFORE the resume, from the same (possibly-cached) `inventory`
   // resumePausedTask itself resolves against — this is the target folder,
@@ -1171,28 +1075,12 @@ export async function resumeAndRerunReviewV1(
     explicitArg,
     target.taskFolderPath,
     async (admissionHandoffToken): Promise<void> => {
-      try {
-        reviewOptionsV1?.onDispatchingV1?.();
-      } catch {
-        // A status-line callback must never block the review dispatch.
-      }
-      const startWatch = watchDispatchStartV1(target.taskFolderPath, reviewOptionsV1?.onStartedV1);
-      try {
-        started =
-          (await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
-            taskFolderPath: target.taskFolderPath,
-            admissionHandoffTokenV1: admissionHandoffToken,
-            ...(reviewOptionsV1?.skipUnchangedTreeGuardV1 ? { skipUnchangedTreeGuardV1: true } : {}),
-          })) === true;
-        if (started) {
-          startWatch.confirm();
-        }
-      } finally {
-        // bugs8 Step 4: an operation that registered for the task is a confirmed start even when the command's own
-        // result was not `true`, so the returned result keeps what the watcher saw.
-        started = started || startWatch.confirmed();
-        startWatch.dispose();
-      }
+      started =
+        (await vscode.commands.executeCommand("vs-code-ai-helper.runReviewWithAI", {
+          taskFolderPath: target.taskFolderPath,
+          admissionHandoffTokenV1: admissionHandoffToken,
+          ...(reviewOptionsV1?.skipUnchangedTreeGuardV1 ? { skipUnchangedTreeGuardV1: true } : {}),
+        })) === true;
     }
   );
   return started;
@@ -1209,9 +1097,9 @@ export async function resumeAndRerunReviewV1(
  *
  * Deliberately dispatches `runImplementationWithAI` rather than a specific
  * "continuation" vs "fresh implementation" command: that routing decision
- * (owed continuation vs the post-review Apply Review template vs the first-round Implementation template) already
- * lives inside `runImplementationWithAI` itself (review1 Step 18: one dispatch, chosen by whether the stage has a
- * current review), so resuming and calling it once is
+ * (owed continuation vs Apply Review vs Implementation) already lives inside
+ * `runImplementationWithAI` itself (`chooseAutomaticImplementationDispatchV1`
+ * / the manual pre-run decision), so resuming and calling it once is
  * sufficient to reach whichever action the escalation's reason actually
  * names — a second copy of that routing logic here would drift from it.
  *
@@ -1259,31 +1147,6 @@ export async function resumeAndDispatchImplementationV1(
         : {}),
     })
   );
-}
-
-/**
- * review1 Step 49: the request a diagnostic round is given. The protected list is the task's own banked files
- * (`implReviewFiles`); the diagnosis path is the next free `evidence/diagnosis-<n>.md`.
- */
-async function buildInvestigationRequestV1(
-  taskFolderPath: string,
-  input: { failure: string; environmentReport: string }
-): Promise<InvestigationRequestV1> {
-  const folderUri = vscode.Uri.file(taskFolderPath);
-  const progress = await readTaskProgressStrictV1(folderUri);
-  const banked = progress.ok ? progress.decoded.progress.implReviewFiles : undefined;
-  let existing: string[] = [];
-  try {
-    existing = (await vscode.workspace.fs.readDirectory(vscode.Uri.joinPath(folderUri, "evidence"))).map(([name]) => name);
-  } catch {
-    // No evidence folder yet: the first diagnosis is number 1.
-  }
-  return {
-    failure: input.failure,
-    environmentReport: input.environmentReport,
-    protectedFiles: collectProtectedFilesV1(banked),
-    diagnosisPath: nextDiagnosisPathV1(existing),
-  };
 }
 
 /**
@@ -1337,26 +1200,8 @@ export async function resumeAndApplyCurrentStageActionV1(
      * dispatches works on this one blocker (its text) instead of on every task-fixable blocker.
      */
     focusBlocker?: string;
-    /**
-     * review1 Step 49: set ONLY by the environmental-failure card's "Investigate it for me" option. The Apply
-     * Review this dispatches is a diagnostic round (`investigate-failure.md`): it writes
-     * `evidence/diagnosis-<n>.md` and changes nothing else.
-     */
-    investigate?: { failure: string; environmentReport: string };
-    /**
-     * review1 Step 49: set ONLY by the diagnosis card's "Apply the suggested fix" option. The owner's choice is
-     * recorded in task.md as an owner-approved out-of-plan change, and the Apply Review this dispatches may edit
-     * only these files.
-     */
-    applyDiagnosisFix?: { diagnosisPath: string; files: string[]; failure: string };
-    /**
-     * bugs8 Step 4: called once, at the moment the dispatch's start is CONFIRMED (an operation registered for the task,
-     * or the downstream command resolved `true`), never before. The command is awaited for the whole round, so this is
-     * how a caller learns of the start in time. In-process only.
-     */
-    onStartedV1?: () => void;
   }
-): Promise<StageDispatchOutcomeV1> {
+): Promise<void> {
   const resolverArg = normalizeResumeTaskArg(explicitArg);
   const target = await resolveTaskContext(
     inventory,
@@ -1365,7 +1210,7 @@ export async function resumeAndApplyCurrentStageActionV1(
     currentTaskStore
   );
   if (!target) {
-    return { kind: "refused", reason: "no task could be found for it", click: RESUME_TASK_CLICK_V1 };
+    return;
   }
   // RC3 item 4, Step 3 completion fix: a card's captured provenance is
   // re-checked HERE, at the moment the option is actually chosen, not merely
@@ -1387,31 +1232,13 @@ export async function resumeAndApplyCurrentStageActionV1(
     const ffProgress = freshForFf.ok ? freshForFf.decoded.progress : target.progress;
     // A read of the stage, bound to a local so the one-door stage-write scan does not take it for a write.
     const { currentStage } = ffProgress;
-    // review1 Step 32: the lost-round card names the lost round, whose ledger row carries the run's counters.
-    const lostRoundRow =
-      resumeFastForwardCandidate.fastForwardLedgerRoundIdV1 !== undefined
-        ? (ffProgress.roundLedger ?? []).find((row) => row.roundId === resumeFastForwardCandidate.fastForwardLedgerRoundIdV1)
-        : undefined;
-    const hasLiveOperation = getLiveTaskOperationV1(target.taskFolderPath) !== undefined;
-    const decision =
-      resumeFastForwardCandidate.fastForwardLedgerRoundIdV1 !== undefined
-        ? decideLedgerBackedFastForwardResumeV1(resumeFastForwardCandidate, {
-            status: ffProgress.status,
-            currentStage,
-            hasLiveOperation,
-            fastForwardRunLive: isFastForwardRunActiveV1(target.taskFolderPath),
-            lostRound: lostRoundRow
-              ? { startedAtMs: Date.parse(lostRoundRow.startedAt), hasFastForwardStamp: lostRoundRow.fastForwardRunV1 !== undefined }
-              : undefined,
-            latestRoundStartedAtMs: latestRoundStartedAtMsV1(ffProgress.roundLedger),
-          })
-        : decideDurableFastForwardResumeV1(resumeFastForwardCandidate, {
-            currentSessionId: getFastForwardSessionIdV1(),
-            status: ffProgress.status,
-            currentStage,
-            hasLiveOperation,
-            latestRoundStartedAtMs: latestRoundStartedAtMsV1(ffProgress.roundLedger),
-          });
+    const decision = decideDurableFastForwardResumeV1(resumeFastForwardCandidate, {
+      currentSessionId: getFastForwardSessionIdV1(),
+      status: ffProgress.status,
+      currentStage,
+      hasLiveOperation: getLiveTaskOperationV1(target.taskFolderPath) !== undefined,
+      latestRoundStartedAtMs: latestRoundStartedAtMsV1(ffProgress.roundLedger),
+    });
     if (decision.trusted) {
       resumeFastForwardTrusted = true;
     } else {
@@ -1433,35 +1260,23 @@ export async function resumeAndApplyCurrentStageActionV1(
   }
   if (resumeFastForward) {
     const ffTaskName = target.progress.displayName ?? target.folderName;
-    // `fastForwardReviewWithAI` resolves void, so only a registered operation confirms a start here; the closure's own
-    // `true` (which keeps this branch's pause behaviour as it was) is not a start signal.
-    // The watch begins inside the closure, after the resume itself (a tracked operation) is over.
-    const ffStartWatch: { current?: DispatchStartWatchV1 } = {};
-    let dispatchedFf: boolean | undefined;
-    try {
-      dispatchedFf = await resumeThenDispatchV1(
-        inventory,
-        currentTaskStore,
-        explicitArg,
-        target.taskFolderPath,
-        async (admissionHandoffToken) => {
-          const dispatch = buildFastForwardResumeDispatchV1(target.taskFolderPath, resumeFastForward, admissionHandoffToken);
-          ffStartWatch.current = watchDispatchStartV1(target.taskFolderPath, explicitArg?.onStartedV1);
-          await vscode.commands.executeCommand(dispatch.command, dispatch.arg);
-          return true;
-        }
-      );
-    } finally {
-      ffStartWatch.current?.dispose();
-    }
+    const dispatchedFf = await resumeThenDispatchV1(
+      inventory,
+      currentTaskStore,
+      explicitArg,
+      target.taskFolderPath,
+      async (admissionHandoffToken) => {
+        const dispatch = buildFastForwardResumeDispatchV1(target.taskFolderPath, resumeFastForward, admissionHandoffToken);
+        await vscode.commands.executeCommand(dispatch.command, dispatch.arg);
+        return true;
+      }
+    );
     if (dispatchedFf === false) {
       NotificationRouter.showWarning(
         `"Keep iterating" resumed "${ffTaskName}" but Fast Forward could not be restarted — see the message above for the cause.`
       );
     }
-    return ffStartWatch.current?.confirmed() === true
-      ? { kind: "started" }
-      : refusedDispatchOutcomeV1(target.taskFolderPath, "Fast Forward did not start (see the message above for the cause)");
+    return;
   }
   // arrangeStageDispatch: false — this function dispatches
   // applyCurrentStageAction itself, below; even though that is the same
@@ -1496,11 +1311,7 @@ export async function resumeAndApplyCurrentStageActionV1(
       plan.precondition,
       plan.restoreSummary
     );
-    return {
-      kind: "refused",
-      reason: `the task stays paused: ${plan.precondition}`,
-      click: RESUME_TASK_CLICK_V1,
-    };
+    return;
   }
   if (plan.kind === "resume-only") {
     const resumed = await resumePausedTask(inventory, currentTaskStore, explicitArg, {
@@ -1509,7 +1320,7 @@ export async function resumeAndApplyCurrentStageActionV1(
     if (resumed.outcome === "resumed") {
       NotificationRouter.showInformation(`Resumed "${taskName}". ${plan.reason}`);
     }
-    return { kind: "recordedOnly", reason: plan.reason, click: RESUME_TASK_CLICK_V1 };
+    return;
   }
   // bugs5 Step 19: the one-cycle stand-in's own Ended line says why Fast Forward did not continue.
   const standInTaskKey = taskKey(target.taskFolderPath);
@@ -1520,35 +1331,6 @@ export async function resumeAndApplyCurrentStageActionV1(
   if (explicitArg?.focusBlocker && plan.kind !== "run-review") {
     setApplyReviewFocusV1(target.taskFolderPath, explicitArg.focusBlocker);
   }
-  if (explicitArg?.investigate && plan.kind !== "run-review") {
-    setInvestigationRequestV1(
-      target.taskFolderPath,
-      await buildInvestigationRequestV1(target.taskFolderPath, explicitArg.investigate)
-    );
-  }
-  if (explicitArg?.applyDiagnosisFix && plan.kind !== "run-review") {
-    const files = sanitizeApprovedFixFilesV1(explicitArg.applyDiagnosisFix.files ?? []);
-    if (files.length === 0) {
-      NotificationRouter.showWarning(
-        `"${taskName}": the suggested fix names no file inside the workspace, so nothing was approved or run.`
-      );
-      return {
-        kind: "refused",
-        reason: "the suggested fix names no file inside the workspace",
-        click: "the diagnosis card's Apply the suggested fix again with a file named",
-      };
-    }
-    const approved = { diagnosisPath: explicitArg.applyDiagnosisFix.diagnosisPath, files, failure: explicitArg.applyDiagnosisFix.failure };
-    await appendOwnerDecisionV1(target.taskFolderPath, {
-      blockerId: "out-of-plan-fix",
-      blockerText: approved.failure.split("\n")[0] ?? "A failing check",
-      answer: describeOutOfPlanApprovalV1(approved),
-    }).catch(() => false);
-    setApprovedFixRequestV1(target.taskFolderPath, approved);
-  }
-  // bugs8 Step 4: the watch begins inside the closure (after the resume, itself a tracked operation, is over). A start is
-  // confirmed by an operation registering for the task, or the downstream command resolving `true`; calling it is not.
-  const startWatch: { current?: DispatchStartWatchV1 } = {};
   try {
     dispatched = await resumeThenDispatchV1(
       inventory,
@@ -1556,7 +1338,6 @@ export async function resumeAndApplyCurrentStageActionV1(
       explicitArg,
       target.taskFolderPath,
       async (admissionHandoffToken) => {
-        startWatch.current = watchDispatchStartV1(target.taskFolderPath, explicitArg?.onStartedV1);
         const result = await vscode.commands.executeCommand(
           plan.kind === "run-review"
             ? "vs-code-ai-helper.runReviewWithAI"
@@ -1566,9 +1347,6 @@ export async function resumeAndApplyCurrentStageActionV1(
             admissionHandoffTokenV1: admissionHandoffToken,
           }
         );
-        if (result === true) {
-          startWatch.current.confirm();
-        }
         // `runReviewWithAI` resolves `true` only when a review round started
         // (a refusal on any guard clause, including "no model configured",
         // resolves `false` or nothing); normalise so resumeThenDispatchV1 clears
@@ -1577,22 +1355,16 @@ export async function resumeAndApplyCurrentStageActionV1(
       }
     );
   } finally {
-    startWatch.current?.dispose();
     clearPendingEndedLineNoteV1(standInTaskKey);
     clearApplyReviewFocusV1(target.taskFolderPath);
-    clearInvestigationRequestV1(target.taskFolderPath);
-    clearApprovedFixRequestV1(target.taskFolderPath);
   }
-  const startConfirmed = startWatch.current?.confirmed() === true;
   // A composed action that did not start its second step must not read as
   // success: both commands report refusal as `false`.
   if (dispatched === false) {
     NotificationRouter.showWarning(
       `"${plan.label}" resumed "${taskName}" but the action was refused, so nothing is running — see the message above for the cause.`
     );
-    return startConfirmed
-      ? { kind: "started" }
-      : refusedDispatchOutcomeV1(target.taskFolderPath, "the action declined to start");
+    return;
   }
   // bugs5 Step 19: a one-cycle run that stands in for a Keep iterating answer never ends as a bare "succeeded".
   // Say why Fast Forward did not continue and what to choose next.
@@ -1609,15 +1381,6 @@ export async function resumeAndApplyCurrentStageActionV1(
       optional: true,
     });
   }
-  if (startConfirmed) {
-    return { kind: "started" };
-  }
-  // Nothing refused out loud, yet nothing confirmed a start: the resume itself did not go through (a held or stale
-  // admission, or a task that stayed paused), and the resume has already said so.
-  return refusedDispatchOutcomeV1(
-    target.taskFolderPath,
-    "the task could not be resumed just now (another action holds it, or it stayed paused)"
-  );
 }
 
 function latestRoundStartedAtMsV1(ledger: readonly { readonly startedAt: string }[] | undefined): number | undefined {
@@ -1695,25 +1458,6 @@ export async function resumeAndSetTaskStageV1(
   const stage = explicitArg.stage;
   const resumeFastForward = explicitArg.resumeFastForward === true;
   const expectedSourceStage = explicitArg.expectedSourceStage;
-  // review1 Step 57: the "Advance to Low-Level Code Review" card option is the same move as Complete Stage & Move
-  // On, so it asks the same question first while plan items are open. Declining changes nothing: the task is not
-  // resumed and the stage stays as it was.
-  if (
-    expectedSourceStage !== undefined &&
-    !(await confirmAdvanceOverOpenItemsV1(vscode.Uri.file(target.taskFolderPath), expectedSourceStage, stage))
-  ) {
-    return;
-  }
-  // review2 Step 19: the "Advance to Publish" card option asks the same question as Complete Stage & Move On.
-  if (
-    expectedSourceStage !== undefined &&
-    !(await confirmUnreviewedFilesV1(vscode.Uri.file(target.taskFolderPath), "Advance to Publish", {
-      destination: stage,
-      source: expectedSourceStage,
-    }))
-  ) {
-    return;
-  }
   // arrangeStageDispatch: false — this function dispatches setTaskStage
   // itself, below, which is a stage MOVE, not a rerun of the current stage's
   // action; a durably arranged current-stage action would be actively wrong
@@ -2072,7 +1816,7 @@ export function registerResumeTaskCommand(
 
   const resumeAndRerunReview = vscode.commands.registerCommand(
     "vs-code-ai-helper.resumeAndRerunReview",
-    (arg?: ResumeTaskArg, reviewOptionsV1?: ResumeAndRerunReviewOptionsV1) =>
+    (arg?: ResumeTaskArg, reviewOptionsV1?: { readonly skipUnchangedTreeGuardV1?: true }) =>
       resumeAndRerunReviewV1(inventory, currentTaskStore, arg, reviewOptionsV1)
   );
   context.subscriptions.push(resumeAndRerunReview);

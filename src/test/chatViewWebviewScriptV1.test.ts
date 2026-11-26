@@ -16,8 +16,6 @@
  * instead of replacing it with an error (verification review, 2026-09-18).
  */
 import * as assert from "node:assert/strict";
-import * as fs from "node:fs";
-import * as path from "node:path";
 import * as vm from "node:vm";
 import { describe, it } from "node:test";
 import { ChatViewProvider } from "../views/chatView";
@@ -173,14 +171,13 @@ function runPanel(): PanelHarness {
     "error",
     "busy-indicator",
     "busy-text",
+    "busy-detail",
+    "busy-actions",
     "steering-note",
     "form",
     "message",
     "send-btn",
     "send-reason",
-    "answering",
-    "answering-text",
-    "answering-cancel",
     "stage-nav",
   ]) {
     elements.set(id, makeElement("div", id));
@@ -817,10 +814,8 @@ void describe("the chat panel's inline script", () => {
     assert.equal(panel.byId("busy-indicator").style.display, "none");
   });
 
-  void describe("run1 Step 20: Chat With AI shows nothing about what is running", () => {
-    // Notifications answers "is it running?". A stale `runStrip` field or message from an older host
-    // must never paint a running line in the chat.
-    const staleStrip = {
+  void describe("chat1 Step 6: the live run strip", () => {
+    const strip = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
       operationId: "op-7",
       label: "Apply Review — High-Level Code Review",
       model: "Claude Sonnet 5.5",
@@ -829,68 +824,98 @@ void describe("the chat panel's inline script", () => {
       latest: "pnpm run lint · 1/12 complete",
       waiting: false,
       cancellable: true,
-    };
+      ...overrides,
+    });
 
-    void it("paints no running line for a state message, even one that still carries a run strip", () => {
+    void it("shows what runs, on which model, since when, and its latest progress", () => {
       const panel = runPanel();
-      panel.post(stateMessage({ runStrip: staleStrip, busy: true, busyLabel: "Implementation Review" }));
+      panel.post(stateMessage({ runStrip: strip() }));
+      const indicator = panel.byId("busy-indicator");
+      assert.equal(indicator.style.display, "block");
+      assert.equal(panel.byId("busy-text").textContent, "Running: Apply Review — High-Level Code Review");
+      const detail = panel.byId("busy-detail").textContent;
+      assert.match(detail, /Claude Sonnet 5\.5/);
+      assert.match(detail, /since 13:58 \(4 min\)/);
+      assert.match(detail, /pnpm run lint · 1\/12 complete/);
+    });
+
+    void it("updates in place from a runStrip message: no new conversation entry, no repaint of it", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip() }));
+      const rowsBefore = panel.byId("messages").children.length;
+      panel.post({ type: "runStrip", runStrip: strip({ latest: "2/12 complete" }) });
+      assert.match(panel.byId("busy-detail").textContent, /2\/12 complete/);
+      assert.equal(panel.byId("messages").children.length, rowsBefore, "the transcript is untouched");
+    });
+
+    void it("is hidden when the run ends, and replaced rather than stacked", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip() }));
+      panel.post({ type: "runStrip", runStrip: strip({ operationId: "op-8", label: "Publish Checks" }) });
+      assert.equal(panel.byId("busy-text").textContent, "Running: Publish Checks");
+      assert.equal(panel.byId("busy-actions").children.length, 2, "one set of links, not two");
+      panel.post({ type: "runStrip", runStrip: null });
       assert.equal(panel.byId("busy-indicator").style.display, "none");
       assert.equal(panel.byId("busy-text").textContent, "");
+      assert.equal(panel.byId("busy-detail").textContent, "");
+      assert.equal(panel.byId("busy-actions").children.length, 0);
     });
 
-    void it("ignores a runStrip message: the conversation and the banner are untouched", () => {
+    void it("offers Show in Notifications, and Stop only for an operation that can be cancelled", () => {
       const panel = runPanel();
-      panel.post(stateMessage());
-      const rowsBefore = panel.byId("messages").children.length;
-      panel.post({ type: "runStrip", runStrip: staleStrip });
-      assert.equal(panel.byId("busy-indicator").style.display, "none");
-      assert.equal(panel.byId("messages").children.length, rowsBefore);
+      panel.post(stateMessage({ runStrip: strip() }));
+      const links = panel.byId("busy-actions").children;
+      assert.deepEqual(
+        links.map((link) => link.textContent),
+        ["Show in Notifications", "Stop"]
+      );
+      links[0]!.listeners.get("click")![0]!({});
+      links[1]!.listeners.get("click")![0]!({});
+      assert.deepEqual(JSON.parse(JSON.stringify(panel.outbound.slice(-2))), [
+        { type: "showRunInNotifications" },
+        { type: "stopRunFromStrip", operationId: "op-7" },
+      ]);
+      panel.post({ type: "runStrip", runStrip: strip({ operationId: "op-9", cancellable: false }) });
+      assert.deepEqual(
+        panel.byId("busy-actions").children.map((link) => link.textContent),
+        ["Show in Notifications"]
+      );
     });
 
-    void it("keeps the waiting banner for a question waiting on the owner, with no run details", () => {
+    void it("announces only a change of label, not each progress tick", () => {
       const panel = runPanel();
-      panel.post(stateMessage({ waitingForUser: true, waitingForUserSource: "liveOperation" }));
+      panel.post(stateMessage({ runStrip: strip() }));
+      const label = panel.byId("busy-text");
+      let labelWrites = 0;
+      let current = label.textContent;
+      Object.defineProperty(label, "textContent", {
+        get: () => current,
+        set: (value: string) => {
+          labelWrites += 1;
+          current = value;
+        },
+      });
+      panel.post({ type: "runStrip", runStrip: strip({ latest: "3/12 complete" }) });
+      panel.post({ type: "runStrip", runStrip: strip({ latest: "4/12 complete" }) });
+      assert.equal(labelWrites, 0, "the live region is not rewritten for a progress tick");
+      panel.post({ type: "runStrip", runStrip: strip({ label: "Publish Checks" }) });
+      assert.equal(labelWrites, 1);
+    });
+
+    void it("says the run waits for the owner, and keeps the waiting banner when only a child waits", () => {
+      const panel = runPanel();
+      panel.post(stateMessage({ runStrip: strip({ waiting: true }), waitingForUser: true, waitingForUserSource: "liveOperation" }));
+      assert.match(panel.byId("busy-text").textContent, /waiting for your answer/);
+      panel.post(stateMessage({ runStrip: null, waitingForUser: true, waitingForUserSource: "liveOperation" }));
       assert.equal(panel.byId("busy-text").textContent, "Waiting for your answer");
-      assert.equal(panel.byId("busy-indicator").style.display, "block");
     });
 
     void it("keeps the reason Send is disabled while a run is in progress", () => {
       const panel = runPanel();
-      panel.post(stateMessage({ busy: true, busyLabel: "Implementation Review" }));
+      panel.post(stateMessage({ runStrip: strip(), busy: true, busyLabel: "Implementation Review" }));
       assert.equal(panel.byId("send-btn").disabled, true);
       assert.match(panel.byId("send-reason").textContent, /Available when Implementation Review finishes/);
     });
-
-    void it("the chat source posts no run strip and the strip module is gone", () => {
-      const source = fs.readFileSync(path.join(__dirname, "..", "..", "src", "views", "chatView.ts"), "utf8");
-      assert.doesNotMatch(source, /runStrip|chatRunStripV1|showRunInNotifications|stopRunFromStrip/);
-      assert.equal(fs.existsSync(path.join(__dirname, "..", "..", "src", "views", "chatRunStripV1.ts")), false);
-    });
-  });
-
-  void it("review2 Step 43: an own-words card shows 'Answering: <card title>' above the box, focuses it, and Cancel goes back", () => {
-    const panel = runPanel();
-    panel.post(stateMessage());
-    panel.post({ type: "answeringOwnWords", text: "Answering: Step 22 acceptance line" });
-    assert.equal(panel.byId("answering").style.display, "block");
-    assert.equal(panel.byId("answering-text").textContent, "Answering: Step 22 acceptance line");
-    // Cancel tells the host and hides the line.
-    for (const handler of panel.byId("answering-cancel").listeners.get("click") ?? []) handler({});
-    assert.ok(panel.outbound.some((m) => (m as { type?: unknown }).type === "cancelOwnWordsAnswer"));
-    assert.equal(panel.byId("answering").style.display, "none");
-    // The host ending the answer hides it too.
-    panel.post({ type: "answeringOwnWords", text: "Answering: x" });
-    panel.post({ type: "answeringOwnWordsEnded" });
-    assert.equal(panel.byId("answering").style.display, "none");
-  });
-
-  void it("review2 Step 43: a busy task does not block the answer to an own-words card", () => {
-    const panel = runPanel();
-    panel.post(stateMessage({ busy: true, busyLabel: "Apply Review", waitingForUser: false }));
-    assert.equal(panel.byId("send-btn").disabled, true);
-    panel.post({ type: "answeringOwnWords", text: "Answering: Step 22" });
-    panel.post(stateMessage({ busy: true, busyLabel: "Apply Review", waitingForUser: false }));
-    assert.equal(panel.byId("send-btn").disabled, false, "the answer is not a chat send");
   });
 
   void it("shows the non-steering note on a task chat and hides it on the global chat", () => {

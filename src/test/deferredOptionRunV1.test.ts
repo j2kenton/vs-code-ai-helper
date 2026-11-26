@@ -8,7 +8,7 @@ import { describe, it } from "node:test";
 import {
   armDeferredOptionRunV1,
   cancelDeferredOptionRunV1,
-  createDeferredRunRegistryV1,
+  decideHeldDispatchV1,
   describeDeferredOptionHeldV1,
   describeDeferredOptionOutcomeV1,
   isDeferredOptionRunArmedV1,
@@ -83,21 +83,6 @@ void describe("armDeferredOptionRunV1 (bugs4 item 26)", () => {
     assert.equal(isDeferredOptionRunArmedV1(h.input.key), false);
   });
 
-  void it("two windows each have their own table: the same answer is armed in both, and cancelling one leaves the other", () => {
-    const windowA = createDeferredRunRegistryV1();
-    const windowB = createDeferredRunRegistryV1();
-    const a = harness();
-    const b = harness();
-    const key = `shared-${Math.random()}`;
-    assert.equal(armDeferredOptionRunV1({ ...a.input, key, registry: windowA }), true);
-    assert.equal(armDeferredOptionRunV1({ ...b.input, key, registry: windowB }), true, "not blocked by the other window's waiter");
-    assert.equal(armDeferredOptionRunV1({ ...a.input, key, registry: windowA }), false, "within one window it is still one waiter");
-    cancelDeferredOptionRunV1(key, windowA);
-    assert.equal(isDeferredOptionRunArmedV1(key, windowA), false);
-    assert.equal(isDeferredOptionRunArmedV1(key, windowB), true);
-    cancelDeferredOptionRunV1(key, windowB);
-  });
-
   void it("an effect that cannot be carried out is reported with its reason", async () => {
     const h = harness({
       carryOut: () => Promise.resolve({ kind: "notCarriedOut", reason: "the task is now at Publish, not Low-Level Code Review." }),
@@ -135,5 +120,13 @@ void describe("armDeferredOptionRunV1 (bugs4 item 26)", () => {
     assert.match(text, /"Apply Review".*still running/);
     assert.match(text, /"Move on" has not run yet/);
     assert.match(text, /offers the choice again/);
+  });
+});
+
+void describe("decideHeldDispatchV1 (bugs6 item 29: Pause wins over a held answer)", () => {
+  void it("a paused task waits for the owner; an active or unknown status dispatches", () => {
+    assert.deepEqual(decideHeldDispatchV1({ taskStatus: "paused" }), { kind: "waitForOwner", reason: "paused" });
+    assert.deepEqual(decideHeldDispatchV1({ taskStatus: "active" }), { kind: "dispatch" });
+    assert.deepEqual(decideHeldDispatchV1({ taskStatus: undefined }), { kind: "dispatch" });
   });
 });
